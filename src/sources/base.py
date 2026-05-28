@@ -20,6 +20,9 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 SESSIONS_DIR = Path(__file__).parent.parent.parent / "state" / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Where browser extensions are stored
+EXT_DIR = Path(__file__).parent.parent.parent / "state" / "extensions"
+
 
 class BaseScraper(ABC):
     """
@@ -60,26 +63,42 @@ class BaseScraper(ABC):
             except Exception:
                 pass
 
-    async def _start_browser(self) -> Page:
+    async def _start_browser(self, load_extensions: bool = False) -> Page:
         """
         Launch a persistent Chromium context backed by a per-source profile dir.
         On first run the browser opens to the site and the user logs in once.
         All cookies/storage are saved automatically in the profile dir so every
         subsequent run is already authenticated — no re-login needed.
+
+        load_extensions=True: also loads the Jobright Autofill extension from
+        state/extensions/jobright-autofill so it can fill company ATS forms.
         """
         # Remove stale lock files so Playwright can acquire the profile
         self._clear_profile_locks()
 
         self._playwright = await async_playwright().start()
 
+        args = [
+            "--start-maximized",
+            "--disable-blink-features=AutomationControlled",
+        ]
+
+        if load_extensions:
+            ext_path = EXT_DIR / "jobright-autofill"
+            if ext_path.exists():
+                ext_str = str(ext_path)
+                args += [
+                    f"--load-extension={ext_str}",
+                    f"--disable-extensions-except={ext_str}",
+                ]
+            else:
+                print(f"[warning] Extension not found at {ext_path} — skipping extension load")
+
         # launch_persistent_context keeps cookies/localStorage across restarts
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(self._profile_dir),
             headless=False,
-            args=[
-                "--start-maximized",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=args,
             slow_mo=80,
             viewport={"width": 1400, "height": 900},
             user_agent=(
