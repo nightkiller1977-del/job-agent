@@ -203,9 +203,9 @@ async def index(request: Request):
         )
 
     return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
+        request=request,
+        name="index.html",
+        context={
             "stats": stats,
             "pending": [dict(r) for r in pending],
             "applied": [dict(r) for r in applied],
