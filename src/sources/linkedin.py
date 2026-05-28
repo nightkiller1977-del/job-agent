@@ -5,6 +5,8 @@ Handles multi-step Easy Apply forms.
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 from datetime import datetime
 from typing import Optional
@@ -58,15 +60,19 @@ class LinkedInScraper(BaseScraper):
             await page.goto(LINKEDIN_BASE, wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
 
-            # Check login
-            if "/login" in page.url or "/authwall" in page.url or "uas/login" in page.url:
-                console.print(
-                    "[red]LinkedIn:[/red] Not logged in. Please log in at https://www.linkedin.com "
-                    "in the opened browser window."
-                )
-                input("  Press Enter once logged in > ")
-                await page.goto(LINKEDIN_BASE, wait_until="domcontentloaded", timeout=30000)
-                await self._delay(2, 3)
+            # Check login — attempt auto-login from .env if not authenticated
+            if "/login" in page.url or "/authwall" in page.url or "uas/login" in page.url or "linkedin.com/feed" not in page.url:
+                email = os.environ.get("LINKEDIN_EMAIL", "")
+                password = os.environ.get("LINKEDIN_PASSWORD", "")
+                if email and password:
+                    console.print("[blue]LinkedIn:[/blue] Not logged in — attempting auto-login…")
+                    logged_in = await self._auto_login(page, email, password)
+                    if not logged_in:
+                        console.print("[red]LinkedIn: Auto-login failed — skipping.[/red]")
+                        return []
+                else:
+                    console.print("[red]LinkedIn:[/red] Not logged in and no credentials in .env. Add LINKEDIN_EMAIL and LINKEDIN_PASSWORD.")
+                    return []
 
             for query in TARGET_SEARCHES:
                 if len(all_jobs) >= self.max_jobs:
@@ -86,6 +92,43 @@ class LinkedInScraper(BaseScraper):
             await self._close_browser()
 
         return all_jobs
+
+    async def _auto_login(self, page, email: str, password: str) -> bool:
+        """Log in to LinkedIn with stored credentials."""
+        try:
+            await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=20000)
+            await self._delay(1.5, 2.5)
+
+            # Fill email
+            await page.wait_for_selector('#username', timeout=8000)
+            await page.fill('#username', email)
+            await self._delay(0.5, 1)
+
+            # Fill password
+            await page.fill('#password', password)
+            await self._delay(0.5, 1)
+
+            # Submit
+            await page.click('button[type="submit"]')
+            console.print("[blue]LinkedIn:[/blue] Credentials submitted, waiting for redirect…")
+
+            # Wait for feed or jobs page
+            for _ in range(20):
+                await asyncio.sleep(2)
+                cur = page.url
+                if "linkedin.com/feed" in cur or "linkedin.com/jobs" in cur or "linkedin.com/mynetwork" in cur:
+                    console.print("[green]LinkedIn: ✓ Auto-login successful! Session saved.[/green]")
+                    await self._save_session()
+                    return True
+                if "checkpoint" in cur or "challenge" in cur:
+                    console.print("[yellow]LinkedIn: Security checkpoint detected — manual action needed.[/yellow]")
+                    return False
+
+            console.print(f"[red]LinkedIn: Login timeout. URL: {page.url}[/red]")
+            return False
+        except Exception as exc:
+            console.print(f"[red]LinkedIn auto-login error: {exc}[/red]")
+            return False
 
     async def _search_jobs(self, page, query: str, seen_ids: set) -> list[dict]:
         """Search LinkedIn jobs for a query and return job dicts."""
