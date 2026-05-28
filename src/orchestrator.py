@@ -215,7 +215,14 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def apply_approved(self) -> None:
-        """Apply to all jobs in 'approved' status."""
+        """Apply to all jobs in 'approved' status.
+
+        First pulls any cloud-approved jobs into the local DB so that jobs
+        approved via the web dashboard are picked up here too.
+        """
+        # Pull cloud-approved jobs into local SQLite first
+        await self._pull_approved_from_cloud()
+
         approved = self.state.get_approved_unapplied()
         if not approved:
             console.print("[yellow]No approved jobs pending application.[/yellow]")
@@ -242,6 +249,8 @@ class Orchestrator:
                     self.state.set_status(job["job_id"], "applied")
                     applied_count += 1
                     console.print(f"[green]Applied! Status updated.[/green]")
+                    # Push "applied" status back to cloud dashboard
+                    await self._push_status_to_cloud(job["job_id"], "applied")
                 else:
                     console.print(f"[yellow]Application not submitted — status unchanged.[/yellow]")
                     skipped_count += 1
@@ -250,6 +259,57 @@ class Orchestrator:
                 skipped_count += 1
 
         console.print(f"\n[bold]Apply run complete:[/bold] {applied_count} applied, {skipped_count} not submitted")
+
+    async def _pull_approved_from_cloud(self) -> None:
+        """Fetch jobs marked 'approved' on the cloud dashboard and upsert them
+        into the local SQLite DB so the apply command can act on them."""
+        dashboard_url = os.environ.get("DASHBOARD_URL", "")
+        sync_secret = os.environ.get("SYNC_SECRET", "")
+        if not dashboard_url:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(
+                    f"{dashboard_url}/api/jobs/approved",
+                    headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
+                )
+                if r.status_code != 200:
+                    console.print(f"[yellow]Cloud pull returned {r.status_code} — skipping.[/yellow]")
+                    return
+                jobs = r.json()
+                if not jobs:
+                    return
+                pulled = 0
+                for job in jobs:
+                    # Insert if new, then always force status to "approved"
+                    # (upsert_job skips existing rows, so set_status does the update)
+                    job["status"] = "approved"
+                    self.state.upsert_job(job)
+                    self.state.set_status(job["job_id"], "approved")
+                    pulled += 1
+                console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")
+        except Exception as e:
+            console.print(f"[dim]Cloud pull failed (non-fatal): {e}[/dim]")
+
+    async def _push_status_to_cloud(self, job_id: str, status: str) -> None:
+        """POST a status update back to the cloud dashboard (non-fatal)."""
+        dashboard_url = os.environ.get("DASHBOARD_URL", "")
+        sync_secret = os.environ.get("SYNC_SECRET", "")
+        if not dashboard_url:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{dashboard_url}/api/action",
+                    json={"job_id": job_id, "action": status},
+                    headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
+                )
+                if r.status_code != 200:
+                    console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
+        except Exception as e:
+            console.print(f"[dim]Cloud status push failed (non-fatal): {e}[/dim]")
 
     # ------------------------------------------------------------------
     # status command
