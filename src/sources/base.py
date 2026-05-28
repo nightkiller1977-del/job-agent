@@ -51,6 +51,15 @@ class BaseScraper(ABC):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _clear_profile_locks(self) -> None:
+        """Remove stale Chromium lock files that prevent re-launching the profile."""
+        for lockfile in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            p = self._profile_dir / lockfile
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     async def _start_browser(self) -> Page:
         """
         Launch a persistent Chromium context backed by a per-source profile dir.
@@ -58,6 +67,9 @@ class BaseScraper(ABC):
         All cookies/storage are saved automatically in the profile dir so every
         subsequent run is already authenticated — no re-login needed.
         """
+        # Remove stale lock files so Playwright can acquire the profile
+        self._clear_profile_locks()
+
         self._playwright = await async_playwright().start()
 
         # launch_persistent_context keeps cookies/localStorage across restarts
