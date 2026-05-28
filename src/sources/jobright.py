@@ -90,58 +90,103 @@ class JobrightScraper(BaseScraper):
     async def _auto_login(self, page, email: str, password: str) -> bool:
         """Attempt to log in to jobright.ai using email/password from .env."""
         try:
-            # Click the Sign In button if visible on the homepage
+            # Step 1: Click the Sign In link/button to open the modal
+            console.print("[magenta]Jobright:[/magenta] Looking for Sign In button…")
+            clicked = False
             for sign_in_sel in [
-                'button:text("Sign In")', 'a:text("Sign In")',
-                'button:text-matches("sign in", "i")', 'a:text-matches("sign in", "i")',
+                'text="Sign In"',
+                'text="SIGN IN"',
+                '[href*="login"]',
+                '[href*="signin"]',
             ]:
                 try:
-                    btn = await page.wait_for_selector(sign_in_sel, timeout=4000)
+                    btn = await page.wait_for_selector(sign_in_sel, timeout=5000)
                     if btn:
                         await btn.click()
-                        await self._delay(1, 2)
+                        await self._delay(1.5, 2.5)
+                        clicked = True
+                        console.print(f"[magenta]Jobright:[/magenta] Clicked sign-in trigger.")
                         break
                 except Exception:
                     continue
 
-            # Wait for the email field in the login modal
-            email_sel = 'input[type="email"], input[placeholder*="mail" i], input[name="email"]'
-            await page.wait_for_selector(email_sel, timeout=8000)
-            await page.fill(email_sel, email)
+            if not clicked:
+                console.print("[yellow]Jobright:[/yellow] No Sign In button found, trying direct login URL…")
+                await page.goto("https://jobright.ai/login", wait_until="domcontentloaded", timeout=15000)
+                await self._delay(2, 3)
+
+            # Step 2: Wait for email input field (try each selector individually)
+            console.print("[magenta]Jobright:[/magenta] Waiting for email input…")
+            email_input = None
+            for sel in [
+                'input[type="email"]',
+                'input[placeholder="Email"]',
+                'input[placeholder*="email" i]',
+                'input[name="email"]',
+                'input[autocomplete="email"]',
+            ]:
+                try:
+                    elem = await page.wait_for_selector(sel, timeout=5000)
+                    if elem:
+                        email_input = elem
+                        console.print(f"[magenta]Jobright:[/magenta] Found email field.")
+                        break
+                except Exception:
+                    continue
+
+            if not email_input:
+                console.print("[red]Jobright:[/red] Could not find email input field.")
+                return False
+
+            # Step 3: Fill email and password
+            await email_input.click()
+            await email_input.fill(email)
             await self._delay(0.5, 1)
 
-            # Fill password
-            pwd_sel = 'input[type="password"]'
-            await page.fill(pwd_sel, password)
+            pwd_input = await page.wait_for_selector('input[type="password"]', timeout=5000)
+            if not pwd_input:
+                console.print("[red]Jobright:[/red] Could not find password input.")
+                return False
+            await pwd_input.click()
+            await pwd_input.fill(password)
             await self._delay(0.5, 1)
 
-            # Click Sign In / Submit
+            # Step 4: Submit
+            console.print("[magenta]Jobright:[/magenta] Submitting credentials…")
+            submitted = False
             for submit_sel in [
                 'button[type="submit"]',
-                'button:text("Sign In")', 'button:text("Log In")',
-                'button:text-matches("sign in", "i")',
+                'button:text("SIGN IN")',
+                'button:text("Sign In")',
+                'button:text("Log In")',
             ]:
                 try:
                     btn = await page.wait_for_selector(submit_sel, timeout=3000)
                     if btn:
                         await btn.click()
+                        submitted = True
                         break
                 except Exception:
                     continue
 
-            # Wait for redirect to jobs page
-            console.print("[magenta]Jobright:[/magenta] Credentials submitted, waiting for redirect…")
-            for _ in range(20):
+            if not submitted:
+                # Try pressing Enter on the password field
+                await pwd_input.press("Enter")
+
+            # Step 5: Wait for redirect to jobs page (up to 30s)
+            console.print("[magenta]Jobright:[/magenta] Waiting for login to complete…")
+            for _ in range(15):
                 await asyncio.sleep(2)
-                if "jobright.ai/jobs" in page.url or "jobright.ai/dashboard" in page.url:
-                    console.print("[green]Jobright: Auto-login successful! Session saved.[/green]")
+                cur = page.url
+                if "jobright.ai/jobs" in cur or "jobright.ai/dashboard" in cur or "jobright.ai/home" in cur:
+                    console.print("[green]Jobright: ✓ Auto-login successful! Session saved.[/green]")
                     await self._save_session()
-                    # Navigate to the recommended jobs page
                     await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=20000)
                     await self._delay(2, 3)
                     return True
+                console.print(f"[dim]  Waiting… {cur}[/dim]")
 
-            console.print(f"[red]Jobright: Login redirect timeout. Current URL: {page.url}[/red]")
+            console.print(f"[red]Jobright: Login redirect timed out. URL: {page.url}[/red]")
             return False
 
         except Exception as exc:
