@@ -1,0 +1,23 @@
+# ── Secrets — NEVER commit these ──────────────────────────────────────────────
+.env
+
+# ── Python ────────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── State & runtime data ──────────────────────────────────────────────────────
+state/jobs.db
+state/sessions/
+state/mcp_scraped.json
+
+# ── Playwright ────────────────────────────────────────────────────────────────
+playwright-report/
+test-results/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store

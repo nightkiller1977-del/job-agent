@@ -1,0 +1,199 @@
+"""
+State manager — SQLite backend for tracking all discovered/applied/skipped jobs.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+
+DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id      TEXT PRIMARY KEY,
+    source      TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    company     TEXT,
+    location    TEXT,
+    salary_raw  TEXT,
+    remote_type TEXT,
+    url         TEXT,
+    description TEXT,
+    score       INTEGER,
+    score_reason TEXT,
+    flags       TEXT,
+    status      TEXT NOT NULL DEFAULT 'discovered',
+    discovered_at TEXT NOT NULL,
+    reviewed_at   TEXT,
+    applied_at    TEXT,
+    extra_json  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_source ON jobs(source);
+CREATE INDEX IF NOT EXISTS idx_discovered_at ON jobs(discovered_at);
+"""
+
+
+class StateManager:
+    def __init__(self, db_path: str = "state/jobs.db"):
+        self.db_path = Path(db_path).expanduser()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn: Optional[sqlite3.Connection] = None
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(DB_SCHEMA)
+
+    # ------------------------------------------------------------------
+    # Write helpers
+    # ------------------------------------------------------------------
+
+    def upsert_job(self, job: dict) -> bool:
+        """
+        Insert or update a job record.
+        Returns True if this is a newly discovered job, False if it already existed.
+        """
+        now = datetime.utcnow().isoformat()
+        extra = {k: v for k, v in job.items() if k not in {
+            "job_id", "source", "title", "company", "location",
+            "salary_raw", "remote_type", "url", "description",
+            "score", "score_reason", "flags", "status",
+            "discovered_at", "reviewed_at", "applied_at",
+        }}
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT job_id FROM jobs WHERE job_id = ?", (job["job_id"],)
+            ).fetchone()
+            if existing:
+                return False
+            conn.execute(
+                """
+                INSERT INTO jobs
+                    (job_id, source, title, company, location, salary_raw,
+                     remote_type, url, description, score, score_reason,
+                     flags, status, discovered_at, extra_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job["job_id"],
+                    job.get("source", ""),
+                    job.get("title", ""),
+                    job.get("company", ""),
+                    job.get("location", ""),
+                    job.get("salary_raw", ""),
+                    job.get("remote_type", ""),
+                    job.get("url", ""),
+                    job.get("description", ""),
+                    job.get("score"),
+                    job.get("score_reason", ""),
+                    job.get("flags", ""),
+                    job.get("status", "discovered"),
+                    job.get("discovered_at", now),
+                    json.dumps(extra) if extra else None,
+                ),
+            )
+            return True
+
+    def set_status(self, job_id: str, status: str) -> None:
+        now = datetime.utcnow().isoformat()
+        ts_field = {
+            "reviewed": "reviewed_at",
+            "applied": "applied_at",
+            "skipped": "reviewed_at",
+            "bookmarked": "reviewed_at",
+        }.get(status)
+        if ts_field:
+            with self._connect() as conn:
+                conn.execute(
+                    f"UPDATE jobs SET status = ?, {ts_field} = ? WHERE job_id = ?",
+                    (status, now, job_id),
+                )
+        else:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = ? WHERE job_id = ?",
+                    (status, job_id),
+                )
+
+    def update_score(self, job_id: str, score: int, reason: str, flags: str = "") -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET score = ?, score_reason = ?, flags = ? WHERE job_id = ?",
+                (score, reason, flags, job_id),
+            )
+
+    # ------------------------------------------------------------------
+    # Read helpers
+    # ------------------------------------------------------------------
+
+    def get_job(self, job_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_jobs_by_status(self, status: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status = ? ORDER BY score DESC, discovered_at DESC",
+                (status,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_pending_review(self) -> list[dict]:
+        """Jobs that are discovered (scored) but not yet reviewed."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = 'discovered'
+                ORDER BY score DESC, discovered_at DESC
+                """,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_approved_unapplied(self) -> list[dict]:
+        """Jobs approved for application but not yet applied."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = 'approved'
+                ORDER BY score DESC, discovered_at DESC
+                """,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_stats(self) -> dict:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) as cnt FROM jobs GROUP BY status"
+            ).fetchall()
+            stats = {r["status"]: r["cnt"] for r in rows}
+            today_rows = conn.execute(
+                """
+                SELECT status, COUNT(*) as cnt FROM jobs
+                WHERE date(discovered_at) = date('now')
+                GROUP BY status
+                """,
+            ).fetchall()
+            stats["today"] = {r["status"]: r["cnt"] for r in today_rows}
+            return stats
+
+    def already_seen(self, job_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return row is not None
