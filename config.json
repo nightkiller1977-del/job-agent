@@ -1,0 +1,58 @@
+{
+  "user_profile": {
+    "current_title": "Director of Software Engineering",
+    "years_experience": 18,
+    "clearance": "Top Secret",
+    "location": "Miami, Florida",
+    "open_to_relocation": ["remote", "miami", "dc_area"],
+    "us_citizen": true,
+    "specialized_experience_gs14_equivalent": true
+  },
+  "target_roles": [
+    "Director of Software Engineering",
+    "Director of IT",
+    "VP of IT",
+    "VP of Software Engineering",
+    "AVP of Software Engineering",
+    "CTO",
+    "CIO",
+    "Engineering Manager",
+    "Program Manager",
+    "GS-15",
+    "SES",
+    "Senior Executive Service",
+    "SL",
+    "Senior Level"
+  ],
+  "reject_roles": [
+    "Software Engineer",
+    "Software Developer",
+    "Staff Engineer",
+    "Principal Engineer",
+    "Data Engineer",
+    "DevOps Engineer",
+    "Individual Contributor",
+    "IC"
+  ],
+  "compensation_thresholds": {
+    "remote": {"min_comp": 180000},
+    "miami_onsite": {"min_comp": 230000},
+    "dc_onsite": {"min_comp": 260000, "max_comp": 320000},
+    "other_onsite": {"action": "skip"},
+    "cleared_dod_remote": {"min_comp": 170000},
+    "cleared_dod_hybrid": {"min_comp": 250000},
+    "federal_gs15": {"action": "always_apply"},
+    "federal_ses": {"action": "always_apply"},
+    "federal_sl": {"action": "always_apply"},
+    "contract_remote": {"min_comp": 180000},
+    "contract_hybrid": {"action": "flag_for_review"}
+  },
+  "search_settings": {
+    "days_posted": 7,
+    "max_jobs_per_source": 50,
+    "delay_min_seconds": 1,
+    "delay_max_seconds": 3
+  },
+  "local_resume_path": "~/resume.pdf",
+  "state_db_path": "state/jobs.db"
+}
