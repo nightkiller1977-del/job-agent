@@ -114,6 +114,9 @@ class Orchestrator:
         else:
             console.print(f"\n[green]Total new jobs this run: {len(all_new_jobs)}[/green]")
 
+        # Sync to cloud dashboard (non-fatal)
+        await self._sync_to_cloud(all_new_jobs)
+
         # Run review queue for all pending jobs (includes older unreviewed ones)
         pending = self.state.get_pending_review()
         if not pending:
@@ -251,6 +254,27 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # status command
     # ------------------------------------------------------------------
+
+    async def _sync_to_cloud(self, jobs: list[dict]) -> None:
+        """POST discovered jobs to the Render dashboard. Non-fatal on any error."""
+        dashboard_url = os.environ.get("DASHBOARD_URL", "")
+        sync_secret = os.environ.get("SYNC_SECRET", "")
+        if not dashboard_url or not jobs:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    f"{dashboard_url}/api/sync",
+                    json=jobs,
+                    headers={"X-Sync-Secret": sync_secret},
+                )
+                if r.status_code == 200:
+                    console.print(f"[green]☁ Synced {len(jobs)} jobs to dashboard.[/green]")
+                else:
+                    console.print(f"[yellow]Dashboard sync returned {r.status_code}[/yellow]")
+        except Exception as e:
+            console.print(f"[dim]Dashboard sync failed (non-fatal): {e}[/dim]")
 
     def show_status(self) -> None:
         """Display stats table."""
