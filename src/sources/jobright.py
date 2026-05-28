@@ -418,97 +418,157 @@ class JobrightScraper(BaseScraper):
 
     async def apply(self, job: dict) -> bool:
         """
-        Apply via jobright — either 1-click/easy apply or extract external URL.
+        Full autofill apply flow powered by the Jobright Autofill Chrome extension:
+
+        1. Open the job page on Jobright
+        2. Use Orion AI to tailor resume (Full Edit + all missing keywords)
+        3. Click Apply Now → company ATS opens in new tab
+        4. Extension auto-detects ATS fields and fills them with profile data
+        5. Auto-login to company portal if credentials in .env
+        6. Confirm with user, then submit
         """
-        console.print(f"\n[magenta]Jobright Apply:[/magenta] Opening {job.get('title')} @ {job.get('company')}")
-        page = await self._start_browser()
+        console.print(f"\n[magenta]Jobright Apply:[/magenta] {job.get('title')} @ {job.get('company')}")
+        page = await self._start_browser(load_extensions=True)
         submitted = False
 
         try:
+            # ── Step 1: Load job page ─────────────────────────────────────────
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
 
-            # Check for Easy Apply / 1-click apply button
-            easy_apply_selectors = [
-                'button:text-matches("Easy Apply", "i")',
-                'button:text-matches("1-Click Apply", "i")',
-                'button:text-matches("Quick Apply", "i")',
-                'button:text-matches("Apply Now", "i")',
-                '[data-testid*="apply"]',
-            ]
+            # Check page is still live (Jobright shows "no longer available")
+            page_text = await page.evaluate("document.body.innerText")
+            if "no longer available" in page_text.lower():
+                console.print(f"[yellow]Jobright:[/yellow] Job {job.get('title')} is no longer listed — skipping.")
+                return False
 
-            apply_btn = None
-            for sel in easy_apply_selectors:
+            # ── Step 2: Open Orion AI resume customization modal ──────────────
+            console.print("[magenta]Jobright:[/magenta] Opening Orion AI resume modal…")
+            await page.evaluate("""
+            () => {
+                const card = document.querySelector('[class*="tool-card"]');
+                if (card) card.click();
+            }
+            """)
+            await self._delay(2, 3)
+
+            # ── Step 3: Improve My Resume for This Job ────────────────────────
+            improve_clicked = False
+            for sel in [
+                'button:text-matches("Improve My Resume", "i")',
+                'button:has-text("Improve My Resume")',
+            ]:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=3000)
+                    btn = await page.wait_for_selector(sel, timeout=5000)
                     if btn:
-                        apply_btn = btn
+                        await btn.click()
+                        improve_clicked = True
                         break
                 except Exception:
                     continue
 
-            if apply_btn:
-                console.print("[magenta]Jobright:[/magenta] Found apply button. Preparing to apply…")
-
-                # Show user a confirmation before clicking
-                console.print("\n[bold yellow]PAUSE — Review before applying:[/bold yellow]")
-                console.print(f"  Title: {job.get('title')}")
-                console.print(f"  Company: {job.get('company')}")
-                console.print(f"  URL: {job.get('url')}")
-                confirm = input("\n  Confirm apply? [y/N] > ").strip().lower()
-                if confirm != "y":
-                    console.print("[yellow]Jobright: Application cancelled by user.[/yellow]")
-                    return False
-
-                await apply_btn.click()
+            if improve_clicked:
                 await self._delay(2, 3)
 
-                # Handle any modal/confirmation dialog
-                for confirm_sel in [
-                    'button:text("Submit")',
-                    'button:text("Apply")',
-                    'button:text("Confirm")',
+                # ── Step 4: Full Edit + all missing keywords ──────────────────
+                await page.evaluate("""
+                () => {
+                    const labels = Array.from(document.querySelectorAll('label, span, p'));
+                    const fullEdit = labels.find(l => l.textContent.trim().match(/^full edit/i));
+                    if (fullEdit) fullEdit.click();
+                    document.querySelectorAll('input[type="checkbox"]:not(:checked)')
+                        .forEach(cb => cb.click());
+                }
+                """)
+                await self._delay(1, 2)
+
+                # ── Step 5: Generate tailored resume ─────────────────────────
+                for sel in [
+                    'button:text-matches("Generate My New Resume", "i")',
+                    'button:has-text("Generate My New Resume")',
                 ]:
                     try:
-                        btn = await page.wait_for_selector(confirm_sel, timeout=3000)
+                        btn = await page.wait_for_selector(sel, timeout=5000)
                         if btn:
-                            final = input(f"\n  [FINAL] Submit application to {job.get('company')}? [y/N] > ").strip().lower()
-                            if final == "y":
-                                await btn.click()
-                                await self._delay(2, 3)
-                                submitted = True
-                                console.print("[green]Jobright: Application submitted![/green]")
-                            else:
-                                console.print("[yellow]Jobright: Final submit cancelled.[/yellow]")
+                            await btn.click()
+                            console.print("[magenta]Jobright:[/magenta] Generating tailored resume… (up to 60s)")
                             break
                     except Exception:
                         continue
 
-                if not submitted:
-                    console.print("[yellow]Jobright: Could not find final submit button. Please complete manually.[/yellow]")
-                    input("  Press Enter when done (or to skip) > ")
+                # Wait for generation (Download Resume + Apply Now appear when done)
+                for _ in range(30):
+                    await asyncio.sleep(2)
+                    btns = await page.evaluate(
+                        "Array.from(document.querySelectorAll('button')).map(b => b.textContent.trim())"
+                    )
+                    if "Download Resume" in btns and "Apply Now" in btns:
+                        score_info = await page.evaluate("""
+                        document.body.innerText.match(/score jumped from [\\d.]+ to [\\d.]+/i)?.[0] || 'generated'
+                        """)
+                        console.print(f"[green]Jobright:[/green] Resume ready — {score_info}")
+                        break
 
+                # Download the tailored PDF
+                await page.evaluate("""
+                Array.from(document.querySelectorAll('button'))
+                    .find(b => b.textContent.trim() === 'Download Resume')?.click()
+                """)
+                await self._delay(1, 2)
+
+            # ── Step 6: Click Apply Now → company ATS opens in new tab ────────
+            console.print("[magenta]Jobright:[/magenta] Clicking Apply Now — opening company portal…")
+            try:
+                async with self._context.expect_page(timeout=15000) as new_page_info:
+                    await page.evaluate("""
+                    Array.from(document.querySelectorAll('button'))
+                        .find(b => b.textContent.trim() === 'Apply Now')?.click()
+                    """)
+                company_page = await new_page_info.value
+                await company_page.wait_for_load_state("domcontentloaded", timeout=30000)
+                await self._delay(4, 6)  # give extension time to inject
+                console.print(f"[magenta]Jobright:[/magenta] Company portal: {company_page.url}")
+            except Exception as e:
+                console.print(f"[yellow]Jobright:[/yellow] No new tab opened ({e}). Trying APPLY WITH AUTOFILL…")
+                # Fallback: dismiss modal and use the top-level Apply with Autofill button
+                await page.evaluate("document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,bubbles:true}))")
+                await self._delay(1, 2)
+                try:
+                    async with self._context.expect_page(timeout=15000) as new_page_info:
+                        btn = await page.wait_for_selector('button:text-matches("Apply with Autofill", "i")', timeout=5000)
+                        if btn:
+                            await btn.click()
+                    company_page = await new_page_info.value
+                    await company_page.wait_for_load_state("domcontentloaded", timeout=30000)
+                    await self._delay(4, 6)
+                except Exception:
+                    console.print("[red]Jobright:[/red] Could not open company portal. Skipping.")
+                    return False
+
+            # Dismiss "Did you apply?" tracking dialog on Jobright (non-blocking)
+            await page.evaluate("""
+            Array.from(document.querySelectorAll('button'))
+                .find(b => b.textContent.includes("didn't apply"))?.click()
+            """)
+
+            # ── Step 7: Handle login on company portal if required ────────────
+            if await self._portal_needs_login(company_page):
+                console.print("[magenta]Jobright:[/magenta] Company portal requires login — attempting…")
+                await self._company_portal_login(company_page)
+                await self._delay(4, 6)
+
+            # ── Step 8: Trigger Jobright extension autofill ───────────────────
+            console.print("[magenta]Jobright:[/magenta] Looking for Jobright autofill button on ATS page…")
+            autofill_triggered = await self._trigger_autofill(company_page)
+            if autofill_triggered:
+                console.print("[magenta]Jobright:[/magenta] Autofill triggered — waiting for fields to populate…")
+                await self._delay(6, 10)
             else:
-                # No easy apply — check for external link
-                external_selectors = [
-                    'a:text-matches("Apply", "i")[href*="http"]',
-                    '[data-testid*="external-apply"]',
-                    'a[href*="lever.co"]',
-                    'a[href*="greenhouse.io"]',
-                    'a[href*="workday.com"]',
-                    'a[href*="linkedin.com/jobs"]',
-                ]
-                for sel in external_selectors:
-                    try:
-                        link = await page.query_selector(sel)
-                        if link:
-                            href = await link.get_attribute("href")
-                            console.print(f"[magenta]Jobright:[/magenta] External application URL: {href}")
-                            console.print("[yellow]Please complete application manually at the URL above.[/yellow]")
-                            input("  Press Enter when done (or to skip) > ")
-                            break
-                    except Exception:
-                        continue
+                console.print("[yellow]Jobright:[/yellow] Autofill button not detected — extension may auto-fill, or fields need manual entry")
+                await self._delay(4, 6)
+
+            # ── Step 9: Confirm and submit ────────────────────────────────────
+            submitted = await self._confirm_and_submit(company_page, job)
 
         except Exception as exc:
             console.print(f"[red]Jobright apply error:[/red] {exc}")
@@ -516,6 +576,206 @@ class JobrightScraper(BaseScraper):
             await self._close_browser()
 
         return submitted
+
+    async def _portal_needs_login(self, page) -> bool:
+        """Return True if the company ATS page is showing a login wall."""
+        url = page.url.lower()
+        if any(w in url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso.", "myworkday"]):
+            return True
+        try:
+            return await page.evaluate("""
+            () => {
+                const emailInput = document.querySelector(
+                    'input[type="email"], input[name*="email" i], input[placeholder*="email" i]'
+                );
+                const passInput = document.querySelector('input[type="password"]');
+                return !!(emailInput || passInput);
+            }
+            """)
+        except Exception:
+            return False
+
+    async def _company_portal_login(self, page) -> None:
+        """Log into a company ATS portal using COMPANY_EMAIL / COMPANY_PASSWORD from .env."""
+        email = os.environ.get("COMPANY_EMAIL", "")
+        password = os.environ.get("COMPANY_PASSWORD", "")
+        if not email or not password:
+            console.print("[yellow]Jobright:[/yellow] Set COMPANY_EMAIL + COMPANY_PASSWORD in .env for auto-login")
+            return
+
+        try:
+            # Fill email field
+            for sel in [
+                'input[type="email"]',
+                'input[name*="email" i]',
+                'input[placeholder*="email" i]',
+                'input[autocomplete="email"]',
+                'input[autocomplete="username"]',
+            ]:
+                try:
+                    elem = await page.wait_for_selector(sel, timeout=3000)
+                    if elem:
+                        await elem.fill(email)
+                        await self._delay(0.5, 1)
+                        break
+                except Exception:
+                    continue
+
+            # Some portals (Workday) split email → Next → password
+            for sel in [
+                'button[type="submit"]',
+                'button:text("Next")',
+                'button:text("Continue")',
+                'button:text("Sign In")',
+            ]:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        await self._delay(2, 3)
+                        break
+                except Exception:
+                    continue
+
+            # Fill password (may now be on next page)
+            try:
+                pwd = await page.wait_for_selector('input[type="password"]', timeout=5000)
+                if pwd:
+                    await pwd.fill(password)
+                    await self._delay(0.5, 1)
+            except Exception:
+                pass
+
+            # Final submit
+            for sel in [
+                'button[type="submit"]',
+                'button:text("Sign In")',
+                'button:text("Log In")',
+                'button:text("Login")',
+            ]:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        await self._delay(4, 6)
+                        break
+                except Exception:
+                    continue
+
+            console.print(f"[green]Jobright:[/green] Login attempted → {page.url}")
+
+        except Exception as e:
+            console.print(f"[yellow]Jobright:[/yellow] Portal login attempt failed: {e}")
+
+    async def _trigger_autofill(self, page) -> bool:
+        """
+        Find and click the Jobright extension's autofill button injected into the ATS page.
+        The extension (built with Plasmo) injects a content UI into the page DOM.
+        """
+        selectors = [
+            # Plasmo extension shadow host element
+            "plasmo-csui",
+            # Elements with jobright in class/id/data attributes
+            '[class*="jobright"]',
+            '[id*="jobright"]',
+            '[data-jobright]',
+            # Button text the extension might inject
+            'button:text-matches("autofill", "i")',
+            'button:text-matches("fill with jobright", "i")',
+            '[aria-label*="jobright" i]',
+            # Extension popup trigger
+            '[class*="autofill-btn"]',
+            '[class*="jb-"]',
+        ]
+
+        for sel in selectors:
+            try:
+                elem = await page.wait_for_selector(sel, timeout=3000)
+                if elem:
+                    await elem.click()
+                    console.print(f"[green]Jobright:[/green] Extension autofill triggered via '{sel}'")
+                    return True
+            except Exception:
+                continue
+
+        # Extension may use shadow DOM — try piercing it
+        try:
+            found = await page.evaluate("""
+            () => {
+                // Walk shadow roots looking for jobright autofill button
+                const walk = (root) => {
+                    for (const el of root.querySelectorAll('*')) {
+                        const text = (el.textContent || '').toLowerCase();
+                        if (text.includes('autofill') || text.includes('jobright')) {
+                            if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        if (el.shadowRoot && walk(el.shadowRoot)) return true;
+                    }
+                    return false;
+                };
+                return walk(document);
+            }
+            """)
+            if found:
+                console.print("[green]Jobright:[/green] Extension autofill triggered via shadow DOM")
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    async def _confirm_and_submit(self, page, job: dict) -> bool:
+        """
+        Find the final Submit / Apply button on the ATS page, show a preview,
+        ask for confirmation, then click.
+        """
+        submit_selectors = [
+            'button:text-matches("^Submit$", "i")',
+            'button:text-matches("Submit Application", "i")',
+            'button:text-matches("^Apply$", "i")',
+            'button:text-matches("Send Application", "i")',
+            'button:text-matches("Complete Application", "i")',
+            '[data-automation-id*="submit" i]',
+            '[aria-label*="submit" i]',
+            '[type="submit"]',
+        ]
+
+        submit_btn = None
+        for sel in submit_selectors:
+            try:
+                btn = await page.wait_for_selector(sel, timeout=5000)
+                if btn:
+                    submit_btn = btn
+                    break
+            except Exception:
+                continue
+
+        console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
+        console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
+        console.print(f"  Portal: {page.url}")
+        if submit_btn:
+            console.print(f"  Submit button found ✓")
+        else:
+            console.print(f"  [yellow]Submit button not found — may need multi-step navigation[/yellow]")
+
+        confirm = input("\n  Submit this application? [y/N] > ").strip().lower()
+        if confirm != "y":
+            console.print("[yellow]Jobright: Submission cancelled.[/yellow]")
+            return False
+
+        if submit_btn:
+            await submit_btn.click()
+            await self._delay(3, 5)
+            console.print("[green]✓ Application submitted![/green]")
+            return True
+        else:
+            console.print("[yellow]Please complete the submission manually in the browser window.[/yellow]")
+            input("  Press Enter when submitted (or to skip) > ")
+            answer = input("  Did you successfully submit? [y/N] > ").strip().lower()
+            return answer == "y"
 
 
 def _infer_remote_type(remote_raw: str, location: str) -> str:
