@@ -422,9 +422,9 @@ class JobrightScraper(BaseScraper):
 
         1. Open the job page on Jobright
         2. Use Orion AI to tailor resume (Full Edit + all missing keywords)
-        3. Click Apply Now → company ATS opens in new tab
-        4. Extension auto-detects ATS fields and fills them with profile data
-        5. Auto-login to company portal if credentials in .env
+        3. Extract the company ATS URL directly from the Jobright page DOM
+        4. Open ATS URL in a new Playwright page (avoids popup-blocking issues)
+        5. Extension auto-fills form fields; auto-login to portal if needed
         6. Confirm with user, then submit
         """
         console.print(f"\n[magenta]Jobright Apply:[/magenta] {job.get('title')} @ {job.get('company')}")
@@ -434,15 +434,19 @@ class JobrightScraper(BaseScraper):
         try:
             # ── Step 1: Load job page ─────────────────────────────────────────
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
-            await self._delay(2, 3)
+            await self._delay(3, 4)
 
-            # Check page is still live (Jobright shows "no longer available")
+            # Check page is still live
             page_text = await page.evaluate("document.body.innerText")
             if "no longer available" in page_text.lower():
-                console.print(f"[yellow]Jobright:[/yellow] Job {job.get('title')} is no longer listed — skipping.")
+                console.print(f"[yellow]Jobright:[/yellow] Job no longer listed — skipping.")
                 return False
 
-            # ── Step 2: Open Orion AI resume customization modal ──────────────
+            # ── Step 2: Extract external ATS URL before opening modal ─────────
+            ext_url = await self._extract_external_url(page)
+            console.print(f"[magenta]Jobright:[/magenta] ATS URL: {ext_url or '(will try Apply Now)'}")
+
+            # ── Step 3: Open Orion AI resume customization modal ──────────────
             console.print("[magenta]Jobright:[/magenta] Opening Orion AI resume modal…")
             await page.evaluate("""
             () => {
@@ -450,27 +454,27 @@ class JobrightScraper(BaseScraper):
                 if (card) card.click();
             }
             """)
-            await self._delay(2, 3)
 
-            # ── Step 3: Improve My Resume for This Job ────────────────────────
-            improve_clicked = False
-            for sel in [
-                'button:text-matches("Improve My Resume", "i")',
-                'button:has-text("Improve My Resume")',
-            ]:
+            # Poll for "Improve My Resume for This Job" button (Step 1 analysis takes ~10s)
+            improve_btn = None
+            console.print("[magenta]Jobright:[/magenta] Waiting for resume analysis (up to 20s)…")
+            for _ in range(20):
+                await asyncio.sleep(1)
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=5000)
-                    if btn:
-                        await btn.click()
-                        improve_clicked = True
+                    improve_btn = await page.query_selector(
+                        'button:text-matches("Improve My Resume", "i")'
+                    )
+                    if improve_btn:
                         break
                 except Exception:
-                    continue
+                    pass
 
-            if improve_clicked:
+            if improve_btn:
+                # ── Step 4: Improve → Step 2 form ────────────────────────────
+                await improve_btn.click()
                 await self._delay(2, 3)
 
-                # ── Step 4: Full Edit + all missing keywords ──────────────────
+                # Full Edit + all missing keywords
                 await page.evaluate("""
                 () => {
                     const labels = Array.from(document.querySelectorAll('label, span, p'));
@@ -483,89 +487,83 @@ class JobrightScraper(BaseScraper):
                 await self._delay(1, 2)
 
                 # ── Step 5: Generate tailored resume ─────────────────────────
-                for sel in [
-                    'button:text-matches("Generate My New Resume", "i")',
-                    'button:has-text("Generate My New Resume")',
-                ]:
-                    try:
-                        btn = await page.wait_for_selector(sel, timeout=5000)
-                        if btn:
-                            await btn.click()
-                            console.print("[magenta]Jobright:[/magenta] Generating tailored resume… (up to 60s)")
+                gen_btn = await page.query_selector(
+                    'button:text-matches("Generate My New Resume", "i")'
+                )
+                if gen_btn:
+                    await gen_btn.click()
+                    console.print("[magenta]Jobright:[/magenta] Generating tailored resume… (~60s)")
+
+                    # Poll until Download Resume + Apply Now appear (max 90s)
+                    for _ in range(45):
+                        await asyncio.sleep(2)
+                        btns = await page.evaluate(
+                            "Array.from(document.querySelectorAll('button')).map(b=>b.textContent.trim())"
+                        )
+                        if "Download Resume" in btns and "Apply Now" in btns:
+                            score_info = await page.evaluate("""
+                            document.body.innerText
+                                .match(/score jumped from [\\d.]+ to [\\d.]+/i)?.[0] || 'generated'
+                            """)
+                            console.print(f"[green]Jobright:[/green] Resume ready — {score_info}")
                             break
-                    except Exception:
-                        continue
 
-                # Wait for generation (Download Resume + Apply Now appear when done)
-                for _ in range(30):
-                    await asyncio.sleep(2)
-                    btns = await page.evaluate(
-                        "Array.from(document.querySelectorAll('button')).map(b => b.textContent.trim())"
-                    )
-                    if "Download Resume" in btns and "Apply Now" in btns:
-                        score_info = await page.evaluate("""
-                        document.body.innerText.match(/score jumped from [\\d.]+ to [\\d.]+/i)?.[0] || 'generated'
-                        """)
-                        console.print(f"[green]Jobright:[/green] Resume ready — {score_info}")
-                        break
-
-                # Download the tailored PDF
-                await page.evaluate("""
-                Array.from(document.querySelectorAll('button'))
-                    .find(b => b.textContent.trim() === 'Download Resume')?.click()
-                """)
-                await self._delay(1, 2)
-
-            # ── Step 6: Click Apply Now → company ATS opens in new tab ────────
-            console.print("[magenta]Jobright:[/magenta] Clicking Apply Now — opening company portal…")
-            try:
-                async with self._context.expect_page(timeout=15000) as new_page_info:
+                    # Download tailored PDF
                     await page.evaluate("""
                     Array.from(document.querySelectorAll('button'))
-                        .find(b => b.textContent.trim() === 'Apply Now')?.click()
+                        .find(b=>b.textContent.trim()==='Download Resume')?.click()
                     """)
-                company_page = await new_page_info.value
-                await company_page.wait_for_load_state("domcontentloaded", timeout=30000)
-                await self._delay(4, 6)  # give extension time to inject
-                console.print(f"[magenta]Jobright:[/magenta] Company portal: {company_page.url}")
-            except Exception as e:
-                console.print(f"[yellow]Jobright:[/yellow] No new tab opened ({e}). Trying APPLY WITH AUTOFILL…")
-                # Fallback: dismiss modal and use the top-level Apply with Autofill button
-                await page.evaluate("document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,bubbles:true}))")
-                await self._delay(1, 2)
-                try:
-                    async with self._context.expect_page(timeout=15000) as new_page_info:
-                        btn = await page.wait_for_selector('button:text-matches("Apply with Autofill", "i")', timeout=5000)
-                        if btn:
-                            await btn.click()
-                    company_page = await new_page_info.value
-                    await company_page.wait_for_load_state("domcontentloaded", timeout=30000)
-                    await self._delay(4, 6)
-                except Exception:
-                    console.print("[red]Jobright:[/red] Could not open company portal. Skipping.")
-                    return False
+                    await self._delay(1, 2)
+            else:
+                console.print("[yellow]Jobright:[/yellow] Improve button not found — using existing resume")
 
-            # Dismiss "Did you apply?" tracking dialog on Jobright (non-blocking)
-            await page.evaluate("""
-            Array.from(document.querySelectorAll('button'))
-                .find(b => b.textContent.includes("didn't apply"))?.click()
-            """)
+            # ── Step 6: Dismiss modal, open company ATS directly ──────────────
+            # Close the resume modal
+            await page.evaluate(
+                "document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,bubbles:true}))"
+            )
+            await self._delay(1, 2)
 
-            # ── Step 7: Handle login on company portal if required ────────────
+            # Navigate to the ATS URL in a new page within our context
+            if not ext_url:
+                # Last resort: try to read it from the page after modal close
+                ext_url = await self._extract_external_url(page)
+
+            if not ext_url:
+                console.print("[red]Jobright:[/red] Could not find company ATS URL — skipping.")
+                return False
+
+            console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
+            company_page = await self._context.new_page()
+            await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
+            await self._delay(4, 6)  # let extension inject into the ATS page
+
+            # Dismiss "Did you apply?" on Jobright (non-blocking)
+            try:
+                await page.evaluate("""
+                Array.from(document.querySelectorAll('button'))
+                    .find(b=>b.textContent.includes("didn't apply"))?.click()
+                """)
+            except Exception:
+                pass
+
+            console.print(f"[magenta]Jobright:[/magenta] Company portal loaded: {company_page.url}")
+
+            # ── Step 7: Handle login if required ─────────────────────────────
             if await self._portal_needs_login(company_page):
-                console.print("[magenta]Jobright:[/magenta] Company portal requires login — attempting…")
+                console.print("[magenta]Jobright:[/magenta] Login required — auto-logging in…")
                 await self._company_portal_login(company_page)
                 await self._delay(4, 6)
 
             # ── Step 8: Trigger Jobright extension autofill ───────────────────
-            console.print("[magenta]Jobright:[/magenta] Looking for Jobright autofill button on ATS page…")
+            console.print("[magenta]Jobright:[/magenta] Triggering Jobright autofill extension…")
             autofill_triggered = await self._trigger_autofill(company_page)
             if autofill_triggered:
-                console.print("[magenta]Jobright:[/magenta] Autofill triggered — waiting for fields to populate…")
-                await self._delay(6, 10)
+                console.print("[magenta]Jobright:[/magenta] Autofill triggered — waiting for fields…")
+                await self._delay(8, 12)
             else:
-                console.print("[yellow]Jobright:[/yellow] Autofill button not detected — extension may auto-fill, or fields need manual entry")
-                await self._delay(4, 6)
+                console.print("[yellow]Jobright:[/yellow] Autofill button not found — extension may auto-fill on load")
+                await self._delay(5, 7)
 
             # ── Step 9: Confirm and submit ────────────────────────────────────
             submitted = await self._confirm_and_submit(company_page, job)
@@ -576,6 +574,48 @@ class JobrightScraper(BaseScraper):
             await self._close_browser()
 
         return submitted
+
+    async def _extract_external_url(self, page) -> str:
+        """
+        Extract the company ATS application URL directly from the Jobright DOM.
+        Tries Next.js page data first, then scans anchor tags for known ATS hostnames.
+        """
+        return await page.evaluate("""
+        () => {
+            // 1. Try Next.js __NEXT_DATA__ (most reliable)
+            try {
+                const nd = JSON.parse(document.getElementById('__NEXT_DATA__')?.textContent || '{}');
+                const pageProps = nd?.props?.pageProps || {};
+                const job = pageProps.job || pageProps.jobDetail || pageProps.jobInfo || {};
+                const url = job.externalApplyLink || job.applyUrl || job.apply_url
+                          || job.externalUrl || job.applicationUrl;
+                if (url && !url.includes('jobright.ai')) return url;
+            } catch(e) {}
+
+            // 2. Scan all <a> tags for known ATS hostnames
+            const ATS = [
+                'myworkdayjobs.com', 'wd1.myworkday', 'wd3.myworkday', 'wd5.myworkday',
+                'greenhouse.io', 'lever.co', 'taleo.net', 'icims.com',
+                'smartrecruiters.com', 'bamboohr.com', 'ashbyhq.com',
+                'workable.com', 'brassring.com', 'successfactors.com',
+                'recruitingbypaycor.com', 'paylocity.com', 'ultipro.com',
+                'myworkday.com', 'jobs.lever.co', 'apply.workable.com',
+                'careers.', '/careers/', '/jobs/', 'recruit.',
+            ];
+            for (const a of document.querySelectorAll('a[href]')) {
+                const h = a.href || '';
+                if (h.includes('jobright.ai')) continue;
+                if (ATS.some(p => h.includes(p))) return h;
+            }
+
+            // 3. "Original Job Post" button/link
+            const orig = Array.from(document.querySelectorAll('a, button'))
+                .find(el => /original job post/i.test(el.textContent));
+            if (orig?.href) return orig.href;
+
+            return '';
+        }
+        """)
 
     async def _portal_needs_login(self, page) -> bool:
         """Return True if the company ATS page is showing a login wall."""
