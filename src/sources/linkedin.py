@@ -141,6 +141,7 @@ class LinkedInScraper(BaseScraper):
             f"{LINKEDIN_JOBS_SEARCH}?keywords={query.replace(' ', '%20')}"
             f"&f_TPR=r604800"
             f"&f_E=4%2C5"
+            f"&f_LF=f_AL"   # Easy Apply only
             f"&sortBy=DD"
         )
         await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
