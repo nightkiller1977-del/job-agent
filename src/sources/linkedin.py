@@ -8,12 +8,13 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
 from datetime import datetime
 from typing import Optional
 
 from rich.console import Console
 
-from .base import BaseScraper
+from .base import BaseScraper, JobExpiredError
 
 console = Console()
 
@@ -68,11 +69,31 @@ class LinkedInScraper(BaseScraper):
                     console.print("[blue]LinkedIn:[/blue] Not logged in — attempting auto-login…")
                     logged_in = await self._auto_login(page, email, password)
                     if not logged_in:
-                        console.print("[red]LinkedIn: Auto-login failed — skipping.[/red]")
-                        return []
+                        if not (sys.stdin and sys.stdin.isatty()):
+                            console.print("[red]LinkedIn: Auto-login failed and running non-interactively. Skipping LinkedIn scrape.[/red]")
+                            return []
+                        console.print(
+                            "\n[yellow]LinkedIn:[/yellow] Auto-login failed.\n"
+                            "  → Please log in manually in the browser window.\n"
+                            "  → Press Enter once you are logged in and on the feed/jobs page."
+                        )
+                        input("  Press Enter once logged in > ")
+                        await page.goto(LINKEDIN_BASE, wait_until="domcontentloaded", timeout=30000)
+                        await self._delay(2, 3)
+                        await self._save_session()
                 else:
-                    console.print("[red]LinkedIn:[/red] Not logged in and no credentials in .env. Add LINKEDIN_EMAIL and LINKEDIN_PASSWORD.")
-                    return []
+                    if not (sys.stdin and sys.stdin.isatty()):
+                        console.print("[red]LinkedIn: Not logged in, no credentials in .env, and running non-interactively. Skipping LinkedIn scrape.[/red]")
+                        return []
+                    console.print(
+                        "\n[yellow]LinkedIn:[/yellow] Not logged in.\n"
+                        "  → Please log in to LinkedIn in the browser window.\n"
+                        "  → Press Enter once logged in."
+                    )
+                    input("  Press Enter once logged in > ")
+                    await page.goto(LINKEDIN_BASE, wait_until="domcontentloaded", timeout=30000)
+                    await self._delay(2, 3)
+                    await self._save_session()
 
             for query in TARGET_SEARCHES:
                 if len(all_jobs) >= self.max_jobs:
@@ -285,7 +306,7 @@ class LinkedInScraper(BaseScraper):
             console.print(f"[dim]LinkedIn card parse error: {exc}[/dim]")
             return None
 
-    async def apply(self, job: dict) -> bool:
+    async def apply(self, job: dict, auto_submit: bool = False) -> bool:
         """
         Execute LinkedIn Easy Apply for an approved job.
         Steps through the multi-page form and pauses before final submit.
@@ -297,6 +318,13 @@ class LinkedInScraper(BaseScraper):
         try:
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
+
+            # Check if job is expired/closed
+            page_text = await page.evaluate("document.body.innerText")
+            if any(w in page_text.lower() for w in ["no longer accepting applications", "job is closed", "no longer available"]):
+                console.print(f"[yellow]LinkedIn:[/yellow] Job no longer accepting applications — skipping.")
+                raise JobExpiredError("LinkedIn: Job is closed or no longer accepting applications.")
+
 
             # Find and click Easy Apply button
             easy_apply_btn = None
@@ -390,7 +418,14 @@ class LinkedInScraper(BaseScraper):
                     console.print(f"  Company: {job.get('company')}")
                     console.print(f"  URL:     {job.get('url')}")
                     console.print("[bold yellow]══════════════════════════════════════[/bold yellow]")
-                    confirm = input("\n  Submit this LinkedIn application? [y/N] > ").strip().lower()
+                    if auto_submit:
+                        console.print("[green]LinkedIn: Auto-submitting application (auto-submit active)![/green]")
+                        confirm = "y"
+                    else:
+                        try:
+                            confirm = input("\n  Submit this LinkedIn application? [y/N] > ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            confirm = "n"
                     if confirm == "y":
                         await submit_btn.click()
                         await self._delay(3, 4)
