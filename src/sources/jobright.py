@@ -448,6 +448,9 @@ class JobrightScraper(BaseScraper):
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
             await self._delay(3, 4)
 
+            # Dismiss the "Jobright Agent (Beta)" upsell popup if it appears
+            await self._dismiss_jobright_popups(page)
+
             # Check page is still live
             page_text = await page.evaluate("document.body.innerText")
             if "no longer available" in page_text.lower():
@@ -649,6 +652,43 @@ class JobrightScraper(BaseScraper):
 
         return submitted
 
+    async def _dismiss_jobright_popups(self, page) -> None:
+        """
+        Dismiss any Jobright upsell/info popups that block the page:
+        - "You can now access Jobright Agent (Beta)" — click the X
+        - "Apply 5x Faster with Autofill" — click 'Yes, Enable Autofill Now'
+        """
+        popup_selectors = [
+            # Generic modal close buttons
+            'button[aria-label="Close"]',
+            'button[aria-label="close"]',
+            '.ant-modal-close',
+            '[class*="modal-close"]',
+            '[class*="close-btn"]',
+        ]
+        for sel in popup_selectors:
+            try:
+                btn = await page.wait_for_selector(sel, timeout=3000)
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    console.print("[dim]Jobright: dismissed popup[/dim]")
+                    await self._delay(0.5, 1)
+            except Exception:
+                continue
+
+        # If "Apply 5x Faster with Autofill" modal appears, enable autofill
+        try:
+            yes_btn = await page.wait_for_selector(
+                'button:text-matches("Yes, Enable Autofill", "i")',
+                timeout=3000
+            )
+            if yes_btn and await yes_btn.is_visible():
+                await yes_btn.click()
+                console.print("[dim]Jobright: enabled autofill via popup[/dim]")
+                await self._delay(1, 2)
+        except Exception:
+            pass
+
     async def _extract_external_url(self, page) -> str:
         """
         Extract the company ATS application URL directly from the Jobright DOM.
@@ -736,6 +776,20 @@ class JobrightScraper(BaseScraper):
             return
 
         try:
+            # ── Step 0: If "Create Account" page is showing, click Sign In first ──
+            # Portals like Home Depot show "Create Account" by default.
+            # We need to click the "Sign In" link to get to the login form.
+            try:
+                sign_in_link = await page.query_selector(
+                    'a:text-matches("^Sign In$", "i"), button:text-matches("^Sign In$", "i")'
+                )
+                if sign_in_link and await sign_in_link.is_visible():
+                    await sign_in_link.click()
+                    console.print("[magenta]Jobright:[/magenta] Clicked Sign In link")
+                    await self._delay(2, 3)
+            except Exception:
+                pass
+
             # ── Step 1: Find and fill email with human-like typing ────────────
             email_filled = False
             for sel in [
