@@ -16,6 +16,12 @@ from typing import Optional
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
+
+class JobExpiredError(Exception):
+    """Exception raised when a job posting is no longer active or listed."""
+    pass
+
+
 # Where session state files are stored
 SESSIONS_DIR = Path(__file__).parent.parent.parent / "state" / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -120,10 +126,17 @@ class BaseScraper(ABC):
 
     async def _close_browser(self, save_session: bool = True) -> None:
         # Persistent context: close the context (saves automatically)
+        # Wrap each step so a crashed browser doesn't raise in the finally block.
         if self._context:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except Exception:
+                pass
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
         self._browser = None
         self._context = None
         self._page = None
@@ -167,10 +180,10 @@ class BaseScraper(ABC):
         ...
 
     @abstractmethod
-    async def apply(self, job: dict) -> bool:
+    async def apply(self, job: dict, auto_submit: bool = False) -> bool:
         """
         Execute the application for a pre-approved job.
-        Must pause before final submit for user confirmation.
+        Optionally bypasses the final manual submit confirmation if auto_submit is True.
         Returns True if application was submitted.
         """
         ...

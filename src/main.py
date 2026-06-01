@@ -69,11 +69,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Scrape only a specific source. Use 'mcp' to score jobs already scraped via Claude-in-Chrome (default: all Playwright sources)",
     )
+    discover_parser.add_argument(
+        "--no-review",
+        action="store_true",
+        help="Skip the terminal review queue (useful for background/cron syncs)",
+    )
 
     # apply
-    subparsers.add_parser(
+    apply_parser = subparsers.add_parser(
         "apply",
         help="Apply to all jobs marked as approved",
+    )
+    apply_parser.add_argument(
+        "--auto-submit",
+        action="store_true",
+        help="Automatically submit applications without final manual confirmation",
     )
 
     # status
@@ -93,10 +103,10 @@ async def main_async(args: argparse.Namespace) -> int:
     orchestrator = Orchestrator(config_path=config_path)
 
     if args.command == "discover":
-        await orchestrator.discover(source=args.source)
+        await orchestrator.discover(source=args.source, no_review=args.no_review)
 
     elif args.command == "apply":
-        await orchestrator.apply_approved()
+        await orchestrator.apply_approved(auto_submit=args.auto_submit)
 
     elif args.command == "status":
         orchestrator.show_status()

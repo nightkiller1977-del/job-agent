@@ -6,12 +6,13 @@ User is assumed to be logged in with a saved resume.
 from __future__ import annotations
 
 import re
+import sys
 from datetime import datetime
 from typing import Optional
 
 from rich.console import Console
 
-from .base import BaseScraper
+from .base import BaseScraper, JobExpiredError
 
 console = Console()
 
@@ -57,6 +58,9 @@ class USAJobsScraper(BaseScraper):
 
             # Check login
             if not await self._is_logged_in(page):
+                if not (sys.stdin and sys.stdin.isatty()):
+                    console.print("[red]USAJobs: Not logged in and running non-interactively. Skipping USAJobs scrape.[/red]")
+                    return []
                 console.print(
                     "[red]USAJobs:[/red] Not logged in. Please log in at https://www.usajobs.gov "
                     "in the opened browser window."
@@ -280,7 +284,7 @@ class USAJobsScraper(BaseScraper):
             console.print(f"[dim]USAJobs card parse error: {exc}[/dim]")
             return None
 
-    async def apply(self, job: dict) -> bool:
+    async def apply(self, job: dict, auto_submit: bool = False) -> bool:
         """
         Execute USAJobs application flow.
         Selects saved resume, answers questionnaire, pauses before final submit.
@@ -293,6 +297,13 @@ class USAJobsScraper(BaseScraper):
         try:
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
+
+            # Check if job is expired/closed
+            page_text = await page.evaluate("document.body.innerText")
+            if "announcement has closed" in page_text.lower() or "no longer available" in page_text.lower():
+                console.print(f"[yellow]USAJobs:[/yellow] Announcement has closed — skipping.")
+                raise JobExpiredError("USAJobs: Announcement has closed.")
+
 
             # Find Apply button
             apply_btn = None
@@ -367,7 +378,14 @@ class USAJobsScraper(BaseScraper):
                     # Show questionnaire answers summary
                     await self._show_review_summary(apply_page)
 
-                    confirm = input("\n  Submit this USAJobs application? [y/N] > ").strip().lower()
+                    if auto_submit:
+                        console.print("[green]USAJobs: Auto-submitting application (auto-submit active)![/green]")
+                        confirm = "y"
+                    else:
+                        try:
+                            confirm = input("\n  Submit this USAJobs application? [y/N] > ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            confirm = "n"
                     if confirm == "y":
                         # Click the final submit
                         for sel in [
@@ -387,8 +405,11 @@ class USAJobsScraper(BaseScraper):
                             except Exception:
                                 continue
                         if not submitted:
-                            console.print("[yellow]USAJobs: Could not find submit button. Please submit manually.[/yellow]")
-                            input("  Press Enter when done > ")
+                            if auto_submit:
+                                console.print("[red]USAJobs: Could not find submit button in auto-submit mode.[/red]")
+                            else:
+                                console.print("[yellow]USAJobs: Could not find submit button. Please submit manually.[/yellow]")
+                                input("  Press Enter when done > ")
                     else:
                         console.print("[yellow]USAJobs: Application cancelled by user.[/yellow]")
                     break
@@ -396,8 +417,14 @@ class USAJobsScraper(BaseScraper):
                 # Navigate to next step
                 navigated = await self._click_next(apply_page)
                 if not navigated:
+                    if auto_submit or not (sys.stdin and sys.stdin.isatty()):
+                        console.print("[red]USAJobs: Could not navigate automatically and running non-interactively/auto-submit. Aborting application.[/red]")
+                        break
                     console.print("[yellow]USAJobs: Could not navigate to next step.[/yellow]")
-                    input("  Please navigate manually and press Enter when ready > ")
+                    try:
+                        input("  Please navigate manually and press Enter when ready > ")
+                    except (EOFError, KeyboardInterrupt):
+                        break
 
         except Exception as exc:
             console.print(f"[red]USAJobs apply error:[/red] {exc}")

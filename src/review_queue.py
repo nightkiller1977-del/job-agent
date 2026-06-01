@@ -226,7 +226,7 @@ def show_summary_table(stats: dict) -> None:
     table.add_column("Today", justify="right", style="dim")
 
     today = stats.get("today", {})
-    for status in ["discovered", "approved", "applied", "skipped", "bookmarked"]:
+    for status in ["discovered", "approved", "applied", "skipped", "bookmarked", "expired"]:
         total = stats.get(status, 0)
         today_count = today.get(status, 0)
         style = ""
@@ -236,6 +236,9 @@ def show_summary_table(stats: dict) -> None:
             style = "bold yellow"
         elif status == "skipped":
             style = "dim"
+        elif status == "expired":
+            style = "bold red"
         table.add_row(status.capitalize(), str(total), str(today_count), style=style)
 
     console.print(table)
+

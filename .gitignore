@@ -12,8 +12,14 @@ build/
 
 # ── State & runtime data ──────────────────────────────────────────────────────
 state/jobs.db
+state/jobs.db-shm
+state/jobs.db-wal
 state/sessions/
 state/mcp_scraped.json
+state/profile.json
+state/agent.log
+state/agent_status.json
+state/extensions/
 
 # ── Playwright ────────────────────────────────────────────────────────────────
 playwright-report/

@@ -9,11 +9,13 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
 from datetime import datetime
 
 from rich.console import Console
 
-from .base import BaseScraper
+from .base import BaseScraper, JobExpiredError
+from src.notifier import notify_error, notify_warning, notify_success, notify_info
 
 console = Console()
 
@@ -37,37 +39,44 @@ class JobrightScraper(BaseScraper):
 
             # Check for login redirect
             if "/login" in page.url or "/signin" in page.url or "auth" in page.url or "jobright.ai" not in page.url:
-                console.print(
-                    "\n[yellow]Jobright:[/yellow] Not logged in.\n"
-                    "  → Please log in to jobright.ai in the browser window that just opened.\n"
-                    "  → Once you're on the jobs page, come back here and press Enter."
-                )
-                input("  Press Enter once logged in > ")
-                await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=30000)
-                await self._delay(2, 3)
-                # Save session so next run is automatic
-                await self._save_session()
-                console.print("[green]Jobright: Session saved — future runs will log in automatically.[/green]")
-
-            console.print(f"[magenta]Jobright:[/magenta] Page loaded: {page.url}")
-
-            # If not on the jobs page, attempt auto-login from .env credentials
-            if "jobright.ai/jobs" not in page.url:
                 email = os.environ.get("JOBRIGHT_EMAIL", "")
                 password = os.environ.get("JOBRIGHT_PASSWORD", "")
-
                 if email and password:
                     console.print("[magenta]Jobright:[/magenta] Not logged in — attempting auto-login…")
                     logged_in = await self._auto_login(page, email, password)
                     if not logged_in:
-                        console.print("[red]Jobright: Auto-login failed — skipping.[/red]")
-                        return []
+                        if not (sys.stdin and sys.stdin.isatty()):
+                            console.print("[red]Jobright: Auto-login failed and running non-interactively. Skipping Jobright scrape.[/red]")
+                            return []
+                        console.print(
+                            "\n[yellow]Jobright:[/yellow] Auto-login failed.\n"
+                            "  → Please log in manually in the browser window.\n"
+                            "  → Press Enter once you are logged in."
+                        )
+                        input("  Press Enter once logged in > ")
+                        await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=30000)
+                        await self._delay(2, 3)
+                        await self._save_session()
                 else:
+                    if not (sys.stdin and sys.stdin.isatty()):
+                        console.print("[red]Jobright: Not logged in, no credentials in .env, and running non-interactively. Skipping Jobright scrape.[/red]")
+                        return []
                     console.print(
-                        "[red]Jobright:[/red] Not logged in and no credentials in .env.\n"
-                        "  Add JOBRIGHT_EMAIL and JOBRIGHT_PASSWORD to your .env file."
+                        "\n[yellow]Jobright:[/yellow] Not logged in.\n"
+                        "  → Please log in to jobright.ai in the browser window that just opened.\n"
+                        "  → Once you're on the jobs page, come back here and press Enter."
                     )
-                    return []
+                    input("  Press Enter once logged in > ")
+                    await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=30000)
+                    await self._delay(2, 3)
+                    await self._save_session()
+                    console.print("[green]Jobright: Session saved — future runs will log in automatically.[/green]")
+
+            console.print(f"[magenta]Jobright:[/magenta] Page loaded: {page.url}")
+
+            if "jobright.ai/jobs" not in page.url:
+                console.print("[red]Jobright: Could not navigate to jobs page — skipping.[/red]")
+                return []
 
             console.print("[magenta]Jobright:[/magenta] Waiting for job cards to render…")
             try:
@@ -416,7 +425,7 @@ class JobrightScraper(BaseScraper):
             console.print(f"[dim]Jobright link fallback error: {exc}[/dim]")
         return jobs
 
-    async def apply(self, job: dict) -> bool:
+    async def apply(self, job: dict, auto_submit: bool = False) -> bool:
         """
         Full autofill apply flow powered by the Jobright Autofill Chrome extension:
 
@@ -427,6 +436,7 @@ class JobrightScraper(BaseScraper):
         5. Extension auto-fills form fields; auto-login to portal if needed
         6. Confirm with user, then submit
         """
+        self.auto_submit = auto_submit
         console.print(f"\n[magenta]Jobright Apply:[/magenta] {job.get('title')} @ {job.get('company')}")
         page = await self._start_browser(load_extensions=True)
         submitted = False
@@ -440,41 +450,59 @@ class JobrightScraper(BaseScraper):
             page_text = await page.evaluate("document.body.innerText")
             if "no longer available" in page_text.lower():
                 console.print(f"[yellow]Jobright:[/yellow] Job no longer listed — skipping.")
-                return False
+                raise JobExpiredError("Job no longer available")
+
 
             # ── Step 2: Extract external ATS URL before opening modal ─────────
             ext_url = await self._extract_external_url(page)
             console.print(f"[magenta]Jobright:[/magenta] ATS URL: {ext_url or '(will try Apply Now)'}")
 
-            # ── Step 3: Open Orion AI resume customization modal ──────────────
+            # ── Step 3: Open Orion AI "Customize Your Resume" tool ───────────
+            # The tool card is active by default (class contains "tool-card-active").
+            # Clicking it opens the resume customization modal.
             console.print("[magenta]Jobright:[/magenta] Opening Orion AI resume modal…")
             await page.evaluate("""
             () => {
-                const card = document.querySelector('[class*="tool-card"]');
+                // Prefer the active card; fall back to the first tool card
+                const card = document.querySelector('[class*="tool-card-active"]')
+                           || document.querySelector('[class*="tool-card"]');
                 if (card) card.click();
             }
             """)
+            await self._delay(2, 3)
 
-            # Poll for "Improve My Resume for This Job" button (Step 1 analysis takes ~10s)
+            # ── Step 4: Look for any resume-improvement trigger button ─────────
+            # The button text changed from "Improve My Resume for This Job"
+            # to "Customize Your Resume" (or similar) in the updated Jobright UI.
             improve_btn = None
-            console.print("[magenta]Jobright:[/magenta] Waiting for resume analysis (up to 20s)…")
+            console.print("[magenta]Jobright:[/magenta] Waiting for resume tool to load (up to 20s)…")
+            improve_patterns = [
+                'button:text-matches("Improve My Resume", "i")',       # legacy
+                'button:text-matches("Customize.*Resume", "i")',       # current
+                'button:text-matches("Tailor.*Resume", "i")',
+                'button:text-matches("Optimize.*Resume", "i")',
+                'button:text-matches("Enhance.*Resume", "i")',
+            ]
             for _ in range(20):
                 await asyncio.sleep(1)
-                try:
-                    improve_btn = await page.query_selector(
-                        'button:text-matches("Improve My Resume", "i")'
-                    )
-                    if improve_btn:
-                        break
-                except Exception:
-                    pass
+                for pat in improve_patterns:
+                    try:
+                        btn = await page.query_selector(pat)
+                        if btn:
+                            improve_btn = btn
+                            break
+                    except Exception:
+                        pass
+                if improve_btn:
+                    break
 
             if improve_btn:
-                # ── Step 4: Improve → Step 2 form ────────────────────────────
+                btn_text = await improve_btn.inner_text()
+                console.print(f"[green]Jobright:[/green] Found resume button: '{btn_text.strip()}'")
                 await improve_btn.click()
                 await self._delay(2, 3)
 
-                # Full Edit + all missing keywords
+                # Select Full Edit mode and check all missing keywords
                 await page.evaluate("""
                 () => {
                     const labels = Array.from(document.querySelectorAll('label, span, p'));
@@ -487,20 +515,32 @@ class JobrightScraper(BaseScraper):
                 await self._delay(1, 2)
 
                 # ── Step 5: Generate tailored resume ─────────────────────────
-                gen_btn = await page.query_selector(
-                    'button:text-matches("Generate My New Resume", "i")'
-                )
+                gen_patterns = [
+                    'button:text-matches("Generate My New Resume", "i")',
+                    'button:text-matches("Generate.*Resume", "i")',
+                    'button:text-matches("^Generate$", "i")',
+                    'button:text-matches("Create.*Resume", "i")',
+                ]
+                gen_btn = None
+                for pat in gen_patterns:
+                    try:
+                        gen_btn = await page.query_selector(pat)
+                        if gen_btn:
+                            break
+                    except Exception:
+                        pass
+
                 if gen_btn:
                     await gen_btn.click()
                     console.print("[magenta]Jobright:[/magenta] Generating tailored resume… (~60s)")
 
-                    # Poll until Download Resume + Apply Now appear (max 90s)
+                    # Poll until Download Resume appears (max 90s)
                     for _ in range(45):
                         await asyncio.sleep(2)
                         btns = await page.evaluate(
                             "Array.from(document.querySelectorAll('button')).map(b=>b.textContent.trim())"
                         )
-                        if "Download Resume" in btns and "Apply Now" in btns:
+                        if any("Download" in b for b in btns):
                             score_info = await page.evaluate("""
                             document.body.innerText
                                 .match(/score jumped from [\\d.]+ to [\\d.]+/i)?.[0] || 'generated'
@@ -511,11 +551,13 @@ class JobrightScraper(BaseScraper):
                     # Download tailored PDF
                     await page.evaluate("""
                     Array.from(document.querySelectorAll('button'))
-                        .find(b=>b.textContent.trim()==='Download Resume')?.click()
+                        .find(b => /download/i.test(b.textContent))?.click()
                     """)
                     await self._delay(1, 2)
+                else:
+                    console.print("[yellow]Jobright:[/yellow] Generate button not found — skipping generation")
             else:
-                console.print("[yellow]Jobright:[/yellow] Improve button not found — using existing resume")
+                console.print("[yellow]Jobright:[/yellow] Resume tool button not found — using existing resume")
 
             # ── Step 6: Dismiss modal, open company ATS directly ──────────────
             # Close the resume modal
@@ -536,7 +578,7 @@ class JobrightScraper(BaseScraper):
             console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
             company_page = await self._context.new_page()
             await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
-            await self._delay(4, 6)  # let extension inject into the ATS page
+            await self._delay(3, 5)
 
             # Dismiss "Did you apply?" on Jobright (non-blocking)
             try:
@@ -549,27 +591,64 @@ class JobrightScraper(BaseScraper):
 
             console.print(f"[magenta]Jobright:[/magenta] Company portal loaded: {company_page.url}")
 
-            # ── Step 7: Handle login if required ─────────────────────────────
-            if await self._portal_needs_login(company_page):
-                console.print("[magenta]Jobright:[/magenta] Login required — auto-logging in…")
-                await self._company_portal_login(company_page)
-                await self._delay(4, 6)
+            # ── Step 7: Click Apply button FIRST ─────────────────────────────
+            # Workday shows a job description page; clicking Apply opens the
+            # sign-in dialog or application form.  Login comes AFTER this.
+            await self._click_ats_apply_button(company_page)
+            await self._delay(3, 5)
+
+            # ── Step 7.5: Handle login if required (non-Workday ATS only) ──────
+            # Workday login/wizard is handled interactively inside
+            # _click_ats_apply_button, so skip the auto-login step for it.
+            try:
+                portal_url = company_page.url
+            except Exception:
+                portal_url = ""
+            if 'myworkdayjobs.com' not in portal_url:
+                if await self._portal_needs_login(company_page):
+                    console.print("[magenta]Jobright:[/magenta] Login required — auto-logging in…")
+                    await self._company_portal_login(company_page)
+                    await self._delay(4, 6)
 
             # ── Step 8: Trigger Jobright extension autofill ───────────────────
-            console.print("[magenta]Jobright:[/magenta] Triggering Jobright autofill extension…")
-            autofill_triggered = await self._trigger_autofill(company_page)
-            if autofill_triggered:
-                console.print("[magenta]Jobright:[/magenta] Autofill triggered — waiting for fields…")
-                await self._delay(8, 12)
+            # For Workday: the user already clicked "Autofill with Resume" and
+            # navigated through the wizard manually — the extension filled fields
+            # during that process.  Skip the programmatic trigger for Workday to
+            # avoid re-triggering and corrupting filled fields.
+            try:
+                current_portal = company_page.url
+            except Exception:
+                current_portal = ""
+
+            if 'myworkdayjobs.com' not in current_portal:
+                console.print("[magenta]Jobright:[/magenta] Triggering Jobright autofill extension…")
+                autofill_triggered = await self._trigger_autofill(company_page)
+                if autofill_triggered:
+                    console.print("[magenta]Jobright:[/magenta] Autofill triggered — waiting for fields…")
+                    await self._delay(10, 15)
+                else:
+                    console.print("[yellow]Jobright:[/yellow] Autofill button not found — extension may auto-fill on load")
+                    await self._delay(5, 8)
             else:
-                console.print("[yellow]Jobright:[/yellow] Autofill button not found — extension may auto-fill on load")
-                await self._delay(5, 7)
+                console.print("[dim]Jobright: Workday — autofill was handled manually, skipping trigger[/dim]")
 
             # ── Step 9: Confirm and submit ────────────────────────────────────
-            submitted = await self._confirm_and_submit(company_page, job)
+            submitted = await self._confirm_and_submit(company_page, job, auto_submit=auto_submit)
+            if submitted:
+                notify_success(
+                    f"Applied: {job.get('title')} @ {job.get('company')}",
+                    f"Application submitted successfully"
+                )
 
         except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
             console.print(f"[red]Jobright apply error:[/red] {exc}")
+            console.print(f"[dim]{tb}[/dim]")
+            notify_error(
+                f"Apply failed: {job.get('title')} @ {job.get('company')}",
+                str(exc)[:200]
+            )
         finally:
             await self._close_browser()
 
@@ -619,10 +698,20 @@ class JobrightScraper(BaseScraper):
 
     async def _portal_needs_login(self, page) -> bool:
         """Return True if the company ATS page is showing a login wall."""
-        url = page.url.lower()
-        if any(w in url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso.", "myworkday"]):
+        try:
+            url = page.url.lower()
+        except Exception:
+            return False  # page closed or invalid
+        if any(w in url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso."]):
             return True
         try:
+            # Workday application forms have email fields (contact info) but NOT
+            # password fields.  Only treat as login wall if a password input exists.
+            # For all other ATS, presence of email OR password indicates a login form.
+            if 'myworkdayjobs.com' in url:
+                return await page.evaluate("""
+                () => !!document.querySelector('input[type="password"]')
+                """)
             return await page.evaluate("""
             () => {
                 const emailInput = document.querySelector(
@@ -636,15 +725,24 @@ class JobrightScraper(BaseScraper):
             return False
 
     async def _company_portal_login(self, page) -> None:
-        """Log into a company ATS portal using COMPANY_EMAIL / COMPANY_PASSWORD from .env."""
+        """
+        Log into a company ATS portal using COMPANY_EMAIL / COMPANY_PASSWORD from .env.
+        Uses page.type() (real keystroke simulation) instead of fill() to avoid
+        bot-detection triggers on Workday and similar ATS portals.
+        """
         email = os.environ.get("COMPANY_EMAIL", "")
         password = os.environ.get("COMPANY_PASSWORD", "")
         if not email or not password:
             console.print("[yellow]Jobright:[/yellow] Set COMPANY_EMAIL + COMPANY_PASSWORD in .env for auto-login")
+            notify_error(
+                "Missing credentials",
+                "Add COMPANY_EMAIL and COMPANY_PASSWORD to .env to enable ATS auto-login"
+            )
             return
 
         try:
-            # Fill email field
+            # ── Step 1: Find and fill email with human-like typing ────────────
+            email_filled = False
             for sel in [
                 'input[type="email"]',
                 'input[name*="email" i]',
@@ -653,51 +751,60 @@ class JobrightScraper(BaseScraper):
                 'input[autocomplete="username"]',
             ]:
                 try:
-                    elem = await page.wait_for_selector(sel, timeout=3000)
+                    elem = await page.wait_for_selector(sel, timeout=4000)
                     if elem:
-                        await elem.fill(email)
+                        await elem.click()
+                        await self._delay(0.3, 0.6)
+                        await elem.type(email, delay=80)   # type() = real keystrokes
                         await self._delay(0.5, 1)
+                        email_filled = True
                         break
                 except Exception:
                     continue
 
-            # Some portals (Workday) split email → Next → password
+            if not email_filled:
+                console.print("[yellow]Jobright:[/yellow] Email field not found — sign-in skipped")
+                return
+
+            # ── Step 2: Submit email (Workday splits email → Next → password) ─
             for sel in [
+                'button:text-matches("^Next$", "i")',
+                'button:text-matches("^Continue$", "i")',
                 'button[type="submit"]',
-                'button:text("Next")',
-                'button:text("Continue")',
-                'button:text("Sign In")',
             ]:
                 try:
-                    btn = await page.query_selector(sel)
-                    if btn:
+                    btn = await page.wait_for_selector(sel, timeout=3000)
+                    if btn and await btn.is_visible():
                         await btn.click()
                         await self._delay(2, 3)
                         break
                 except Exception:
                     continue
 
-            # Fill password (may now be on next page)
+            # ── Step 3: Fill password ─────────────────────────────────────────
             try:
-                pwd = await page.wait_for_selector('input[type="password"]', timeout=5000)
+                pwd = await page.wait_for_selector('input[type="password"]', timeout=8000)
                 if pwd:
-                    await pwd.fill(password)
+                    await pwd.click()
+                    await self._delay(0.3, 0.6)
+                    await pwd.type(password, delay=80)     # type() = real keystrokes
                     await self._delay(0.5, 1)
             except Exception:
-                pass
+                console.print("[yellow]Jobright:[/yellow] Password field not found — may be SSO-only")
+                return
 
-            # Final submit
+            # ── Step 4: Submit ────────────────────────────────────────────────
             for sel in [
+                'button:text-matches("^Sign In$", "i")',
+                'button:text-matches("^Log In$", "i")',
+                'button:text-matches("^Login$", "i")',
                 'button[type="submit"]',
-                'button:text("Sign In")',
-                'button:text("Log In")',
-                'button:text("Login")',
             ]:
                 try:
-                    btn = await page.query_selector(sel)
-                    if btn:
+                    btn = await page.wait_for_selector(sel, timeout=3000)
+                    if btn and await btn.is_visible():
                         await btn.click()
-                        await self._delay(4, 6)
+                        await self._delay(5, 8)  # wait for redirect
                         break
                 except Exception:
                     continue
@@ -706,6 +813,201 @@ class JobrightScraper(BaseScraper):
 
         except Exception as e:
             console.print(f"[yellow]Jobright:[/yellow] Portal login attempt failed: {e}")
+
+    async def _click_ats_apply_button(self, page) -> bool:
+        """
+        Navigate to / click into the application form on an ATS job listing page.
+
+        Strategy:
+        • Workday (myworkdayjobs.com) — append /apply to the job URL to enter the
+          wizard directly; this is more reliable than clicking a button that may
+          mis-match navigation links.
+        • Greenhouse / Lever / others — click the visible Apply/Apply Now button.
+
+        Returns True if we successfully entered the form (or are already on it).
+        """
+        current_url = page.url
+
+        # ── Workday: navigate directly to autofillWithResume endpoint ───────
+        # This skips the "Start Your Application" chooser entirely.
+        # If the Workday session is active → opens the application form.
+        # If session expired → Workday shows its sign-in page; we handle that below.
+        if 'myworkdayjobs.com' in current_url and '/apply' not in current_url:
+            apply_url = current_url.rstrip('/') + '/apply/autofillWithResume'
+            console.print(f"[magenta]Jobright:[/magenta] Workday — navigating to autofillWithResume…")
+            try:
+                await page.goto(apply_url, wait_until="domcontentloaded", timeout=30000)
+                await self._delay(4, 6)
+                after = page.url
+                console.print(f"[magenta]Jobright:[/magenta] Landed on: {after[:90]}")
+            except Exception as e:
+                console.print(f"[yellow]Jobright:[/yellow] Workday nav failed ({e})")
+
+        # ── Workday "Start Your Application" chooser ─────────────────────────
+        # After landing on /apply, Workday shows:
+        #   "Autofill with Resume" | "Apply Manually" | "Use My Last Application"
+        # We use a JS-dispatched click (not Playwright .click()) to avoid the
+        # Chromium crash that Playwright's synthetic mouse events triggered.
+        # Priority: Use My Last Application > Autofill with Resume > Apply Manually
+        try:
+            current = page.url
+        except Exception:
+            current = ""
+        # After navigating to autofillWithResume: handle sign-in if needed,
+        # then auto-navigate the wizard steps.
+        if 'myworkdayjobs.com' in current:
+            await self._workday_handle_post_chooser(page)
+            return True
+
+        # ── Other ATS: click the Apply / Apply Now button ────────────────────
+        apply_selectors = [
+            # Workday fallback (data-automation-id only, not broad text matches)
+            '[data-automation-id="jobPostingApplyButton"]',
+            # Greenhouse / Lever
+            '#apply_button',
+            'a.btn-apply',
+            '.apply-button',
+            # Text-match on button elements only (not anchors, to avoid nav links)
+            'button:text-matches("^Apply Now$", "i")',
+            'button:text-matches("^Apply$", "i")',
+            'button:text-matches("Apply for This Job", "i")',
+            'button:text-matches("Apply for Job", "i")',
+        ]
+
+        for sel in apply_selectors:
+            try:
+                btn = await page.wait_for_selector(sel, timeout=4000)
+                if btn:
+                    await btn.click()
+                    from rich.markup import escape
+                    console.print(f"[magenta]Jobright:[/magenta] Clicked Apply button → waiting for form…")
+                    await self._delay(4, 6)
+                    return True
+            except Exception:
+                continue
+
+        console.print("[dim]Jobright: No Apply button found — may already be on the application form[/dim]")
+        return False
+
+    async def _workday_handle_post_chooser(self, page) -> None:
+        """
+        Called right after clicking the Workday 'Start Your Application' chooser.
+        Handles two possible outcomes:
+          A) Sign-in page appeared → pause for ONE-TIME manual sign-in (session is
+             then saved to the persistent profile so future runs skip this step)
+          B) Application form appeared → let the Jobright extension fill it, then
+             auto-click 'Next' through each wizard step until the Review page.
+        """
+        await self._delay(3, 5)
+
+        # ── A: Sign-in wall ───────────────────────────────────────────────────
+        # Workday's sign-in page uses SSO/OAuth that crashes Chromium when
+        # automated.  We pause and let the user sign in once; the persistent
+        # profile saves the session so every future run is automatic.
+        needs_login = False
+        try:
+            url = page.url.lower()
+            if any(w in url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso."]):
+                needs_login = True
+        except Exception:
+            pass
+
+        if not needs_login:
+            try:
+                pwd = await page.query_selector('input[type="password"]')
+                if pwd:
+                    needs_login = True
+            except Exception:
+                pass
+
+        if needs_login:
+            # Use credentials from .env (COMPANY_EMAIL / COMPANY_PASSWORD).
+            # page.type() simulates real keystrokes to avoid Workday bot detection.
+            console.print("[magenta]Jobright:[/magenta] Workday sign-in — using credentials from .env…")
+            await self._company_portal_login(page)
+            await self._delay(4, 6)
+
+            # Verify we left the sign-in page
+            try:
+                new_url = page.url.lower()
+                still_login = any(w in new_url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso."])
+                if still_login:
+                    pwd_check = await page.query_selector('input[type="password"]')
+                    still_login = bool(pwd_check)
+            except Exception:
+                still_login = False
+
+            if still_login:
+                console.print("[red]Jobright: Workday sign-in did not complete — skipping this job.[/red]")
+                notify_error(
+                    "Workday login failed",
+                    "Check COMPANY_EMAIL / COMPANY_PASSWORD in .env — credentials may be wrong or portal uses SSO"
+                )
+                return
+
+        # ── B: Auto-navigate Workday wizard ──────────────────────────────────
+        # Wait for the application form to fully load after login/redirect.
+        console.print("[magenta]Jobright:[/magenta] Waiting for Workday application form to load…")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            pass
+        await self._delay(5, 7)  # extra buffer for JS rendering
+
+        # The extension fills fields on each step; we click 'Next' until we
+        # reach the Review/Submit page (where the button text becomes 'Submit').
+        console.print("[magenta]Jobright:[/magenta] Navigating Workday wizard steps…")
+        for step_num in range(30):   # max 30 steps — GDIT/CVS/Citi have 15-20+ pages
+            await self._delay(4, 6)  # wait for extension to fill the current step
+
+            # Early exit: URL contains 'review' or 'confirm' — we're at the final page
+            try:
+                cur_url = page.url.lower()
+                if any(w in cur_url for w in ["/review", "/confirm", "/submit"]):
+                    console.print(f"[green]Jobright:[/green] Reached review/submit URL — ready to submit")
+                    break
+            except Exception:
+                pass
+
+            # Get the Next/Submit button (Workday uses data-automation-id)
+            next_btn = None
+            for sel in [
+                '[data-automation-id="bottom-navigation-next-button"]',
+                'button:text-matches("^Next$", "i")',
+                'button:text-matches("^Save and Continue$", "i")',
+                'button:text-matches("^Continue$", "i")',
+            ]:
+                try:
+                    btn = await page.wait_for_selector(sel, timeout=5000)
+                    if btn and await btn.is_visible():
+                        next_btn = btn
+                        break
+                except Exception:
+                    continue
+
+            if not next_btn:
+                console.print(f"[dim]Jobright: No Next button on step {step_num+1} — may be on final page[/dim]")
+                break
+
+            btn_text = ""
+            try:
+                btn_text = (await next_btn.inner_text()).strip()
+            except Exception:
+                pass
+
+            # Stop auto-clicking when we reach Review/Submit
+            if any(w in btn_text.lower() for w in ["submit", "review", "confirm"]):
+                console.print(f"[green]Jobright:[/green] Reached final step: '{btn_text}' — ready to submit")
+                break
+
+            console.print(f"[dim]Jobright: Step {step_num+1} → clicking '{btn_text or 'Next'}'[/dim]")
+            try:
+                await next_btn.click()
+            except Exception as e:
+                console.print(f"[yellow]Jobright:[/yellow] Next click failed: {e}")
+                break
+
+        console.print("[magenta]Jobright:[/magenta] Workday wizard navigation complete")
 
     async def _trigger_autofill(self, page) -> bool:
         """
@@ -733,7 +1035,7 @@ class JobrightScraper(BaseScraper):
                 elem = await page.wait_for_selector(sel, timeout=3000)
                 if elem:
                     await elem.click()
-                    console.print(f"[green]Jobright:[/green] Extension autofill triggered via '{sel}'")
+                    console.print(f"[green]Jobright:[/green] Extension autofill triggered")
                     return True
             except Exception:
                 continue
@@ -767,41 +1069,55 @@ class JobrightScraper(BaseScraper):
 
         return False
 
-    async def _confirm_and_submit(self, page, job: dict) -> bool:
+    async def _confirm_and_submit(self, page, job: dict, auto_submit: bool = False) -> bool:
         """
         Find the final Submit / Apply button on the ATS page, show a preview,
-        ask for confirmation, then click.
+        optionally ask for confirmation, then click.
         """
         submit_selectors = [
+            # Workday final-step submit (data-automation-id)
+            '[data-automation-id="bottom-navigation-next-button"]',
+            '[data-automation-id*="submit" i]',
+            # Generic text-based
             'button:text-matches("^Submit$", "i")',
             'button:text-matches("Submit Application", "i")',
             'button:text-matches("^Apply$", "i")',
             'button:text-matches("Send Application", "i")',
             'button:text-matches("Complete Application", "i")',
-            '[data-automation-id*="submit" i]',
             '[aria-label*="submit" i]',
-            '[type="submit"]',
         ]
 
         submit_btn = None
         for sel in submit_selectors:
             try:
-                btn = await page.wait_for_selector(sel, timeout=5000)
-                if btn:
+                btn = await page.wait_for_selector(sel, timeout=4000)
+                if btn and await btn.is_visible():
                     submit_btn = btn
                     break
             except Exception:
                 continue
 
+        try:
+            portal_url = page.url
+        except Exception:
+            portal_url = "(unknown)"
+
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
         console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
-        console.print(f"  Portal: {page.url}")
+        console.print(f"  Portal: {portal_url}")
         if submit_btn:
-            console.print(f"  Submit button found ✓")
+            console.print(f"  [green]Submit button found ✓[/green]")
         else:
-            console.print(f"  [yellow]Submit button not found — may need multi-step navigation[/yellow]")
+            console.print(f"  [yellow]Submit button not found — navigate to the final step in the browser[/yellow]")
 
-        confirm = input("\n  Submit this application? [y/N] > ").strip().lower()
+        if auto_submit:
+            console.print("[green]Jobright: Auto-submitting application (auto-submit active)![/green]")
+            confirm = "y"
+        else:
+            try:
+                confirm = input("\n  Submit this application? [y/N] > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                confirm = "n"
         if confirm != "y":
             console.print("[yellow]Jobright: Submission cancelled.[/yellow]")
             return False
@@ -812,10 +1128,17 @@ class JobrightScraper(BaseScraper):
             console.print("[green]✓ Application submitted![/green]")
             return True
         else:
-            console.print("[yellow]Please complete the submission manually in the browser window.[/yellow]")
-            input("  Press Enter when submitted (or to skip) > ")
-            answer = input("  Did you successfully submit? [y/N] > ").strip().lower()
-            return answer == "y"
+            # No submit button found — user must click it manually in the browser
+            if auto_submit:
+                console.print("[red]Jobright: Submit button not found — cannot auto-submit. Skipping.[/red]")
+                return False
+            console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")
+            try:
+                input("  Press Enter after submitting (or to skip) > ")
+                answer = input("  Did you successfully submit? [y/N] > ").strip().lower()
+                return answer == "y"
+            except (EOFError, KeyboardInterrupt):
+                return False
 
 
 def _infer_remote_type(remote_raw: str, location: str) -> str:

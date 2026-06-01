@@ -112,7 +112,7 @@ class JobRecord(BaseModel):
 
 class ActionRequest(BaseModel):
     job_id: str
-    action: str  # "approved" | "skipped" | "bookmarked" | "applied"
+    action: str  # "approved" | "skipped" | "bookmarked" | "applied" | "expired"
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +322,8 @@ async def sync_jobs(
 
 @app.post("/api/action")
 async def job_action(body: ActionRequest):
-    """Update a job's status (approved / skipped / bookmarked / applied)."""
-    valid_actions = {"approved", "skipped", "bookmarked", "applied"}
+    """Update a job's status (approved / skipped / bookmarked / applied / expired)."""
+    valid_actions = {"approved", "skipped", "bookmarked", "applied", "expired"}
     if body.action not in valid_actions:
         raise HTTPException(
             status_code=400,
