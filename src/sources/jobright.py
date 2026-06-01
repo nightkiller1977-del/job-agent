@@ -16,6 +16,7 @@ from rich.console import Console
 
 from .base import BaseScraper, JobExpiredError
 from src.notifier import notify_error, notify_warning, notify_success, notify_info
+from src.resume_helper import ResumeFieldFixer
 
 console = Console()
 
@@ -437,6 +438,7 @@ class JobrightScraper(BaseScraper):
         6. Confirm with user, then submit
         """
         self.auto_submit = auto_submit
+        self._field_fixer = ResumeFieldFixer()
         console.print(f"\n[magenta]Jobright Apply:[/magenta] {job.get('title')} @ {job.get('company')}")
         page = await self._start_browser(load_extensions=True)
         submitted = False
@@ -458,43 +460,36 @@ class JobrightScraper(BaseScraper):
             console.print(f"[magenta]Jobright:[/magenta] ATS URL: {ext_url or '(will try Apply Now)'}")
 
             # ── Step 3: Open Orion AI "Customize Your Resume" tool ───────────
-            # The tool card is active by default (class contains "tool-card-active").
-            # Clicking it opens the resume customization modal.
+            # Wait for the tool card to be present, then click it.
             console.print("[magenta]Jobright:[/magenta] Opening Orion AI resume modal…")
-            await page.evaluate("""
-            () => {
-                // Prefer the active card; fall back to the first tool card
-                const card = document.querySelector('[class*="tool-card-active"]')
-                           || document.querySelector('[class*="tool-card"]');
-                if (card) card.click();
-            }
-            """)
-            await self._delay(2, 3)
+            try:
+                tool_card = await page.wait_for_selector(
+                    '[class*="tool-card-active"], [class*="tool-card"]',
+                    timeout=10000
+                )
+                if tool_card:
+                    await tool_card.click()
+                    console.print("[magenta]Jobright:[/magenta] Tool card clicked — waiting for modal…")
+            except Exception:
+                console.print("[yellow]Jobright:[/yellow] Tool card not found on this page")
 
-            # ── Step 4: Look for any resume-improvement trigger button ─────────
-            # The button text changed from "Improve My Resume for This Job"
-            # to "Customize Your Resume" (or similar) in the updated Jobright UI.
+            # ── Step 4: Wait for "Improve My Resume for This Job" button ──────
+            # The modal takes ~8-10s to render the score analysis.
+            # Use wait_for_selector (event-driven) instead of polling for reliability.
             improve_btn = None
-            console.print("[magenta]Jobright:[/magenta] Waiting for resume tool to load (up to 20s)…")
-            improve_patterns = [
-                'button:text-matches("Improve My Resume", "i")',       # legacy
-                'button:text-matches("Customize.*Resume", "i")',       # current
-                'button:text-matches("Tailor.*Resume", "i")',
-                'button:text-matches("Optimize.*Resume", "i")',
-                'button:text-matches("Enhance.*Resume", "i")',
-            ]
-            for _ in range(20):
-                await asyncio.sleep(1)
-                for pat in improve_patterns:
-                    try:
-                        btn = await page.query_selector(pat)
-                        if btn:
-                            improve_btn = btn
-                            break
-                    except Exception:
-                        pass
-                if improve_btn:
-                    break
+            console.print("[magenta]Jobright:[/magenta] Waiting for resume tool to load (up to 30s)…")
+            for pat in [
+                'button:text-matches("Improve My Resume for This Job", "i")',  # confirmed current text
+                'button:text-matches("Improve My Resume", "i")',               # partial match fallback
+                'button:text-matches("Customize.*Resume", "i")',
+                'button:text-matches("Generate.*Resume", "i")',
+            ]:
+                try:
+                    improve_btn = await page.wait_for_selector(pat, timeout=30000)
+                    if improve_btn:
+                        break
+                except Exception:
+                    continue
 
             if improve_btn:
                 btn_text = await improve_btn.inner_text()
@@ -900,50 +895,25 @@ class JobrightScraper(BaseScraper):
         """
         await self._delay(3, 5)
 
-        # ── A: Sign-in wall ───────────────────────────────────────────────────
-        # Workday's sign-in page uses SSO/OAuth that crashes Chromium when
-        # automated.  We pause and let the user sign in once; the persistent
-        # profile saves the session so every future run is automatic.
-        needs_login = False
+        # ── A: Check if Workday redirected to a sign-in page ─────────────────
+        # Filling Workday credentials programmatically crashes Chromium (SSO/bot
+        # detection).  The persistent browser profile saves the session after the
+        # first manual login, so this block is only reached when the session
+        # has expired.  We detect the redirect and abort gracefully — the user
+        # will need to re-run once manually to refresh the session.
         try:
             url = page.url.lower()
-            if any(w in url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso."]):
-                needs_login = True
+            on_login_page = any(w in url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso."])
         except Exception:
-            pass
+            on_login_page = False
 
-        if not needs_login:
-            try:
-                pwd = await page.query_selector('input[type="password"]')
-                if pwd:
-                    needs_login = True
-            except Exception:
-                pass
-
-        if needs_login:
-            # Use credentials from .env (COMPANY_EMAIL / COMPANY_PASSWORD).
-            # page.type() simulates real keystrokes to avoid Workday bot detection.
-            console.print("[magenta]Jobright:[/magenta] Workday sign-in — using credentials from .env…")
-            await self._company_portal_login(page)
-            await self._delay(4, 6)
-
-            # Verify we left the sign-in page
-            try:
-                new_url = page.url.lower()
-                still_login = any(w in new_url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso."])
-                if still_login:
-                    pwd_check = await page.query_selector('input[type="password"]')
-                    still_login = bool(pwd_check)
-            except Exception:
-                still_login = False
-
-            if still_login:
-                console.print("[red]Jobright: Workday sign-in did not complete — skipping this job.[/red]")
-                notify_error(
-                    "Workday login failed",
-                    "Check COMPANY_EMAIL / COMPANY_PASSWORD in .env — credentials may be wrong or portal uses SSO"
-                )
-                return
+        if on_login_page:
+            console.print("[red]Jobright: Workday session expired — sign in once manually to refresh.[/red]")
+            notify_error(
+                "Workday session expired",
+                "Open the Playwright browser, sign in to the Workday portal, then re-run apply."
+            )
+            return
 
         # ── B: Auto-navigate Workday wizard ──────────────────────────────────
         # Wait for the application form to fully load after login/redirect.
@@ -959,6 +929,11 @@ class JobrightScraper(BaseScraper):
         console.print("[magenta]Jobright:[/magenta] Navigating Workday wizard steps…")
         for step_num in range(30):   # max 30 steps — GDIT/CVS/Citi have 15-20+ pages
             await self._delay(4, 6)  # wait for extension to fill the current step
+
+            # Second-pass check: fix any empty or incorrect fields using resume profile
+            if hasattr(self, "_field_fixer") and self._field_fixer:
+                await self._field_fixer.fix_fields(page)
+
 
             # Early exit: URL contains 'review' or 'confirm' — we're at the final page
             try:
@@ -1123,7 +1098,14 @@ class JobrightScraper(BaseScraper):
             return False
 
         if submit_btn:
-            await submit_btn.click()
+            # Use JS click to bypass Workday overlay divs that intercept pointer events
+            try:
+                await page.evaluate("btn => btn.click()", submit_btn)
+            except Exception:
+                # Fallback: dispatch a MouseEvent directly
+                await page.evaluate("""btn => {
+                    btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                }""", submit_btn)
             await self._delay(3, 5)
             console.print("[green]✓ Application submitted![/green]")
             return True
