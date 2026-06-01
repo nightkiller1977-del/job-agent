@@ -19,7 +19,10 @@ from .sources.jobright import JobrightScraper
 from .sources.linkedin import LinkedInScraper
 from .sources.usajobs import USAJobsScraper
 
+from .sources.base import JobExpiredError
+
 console = Console()
+
 
 SOURCE_MAP = {
     "jobright": JobrightScraper,
@@ -56,7 +59,7 @@ class Orchestrator:
     # discover command
     # ------------------------------------------------------------------
 
-    async def discover(self, source: Optional[str] = None) -> None:
+    async def discover(self, source: Optional[str] = None, no_review: bool = False) -> None:
         """Scrape jobs, score them, save to DB, and run review queue.
 
         source='mcp' is a special mode: reads from state/mcp_scraped.json
@@ -65,7 +68,7 @@ class Orchestrator:
         """
         # ------ MCP file-based import mode ------
         if source == "mcp":
-            await self._discover_from_mcp_file()
+            await self._discover_from_mcp_file(no_review=no_review)
             return
 
         sources_to_run = [source] if source else list(SOURCE_MAP.keys())
@@ -118,6 +121,11 @@ class Orchestrator:
         await self._sync_to_cloud(all_new_jobs)
 
         # Run review queue for all pending jobs (includes older unreviewed ones)
+        import sys
+        if no_review or not (sys.stdin and sys.stdin.isatty()):
+            console.print("\n[yellow]Skipping terminal review queue (no-review flag or non-interactive terminal).[/yellow]")
+            return
+
         pending = self.state.get_pending_review()
         if not pending:
             console.print("[yellow]No jobs pending review.[/yellow]")
@@ -132,7 +140,7 @@ class Orchestrator:
             f"{summary['bookmarked']} bookmarked"
         )
 
-    async def _discover_from_mcp_file(self) -> None:
+    async def _discover_from_mcp_file(self, no_review: bool = False) -> None:
         """Load jobs scraped by the Claude-in-Chrome MCP tools, score, and review."""
         import hashlib
         console.rule("[bold magenta]Loading MCP-scraped jobs[/bold magenta]")
@@ -169,6 +177,11 @@ class Orchestrator:
             console.print(f"  Saved {saved} jobs to database")
 
         # Review queue
+        import sys
+        if no_review or not (sys.stdin and sys.stdin.isatty()):
+            console.print("\n[yellow]Skipping terminal review queue (no-review flag or non-interactive terminal).[/yellow]")
+            return
+
         pending = self.state.get_pending_review()
         if not pending:
             console.print("[yellow]No jobs pending review.[/yellow]")
@@ -208,13 +221,24 @@ class Orchestrator:
         job["score_reason"] = reason
         job["flags"] = flags
         job["recommended_action"] = action
+
+        # Auto-classify job status based on recommended action for full automation
+        if action == "apply":
+            job["status"] = "approved"
+            console.print(f"  [green]→ Auto-approved: {job.get('title')} @ {job.get('company')} (Score: {score})[/green]")
+        elif action == "skip":
+            job["status"] = "skipped"
+            console.print(f"  [dim]→ Auto-skipped: {job.get('title')} @ {job.get('company')} (Score: {score})[/dim]")
+        else:
+            job["status"] = "discovered"
+
         return job
 
     # ------------------------------------------------------------------
     # apply command
     # ------------------------------------------------------------------
 
-    async def apply_approved(self) -> None:
+    async def apply_approved(self, auto_submit: bool = False) -> None:
         """Apply to all jobs in 'approved' status.
 
         First pulls any cloud-approved jobs into the local DB so that jobs
@@ -244,7 +268,7 @@ class Orchestrator:
 
             scraper = SOURCE_MAP[source](self.config)
             try:
-                result = await scraper.apply(job)
+                result = await scraper.apply(job, auto_submit=auto_submit)
                 if result:
                     self.state.set_status(job["job_id"], "applied")
                     applied_count += 1
@@ -254,9 +278,15 @@ class Orchestrator:
                 else:
                     console.print(f"[yellow]Application not submitted — status unchanged.[/yellow]")
                     skipped_count += 1
+            except JobExpiredError as exc:
+                self.state.set_status(job["job_id"], "expired")
+                console.print(f"[red]Job no longer active (expired). Status updated to expired.[/red]")
+                # Push "expired" status back to cloud dashboard
+                await self._push_status_to_cloud(job["job_id"], "expired")
             except Exception as exc:
                 console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")
                 skipped_count += 1
+
 
         console.print(f"\n[bold]Apply run complete:[/bold] {applied_count} applied, {skipped_count} not submitted")
 
