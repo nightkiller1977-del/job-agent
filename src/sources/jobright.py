@@ -708,6 +708,8 @@ class JobrightScraper(BaseScraper):
                 () => {
                     const url = location.href.toLowerCase();
                     const body = (document.body?.innerText || '').toLowerCase();
+                    const signInPage = /create account\\/?sign in|sign in with email|sign in with google|sign in with linkedin/.test(body);
+                    if (signInPage) return false;
                     const formish = document.querySelectorAll('input, textarea, select, form').length;
                     const reviewText = /(review|submit|confirm|questionnaire|work experience|contact information)/i.test(body);
                     const workflowUrl = /(\\/apply|review|submit|confirm|application)/i.test(url);
@@ -1046,6 +1048,19 @@ class JobrightScraper(BaseScraper):
             on_login_page = any(w in url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso."])
         except Exception:
             on_login_page = False
+
+        if not on_login_page:
+            try:
+                on_login_page = await page.evaluate(
+                    """
+                    () => {
+                        const text = (document.body?.innerText || '').toLowerCase();
+                        return /create account\\/?sign in|sign in with email|sign in with google|sign in with linkedin/.test(text);
+                    }
+                    """
+                )
+            except Exception:
+                on_login_page = False
 
         if on_login_page:
             console.print("[red]Jobright: Workday session expired — sign in once manually to refresh.[/red]")
