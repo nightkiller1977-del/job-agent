@@ -83,8 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument(
         "--auto-submit",
         action="store_true",
-        default=True,   # Jobs are pre-approved in the review queue — auto-submit by default
-        help="Automatically submit applications without manual confirmation (default: True)",
+        default=False,
+        help="Automatically submit applications without manual confirmation (default: False)",
     )
     apply_parser.add_argument(
         "--no-auto-submit",

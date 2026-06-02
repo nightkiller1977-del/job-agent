@@ -488,7 +488,7 @@ class JobrightScraper(BaseScraper):
                 'button:text-matches("Generate.*Resume", "i")',
             ]:
                 try:
-                    improve_btn = await page.wait_for_selector(pat, timeout=30000)
+                    improve_btn = await page.wait_for_selector(pat, timeout=8000)
                     if improve_btn:
                         break
                 except Exception:
@@ -592,7 +592,7 @@ class JobrightScraper(BaseScraper):
             # ── Step 7: Click Apply button FIRST ─────────────────────────────
             # Workday shows a job description page; clicking Apply opens the
             # sign-in dialog or application form.  Login comes AFTER this.
-            await self._click_ats_apply_button(company_page)
+            entered_form = await self._click_ats_apply_button(company_page)
             await self._delay(3, 5)
 
             # ── Step 7.5: Handle login if required (non-Workday ATS only) ──────
@@ -619,6 +619,9 @@ class JobrightScraper(BaseScraper):
                 current_portal = ""
 
             if 'myworkdayjobs.com' not in current_portal:
+                if not entered_form and not await self._looks_like_application_form(company_page):
+                    console.print("[yellow]Jobright:[/yellow] Could not enter the ATS application form — skipping this job.")
+                    return False
                 console.print("[magenta]Jobright:[/magenta] Triggering Jobright autofill extension…")
                 autofill_triggered = await self._trigger_autofill(company_page)
                 if autofill_triggered:
@@ -631,6 +634,9 @@ class JobrightScraper(BaseScraper):
                 console.print("[dim]Jobright: Workday — autofill was handled manually, skipping trigger[/dim]")
 
             # ── Step 9: Confirm and submit ────────────────────────────────────
+            if not await self._looks_like_application_form(company_page):
+                console.print("[yellow]Jobright:[/yellow] ATS page does not look like an application form or review page — skipping submit step.")
+                return False
             submitted = await self._confirm_and_submit(company_page, job, auto_submit=auto_submit)
             if submitted:
                 notify_success(
@@ -651,6 +657,66 @@ class JobrightScraper(BaseScraper):
             await self._close_browser()
 
         return submitted
+
+    async def _click_visible_control_by_text(self, page, patterns: list[str]) -> bool:
+        """Click the first visible button/link/control whose text matches."""
+        return await page.evaluate(
+            """
+            (patterns) => {
+                const regexes = patterns.map(p => new RegExp(p, 'i'));
+                const candidates = Array.from(document.querySelectorAll([
+                    'button',
+                    'a',
+                    '[role="button"]',
+                    'input[type="button"]',
+                    'input[type="submit"]'
+                ].join(',')));
+                const isVisible = el => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden' &&
+                        style.display !== 'none' &&
+                        !el.disabled &&
+                        rect.width > 0 &&
+                        rect.height > 0;
+                };
+                for (const el of candidates) {
+                    if (!isVisible(el)) continue;
+                    const text = [
+                        el.innerText,
+                        el.textContent,
+                        el.value,
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('title')
+                    ].filter(Boolean).join(' ').trim();
+                    if (regexes.some(re => re.test(text))) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+            """,
+            patterns,
+        )
+
+    async def _looks_like_application_form(self, page) -> bool:
+        """Detect whether the ATS page is actually in an apply/review workflow."""
+        try:
+            return await page.evaluate(
+                """
+                () => {
+                    const url = location.href.toLowerCase();
+                    const body = (document.body?.innerText || '').toLowerCase();
+                    const formish = document.querySelectorAll('input, textarea, select, form').length;
+                    const reviewText = /(review|submit|confirm|questionnaire|work experience|contact information)/i.test(body);
+                    const workflowUrl = /(\\/apply|review|submit|confirm|application)/i.test(url);
+                    return reviewText || formish >= 3 || (workflowUrl && formish > 0);
+                }
+                """
+            )
+        except Exception:
+            return False
 
     async def _dismiss_jobright_popups(self, page) -> None:
         """
@@ -905,8 +971,15 @@ class JobrightScraper(BaseScraper):
         # After navigating to autofillWithResume: handle sign-in if needed,
         # then auto-navigate the wizard steps.
         if 'myworkdayjobs.com' in current:
+            await self._click_visible_control_by_text(page, [
+                '^use my last application$',
+                '^autofill with resume$',
+                '^apply manually$',
+                '^start application$',
+            ])
+            await self._delay(3, 5)
             await self._workday_handle_post_chooser(page)
-            return True
+            return await self._looks_like_application_form(page)
 
         # ── Other ATS: click the Apply / Apply Now button ────────────────────
         apply_selectors = [
@@ -935,8 +1008,21 @@ class JobrightScraper(BaseScraper):
             except Exception:
                 continue
 
+        clicked = await self._click_visible_control_by_text(page, [
+            '^apply now$',
+            '^apply$',
+            'apply for this job',
+            'apply for job',
+            'start application',
+            'begin application',
+        ])
+        if clicked:
+            console.print("[magenta]Jobright:[/magenta] Clicked Apply control → waiting for form…")
+            await self._delay(4, 6)
+            return await self._looks_like_application_form(page)
+
         console.print("[dim]Jobright: No Apply button found — may already be on the application form[/dim]")
-        return False
+        return await self._looks_like_application_form(page)
 
     async def _workday_handle_post_chooser(self, page) -> None:
         """
@@ -1107,12 +1193,15 @@ class JobrightScraper(BaseScraper):
             # Workday final-step submit (data-automation-id)
             '[data-automation-id="bottom-navigation-next-button"]',
             '[data-automation-id*="submit" i]',
+            'input[type="submit"][value*="Submit" i]',
+            'input[type="button"][value*="Submit" i]',
             # Generic text-based
             'button:text-matches("^Submit$", "i")',
             'button:text-matches("Submit Application", "i")',
             'button:text-matches("^Apply$", "i")',
             'button:text-matches("Send Application", "i")',
             'button:text-matches("Complete Application", "i")',
+            '[role="button"]:text-matches("Submit|Send Application|Complete Application", "i")',
             '[aria-label*="submit" i]',
         ]
 
@@ -1130,6 +1219,14 @@ class JobrightScraper(BaseScraper):
             portal_url = page.url
         except Exception:
             portal_url = "(unknown)"
+
+        if not submit_btn and (auto_submit or not (sys.stdin and sys.stdin.isatty())):
+            console.print(
+                "[yellow]Jobright: Submit button not found and this run is non-interactive — "
+                "skipping instead of prompting.[/yellow]"
+            )
+            console.print(f"[dim]Portal: {portal_url}[/dim]")
+            return False
 
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
         console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
