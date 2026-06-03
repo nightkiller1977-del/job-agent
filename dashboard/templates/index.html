@@ -4,7 +4,16 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Job Agent Dashboard</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Self-hosted Tailwind — avoids Safari ITP blocking cdn.tailwindcss.com -->
+  <link rel="stylesheet" href="/static/css/tailwind.min.css">
+  <!-- Fallback: if static file fails (e.g. first deploy), try CDN -->
+  <script>
+    document.querySelector('link[href="/static/css/tailwind.min.css"]').onerror = function() {
+      var s = document.createElement('script');
+      s.src = 'https://cdn.tailwindcss.com';
+      document.head.appendChild(s);
+    };
+  </script>
   <style>
     body { font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; }
     .score-green  { background: #16a34a; color: #fff; }
