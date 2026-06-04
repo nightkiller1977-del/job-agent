@@ -8,6 +8,8 @@ Usage:
   python src/main.py discover --source usajobs
   python src/main.py discover --source jobright
   python src/main.py apply                     # Apply to all approved-but-not-yet-applied jobs
+  python src/main.py apply --limit 1           # Apply only the first approved job
+  python src/main.py preflight                 # Check approved queue readiness
   python src/main.py status                    # Show stats
 """
 from __future__ import annotations
@@ -92,6 +94,36 @@ def build_parser() -> argparse.ArgumentParser:
         dest="auto_submit",
         help="Pause for manual confirmation before each submission",
     )
+    apply_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of approved jobs to attempt in this run",
+    )
+    apply_parser.add_argument(
+        "--job-id",
+        default=None,
+        help="Only attempt a specific approved job_id",
+    )
+    apply_parser.add_argument(
+        "--source",
+        choices=["linkedin", "usajobs", "jobright"],
+        default=None,
+        help="Only attempt approved jobs from one source",
+    )
+    apply_parser.add_argument(
+        "--company",
+        default=None,
+        help="Only attempt approved jobs whose company contains this text",
+    )
+
+    # preflight
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Pull cloud approvals and report which jobs are ready or likely blocked before applying",
+    )
+    preflight_parser.add_argument("--source", choices=["linkedin", "usajobs", "jobright"], default=None)
+    preflight_parser.add_argument("--company", default=None)
 
     # status
     subparsers.add_parser(
@@ -113,7 +145,16 @@ async def main_async(args: argparse.Namespace) -> int:
         await orchestrator.discover(source=args.source, no_review=args.no_review)
 
     elif args.command == "apply":
-        await orchestrator.apply_approved(auto_submit=args.auto_submit)
+        await orchestrator.apply_approved(
+            auto_submit=args.auto_submit,
+            limit=args.limit,
+            job_id=args.job_id,
+            source=args.source,
+            company=args.company,
+        )
+
+    elif args.command == "preflight":
+        await orchestrator.preflight_approved(source=args.source, company=args.company)
 
     elif args.command == "status":
         orchestrator.show_status()
