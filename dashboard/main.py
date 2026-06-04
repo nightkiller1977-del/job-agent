@@ -125,6 +125,26 @@ class ActionRequest(BaseModel):
 # Routes
 # ---------------------------------------------------------------------------
 
+@app.get("/health")
+async def health():
+    """Render/monitoring health check."""
+    db_ok = False
+    if DATABASE_URL:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    db_ok = cur.fetchone()[0] == 1
+        except Exception:
+            db_ok = False
+    return {"ok": bool(DATABASE_URL) and db_ok, "database": "ok" if db_ok else "unavailable"}
+
+
+@app.head("/")
+async def head_index():
+    """Allow HEAD checks on the dashboard root."""
+    return HTMLResponse(status_code=200)
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Main dashboard page."""

@@ -20,6 +20,7 @@ from .sources.linkedin import LinkedInScraper
 from .sources.usajobs import USAJobsScraper
 
 from .sources.base import JobExpiredError
+from .notifier import notify_info, notify_warning, record_run_stats
 
 console = Console()
 
@@ -238,7 +239,74 @@ class Orchestrator:
     # apply command
     # ------------------------------------------------------------------
 
-    async def apply_approved(self, auto_submit: bool = False) -> None:
+    def _filter_jobs(
+        self,
+        jobs: list[dict],
+        *,
+        job_id: Optional[str] = None,
+        source: Optional[str] = None,
+        company: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[dict]:
+        filtered = jobs
+        if job_id:
+            filtered = [j for j in filtered if j.get("job_id") == job_id]
+        if source:
+            filtered = [j for j in filtered if j.get("source") == source]
+        if company:
+            needle = company.lower()
+            filtered = [j for j in filtered if needle in (j.get("company") or "").lower()]
+        if limit is not None:
+            filtered = filtered[: max(0, limit)]
+        return filtered
+
+    def _classify_apply_readiness(self, job: dict) -> tuple[str, str]:
+        company = (job.get("company") or "").lower()
+        url = (job.get("url") or "").lower()
+        if "myworkdayjobs.com" in url:
+            return ("needs-session", "Workday jobs require a fresh authenticated browser profile before apply can complete.")
+        if "brassring.com" in url or "lockheed" in company:
+            return ("needs-portal-login", "BrassRing often requires company portal login before submit is reachable.")
+        if "microsoft.com" in url or "microsoft" in company:
+            return ("needs-review", "Microsoft portal may require manual account/session review before final submit.")
+        if any(name in company for name in ["cvs", "citi"]):
+            return ("needs-session", "Likely Workday-backed company; verify session before apply.")
+        return ("unknown", "No known blocker detected, but ATS still needs runtime verification.")
+
+    async def preflight_approved(self, source: Optional[str] = None, company: Optional[str] = None) -> None:
+        """Pull cloud-approved jobs and print production-readiness blockers."""
+        await self._pull_approved_from_cloud()
+        approved = self._filter_jobs(
+            self.state.get_approved_unapplied(),
+            source=source,
+            company=company,
+        )
+        if not approved:
+            console.print("[yellow]No approved jobs pending application.[/yellow]")
+            return
+
+        console.print(f"\n[bold]Approved apply preflight: {len(approved)} job(s)[/bold]")
+        blockers: dict[str, int] = {}
+        for job in approved:
+            readiness, detail = self._classify_apply_readiness(job)
+            blockers[readiness] = blockers.get(readiness, 0) + 1
+            console.print(
+                f"  • [{readiness}] {job.get('title')} @ {job.get('company')} "
+                f"({job.get('source')}, score={job.get('score')})"
+            )
+            console.print(f"    [dim]{detail}[/dim]")
+        console.print("\n[bold]Preflight summary[/bold]")
+        for key, count in sorted(blockers.items()):
+            console.print(f"  {key}: {count}")
+
+    async def apply_approved(
+        self,
+        auto_submit: bool = False,
+        limit: Optional[int] = None,
+        job_id: Optional[str] = None,
+        source: Optional[str] = None,
+        company: Optional[str] = None,
+    ) -> None:
         """Apply to all jobs in 'approved' status.
 
         First pulls any cloud-approved jobs into the local DB so that jobs
@@ -247,15 +315,27 @@ class Orchestrator:
         # Pull cloud-approved jobs into local SQLite first
         await self._pull_approved_from_cloud()
 
-        approved = self.state.get_approved_unapplied()
+        approved = self._filter_jobs(
+            self.state.get_approved_unapplied(),
+            job_id=job_id,
+            source=source,
+            company=company,
+            limit=limit,
+        )
         if not approved:
             console.print("[yellow]No approved jobs pending application.[/yellow]")
             return
 
         console.print(f"\n[bold]Applying to {len(approved)} approved jobs[/bold]")
+        notify_info(
+            "Apply run started",
+            f"{len(approved)} approved job(s), auto_submit={auto_submit}, source={source or 'all'}",
+        )
 
         applied_count = 0
+        failed_count = 0
         skipped_count = 0
+        outcomes: list[dict] = []
 
         for job in approved:
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
@@ -264,6 +344,7 @@ class Orchestrator:
             if source not in SOURCE_MAP:
                 console.print(f"[red]Unknown source '{source}' — skipping.[/red]")
                 skipped_count += 1
+                outcomes.append({"job": job, "status": "skipped", "reason": f"unknown source {source}"})
                 continue
 
             scraper = SOURCE_MAP[source](self.config)
@@ -272,23 +353,49 @@ class Orchestrator:
                 if result:
                     self.state.set_status(job["job_id"], "applied")
                     applied_count += 1
+                    outcomes.append({"job": job, "status": "applied", "reason": "submitted"})
                     console.print(f"[green]Applied! Status updated.[/green]")
                     # Push "applied" status back to cloud dashboard
                     await self._push_status_to_cloud(job["job_id"], "applied")
                 else:
-                    console.print(f"[yellow]Application not submitted — status unchanged.[/yellow]")
+                    reason = getattr(scraper, "last_apply_detail", "") or "not submitted"
+                    code = getattr(scraper, "last_apply_status", "") or "blocked"
+                    console.print(f"[yellow]Application not submitted ({code}) — status unchanged.[/yellow]")
+                    if reason:
+                        console.print(f"[dim]{reason}[/dim]")
                     skipped_count += 1
+                    outcomes.append({"job": job, "status": code, "reason": reason})
             except JobExpiredError as exc:
                 self.state.set_status(job["job_id"], "expired")
                 console.print(f"[red]Job no longer active (expired). Status updated to expired.[/red]")
+                outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
                 # Push "expired" status back to cloud dashboard
                 await self._push_status_to_cloud(job["job_id"], "expired")
             except Exception as exc:
                 console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")
-                skipped_count += 1
+                failed_count += 1
+                outcomes.append({"job": job, "status": "error", "reason": str(exc)})
 
 
-        console.print(f"\n[bold]Apply run complete:[/bold] {applied_count} applied, {skipped_count} not submitted")
+        record_run_stats(applied_count, failed_count, skipped_count)
+        console.print(
+            f"\n[bold]Apply run complete:[/bold] "
+            f"{applied_count} applied, {failed_count} failed, {skipped_count} blocked/not submitted"
+        )
+        if outcomes:
+            console.print("\n[bold]Apply outcome details[/bold]")
+            for item in outcomes:
+                job = item["job"]
+                console.print(
+                    f"  • {item['status']}: {job.get('title')} @ {job.get('company')}"
+                )
+                if item.get("reason"):
+                    console.print(f"    [dim]{item['reason']}[/dim]")
+        if applied_count == 0 and skipped_count:
+            notify_warning(
+                "Apply run blocked",
+                f"0 submitted, {skipped_count} blocked. Run preflight and refresh ATS sessions.",
+            )
 
     async def _pull_approved_from_cloud(self) -> None:
         """Fetch jobs marked 'approved' on the cloud dashboard and upsert them

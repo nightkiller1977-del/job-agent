@@ -28,6 +28,11 @@ JOBRIGHT_MATCHED_URL = "https://jobright.ai/jobs/recommend"
 class JobrightScraper(BaseScraper):
     name = "jobright"
 
+    def _set_apply_outcome(self, status: str, detail: str) -> bool:
+        self.last_apply_status = status
+        self.last_apply_detail = detail
+        return False
+
     async def scrape(self) -> list[dict]:
         console.print("[magenta]Jobright:[/magenta] Opening browser…")
         page = await self._start_browser()
@@ -438,6 +443,9 @@ class JobrightScraper(BaseScraper):
         6. Confirm with user, then submit
         """
         self.auto_submit = auto_submit
+        self.last_apply_status = "started"
+        self.last_apply_detail = ""
+        self._workday_session_expired = False
         self._field_fixer = ResumeFieldFixer()
         console.print(f"\n[magenta]Jobright Apply:[/magenta] {job.get('title')} @ {job.get('company')}")
         page = await self._start_browser(load_extensions=True)
@@ -571,7 +579,10 @@ class JobrightScraper(BaseScraper):
 
             if not ext_url:
                 console.print("[red]Jobright:[/red] Could not find company ATS URL — skipping.")
-                return False
+                return self._set_apply_outcome(
+                    "missing_ats_url",
+                    "Could not extract the company ATS URL from the Jobright posting.",
+                )
 
             console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
             company_page = await self._context.new_page()
@@ -594,6 +605,11 @@ class JobrightScraper(BaseScraper):
             # sign-in dialog or application form.  Login comes AFTER this.
             entered_form = await self._click_ats_apply_button(company_page)
             await self._delay(3, 5)
+            if getattr(self, "_workday_session_expired", False):
+                return self._set_apply_outcome(
+                    "workday_session_expired",
+                    "Workday redirected to sign-in. Re-authenticate this company Workday portal in the Playwright profile, then rerun apply.",
+                )
 
             # ── Step 7.5: Handle login if required (non-Workday ATS only) ──────
             # Workday login/wizard is handled interactively inside
@@ -621,7 +637,10 @@ class JobrightScraper(BaseScraper):
             if 'myworkdayjobs.com' not in current_portal:
                 if not entered_form and not await self._looks_like_application_form(company_page):
                     console.print("[yellow]Jobright:[/yellow] Could not enter the ATS application form — skipping this job.")
-                    return False
+                    return self._set_apply_outcome(
+                        "form_not_reached",
+                        f"Company portal did not expose an application form after opening {current_portal}.",
+                    )
                 console.print("[magenta]Jobright:[/magenta] Triggering Jobright autofill extension…")
                 autofill_triggered = await self._trigger_autofill(company_page)
                 if autofill_triggered:
@@ -636,9 +655,14 @@ class JobrightScraper(BaseScraper):
             # ── Step 9: Confirm and submit ────────────────────────────────────
             if not await self._looks_like_application_form(company_page):
                 console.print("[yellow]Jobright:[/yellow] ATS page does not look like an application form or review page — skipping submit step.")
-                return False
+                return self._set_apply_outcome(
+                    "form_not_detected",
+                    f"ATS page loaded but no application/review form was detected at {company_page.url}.",
+                )
             submitted = await self._confirm_and_submit(company_page, job, auto_submit=auto_submit)
             if submitted:
+                self.last_apply_status = "submitted"
+                self.last_apply_detail = "Application submitted successfully."
                 notify_success(
                     f"Applied: {job.get('title')} @ {job.get('company')}",
                     f"Application submitted successfully"
@@ -653,6 +677,8 @@ class JobrightScraper(BaseScraper):
                 f"Apply failed: {job.get('title')} @ {job.get('company')}",
                 str(exc)[:200]
             )
+            self.last_apply_status = "error"
+            self.last_apply_detail = str(exc)
         finally:
             await self._close_browser()
 
@@ -1064,6 +1090,7 @@ class JobrightScraper(BaseScraper):
 
         if on_login_page:
             console.print("[red]Jobright: Workday session expired — sign in once manually to refresh.[/red]")
+            self._workday_session_expired = True
             notify_error(
                 "Workday session expired",
                 "Open the Playwright browser, sign in to the Workday portal, then re-run apply."
@@ -1241,7 +1268,10 @@ class JobrightScraper(BaseScraper):
                 "skipping instead of prompting.[/yellow]"
             )
             console.print(f"[dim]Portal: {portal_url}[/dim]")
-            return False
+            return self._set_apply_outcome(
+                "submit_not_found",
+                f"Reached portal but could not find a final Submit/Apply button at {portal_url}.",
+            )
 
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
         console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
@@ -1261,7 +1291,10 @@ class JobrightScraper(BaseScraper):
                 confirm = "n"
         if confirm != "y":
             console.print("[yellow]Jobright: Submission cancelled.[/yellow]")
-            return False
+            return self._set_apply_outcome(
+                "submission_cancelled",
+                "Final submission was not confirmed by the user.",
+            )
 
         if submit_btn:
             # Use JS click to bypass Workday overlay divs that intercept pointer events
@@ -1279,7 +1312,10 @@ class JobrightScraper(BaseScraper):
             # No submit button found — user must click it manually in the browser
             if auto_submit:
                 console.print("[red]Jobright: Submit button not found — cannot auto-submit. Skipping.[/red]")
-                return False
+                return self._set_apply_outcome(
+                    "submit_not_found",
+                    f"Auto-submit requested, but no submit button was found at {portal_url}.",
+                )
             console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")
             try:
                 input("  Press Enter after submitting (or to skip) > ")
