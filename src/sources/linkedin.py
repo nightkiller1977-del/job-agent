@@ -311,6 +311,8 @@ class LinkedInScraper(BaseScraper):
         Execute LinkedIn Easy Apply for an approved job.
         Steps through the multi-page form and pauses before final submit.
         """
+        self.last_apply_status = "started"
+        self.last_apply_detail = ""
         console.print(f"\n[blue]LinkedIn Apply:[/blue] {job.get('title')} @ {job.get('company')}")
         page = await self._start_browser()
         submitted = False
@@ -318,6 +320,11 @@ class LinkedInScraper(BaseScraper):
         try:
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
+            if await self._needs_login(page):
+                return self._set_apply_outcome(
+                    "linkedin_login_required",
+                    "LinkedIn redirected to login/authwall. Run prepare-sessions --source linkedin and sign in once.",
+                )
 
             # Check if job is expired/closed
             page_text = await page.evaluate("document.body.innerText")
@@ -344,7 +351,10 @@ class LinkedInScraper(BaseScraper):
 
             if not easy_apply_btn:
                 console.print("[yellow]LinkedIn: Easy Apply button not found. May not be an Easy Apply job.[/yellow]")
-                return False
+                return self._set_apply_outcome(
+                    "linkedin_easy_apply_not_found",
+                    "LinkedIn did not expose an Easy Apply button for this job.",
+                )
 
             await easy_apply_btn.click()
             await self._delay(2, 3)
@@ -433,6 +443,10 @@ class LinkedInScraper(BaseScraper):
                         console.print("[green]LinkedIn: Application submitted![/green]")
                     else:
                         console.print("[yellow]LinkedIn: Application cancelled by user.[/yellow]")
+                        self._set_apply_outcome(
+                            "submission_cancelled",
+                            "Final LinkedIn submission was not confirmed by the user.",
+                        )
                     break
                 elif review_btn:
                     await review_btn.click()
@@ -442,17 +456,66 @@ class LinkedInScraper(BaseScraper):
                     await self._delay(1, 2)
                 else:
                     console.print("[yellow]LinkedIn: No navigable button found. Stopping.[/yellow]")
+                    return self._set_apply_outcome(
+                        "linkedin_step_blocked",
+                        "Easy Apply modal opened, but no Next/Review/Submit control was found on the current step.",
+                    )
                     break
 
         except Exception as exc:
             console.print(f"[red]LinkedIn apply error:[/red] {exc}")
+            self._set_apply_outcome("linkedin_error", str(exc))
         finally:
             # Keep browser open briefly so user can see result
             if submitted:
                 await self._delay(3, 4)
             await self._close_browser()
 
+        if submitted:
+            self.last_apply_status = "submitted"
+            self.last_apply_detail = "LinkedIn application submitted successfully."
+        elif self.last_apply_status in ("started", "", None):
+            self._set_apply_outcome(
+                "linkedin_not_submitted",
+                "LinkedIn apply flow ended without reaching a submitted state.",
+            )
         return submitted
+
+    async def prepare_session(self, job: Optional[dict] = None) -> None:
+        """Open LinkedIn in the persistent profile so the user can refresh login/challenge state."""
+        console.print("\n[blue]LinkedIn Session Prep:[/blue] Opening LinkedIn session")
+        page = await self._start_browser()
+        try:
+            target = (job or {}).get("url") or LINKEDIN_BASE
+            await page.goto(target, wait_until="domcontentloaded", timeout=30000)
+            await self._delay(2, 3)
+            if await self._needs_login(page):
+                console.print("[yellow]LinkedIn needs login or challenge completion in this browser window.[/yellow]")
+            else:
+                console.print("[green]LinkedIn session appears authenticated.[/green]")
+            if sys.stdin and sys.stdin.isatty():
+                input("Press Enter after LinkedIn session is ready > ")
+            else:
+                console.print("[yellow]Non-interactive run: rerun from Terminal to pause while signing in.[/yellow]")
+        finally:
+            await self._close_browser()
+
+    async def _needs_login(self, page) -> bool:
+        try:
+            url = page.url.lower()
+            if any(part in url for part in ["/login", "/authwall", "uas/login", "checkpoint", "challenge"]):
+                return True
+            return await page.evaluate(
+                """
+                () => {
+                    const text = (document.body?.innerText || '').toLowerCase();
+                    return /sign in|join linkedin|security verification|checkpoint/.test(text) &&
+                        !!document.querySelector('input[type="password"], input[name="session_password"]');
+                }
+                """
+            )
+        except Exception:
+            return False
 
     async def _fill_easy_apply_fields(self, page) -> None:
         """

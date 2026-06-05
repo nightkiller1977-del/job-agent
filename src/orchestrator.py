@@ -261,8 +261,13 @@ class Orchestrator:
         return filtered
 
     def _classify_apply_readiness(self, job: dict) -> tuple[str, str]:
+        source = (job.get("source") or "").lower()
         company = (job.get("company") or "").lower()
         url = (job.get("url") or "").lower()
+        if source == "linkedin":
+            return ("needs-session", "LinkedIn Easy Apply requires a fresh authenticated LinkedIn browser session.")
+        if source == "usajobs":
+            return ("needs-session", "USAJobs requires a signed-in USAJobs/Login.gov browser session and a saved resume.")
         if "myworkdayjobs.com" in url:
             return ("needs-session", "Workday jobs require a fresh authenticated browser profile before apply can complete.")
         if "brassring.com" in url or "lockheed" in company:
