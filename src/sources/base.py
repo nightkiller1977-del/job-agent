@@ -48,6 +48,14 @@ class BaseScraper(ABC):
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._playwright = None
+        self.last_apply_status = ""
+        self.last_apply_detail = ""
+
+    def _set_apply_outcome(self, status: str, detail: str) -> bool:
+        """Record why an apply attempt did or did not submit."""
+        self.last_apply_status = status
+        self.last_apply_detail = detail
+        return False
 
     @property
     def _session_file(self) -> Path:

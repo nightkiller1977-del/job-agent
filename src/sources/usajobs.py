@@ -289,6 +289,8 @@ class USAJobsScraper(BaseScraper):
         Execute USAJobs application flow.
         Selects saved resume, answers questionnaire, pauses before final submit.
         """
+        self.last_apply_status = "started"
+        self.last_apply_detail = ""
         console.print(f"\n[cyan]USAJobs Apply:[/cyan] {job.get('title')} @ {job.get('company')}")
         console.print(f"  Announcement: {job.get('announcement_number', 'N/A')}")
         page = await self._start_browser()
@@ -297,6 +299,11 @@ class USAJobsScraper(BaseScraper):
         try:
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
+            if not await self._is_logged_in(page):
+                return self._set_apply_outcome(
+                    "usajobs_login_required",
+                    "USAJobs session is not authenticated. Run prepare-sessions --source usajobs and sign in once.",
+                )
 
             # Check if job is expired/closed
             page_text = await page.evaluate("document.body.innerText")
@@ -324,7 +331,10 @@ class USAJobsScraper(BaseScraper):
 
             if not apply_btn:
                 console.print("[yellow]USAJobs: Apply button not found.[/yellow]")
-                return False
+                return self._set_apply_outcome(
+                    "usajobs_apply_button_not_found",
+                    "USAJobs did not expose an Apply button for this announcement.",
+                )
 
             await apply_btn.click()
             await self._delay(3, 4)
@@ -407,11 +417,19 @@ class USAJobsScraper(BaseScraper):
                         if not submitted:
                             if auto_submit:
                                 console.print("[red]USAJobs: Could not find submit button in auto-submit mode.[/red]")
+                                return self._set_apply_outcome(
+                                    "usajobs_submit_not_found",
+                                    "Reached USAJobs final review but could not find the final submit button.",
+                                )
                             else:
                                 console.print("[yellow]USAJobs: Could not find submit button. Please submit manually.[/yellow]")
                                 input("  Press Enter when done > ")
                     else:
                         console.print("[yellow]USAJobs: Application cancelled by user.[/yellow]")
+                        self._set_apply_outcome(
+                            "submission_cancelled",
+                            "Final USAJobs submission was not confirmed by the user.",
+                        )
                     break
 
                 # Navigate to next step
@@ -419,6 +437,10 @@ class USAJobsScraper(BaseScraper):
                 if not navigated:
                     if auto_submit or not (sys.stdin and sys.stdin.isatty()):
                         console.print("[red]USAJobs: Could not navigate automatically and running non-interactively/auto-submit. Aborting application.[/red]")
+                        return self._set_apply_outcome(
+                            "usajobs_step_blocked",
+                            f"USAJobs wizard could not navigate beyond step {step} at {apply_page.url}.",
+                        )
                         break
                     console.print("[yellow]USAJobs: Could not navigate to next step.[/yellow]")
                     try:
@@ -428,12 +450,40 @@ class USAJobsScraper(BaseScraper):
 
         except Exception as exc:
             console.print(f"[red]USAJobs apply error:[/red] {exc}")
+            self._set_apply_outcome("usajobs_error", str(exc))
         finally:
             if submitted:
                 await self._delay(3, 4)
             await self._close_browser()
 
+        if submitted:
+            self.last_apply_status = "submitted"
+            self.last_apply_detail = "USAJobs application submitted successfully."
+        elif self.last_apply_status in ("started", "", None):
+            self._set_apply_outcome(
+                "usajobs_not_submitted",
+                "USAJobs apply flow ended without reaching a submitted state.",
+            )
         return submitted
+
+    async def prepare_session(self, job: Optional[dict] = None) -> None:
+        """Open USAJobs in the persistent profile so the user can refresh login/session state."""
+        console.print("\n[cyan]USAJobs Session Prep:[/cyan] Opening USAJobs session")
+        page = await self._start_browser()
+        try:
+            target = (job or {}).get("url") or USAJOBS_BASE
+            await page.goto(target, wait_until="domcontentloaded", timeout=30000)
+            await self._delay(2, 3)
+            if await self._is_logged_in(page):
+                console.print("[green]USAJobs session appears authenticated.[/green]")
+            else:
+                console.print("[yellow]USAJobs needs login in this browser window.[/yellow]")
+            if sys.stdin and sys.stdin.isatty():
+                input("Press Enter after USAJobs session is ready > ")
+            else:
+                console.print("[yellow]Non-interactive run: rerun from Terminal to pause while signing in.[/yellow]")
+        finally:
+            await self._close_browser()
 
     async def _is_resume_page(self, page) -> bool:
         """Check if current page is the resume selection step."""
