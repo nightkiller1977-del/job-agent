@@ -299,6 +299,52 @@ class Orchestrator:
         for key, count in sorted(blockers.items()):
             console.print(f"  {key}: {count}")
 
+    async def prepare_sessions(
+        self,
+        source: Optional[str] = None,
+        company: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> None:
+        """Open approved jobs that need authenticated ATS sessions.
+
+        This is intentionally separate from apply: the user can refresh Workday,
+        Microsoft, or BrassRing cookies once in the persistent browser profile,
+        then run apply afterward without each job failing independently.
+        """
+        await self._pull_approved_from_cloud()
+        approved = self._filter_jobs(
+            self.state.get_approved_unapplied(),
+            source=source,
+            company=company,
+        )
+        session_jobs = []
+        for job in approved:
+            readiness, _detail = self._classify_apply_readiness(job)
+            if readiness in {"needs-session", "needs-portal-login", "needs-review"}:
+                session_jobs.append(job)
+        if limit is not None:
+            session_jobs = session_jobs[: max(0, limit)]
+
+        if not session_jobs:
+            console.print("[green]No approved jobs need session preparation.[/green]")
+            return
+
+        console.print(f"\n[bold]Preparing sessions for {len(session_jobs)} approved job(s)[/bold]")
+        console.print("[dim]Sign in or complete portal account prompts in each browser window, then return here.[/dim]")
+
+        for job in session_jobs:
+            scraper_cls = SOURCE_MAP.get(job.get("source", ""))
+            if not scraper_cls:
+                console.print(f"[yellow]Skipping unknown source: {job.get('source')}[/yellow]")
+                continue
+            scraper = scraper_cls(self.config)
+            prepare = getattr(scraper, "prepare_session", None)
+            if not prepare:
+                console.print(f"[yellow]{job.get('source')} does not support session preparation.[/yellow]")
+                continue
+            console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
+            await prepare(job)
+
     async def apply_approved(
         self,
         auto_submit: bool = False,

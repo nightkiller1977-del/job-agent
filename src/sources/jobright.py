@@ -610,6 +610,11 @@ class JobrightScraper(BaseScraper):
                     "workday_session_expired",
                     "Workday redirected to sign-in. Re-authenticate this company Workday portal in the Playwright profile, then rerun apply.",
                 )
+            if not entered_form and self.last_apply_status not in ("started", "", None):
+                console.print(
+                    f"[yellow]Jobright:[/yellow] Portal blocked before form: {self.last_apply_status}"
+                )
+                return False
 
             # ── Step 7.5: Handle login if required (non-Workday ATS only) ──────
             # Workday login/wizard is handled interactively inside
@@ -637,9 +642,16 @@ class JobrightScraper(BaseScraper):
             if 'myworkdayjobs.com' not in current_portal:
                 if not entered_form and not await self._looks_like_application_form(company_page):
                     console.print("[yellow]Jobright:[/yellow] Could not enter the ATS application form — skipping this job.")
+                    if self.last_apply_status not in ("started", "", None):
+                        return False
+                    family = await self._detect_portal_family(company_page)
+                    controls = await self._visible_controls_snapshot(company_page)
                     return self._set_apply_outcome(
-                        "form_not_reached",
-                        f"Company portal did not expose an application form after opening {current_portal}.",
+                        f"{family}_form_not_reached" if family != "generic" else "form_not_reached",
+                        (
+                            f"Company portal did not expose an application form after opening "
+                            f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
+                        ),
                     )
                 console.print("[magenta]Jobright:[/magenta] Triggering Jobright autofill extension…")
                 autofill_triggered = await self._trigger_autofill(company_page)
@@ -655,9 +667,16 @@ class JobrightScraper(BaseScraper):
             # ── Step 9: Confirm and submit ────────────────────────────────────
             if not await self._looks_like_application_form(company_page):
                 console.print("[yellow]Jobright:[/yellow] ATS page does not look like an application form or review page — skipping submit step.")
+                if self.last_apply_status not in ("started", "", None):
+                    return False
+                family = await self._detect_portal_family(company_page)
+                controls = await self._visible_controls_snapshot(company_page)
                 return self._set_apply_outcome(
-                    "form_not_detected",
-                    f"ATS page loaded but no application/review form was detected at {company_page.url}.",
+                    f"{family}_form_not_detected" if family != "generic" else "form_not_detected",
+                    (
+                        f"ATS page loaded but no application/review form was detected at "
+                        f"{company_page.url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                    ),
                 )
             submitted = await self._confirm_and_submit(company_page, job, auto_submit=auto_submit)
             if submitted:
@@ -683,6 +702,53 @@ class JobrightScraper(BaseScraper):
             await self._close_browser()
 
         return submitted
+
+    async def prepare_session(self, job: dict) -> None:
+        """Open the external ATS portal in the persistent profile for login/session refresh."""
+        console.print(
+            f"\n[magenta]Jobright Session Prep:[/magenta] {job.get('title')} @ {job.get('company')}"
+        )
+        page = await self._start_browser(load_extensions=True)
+        try:
+            await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
+            await self._delay(2, 3)
+            await self._dismiss_jobright_popups(page)
+            ext_url = await self._extract_external_url(page)
+            if not ext_url:
+                console.print("[red]Jobright:[/red] Could not find company ATS URL for session prep.")
+                return
+
+            company_page = await self._context.new_page()
+            await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
+            await self._delay(4, 6)
+            family = await self._detect_portal_family(company_page)
+            console.print(f"[cyan]Portal:[/cyan] {company_page.url}")
+            console.print(f"[cyan]Detected:[/cyan] {family}")
+
+            if family == "workday":
+                await self._click_ats_apply_button(company_page)
+            elif family == "microsoft":
+                await self._handle_microsoft_apply(company_page)
+            elif family == "brassring":
+                await self._handle_brassring_apply(company_page)
+            else:
+                await self._click_ats_apply_button(company_page)
+
+            controls = await self._visible_controls_snapshot(company_page)
+            console.print(f"[dim]Visible controls: {self._format_controls_snapshot(controls)}[/dim]")
+            console.print(
+                "[bold yellow]Use the browser window now:[/bold yellow] sign in, create/refresh the portal profile, "
+                "or click through until the application form is reachable."
+            )
+            if sys.stdin and sys.stdin.isatty():
+                input("Press Enter after this portal session is ready > ")
+            else:
+                console.print(
+                    "[yellow]Non-interactive run: leaving this as a diagnostic prep only. "
+                    "Run from Terminal to pause while you sign in.[/yellow]"
+                )
+        finally:
+            await self._close_browser()
 
     async def _click_visible_control_by_text(self, page, patterns: list[str]) -> bool:
         """Click the first visible button/link/control whose text matches."""
@@ -726,9 +792,180 @@ class JobrightScraper(BaseScraper):
             patterns,
         )
 
+    async def _visible_controls_snapshot(self, page, limit: int = 40) -> list[dict]:
+        """Return visible buttons/links/inputs to make ATS failures diagnosable."""
+        try:
+            return await page.evaluate(
+                """
+                (limit) => {
+                    const candidates = Array.from(document.querySelectorAll([
+                        'button',
+                        'a',
+                        '[role="button"]',
+                        'input[type="button"]',
+                        'input[type="submit"]'
+                    ].join(',')));
+                    const visible = el => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.visibility !== 'hidden' &&
+                            style.display !== 'none' &&
+                            !el.disabled &&
+                            rect.width > 0 &&
+                            rect.height > 0;
+                    };
+                    return candidates.filter(visible).slice(0, limit).map(el => ({
+                        tag: el.tagName,
+                        role: el.getAttribute('role') || '',
+                        text: [
+                            el.innerText,
+                            el.textContent,
+                            el.value,
+                            el.getAttribute('aria-label'),
+                            el.getAttribute('title')
+                        ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim().slice(0, 120),
+                        href: el.href || el.getAttribute('href') || '',
+                    }));
+                }
+                """,
+                limit,
+            )
+        except Exception:
+            return []
+
+    def _format_controls_snapshot(self, controls: list[dict]) -> str:
+        if not controls:
+            return "No visible controls detected."
+        lines = []
+        for c in controls[:15]:
+            label = c.get("text") or c.get("href") or "(no text)"
+            lines.append(f"{c.get('tag','?')} {label}")
+        return "; ".join(lines)
+
+    async def _has_visible_control_matching(self, page, patterns: list[str]) -> bool:
+        try:
+            return await page.evaluate(
+                """
+                (patterns) => {
+                    const regexes = patterns.map(p => new RegExp(p, 'i'));
+                    const candidates = Array.from(document.querySelectorAll([
+                        'button',
+                        'a',
+                        '[role="button"]',
+                        'input[type="button"]',
+                        'input[type="submit"]'
+                    ].join(',')));
+                    const visible = el => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.visibility !== 'hidden' &&
+                            style.display !== 'none' &&
+                            !el.disabled &&
+                            rect.width > 0 &&
+                            rect.height > 0;
+                    };
+                    return candidates.some(el => {
+                        if (!visible(el)) return false;
+                        const text = [
+                            el.innerText,
+                            el.textContent,
+                            el.value,
+                            el.getAttribute('aria-label'),
+                            el.getAttribute('title')
+                        ].filter(Boolean).join(' ').trim();
+                        return regexes.some(re => re.test(text));
+                    });
+                }
+                """,
+                patterns,
+            )
+        except Exception:
+            return False
+
+    async def _detect_portal_family(self, page) -> str:
+        try:
+            url = page.url.lower()
+        except Exception:
+            url = ""
+        if "myworkdayjobs.com" in url:
+            return "workday"
+        if "brassring.com" in url:
+            return "brassring"
+        if "careers.microsoft.com" in url or "microsoft.com/careers" in url:
+            return "microsoft"
+        if "greenhouse.io" in url:
+            return "greenhouse"
+        if "lever.co" in url:
+            return "lever"
+        return "generic"
+
+    async def _looks_like_login_wall(self, page) -> bool:
+        try:
+            return await page.evaluate(
+                """
+                () => {
+                    const body = (document.body?.innerText || '').toLowerCase();
+                    const password = !!document.querySelector('input[type="password"]');
+                    const email = !!document.querySelector('input[type="email"], input[name*="email" i], input[placeholder*="email" i]');
+                    const loginText = /(sign in|log in|login|create account|forgot password|sso|single sign-on)/i.test(body);
+                    return password || (email && loginText);
+                }
+                """
+            )
+        except Exception:
+            return False
+
+    async def _click_first_matching_link_or_button(self, page, patterns: list[str]) -> bool:
+        """Like _click_visible_control_by_text but returns href navigation for anchors when possible."""
+        return await page.evaluate(
+            """
+            (patterns) => {
+                const regexes = patterns.map(p => new RegExp(p, 'i'));
+                const candidates = Array.from(document.querySelectorAll([
+                    'button',
+                    'a',
+                    '[role="button"]',
+                    'input[type="button"]',
+                    'input[type="submit"]'
+                ].join(',')));
+                const visible = el => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden' &&
+                        style.display !== 'none' &&
+                        !el.disabled &&
+                        rect.width > 0 &&
+                        rect.height > 0;
+                };
+                for (const el of candidates) {
+                    if (!visible(el)) continue;
+                    const text = [
+                        el.innerText,
+                        el.textContent,
+                        el.value,
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('title')
+                    ].filter(Boolean).join(' ').trim();
+                    if (!regexes.some(re => re.test(text))) continue;
+                    const href = el.href || el.getAttribute('href');
+                    if (href && !href.startsWith('#')) {
+                        window.location.href = href;
+                    } else {
+                        el.click();
+                    }
+                    return true;
+                }
+                return false;
+            }
+            """,
+            patterns,
+        )
+
     async def _looks_like_application_form(self, page) -> bool:
         """Detect whether the ATS page is actually in an apply/review workflow."""
         try:
+            if await self._looks_like_login_wall(page):
+                return False
             return await page.evaluate(
                 """
                 () => {
@@ -737,7 +974,7 @@ class JobrightScraper(BaseScraper):
                     const signInPage = /create account\\/?sign in|sign in with email|sign in with google|sign in with linkedin/.test(body);
                     if (signInPage) return false;
                     const formish = document.querySelectorAll('input, textarea, select, form').length;
-                    const reviewText = /(review|submit|confirm|questionnaire|work experience|contact information)/i.test(body);
+                    const reviewText = /(review|submit|confirm|questionnaire|work experience|contact information|my information|resume|experience|profile|candidate profile|employment|job submission)/i.test(body);
                     const workflowUrl = /(\\/apply|review|submit|confirm|application)/i.test(url);
                     return reviewText || formish >= 3 || (workflowUrl && formish > 0);
                 }
@@ -1009,6 +1246,20 @@ class JobrightScraper(BaseScraper):
             await self._workday_handle_post_chooser(page)
             return await self._looks_like_application_form(page)
 
+        # ── Microsoft careers ───────────────────────────────────────────────
+        # Microsoft often renders an application shell where the job detail page
+        # and form are separate client-side states. Click broad Apply/Sign-in
+        # controls and classify login walls clearly instead of returning a vague
+        # submit_not_found later.
+        if 'careers.microsoft.com' in current.lower() or 'microsoft.com/careers' in current.lower():
+            return await self._handle_microsoft_apply(page)
+
+        # ── BrassRing ───────────────────────────────────────────────────────
+        # BrassRing frequently hides the application behind "Apply to job" /
+        # "Sign in" controls on a hash-based job details URL.
+        if 'brassring.com' in current.lower():
+            return await self._handle_brassring_apply(page)
+
         # ── Other ATS: click the Apply / Apply Now button ────────────────────
         apply_selectors = [
             # Workday fallback (data-automation-id only, not broad text matches)
@@ -1051,6 +1302,99 @@ class JobrightScraper(BaseScraper):
 
         console.print("[dim]Jobright: No Apply button found — may already be on the application form[/dim]")
         return await self._looks_like_application_form(page)
+
+    async def _handle_microsoft_apply(self, page) -> bool:
+        console.print("[magenta]Jobright:[/magenta] Microsoft portal — locating apply flow…")
+        if await self._looks_like_login_wall(page):
+            self._set_apply_outcome(
+                "microsoft_login_required",
+                "Microsoft careers is showing a login/account wall. Sign in once in the Playwright profile, then rerun apply.",
+            )
+            return False
+
+        clicked = False
+        before_url = page.url
+        for _ in range(8):
+            try:
+                explicit_apply = await page.query_selector(
+                    'a:text-matches("Apply now", "i"), button:text-matches("Apply now", "i")'
+                )
+                if explicit_apply and await explicit_apply.is_visible():
+                    await explicit_apply.click()
+                    clicked = True
+                    break
+            except Exception:
+                pass
+            clicked = await self._click_first_matching_link_or_button(page, [
+                '^apply now$',
+                '^apply$',
+                'apply for this job',
+                'sign in to apply',
+                'start application',
+                'continue application',
+            ])
+            if clicked:
+                break
+            await self._delay(2, 3)
+
+        if clicked:
+            await self._delay(5, 8)
+            if await self._looks_like_login_wall(page):
+                self._set_apply_outcome(
+                    "microsoft_login_required",
+                    f"Microsoft careers redirected to login at {page.url}.",
+                )
+                return False
+            apply_still_visible = await self._has_visible_control_matching(page, ['^apply now$', '^apply$'])
+            url_changed = page.url != before_url
+            if (url_changed or not apply_still_visible) and await self._looks_like_application_form(page):
+                console.print("[green]Jobright:[/green] Microsoft application form detected.")
+                return True
+
+        controls = await self._visible_controls_snapshot(page)
+        self._set_apply_outcome(
+            "microsoft_apply_control_not_activated" if clicked else "microsoft_apply_not_reached",
+            f"Could not enter Microsoft application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
+        )
+        return False
+
+    async def _handle_brassring_apply(self, page) -> bool:
+        console.print("[magenta]Jobright:[/magenta] BrassRing portal — locating apply flow…")
+        if await self._looks_like_login_wall(page):
+            self._set_apply_outcome(
+                "brassring_login_required",
+                "BrassRing is showing a login wall before the application form is reachable.",
+            )
+            return False
+
+        clicked = await self._click_first_matching_link_or_button(page, [
+            '^apply to job$',
+            '^apply$',
+            '^apply now$',
+            'apply for this job',
+            'start application',
+            'create profile',
+            'sign in',
+            'login',
+        ])
+        if clicked:
+            await self._delay(5, 8)
+            if await self._looks_like_login_wall(page):
+                self._set_apply_outcome(
+                    "brassring_login_required",
+                    f"BrassRing redirected to login/profile page at {page.url}.",
+                )
+                return False
+            if await self._looks_like_application_form(page):
+                console.print("[green]Jobright:[/green] BrassRing application form detected.")
+                return True
+
+        controls = await self._visible_controls_snapshot(page)
+        self._set_apply_outcome(
+            "brassring_apply_not_reached",
+            f"Could not enter BrassRing application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
+        )
+        return False
 
     async def _workday_handle_post_chooser(self, page) -> None:
         """
@@ -1261,6 +1605,7 @@ class JobrightScraper(BaseScraper):
             portal_url = page.url
         except Exception:
             portal_url = "(unknown)"
+        family = await self._detect_portal_family(page)
 
         if not submit_btn and (auto_submit or not (sys.stdin and sys.stdin.isatty())):
             console.print(
@@ -1268,9 +1613,13 @@ class JobrightScraper(BaseScraper):
                 "skipping instead of prompting.[/yellow]"
             )
             console.print(f"[dim]Portal: {portal_url}[/dim]")
+            controls = await self._visible_controls_snapshot(page)
             return self._set_apply_outcome(
-                "submit_not_found",
-                f"Reached portal but could not find a final Submit/Apply button at {portal_url}.",
+                f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
+                (
+                    f"Reached portal but could not find a final Submit/Apply button at "
+                    f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                ),
             )
 
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
@@ -1312,9 +1661,13 @@ class JobrightScraper(BaseScraper):
             # No submit button found — user must click it manually in the browser
             if auto_submit:
                 console.print("[red]Jobright: Submit button not found — cannot auto-submit. Skipping.[/red]")
+                controls = await self._visible_controls_snapshot(page)
                 return self._set_apply_outcome(
-                    "submit_not_found",
-                    f"Auto-submit requested, but no submit button was found at {portal_url}.",
+                    f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
+                    (
+                        f"Auto-submit requested, but no submit button was found at "
+                        f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                    ),
                 )
             console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")
             try:
