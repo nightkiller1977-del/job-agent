@@ -114,11 +114,17 @@ class IndeedScraper(BaseScraper):
         return jobs
 
     def _on_login_page(self, page) -> bool:
+        """Return True if Indeed is showing a login/auth wall OR the empty-search
+        redirect that indicates no active session."""
         try:
-            return any(
-                w in page.url
-                for w in ["/account/login", "secure.indeed.com", "/auth", "/signin"]
-            )
+            url = page.url
+            login_indicators = [
+                "/account/login", "secure.indeed.com", "/auth", "/signin",
+                # Redirected to the generic search homepage — happens when not logged in
+                # and /jobs has no personalised feed to show.
+                "?from=jobsearch-empty-whatwhere",
+            ]
+            return any(w in url for w in login_indicators)
         except Exception:
             return False
 
@@ -431,10 +437,8 @@ class IndeedScraper(BaseScraper):
             await self._delay(2, 3)
             console.print(f"[cyan]Current URL:[/cyan] {page.url}")
 
-            # Detect whether a login wall is present
-            login_in_url = any(tok in page.url.lower() for tok in ("login", "signin", "auth"))
-            login_input  = await page.query_selector('input[type="email"], #login-email-input, input[name="email"]')
-            needs_login  = login_in_url or (login_input is not None)
+            # Detect whether a login wall is present (reuse the same check as scrape())
+            needs_login = self._on_login_page(page)
 
             if needs_login:
                 email    = os.environ.get("INDEED_EMAIL", "")
@@ -477,6 +481,19 @@ class IndeedScraper(BaseScraper):
     async def _auto_login(self, page, email: str, password: str) -> bool:
         """Attempt programmatic login to Indeed."""
         try:
+            # If we're on the homepage redirect (no session) rather than the actual
+            # login form, navigate to the sign-in page directly.
+            if "?from=jobsearch-empty-whatwhere" in page.url or (
+                "/account/login" not in page.url and "secure.indeed.com" not in page.url
+                and "signin" not in page.url.lower()
+            ):
+                await page.goto(
+                    "https://secure.indeed.com/account/login",
+                    wait_until="domcontentloaded",
+                    timeout=20000,
+                )
+                await self._delay(1.5, 2.5)
+
             email_input = None
             for sel in [
                 'input[type="email"]',

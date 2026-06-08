@@ -48,6 +48,8 @@
     "contract_hybrid": {"action": "flag_for_review"}
   },
   "search_settings": {
+    "keywords": "Director VP Engineering CTO CIO Software",
+    "location": "Remote",
     "days_posted": 7,
     "max_jobs_per_source": 50,
     "delay_min_seconds": 1,
