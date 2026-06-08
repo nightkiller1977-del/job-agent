@@ -132,6 +132,58 @@ class StateManager:
                 (score, reason, flags, job_id),
             )
 
+    def update_job_details(self, job_id: str, job: dict) -> None:
+        """Refresh display fields for an existing job without changing status."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET title = COALESCE(NULLIF(?, ''), title),
+                    company = COALESCE(NULLIF(?, ''), company),
+                    location = COALESCE(NULLIF(?, ''), location),
+                    salary_raw = COALESCE(NULLIF(?, ''), salary_raw),
+                    remote_type = COALESCE(NULLIF(?, ''), remote_type),
+                    url = COALESCE(NULLIF(?, ''), url),
+                    description = COALESCE(NULLIF(?, ''), description)
+                WHERE job_id = ?
+                """,
+                (
+                    job.get("title", ""),
+                    job.get("company", ""),
+                    job.get("location", ""),
+                    job.get("salary_raw", ""),
+                    job.get("remote_type", ""),
+                    job.get("url", ""),
+                    job.get("description", ""),
+                    job_id,
+                ),
+            )
+
+    def record_apply_attempt(self, job_id: str, status: str, detail: str = "") -> None:
+        """Persist the most recent apply attempt outcome into extra_json.
+        Does NOT change the job status field. Increments attempt_count each call.
+        Callers: orchestrator.apply_approved() after every attempt, success or block.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            extra: dict = {}
+            if row and row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    pass
+            extra["apply_last_attempt"] = now
+            extra["apply_last_status"]  = status
+            extra["apply_last_detail"]  = (detail or "")[:500]
+            extra["apply_attempt_count"] = extra.get("apply_attempt_count", 0) + 1
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
     # ------------------------------------------------------------------
     # Read helpers
     # ------------------------------------------------------------------

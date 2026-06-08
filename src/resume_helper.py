@@ -1,11 +1,87 @@
+from __future__ import annotations
+
 import json
 import os
 import re
 from pathlib import Path
+from typing import Iterable
 from rich.console import Console
 from playwright.async_api import Page
 
 console = Console()
+
+
+RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
+
+
+def resolve_resume_path(config: dict | None = None, preferred: str = "") -> str:
+    """Return the best existing resume file path for uploads.
+
+    Order of preference:
+    1. Explicit tailored/downloaded resume path.
+    2. Environment override.
+    3. config.json local_resume_path/resume_path.
+    4. Common local job-application folders.
+    """
+    config = config or {}
+    candidates: list[Path] = []
+
+    def add_path(value: str | None) -> None:
+        if value:
+            candidates.append(Path(value).expanduser())
+
+    add_path(preferred)
+    add_path(os.environ.get("LOCAL_RESUME_PATH"))
+    add_path(os.environ.get("RESUME_PATH"))
+    add_path(config.get("local_resume_path"))
+    add_path(config.get("resume_path"))
+
+    project_root = Path(__file__).parent.parent
+    search_dirs = [
+        project_root / "state" / "tailored_resumes",
+        project_root / "state" / "resumes",
+        project_root,
+        Path.home() / "Documents" / "Job App",
+        Path.home() / "Documents" / "Job App 2",
+        Path.home() / "Documents",
+        Path.home() / "Downloads",
+        Path.home() / "Desktop",
+    ]
+
+    for path in candidates:
+        resolved = _existing_resume(path)
+        if resolved:
+            return str(resolved)
+
+    discovered = _discover_latest_resume(search_dirs)
+    return str(discovered) if discovered else ""
+
+
+def _existing_resume(path: Path) -> Path | None:
+    if path.is_file() and path.suffix.lower() in RESUME_EXTENSIONS:
+        return path
+    if path.is_dir():
+        return _discover_latest_resume([path])
+    return None
+
+
+def _discover_latest_resume(dirs: Iterable[Path]) -> Path | None:
+    matches: list[Path] = []
+    for directory in dirs:
+        try:
+            if not directory.exists() or not directory.is_dir():
+                continue
+            for child in directory.rglob("*"):
+                if not child.is_file() or child.suffix.lower() not in RESUME_EXTENSIONS:
+                    continue
+                name = child.name.lower()
+                if "resume" in name or "cv" in name:
+                    matches.append(child)
+        except Exception:
+            continue
+    if not matches:
+        return None
+    return max(matches, key=lambda p: p.stat().st_mtime)
 
 class ResumeFieldFixer:
     """
@@ -195,4 +271,3 @@ class ResumeFieldFixer:
         except Exception:
             pass
         return False
-

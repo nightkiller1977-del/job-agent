@@ -112,6 +112,7 @@ class BaseScraper(ABC):
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(self._profile_dir),
             headless=False,
+            accept_downloads=True,
             args=args,
             slow_mo=80,
             viewport={"width": 1400, "height": 900},
