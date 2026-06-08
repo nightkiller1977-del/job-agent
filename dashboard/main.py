@@ -21,6 +21,49 @@ load_dotenv()
 
 app = FastAPI(title="Job Agent Dashboard")
 
+# ---------------------------------------------------------------------------
+# Credential encryption helpers
+# ---------------------------------------------------------------------------
+# Set CREDENTIAL_ENCRYPTION_KEY on Render (generate once with Fernet.generate_key()).
+# If unset, passwords are stored/returned as plaintext with a warning logged.
+# Existing plaintext values are transparently read back even after the key is added.
+
+def _get_cipher():
+    """Return a Fernet cipher if CREDENTIAL_ENCRYPTION_KEY env var is set, else None."""
+    key = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        return Fernet(key.encode())
+    except Exception as exc:
+        print(f"[WARN] CREDENTIAL_ENCRYPTION_KEY is set but invalid: {exc}")
+        return None
+
+
+def _encrypt_password(plain: str) -> str:
+    """Encrypt a plaintext password. Returns plaintext if no key configured."""
+    cipher = _get_cipher()
+    if cipher is None:
+        print("[WARN] CREDENTIAL_ENCRYPTION_KEY not set — storing credential in plaintext.")
+        return plain
+    return cipher.encrypt(plain.encode()).decode()
+
+
+def _decrypt_password(stored: str) -> str:
+    """Decrypt a stored password. Gracefully handles plaintext (pre-encryption migration)."""
+    if not stored:
+        return stored
+    cipher = _get_cipher()
+    if cipher is None:
+        return stored  # No key — return as-is (plaintext mode)
+    try:
+        from cryptography.fernet import InvalidToken
+        return cipher.decrypt(stored.encode()).decode()
+    except (InvalidToken, Exception):
+        # Value was stored before encryption was enabled — return as plaintext
+        return stored
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
@@ -65,6 +108,15 @@ CREATE TABLE IF NOT EXISTS sync_log (
   source     TEXT,
   notes      TEXT
 );
+
+CREATE TABLE IF NOT EXISTS credentials (
+  platform   TEXT PRIMARY KEY,
+  email      TEXT,
+  password   TEXT,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS extra_json TEXT;
 """
 
 
@@ -121,9 +173,40 @@ class ActionRequest(BaseModel):
     action: str  # "approved" | "skipped" | "bookmarked" | "applied" | "expired"
 
 
+class ExternalJobRequest(BaseModel):
+    url: str
+
+
+class CredentialsRequest(BaseModel):
+    platform: str
+    email: str
+    password: str
+
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@app.get("/health")
+async def health():
+    """Render/monitoring health check."""
+    db_ok = False
+    if DATABASE_URL:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    db_ok = cur.fetchone()[0] == 1
+        except Exception:
+            db_ok = False
+    return {"ok": bool(DATABASE_URL) and db_ok, "database": "ok" if db_ok else "unavailable"}
+
+
+@app.head("/")
+async def head_index():
+    """Allow HEAD checks on the dashboard root."""
+    return HTMLResponse(status_code=200)
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -203,10 +286,46 @@ async def index(request: Request):
                 row = cur.fetchone()
                 last_sync = row["last_sync"] if row else None
 
+                # Fetch credentials (decrypt passwords for template — UI pre-fills forms)
+                cur.execute("SELECT platform, email, password FROM credentials")
+                credentials_rows = cur.fetchall()
+                credentials = {
+                    r["platform"]: {
+                        "email": r["email"],
+                        "password": _decrypt_password(r["password"] or ""),
+                    }
+                    for r in credentials_rows
+                }
+
     except Exception as exc:
         return HTMLResponse(
             f"<h1>Database error</h1><pre>{exc}</pre>", status_code=500
         )
+
+    # Parse extra_json for approved jobs and inject apply attempt fields
+    _BLOCKED_STATUSES = {
+        "needs-session", "needs-portal-login", "needs-review",
+        "linkedin_login_required", "workday_session_expired",
+        "brassring_login_required", "microsoft_login_required",
+    }
+    import json as _json
+    approved_dicts: list[dict] = []
+    for row in approved:
+        d = dict(row)
+        extra_raw = d.get("extra_json")
+        extra: dict = {}
+        if extra_raw:
+            try:
+                extra = _json.loads(extra_raw)
+            except Exception:
+                pass
+        d["apply_last_status"]  = extra.get("apply_last_status", "")
+        d["apply_last_detail"]  = extra.get("apply_last_detail", "")
+        d["apply_attempt_count"] = extra.get("apply_attempt_count", 0)
+        approved_dicts.append(d)
+
+    # Sort: session-blocked last, ready first
+    approved_dicts.sort(key=lambda j: 1 if j.get("apply_last_status") in _BLOCKED_STATUSES else 0)
 
     return templates.TemplateResponse(
         request=request,
@@ -215,12 +334,14 @@ async def index(request: Request):
             "stats": stats,
             "pending": [dict(r) for r in pending],
             "applied": [dict(r) for r in applied],
-            "approved": [dict(r) for r in approved],
+            "approved": approved_dicts,
             "sync_log": [dict(r) for r in sync_log],
             "last_sync": last_sync,
             "now": datetime.now(timezone.utc),
+            "credentials": credentials,
         },
     )
+
 
 
 @app.post("/api/sync")
@@ -265,13 +386,13 @@ async def sync_jobs(
                                 (job_id, source, title, company, location,
                                  salary_raw, remote_type, url, score,
                                  score_reason, flags, status, discovered_at,
-                                 updated_at)
+                                 updated_at, extra_json)
                             VALUES
                                 (%(job_id)s, %(source)s, %(title)s,
                                  %(company)s, %(location)s, %(salary_raw)s,
                                  %(remote_type)s, %(url)s, %(score)s,
                                  %(score_reason)s, %(flags)s, %(status)s,
-                                 %(discovered_at)s, NOW())
+                                 %(discovered_at)s, NOW(), %(extra_json)s)
                             ON CONFLICT (job_id) DO UPDATE SET
                                 source       = EXCLUDED.source,
                                 title        = EXCLUDED.title,
@@ -283,6 +404,7 @@ async def sync_jobs(
                                 score        = EXCLUDED.score,
                                 score_reason = EXCLUDED.score_reason,
                                 flags        = EXCLUDED.flags,
+                                extra_json   = EXCLUDED.extra_json,
                                 updated_at   = NOW()
                             """,
                             {
@@ -299,6 +421,7 @@ async def sync_jobs(
                                 "flags":        raw.get("flags", ""),
                                 "status":       raw.get("status", "discovered"),
                                 "discovered_at": discovered_at,
+                                "extra_json":   raw.get("extra_json"),
                             },
                         )
                         upserted += 1
@@ -358,6 +481,76 @@ async def job_action(body: ActionRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
     return {"ok": True, "job_id": body.job_id, "status": body.action}
+
+
+@app.post("/api/jobs/external")
+async def add_external_job(body: ExternalJobRequest):
+    """Add a placeholder for an external job URL to be hydrated locally."""
+    url = body.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required")
+
+    import hashlib
+    job_id = hashlib.md5(url.encode()).hexdigest()[:16]
+
+    source = "external"
+    url_lower = url.lower()
+    if "linkedin.com" in url_lower:
+        source = "linkedin"
+    elif "usajobs.gov" in url_lower:
+        source = "usajobs"
+    elif "jobright.ai" in url_lower:
+        source = "jobright"
+
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM jobs WHERE job_id = %s", (job_id,))
+                if cur.fetchone():
+                    raise HTTPException(status_code=400, detail="Job already exists in queue")
+
+                cur.execute(
+                    """
+                    INSERT INTO jobs (job_id, source, title, company, url, status, flags, discovered_at)
+                    VALUES (%s, %s, %s, %s, %s, 'discovered', 'needs_hydration', NOW())
+                    """,
+                    (job_id, source, "Importing...", "Pending local agent sync", url),
+                )
+            conn.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"ok": True, "job_id": job_id, "url": url}
+
+
+@app.get("/api/jobs/unhydrated")
+async def get_unhydrated(x_sync_secret: Optional[str] = Header(default=None)):
+    """Fetch jobs that need to be scraped/hydrated by the local agent."""
+    if SYNC_SECRET and x_sync_secret != SYNC_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid sync secret")
+
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT job_id, url, source FROM jobs
+                    WHERE flags LIKE '%needs_hydration%'
+                    """
+                )
+                rows = cur.fetchall()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return [dict(r) for r in rows]
 
 
 @app.get("/api/status")
@@ -461,3 +654,66 @@ async def get_errors():
         raise HTTPException(status_code=500, detail=str(exc))
 
     return [dict(r) for r in rows]
+
+
+@app.get("/api/credentials")
+async def get_credentials(x_sync_secret: Optional[str] = Header(default=None)):
+    """Fetch all credentials for the local agent."""
+    if SYNC_SECRET and x_sync_secret != SYNC_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid sync secret")
+
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT platform, email, password FROM credentials")
+                rows = cur.fetchall()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # Decrypt passwords before returning to the local agent
+    result = []
+    for r in rows:
+        row = dict(r)
+        row["password"] = _decrypt_password(row.get("password") or "")
+        result.append(row)
+    return result
+
+
+@app.post("/api/credentials")
+async def save_credentials(body: CredentialsRequest):
+    """Save or update credentials for a platform. Encrypts password at rest."""
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
+
+    platform = body.platform.strip().lower()
+    valid_platforms = {"indeed", "linkedin", "jobright"}
+    if platform not in valid_platforms:
+        raise HTTPException(
+            status_code=400,
+            detail=f"platform must be one of {sorted(valid_platforms)}",
+        )
+
+    encrypted_pw = _encrypt_password(body.password.strip())
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO credentials (platform, email, password, updated_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (platform) DO UPDATE SET
+                        email    = EXCLUDED.email,
+                        password = EXCLUDED.password,
+                        updated_at = NOW()
+                    """,
+                    (platform, body.email.strip(), encrypted_pw),
+                )
+            conn.commit()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"ok": True, "platform": platform}
