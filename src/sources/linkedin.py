@@ -10,11 +10,14 @@ import os
 import re
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
+from urllib.parse import quote_plus
 
 from rich.console import Console
 
 from .base import BaseScraper, JobExpiredError
+from src.resume_helper import resolve_resume_path
 
 console = Console()
 
@@ -33,6 +36,8 @@ TARGET_SEARCHES = [
     "Program Manager DoD",
     "Director Engineering cleared",
 ]
+
+LOGIN_URL_MARKERS = ("/login", "/authwall", "uas/login", "checkpoint", "challenge")
 
 # User profile answers for Easy Apply forms
 USER_ANSWERS = {
@@ -57,12 +62,14 @@ class LinkedInScraper(BaseScraper):
         seen_ids: set[str] = set()
 
         try:
-            # Go to LinkedIn jobs
-            await page.goto(LINKEDIN_BASE, wait_until="domcontentloaded", timeout=30000)
+            # Go directly to Jobs. Some authenticated LinkedIn accounts no longer
+            # redirect the bare host to /feed, so using /feed as the auth signal
+            # causes valid sessions to be treated as logged out.
+            await page.goto(f"{LINKEDIN_BASE}/jobs/", wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
 
             # Check login — attempt auto-login from .env if not authenticated
-            if "/login" in page.url or "/authwall" in page.url or "uas/login" in page.url or "linkedin.com/feed" not in page.url:
+            if await self._needs_login(page):
                 email = os.environ.get("LINKEDIN_EMAIL", "")
                 password = os.environ.get("LINKEDIN_PASSWORD", "")
                 if email and password:
@@ -78,7 +85,7 @@ class LinkedInScraper(BaseScraper):
                             "  → Press Enter once you are logged in and on the feed/jobs page."
                         )
                         input("  Press Enter once logged in > ")
-                        await page.goto(LINKEDIN_BASE, wait_until="domcontentloaded", timeout=30000)
+                        await page.goto(f"{LINKEDIN_BASE}/jobs/", wait_until="domcontentloaded", timeout=30000)
                         await self._delay(2, 3)
                         await self._save_session()
                 else:
@@ -91,11 +98,12 @@ class LinkedInScraper(BaseScraper):
                         "  → Press Enter once logged in."
                     )
                     input("  Press Enter once logged in > ")
-                    await page.goto(LINKEDIN_BASE, wait_until="domcontentloaded", timeout=30000)
+                    await page.goto(f"{LINKEDIN_BASE}/jobs/", wait_until="domcontentloaded", timeout=30000)
                     await self._delay(2, 3)
                     await self._save_session()
 
-            for query in TARGET_SEARCHES:
+            searches = self.config.get("target_roles") or TARGET_SEARCHES
+            for query in searches:
                 if len(all_jobs) >= self.max_jobs:
                     break
                 console.print(f"[blue]LinkedIn:[/blue] Searching '{query}'…")
@@ -114,23 +122,201 @@ class LinkedInScraper(BaseScraper):
 
         return all_jobs
 
+    async def scrape_saved(self) -> list[dict]:
+        """Import jobs the user explicitly saved in LinkedIn.
+
+        A saved job is treated as user intent to apply, so callers should mark
+        these as approved without running the normal score gate.
+        """
+        console.print("[blue]LinkedIn Saved:[/blue] Opening browser…")
+        page = await self._start_browser()
+        jobs: list[dict] = []
+        seen_ids: set[str] = set()
+
+        try:
+            await page.goto("https://www.linkedin.com/my-items/saved-jobs/", wait_until="domcontentloaded", timeout=30000)
+            await self._delay(2, 3)
+
+            if await self._needs_login(page):
+                email = os.environ.get("LINKEDIN_EMAIL", "")
+                password = os.environ.get("LINKEDIN_PASSWORD", "")
+                if email and password:
+                    console.print("[blue]LinkedIn Saved:[/blue] Not logged in — attempting auto-login…")
+                    if not await self._auto_login(page, email, password):
+                        console.print("[red]LinkedIn Saved: Auto-login failed. Skipping saved-job import.[/red]")
+                        return []
+                    await page.goto("https://www.linkedin.com/my-items/saved-jobs/", wait_until="domcontentloaded", timeout=30000)
+                    await self._delay(2, 3)
+                else:
+                    console.print("[red]LinkedIn Saved: Missing LINKEDIN_EMAIL/LINKEDIN_PASSWORD. Skipping saved-job import.[/red]")
+                    return []
+
+            for _ in range(5):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await self._delay(1, 2)
+
+            card_selectors = [
+                ".job-card-container",
+                ".jobs-saved-job-card",
+                ".reusable-search__result-container",
+                "li:has(a[href*='/jobs/view/'])",
+            ]
+            cards = []
+            for sel in card_selectors:
+                try:
+                    found = await page.query_selector_all(sel)
+                    if found:
+                        cards = found
+                        break
+                except Exception:
+                    continue
+
+            for card in cards[:self.max_jobs]:
+                job = await self._parse_card(card, page, "saved")
+                if job and job["job_id"] not in seen_ids:
+                    await self._hydrate_job_detail(page, job)
+                    jobs.append(self._mark_saved_job(job))
+                    seen_ids.add(job["job_id"])
+
+            if not jobs:
+                fallback_jobs = await self._extract_jobs_from_page(page, "saved", seen_ids)
+                for job in fallback_jobs:
+                    await self._hydrate_job_detail(page, job)
+                    jobs.append(self._mark_saved_job(job))
+
+            console.print(f"[blue]LinkedIn Saved:[/blue] Total: {len(jobs)} saved jobs found.")
+        except Exception as exc:
+            console.print(f"[red]LinkedIn saved-job import error:[/red] {exc}")
+        finally:
+            await self._close_browser()
+
+        return jobs
+
+    def _mark_saved_job(self, job: dict) -> dict:
+        job["status"] = "approved"
+        job["score"] = max(int(job.get("score") or 0), 100)
+        job["score_reason"] = "User saved this job in LinkedIn; approved regardless of score."
+        job["flags"] = ",".join(filter(None, [job.get("flags", ""), "linkedin_saved"]))
+        job["recommended_action"] = "apply"
+        job["saved_on_linkedin"] = True
+        return job
+
+    async def _hydrate_job_detail(self, page, job: dict) -> None:
+        """Fill missing saved-job fields from the LinkedIn job detail page."""
+        if job.get("title") and job.get("company"):
+            return
+        url = job.get("url")
+        if not url:
+            return
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await self._delay(1, 2)
+            title = await self._first_text(page, [
+                ".job-details-jobs-unified-top-card__job-title",
+                ".jobs-unified-top-card__job-title",
+                "h1",
+            ])
+            company = await self._first_text(page, [
+                ".job-details-jobs-unified-top-card__company-name",
+                ".jobs-unified-top-card__company-name",
+                "a[href*='/company/']",
+            ])
+            location = await self._first_text(page, [
+                ".job-details-jobs-unified-top-card__tertiary-description-container",
+                ".jobs-unified-top-card__bullet",
+                ".jobs-unified-top-card__workplace-type",
+            ])
+            description = await self._first_text(page, [
+                ".jobs-description-content__text",
+                "#job-details",
+                ".jobs-box__html-content",
+            ])
+            if not title:
+                page_title = await page.title()
+                title_parts = [part.strip() for part in page_title.split("|")]
+                if title_parts and title_parts[-1].lower() == "linkedin":
+                    title_parts = title_parts[:-1]
+                if title_parts:
+                    title = title_parts[0]
+                if not company and len(title_parts) > 1:
+                    company = title_parts[1]
+            if title:
+                job["title"] = title
+            if company:
+                job["company"] = company
+            if location and not job.get("location"):
+                job["location"] = location
+                job["remote_type"] = _infer_remote_type(location, "")
+            if description:
+                job["description"] = description[:5000]
+        except Exception as exc:
+            console.print(f"[dim]LinkedIn saved detail hydration error: {exc}[/dim]")
+
+    async def _first_text(self, page, selectors: list[str]) -> str:
+        for sel in selectors:
+            try:
+                elem = await page.query_selector(sel)
+                if elem:
+                    text = (await elem.inner_text()).strip()
+                    if text:
+                        return text
+            except Exception:
+                continue
+        return ""
+
     async def _auto_login(self, page, email: str, password: str) -> bool:
         """Log in to LinkedIn with stored credentials."""
         try:
             await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=20000)
             await self._delay(1.5, 2.5)
+            if await self._needs_login(page) is False:
+                console.print("[green]LinkedIn: Already authenticated after login redirect.[/green]")
+                await self._save_session()
+                return True
 
             # Fill email
-            await page.wait_for_selector('#username', timeout=8000)
-            await page.fill('#username', email)
+            username_selectors = [
+                '#username',
+                'input[name="session_key"]',
+                'input[autocomplete="username"]',
+                'input[type="email"]',
+            ]
+            password_selectors = [
+                '#password',
+                'input[name="session_password"]',
+                'input[autocomplete="current-password"]',
+                'input[type="password"]',
+            ]
+            username_filled = await self._fill_first_available(page, username_selectors, email, timeout=10000)
+            if not username_filled:
+                console.print(f"[red]LinkedIn: Login form not found. Current URL: {page.url}[/red]")
+                return False
             await self._delay(0.5, 1)
 
             # Fill password
-            await page.fill('#password', password)
+            password_field = await self._fill_first_available(page, password_selectors, password, timeout=8000)
+            password_filled = bool(password_field)
+            if not password_filled:
+                console.print(f"[red]LinkedIn: Password field not found. Current URL: {page.url}[/red]")
+                return False
             await self._delay(0.5, 1)
 
             # Submit
-            await page.click('button[type="submit"]')
+            submitted = False
+            for sel in ['button[type="submit"]', 'button:text-matches("Sign in", "i")']:
+                try:
+                    await page.click(sel, timeout=5000)
+                    submitted = True
+                    break
+                except Exception:
+                    continue
+            if not submitted:
+                try:
+                    await password_field.press("Enter")
+                    submitted = True
+                except Exception:
+                    console.print(f"[red]LinkedIn: Sign-in button not found. Current URL: {page.url}[/red]")
+                    return False
             console.print("[blue]LinkedIn:[/blue] Credentials submitted, waiting for redirect…")
 
             # Wait for feed or jobs page
@@ -151,6 +337,22 @@ class LinkedInScraper(BaseScraper):
             console.print(f"[red]LinkedIn auto-login error: {exc}[/red]")
             return False
 
+    async def _fill_first_available(self, page, selectors: list[str], value: str, timeout: int = 5000):
+        """Fill the first visible matching input from a selector list."""
+        deadline = asyncio.get_event_loop().time() + (timeout / 1000)
+        while asyncio.get_event_loop().time() < deadline:
+            for sel in selectors:
+                try:
+                    fields = await page.query_selector_all(sel)
+                    for field in fields:
+                        if await field.is_visible():
+                            await field.fill(value)
+                            return field
+                except Exception:
+                    continue
+            await asyncio.sleep(0.25)
+        return None
+
     async def _search_jobs(self, page, query: str, seen_ids: set) -> list[dict]:
         """Search LinkedIn jobs for a query and return job dicts."""
         jobs = []
@@ -159,7 +361,7 @@ class LinkedInScraper(BaseScraper):
         # f_E=4,5 = Director and Executive level
         # f_LF=f_AL = Easy Apply only — sometimes
         search_url = (
-            f"{LINKEDIN_JOBS_SEARCH}?keywords={query.replace(' ', '%20')}"
+            f"{LINKEDIN_JOBS_SEARCH}?keywords={quote_plus(query)}"
             f"&f_TPR=r604800"
             f"&f_E=4%2C5"
             f"&f_LF=f_AL"   # Easy Apply only
@@ -167,10 +369,29 @@ class LinkedInScraper(BaseScraper):
         )
         await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
         await self._delay(2, 3)
+        if await self._needs_login(page):
+            console.print("[yellow]LinkedIn:[/yellow] Search redirected to login/authwall; no jobs collected for this query.")
+            return []
 
         # Scroll to load results
-        for _ in range(3):
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        results_container_selectors = [
+            ".jobs-search-results-list",
+            ".scaffold-layout__list",
+            "ul.jobs-search-results__list",
+        ]
+        for _ in range(4):
+            scrolled = False
+            for sel in results_container_selectors:
+                try:
+                    container = await page.query_selector(sel)
+                    if container:
+                        await container.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+                        scrolled = True
+                        break
+                except Exception:
+                    continue
+            if not scrolled:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await self._delay(1, 2)
 
         # Get all job cards
@@ -195,6 +416,73 @@ class LinkedInScraper(BaseScraper):
             if job and job["job_id"] not in seen_ids:
                 jobs.append(job)
 
+        if not jobs:
+            jobs = await self._extract_jobs_from_page(page, query, seen_ids)
+
+        return jobs
+
+    async def _extract_jobs_from_page(self, page, query: str, seen_ids: set) -> list[dict]:
+        """Fallback parser for LinkedIn DOM changes where card selectors move."""
+        try:
+            raw_jobs = await page.evaluate(
+                """
+                () => {
+                    const anchors = [...document.querySelectorAll('a[href*="/jobs/view/"]')];
+                    const byUrl = new Map();
+                    for (const anchor of anchors) {
+                        const href = anchor.href || anchor.getAttribute('href') || '';
+                        if (!href) continue;
+                        const url = href.split('?')[0];
+                        if (byUrl.has(url)) continue;
+                        const card =
+                            anchor.closest('.job-card-container, .jobs-search-results__list-item, li.scaffold-layout__list-item') ||
+                            anchor.closest('li') ||
+                            anchor.parentElement;
+                        const text = (card?.innerText || anchor.innerText || '').trim();
+                        const lines = text.split('\\n').map(line => line.trim()).filter(Boolean);
+                        byUrl.set(url, {
+                            url,
+                            title: lines[0] || anchor.innerText.trim(),
+                            company: lines[1] || '',
+                            location: lines.find(line => /remote|hybrid|united states|miami|washington|dc|fl/i.test(line)) || '',
+                            description: text.slice(0, 500),
+                            has_easy_apply: /easy apply/i.test(text)
+                        });
+                    }
+                    return [...byUrl.values()];
+                }
+                """
+            )
+        except Exception as exc:
+            console.print(f"[dim]LinkedIn fallback extraction error: {exc}[/dim]")
+            return []
+
+        jobs = []
+        for raw in raw_jobs[: self.max_jobs - len(seen_ids)]:
+            url = raw.get("url", "")
+            if not url:
+                continue
+            if not url.startswith("http"):
+                url = LINKEDIN_BASE + url
+            job_id = self._make_job_id(url)
+            if job_id in seen_ids:
+                continue
+            jobs.append({
+                "job_id": job_id,
+                "source": "linkedin",
+                "title": raw.get("title", ""),
+                "company": raw.get("company", ""),
+                "location": raw.get("location", ""),
+                "salary_raw": "",
+                "remote_type": _infer_remote_type(raw.get("location", ""), ""),
+                "url": url,
+                "description": raw.get("description", ""),
+                "has_easy_apply": bool(raw.get("has_easy_apply")),
+                "search_query": query,
+                "discovered_at": datetime.utcnow().isoformat(),
+            })
+        if jobs:
+            console.print(f"[blue]LinkedIn:[/blue] Fallback parser recovered {len(jobs)} job cards.")
         return jobs
 
     async def _parse_card(self, card, page, query: str) -> Optional[dict]:
@@ -314,6 +602,14 @@ class LinkedInScraper(BaseScraper):
         self.last_apply_status = "started"
         self.last_apply_detail = ""
         console.print(f"\n[blue]LinkedIn Apply:[/blue] {job.get('title')} @ {job.get('company')}")
+        tailored_resume_path = await self._tailor_resume_with_jobright(job)
+        resume_path = tailored_resume_path or self._configured_resume_path()
+        if tailored_resume_path:
+            console.print(f"[blue]LinkedIn Apply:[/blue] Using tailored resume: {tailored_resume_path}")
+        elif resume_path:
+            console.print(f"[yellow]LinkedIn Apply:[/yellow] Tailored resume unavailable; using configured resume: {resume_path}")
+        else:
+            console.print("[yellow]LinkedIn Apply:[/yellow] No tailored or configured resume path available.")
         page = await self._start_browser()
         submitted = False
 
@@ -337,6 +633,9 @@ class LinkedInScraper(BaseScraper):
             easy_apply_btn = None
             for sel in [
                 'button.jobs-apply-button',
+                'a[href*="/jobs/view/"][href*="/apply/"]',
+                'a:text-matches("^Continue$", "i")',
+                'button:text-matches("^Continue$", "i")',
                 'button:text-matches("Easy Apply", "i")',
                 '[data-control-name="jobdetails_topcard_inapply"]',
                 '.jobs-apply-button--top-card',
@@ -344,6 +643,13 @@ class LinkedInScraper(BaseScraper):
                 try:
                     btn = await page.wait_for_selector(sel, timeout=5000)
                     if btn:
+                        try:
+                            text = (await btn.inner_text()).strip().lower()
+                            href = (await btn.get_attribute("href") or "").lower()
+                            if text == "continue" and "/apply/" not in href:
+                                continue
+                        except Exception:
+                            pass
                         easy_apply_btn = btn
                         break
                 except Exception:
@@ -351,10 +657,14 @@ class LinkedInScraper(BaseScraper):
 
             if not easy_apply_btn:
                 console.print("[yellow]LinkedIn: Easy Apply button not found. May not be an Easy Apply job.[/yellow]")
-                return self._set_apply_outcome(
-                    "linkedin_easy_apply_not_found",
-                    "LinkedIn did not expose an Easy Apply button for this job.",
-                )
+                external_url = await self._extract_external_apply_url(page)
+                if not external_url:
+                    return self._set_apply_outcome(
+                        "linkedin_easy_apply_not_found",
+                        "LinkedIn did not expose an Easy Apply button or a usable external apply link for this job.",
+                    )
+                console.print(f"[blue]LinkedIn Apply:[/blue] External apply URL found: {external_url[:100]}")
+                return await self._apply_external_ats(job, external_url, resume_path, auto_submit=auto_submit)
 
             await easy_apply_btn.click()
             await self._delay(2, 3)
@@ -365,6 +675,20 @@ class LinkedInScraper(BaseScraper):
             while step < max_steps:
                 step += 1
                 await self._delay(1, 2)
+                try:
+                    heading = await page.evaluate(
+                        """
+                        () => {
+                            const h = document.querySelector('h1,h2,h3');
+                            const pageText = document.body?.innerText?.match(/\\d+\\/\\d+ pages/i)?.[0] || '';
+                            return [pageText, h?.innerText || ''].filter(Boolean).join(' — ');
+                        }
+                        """
+                    )
+                    if heading:
+                        console.print(f"[dim]LinkedIn apply step {step}: {heading[:140]}[/dim]")
+                except Exception:
+                    pass
 
                 # Check if modal is open
                 modal = None
@@ -377,11 +701,14 @@ class LinkedInScraper(BaseScraper):
                         continue
 
                 if not modal:
-                    console.print("[dim]LinkedIn: Modal closed — application may be complete.[/dim]")
-                    break
+                    if "/apply/" in page.url:
+                        modal = page
+                    else:
+                        console.print("[dim]LinkedIn: Modal closed — application may be complete.[/dim]")
+                        break
 
                 # Fill form fields in the current step
-                await self._fill_easy_apply_fields(page)
+                await self._fill_easy_apply_fields(page, resume_path=resume_path)
                 await self._delay(1, 1.5)
 
                 # Check for Next / Review / Submit buttons
@@ -454,6 +781,8 @@ class LinkedInScraper(BaseScraper):
                 elif next_btn:
                     await next_btn.click()
                     await self._delay(1, 2)
+                elif await self._click_linkedin_button_by_text(page, [r"^Next$", r"^Continue$"]):
+                    await self._delay(1, 2)
                 else:
                     console.print("[yellow]LinkedIn: No navigable button found. Stopping.[/yellow]")
                     return self._set_apply_outcome(
@@ -461,6 +790,12 @@ class LinkedInScraper(BaseScraper):
                         "Easy Apply modal opened, but no Next/Review/Submit control was found on the current step.",
                     )
                     break
+
+            if step >= max_steps and not submitted and self.last_apply_status in ("started", "", None):
+                self._set_apply_outcome(
+                    "linkedin_max_steps_reached",
+                    f"LinkedIn apply flow reached {max_steps} steps without exposing a final Submit control.",
+                )
 
         except Exception as exc:
             console.print(f"[red]LinkedIn apply error:[/red] {exc}")
@@ -480,6 +815,116 @@ class LinkedInScraper(BaseScraper):
                 "LinkedIn apply flow ended without reaching a submitted state.",
             )
         return submitted
+
+    async def _tailor_resume_with_jobright(self, job: dict) -> str:
+        try:
+            from .jobright import JobrightScraper
+            return await JobrightScraper(self.config).tailor_resume_for_external_job(job)
+        except Exception as exc:
+            console.print(f"[yellow]LinkedIn Apply:[/yellow] Jobright resume tailoring failed: {exc}")
+            return ""
+
+    def _configured_resume_path(self) -> str:
+        return resolve_resume_path(self.config)
+
+    async def _extract_external_apply_url(self, page) -> str:
+        """Find or reveal the external company apply URL on a LinkedIn job page."""
+        url = await page.evaluate("""
+        () => {
+            const direct = Array.from(document.querySelectorAll('a[href]'))
+                .map(a => a.href)
+                .find(h => h && !h.includes('linkedin.com') && /apply|job|career|workday|greenhouse|lever|icims|brassring|taleo|smartrecruiters|successfactors|ashby/i.test(h));
+            if (direct) return direct;
+
+            const buttons = Array.from(document.querySelectorAll('button,a,[role="button"]'));
+            const apply = buttons.find(el => /\\bapply\\b/i.test(el.innerText || el.textContent || el.getAttribute('aria-label') || ''));
+            return apply?.href || '';
+        }
+        """)
+        if url and "linkedin.com" not in url:
+            return url
+
+        apply_btn = None
+        for sel in [
+            'button:text-matches("^Apply$", "i")',
+            'a:text-matches("^Apply$", "i")',
+            'button:text-matches("Apply on company site", "i")',
+            'a:text-matches("Apply on company site", "i")',
+            '.jobs-apply-button',
+        ]:
+            try:
+                candidate = await page.query_selector(sel)
+                if candidate:
+                    text = (await candidate.inner_text()).strip().lower()
+                    if "easy apply" not in text:
+                        apply_btn = candidate
+                        break
+            except Exception:
+                continue
+        if not apply_btn:
+            return ""
+
+        original_pages = set(page.context.pages)
+        try:
+            async with page.expect_popup(timeout=8000) as popup_info:
+                await apply_btn.click()
+            popup = await popup_info.value
+            await popup.wait_for_load_state("domcontentloaded", timeout=20000)
+            external = popup.url
+            if external and "linkedin.com" not in external:
+                return external
+        except Exception:
+            try:
+                await apply_btn.click()
+                await self._delay(2, 3)
+                for opened in page.context.pages:
+                    if opened not in original_pages and "linkedin.com" not in opened.url:
+                        return opened.url
+                if page.url and "linkedin.com" not in page.url:
+                    return page.url
+            except Exception:
+                return ""
+        return ""
+
+    async def _apply_external_ats(self, job: dict, external_url: str, resume_path: str, auto_submit: bool = False) -> bool:
+        try:
+            from .jobright import JobrightScraper
+            scraper = JobrightScraper(self.config)
+            result = await scraper.apply_external_ats_job(
+                job,
+                external_url,
+                resume_path=resume_path,
+                auto_submit=auto_submit,
+            )
+            self.last_apply_status = scraper.last_apply_status
+            self.last_apply_detail = scraper.last_apply_detail
+            return result
+        except Exception as exc:
+            return self._set_apply_outcome("linkedin_external_apply_error", str(exc))
+
+    async def _click_linkedin_button_by_text(self, page, patterns: list[str]) -> bool:
+        try:
+            return await page.evaluate(
+                """
+                (patterns) => {
+                    const regexes = patterns.map(p => new RegExp(p, 'i'));
+                    const controls = Array.from(document.querySelectorAll('button,a,[role="button"]'));
+                    const match = controls.find(el => {
+                        if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                        const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+                        if (!text) return false;
+                        return regexes.some(re => re.test(text));
+                    });
+                    if (!match) return false;
+                    match.scrollIntoView({block: 'center', inline: 'center'});
+                    match.click();
+                    return true;
+                }
+                """,
+                patterns,
+            )
+        except Exception:
+            return False
 
     async def prepare_session(self, job: Optional[dict] = None) -> None:
         """Open LinkedIn in the persistent profile so the user can refresh login/challenge state."""
@@ -503,13 +948,13 @@ class LinkedInScraper(BaseScraper):
     async def _needs_login(self, page) -> bool:
         try:
             url = page.url.lower()
-            if any(part in url for part in ["/login", "/authwall", "uas/login", "checkpoint", "challenge"]):
+            if any(part in url for part in LOGIN_URL_MARKERS):
                 return True
             return await page.evaluate(
                 """
                 () => {
                     const text = (document.body?.innerText || '').toLowerCase();
-                    return /sign in|join linkedin|security verification|checkpoint/.test(text) &&
+                    return /sign in|join linkedin|security verification|checkpoint|authwall/.test(text) &&
                         !!document.querySelector('input[type="password"], input[name="session_password"]');
                 }
                 """
@@ -517,18 +962,23 @@ class LinkedInScraper(BaseScraper):
         except Exception:
             return False
 
-    async def _fill_easy_apply_fields(self, page) -> None:
+    async def _fill_easy_apply_fields(self, page, resume_path: str = "") -> None:
         """
         Attempt to auto-fill common LinkedIn Easy Apply form fields based on user profile.
         """
         await self._delay(0.5, 1)
+        if resume_path:
+            await self._upload_resume_if_prompted(page, resume_path)
 
         # Phone number — fill if empty
-        phone_inputs = await page.query_selector_all('input[id*="phone"], input[placeholder*="phone"], input[name*="phone"]')
+        phone_inputs = await page.query_selector_all(
+            'input[id*="phone"], input[placeholder*="phone"], input[name*="phone"], '
+            'input[aria-label*="phone" i], input[type="tel"]'
+        )
         for inp in phone_inputs:
             current = await inp.input_value()
             if not current:
-                phone = USER_ANSWERS.get("phone_default", "")
+                phone = USER_ANSWERS.get("phone_default", "") or self._profile_value("personal_info", "phone")
                 if phone:
                     await inp.fill(phone)
                     await self._delay(0.3, 0.5)
@@ -537,6 +987,26 @@ class LinkedInScraper(BaseScraper):
         await self._fill_select_fields(page)
         await self._fill_radio_fields(page)
         await self._fill_text_questions(page)
+
+    async def _upload_resume_if_prompted(self, page, resume_path: str) -> None:
+        path = Path(resume_path).expanduser()
+        if not path.exists():
+            return
+        try:
+            file_inputs = await page.query_selector_all('input[type="file"]')
+            for file_input in file_inputs:
+                accept = (await file_input.get_attribute("accept") or "").lower()
+                name = (await file_input.get_attribute("name") or "").lower()
+                label = (await self._get_field_label(page, file_input) or "").lower()
+                hints = " ".join([accept, name, label])
+                if accept and not any(ext in accept for ext in [".pdf", "pdf", "application/pdf"]):
+                    continue
+                if any(word in hints for word in ["resume", "cv", "upload", "file"]) or not hints.strip():
+                    await file_input.set_input_files(str(path))
+                    console.print(f"[green]LinkedIn:[/green] Uploaded resume: {path.name}")
+                    await self._delay(1, 2)
+        except Exception as exc:
+            console.print(f"[yellow]LinkedIn:[/yellow] Resume upload check failed: {exc}")
 
     async def _fill_select_fields(self, page) -> None:
         """Fill dropdown selects based on common LinkedIn question patterns."""
@@ -576,6 +1046,11 @@ class LinkedInScraper(BaseScraper):
                 elif "sponsor" in label_lower:
                     for val, text in option_values:
                         if "no" in text:
+                            chosen = val
+                            break
+                elif "phone" in label_lower and "country" in label_lower:
+                    for val, text in option_values:
+                        if "united states" in text or "(+1)" in text:
                             chosen = val
                             break
 
@@ -664,6 +1139,19 @@ class LinkedInScraper(BaseScraper):
         except Exception:
             pass
         return ""
+
+    def _profile_value(self, section: str, key: str) -> str:
+        try:
+            import json
+            profile_path = Path("state/profile.json")
+            if not profile_path.exists():
+                profile_path = Path(__file__).parent.parent.parent / "state" / "profile.json"
+            if not profile_path.exists():
+                return ""
+            data = json.loads(profile_path.read_text())
+            return str(data.get(section, {}).get(key, "") or "")
+        except Exception:
+            return ""
 
 
 def _infer_remote_type(location: str, description: str) -> str:
