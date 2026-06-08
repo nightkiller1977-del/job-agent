@@ -496,6 +496,7 @@ class JobrightScraper(BaseScraper):
         Tries a direct download first; if the resume needs (re)generation, delegates
         to _run_orion_resume_wizard which robustly handles Full Edit + Select All.
         """
+        await self._delay(1, 2)
         result = await self._download_visible_resume(page, job, before)
         if result:
             return result
@@ -505,8 +506,22 @@ class JobrightScraper(BaseScraper):
         if wizard_result:
             return wizard_result
 
+        # The drawer may already be on Step 2 from a prior partial run.
+        generated = await self._click_jobright_resume_control(page, [
+            r"Generate\s+My\s+New\s+Resume",
+            r"Generate.*Resume",
+            r"^Generate$",
+        ], timeout_ms=5000)
+        if generated:
+            console.print("[magenta]Jobright Tailor:[/magenta] Resuming custom resume generation.")
+            for _ in range(60):
+                await asyncio.sleep(2)
+                result = await self._download_visible_resume(page, job, before)
+                if result:
+                    return result
+
         # Final fallback: bare Regenerate button (no keyword/edit-type step)
-        regenerated = await self._click_first_button_text(page, [r"^Regenerate$"])
+        regenerated = await self._click_jobright_resume_control(page, [r"^Regenerate$"], timeout_ms=5000)
         if regenerated:
             console.print("[magenta]Jobright Tailor:[/magenta] Regenerating custom resume.")
             for _ in range(40):
@@ -515,6 +530,59 @@ class JobrightScraper(BaseScraper):
                 if result:
                     return result
         return ""
+
+    async def _click_jobright_resume_control(self, page, patterns: list[str], timeout_ms: int = 10000) -> bool:
+        """Click a visible Jobright resume drawer control by text."""
+        deadline = asyncio.get_event_loop().time() + (timeout_ms / 1000)
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                clicked = await page.evaluate(
+                    """
+                    (patterns) => {
+                        const regexes = patterns.map(p => new RegExp(p, 'i'));
+                        const root = document.querySelector('.ant-drawer-open') || document;
+                        const controls = Array.from(root.querySelectorAll([
+                            'button',
+                            'a',
+                            '[role="button"]',
+                            'input[type="button"]',
+                            'input[type="submit"]'
+                        ].join(',')));
+                        const visible = el => {
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.visibility !== 'hidden' &&
+                                style.display !== 'none' &&
+                                !el.disabled &&
+                                el.getAttribute('aria-disabled') !== 'true' &&
+                                rect.width > 0 &&
+                                rect.height > 0;
+                        };
+                        const match = controls.find(el => {
+                            if (!visible(el)) return false;
+                            const text = [
+                                el.innerText,
+                                el.textContent,
+                                el.value,
+                                el.getAttribute('aria-label'),
+                                el.getAttribute('title')
+                            ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                            return text && regexes.some(re => re.test(text));
+                        });
+                        if (!match) return false;
+                        match.scrollIntoView({block: 'center', inline: 'center'});
+                        match.click();
+                        return true;
+                    }
+                    """,
+                    patterns,
+                )
+                if clicked:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        return False
 
     async def _run_orion_resume_wizard(self, page, job: dict, before: Path | None = None) -> str:
         """Execute the Jobright Orion 3-step resume wizard reliably.
@@ -1234,100 +1302,15 @@ class JobrightScraper(BaseScraper):
             ext_url = popup_ext_url or await self._extract_external_url(page)
             console.print(f"[magenta]Jobright:[/magenta] ATS URL: {ext_url or '(will try Apply Now)'}")
 
-            # ── Step 3: Open Orion AI "Customize Your Resume" tool ───────────
-            # Wait for the tool card to be present, then click it.
-            console.print("[magenta]Jobright:[/magenta] Opening Orion AI resume modal…")
-            try:
-                tool_card = await page.wait_for_selector(
-                    '[class*="tool-card-active"], [class*="tool-card"]',
-                    timeout=10000
-                )
-                if tool_card:
-                    await tool_card.click()
-                    console.print("[magenta]Jobright:[/magenta] Tool card clicked — waiting for modal…")
-            except Exception:
-                console.print("[yellow]Jobright:[/yellow] Tool card not found on this page")
-
-            # ── Step 4: Wait for "Improve My Resume for This Job" button ──────
-            # The modal takes ~8-10s to render the score analysis.
-            # Use wait_for_selector (event-driven) instead of polling for reliability.
-            improve_btn = None
-            console.print("[magenta]Jobright:[/magenta] Waiting for resume tool to load (up to 30s)…")
-            for pat in [
-                'button:text-matches("Improve My Resume for This Job", "i")',  # confirmed current text
-                'button:text-matches("Improve My Resume", "i")',               # partial match fallback
-                'button:text-matches("Customize.*Resume", "i")',
-                'button:text-matches("Generate.*Resume", "i")',
-            ]:
-                try:
-                    improve_btn = await page.wait_for_selector(pat, timeout=8000)
-                    if improve_btn:
-                        break
-                except Exception:
-                    continue
-
-            if improve_btn:
-                btn_text = await improve_btn.inner_text()
-                console.print(f"[green]Jobright:[/green] Found resume button: '{btn_text.strip()}'")
-                await improve_btn.click()
-                await self._delay(2, 3)
-
-                # Select Full Edit mode and check all missing keywords
-                await page.evaluate("""
-                () => {
-                    const labels = Array.from(document.querySelectorAll('label, span, p'));
-                    const fullEdit = labels.find(l => l.textContent.trim().match(/^full edit/i));
-                    if (fullEdit) fullEdit.click();
-                    document.querySelectorAll('input[type="checkbox"]:not(:checked)')
-                        .forEach(cb => cb.click());
-                }
-                """)
-                await self._delay(1, 2)
-
-                # ── Step 5: Generate tailored resume ─────────────────────────
-                gen_patterns = [
-                    'button:text-matches("Generate My New Resume", "i")',
-                    'button:text-matches("Generate.*Resume", "i")',
-                    'button:text-matches("^Generate$", "i")',
-                    'button:text-matches("Create.*Resume", "i")',
-                ]
-                gen_btn = None
-                for pat in gen_patterns:
-                    try:
-                        gen_btn = await page.query_selector(pat)
-                        if gen_btn:
-                            break
-                    except Exception:
-                        pass
-
-                if gen_btn:
-                    await gen_btn.click()
-                    console.print("[magenta]Jobright:[/magenta] Generating tailored resume… (~60s)")
-
-                    # Poll until Download Resume appears (max 90s)
-                    for _ in range(45):
-                        await asyncio.sleep(2)
-                        btns = await page.evaluate(
-                            "Array.from(document.querySelectorAll('button')).map(b=>b.textContent.trim())"
-                        )
-                        if any("Download" in b for b in btns):
-                            score_info = await page.evaluate("""
-                            document.body.innerText
-                                .match(/score jumped from [\\d.]+ to [\\d.]+/i)?.[0] || 'generated'
-                            """)
-                            console.print(f"[green]Jobright:[/green] Resume ready — {score_info}")
-                            break
-
-                    # Download tailored PDF
-                    await page.evaluate("""
-                    Array.from(document.querySelectorAll('button'))
-                        .find(b => /download/i.test(b.textContent))?.click()
-                    """)
-                    await self._delay(1, 2)
-                else:
-                    console.print("[yellow]Jobright:[/yellow] Generate button not found — skipping generation")
+            # ── Step 3: Generate/download a tailored resume if Jobright exposes it
+            tailored_resume_path = await self._generate_tailored_resume(page, job)
+            resume_path = resolve_resume_path(self.config, preferred=tailored_resume_path)
+            if tailored_resume_path:
+                console.print(f"[green]Jobright:[/green] Using tailored resume: {tailored_resume_path}")
+            elif resume_path:
+                console.print(f"[yellow]Jobright:[/yellow] Tailored resume unavailable; using configured resume: {resume_path}")
             else:
-                console.print("[yellow]Jobright:[/yellow] Resume tool button not found — using existing resume")
+                console.print("[yellow]Jobright:[/yellow] No tailored or configured resume path available.")
 
             # ── Step 6: Dismiss modal, open company ATS directly ──────────────
             # Close the resume modal
@@ -1352,6 +1335,8 @@ class JobrightScraper(BaseScraper):
             company_page = await self._context.new_page()
             await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
             await self._delay(3, 5)
+            if resume_path:
+                await self._upload_resume_if_prompted(company_page, resume_path)
 
             # Dismiss "Did you apply?" on Jobright (non-blocking)
             try:
@@ -1369,6 +1354,8 @@ class JobrightScraper(BaseScraper):
             # sign-in dialog or application form.  Login comes AFTER this.
             entered_form = await self._click_ats_apply_button(company_page)
             await self._delay(3, 5)
+            if resume_path:
+                await self._upload_resume_if_prompted(company_page, resume_path)
             if getattr(self, "_workday_session_expired", False):
                 return self._set_apply_outcome(
                     "workday_session_expired",
