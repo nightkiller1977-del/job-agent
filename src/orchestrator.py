@@ -309,21 +309,32 @@ class Orchestrator:
         return filtered
 
     def _classify_apply_readiness(self, job: dict) -> tuple[str, str]:
+        import json as _json
         source = (job.get("source") or "").lower()
         company = (job.get("company") or "").lower()
         url = (job.get("url") or "").lower()
+        # Also check any previously-extracted ATS URL stored in extra_json
+        try:
+            extra = job.get("extra_json") or {}
+            if isinstance(extra, str):
+                extra = _json.loads(extra)
+            ats_url = (extra.get("ats_url") or "").lower()
+        except Exception:
+            ats_url = ""
+        all_urls = url + " " + ats_url
+
         if source == "linkedin":
             return ("needs-session", "LinkedIn Easy Apply requires a fresh authenticated LinkedIn browser session.")
         if source == "usajobs":
             return ("needs-session", "USAJobs requires a signed-in USAJobs/Login.gov browser session and a saved resume.")
-        if "myworkdayjobs.com" in url:
+        if "myworkdayjobs.com" in all_urls or "myworkday.com" in all_urls:
             return ("needs-session", "Workday jobs require a fresh authenticated browser profile before apply can complete.")
-        if "brassring.com" in url or "lockheed" in company:
+        if "brassring.com" in all_urls or "lockheed" in company:
             return ("needs-portal-login", "BrassRing often requires company portal login before submit is reachable.")
-        if "microsoft.com" in url or "microsoft" in company:
+        if "microsoft.com" in all_urls or "microsoft" in company:
             return ("needs-review", "Microsoft portal may require manual account/session review before final submit.")
-        if any(name in company for name in ["cvs", "citi"]):
-            return ("needs-session", "Likely Workday-backed company; verify session before apply.")
+        if any(name in company for name in ["cvs", "citi", "pfizer", "workday"]):
+            return ("needs-session", "Likely Workday-backed company; verify session/account state before apply.")
         return ("unknown", "No known blocker detected, but ATS still needs runtime verification.")
 
     async def preflight_approved(self, source: Optional[str] = None, company: Optional[str] = None) -> None:
