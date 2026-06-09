@@ -397,7 +397,10 @@ class IndeedScraper(BaseScraper):
         # ── Step 2: Delegate to Jobright's battle-tested ATS machinery ───────
         console.print(f"[blue]Indeed:[/blue] Handing off to ATS: {ext_url[:80]}")
         jr = JobrightScraper(self.config)
-        return await jr.apply_external_ats_job(job, ext_url, auto_submit=auto_submit)
+        result = await jr.apply_external_ats_job(job, ext_url, auto_submit=auto_submit)
+        self.last_apply_status = jr.last_apply_status
+        self.last_apply_detail = jr.last_apply_detail
+        return result
 
     async def _extract_apply_url(self, page) -> str:
         """

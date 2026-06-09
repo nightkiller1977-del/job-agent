@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -152,6 +153,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show current job application stats",
     )
 
+    # ops-check
+    ops_parser = subparsers.add_parser(
+        "ops-check",
+        help="Run the safe operational readiness flow: queue preflight plus mock apply-path tests",
+    )
+    ops_parser.add_argument("--source", choices=["linkedin", "usajobs", "jobright", "indeed"], default=None)
+    ops_parser.add_argument("--company", default=None)
+    ops_parser.add_argument(
+        "--skip-functional",
+        action="store_true",
+        help="Only run approved-queue preflight; skip mock Playwright apply-path tests",
+    )
+
     # hydrate
     subparsers.add_parser(
         "hydrate",
@@ -192,6 +206,19 @@ async def main_async(args: argparse.Namespace) -> int:
 
     elif args.command == "status":
         orchestrator.show_status()
+
+    elif args.command == "ops-check":
+        console.rule("[bold green]Operational flow check[/bold green]")
+        await orchestrator.preflight_approved(source=args.source, company=args.company)
+        if not args.skip_functional:
+            console.rule("[bold blue]Functional apply-path smoke tests[/bold blue]")
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", "tests/test_apply_functional.py", "-q"],
+                cwd=str(project_root),
+            )
+            if result.returncode != 0:
+                return result.returncode
+        console.print("[green]Operational flow check passed.[/green]")
 
     elif args.command == "hydrate":
         await orchestrator.hydrate_external_jobs()

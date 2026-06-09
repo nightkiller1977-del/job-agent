@@ -49,6 +49,7 @@ python src/main.py apply
 
 # Production-safe apply flow
 python src/main.py preflight
+python src/main.py ops-check
 python src/main.py apply --limit 1 --no-auto-submit
 python src/main.py apply --company "Microsoft" --no-auto-submit
 
@@ -102,6 +103,7 @@ Missing salary: always flag for review (never auto-skip).
 - **Never submits without user confirmation.** Every application pauses before final submit for your review.
 - Use `--auto-submit` only after a targeted non-submit run has verified the source/session/form path.
 - Use `python src/main.py preflight` before production apply runs. It pulls cloud-approved jobs into local SQLite and reports likely ATS blockers such as expired Workday sessions or portal login requirements.
+- Use `python src/main.py ops-check` for the safe operational readiness check. It runs approved-queue preflight, then the mock Playwright apply-path suite for LinkedIn Easy Apply, LinkedIn external ATS, LinkedIn interstitial redirects, and Indeed → ATS handoff. Add `--skip-functional` when you only want the queue/session summary.
 - Use `--limit`, `--job-id`, `--source`, or `--company` to run targeted application batches instead of attempting the full queue blindly.
 - All discovered jobs are stored in SQLite (`state/jobs.db`) — you'll never apply to the same job twice.
 - Browser runs in headed (visible) mode so you can see exactly what's happening.
