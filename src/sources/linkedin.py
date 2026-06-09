@@ -670,13 +670,16 @@ class LinkedInScraper(BaseScraper):
             await self._delay(2, 3)
 
             # Step through modal pages
-            max_steps = 10
+            max_steps = 15
             step = 0
+            _prev_page_text = ""
+            _stuck_count = 0
             while step < max_steps:
                 step += 1
                 await self._delay(1, 2)
+                page_text = ""
                 try:
-                    heading = await page.evaluate(
+                    page_text = await page.evaluate(
                         """
                         () => {
                             const h = document.querySelector('h1,h2,h3');
@@ -685,10 +688,36 @@ class LinkedInScraper(BaseScraper):
                         }
                         """
                     )
-                    if heading:
-                        console.print(f"[dim]LinkedIn apply step {step}: {heading[:140]}[/dim]")
+                    if page_text:
+                        console.print(f"[dim]LinkedIn apply step {step}: {page_text[:140]}[/dim]")
                 except Exception:
                     pass
+
+                # Stuck detection — if same page 3 steps in a row, grab errors and bail
+                if page_text and page_text == _prev_page_text:
+                    _stuck_count += 1
+                    if _stuck_count >= 3:
+                        try:
+                            errors = await page.evaluate(
+                                """
+                                () => Array.from(document.querySelectorAll(
+                                    '.artdeco-inline-feedback--error, [class*="error"], [aria-invalid="true"]'
+                                )).map(e => e.innerText?.trim()).filter(Boolean).slice(0, 5)
+                                """
+                            )
+                        except Exception:
+                            errors = []
+                        err_str = "; ".join(errors) if errors else "unknown validation error"
+                        console.print(f"[yellow]LinkedIn: Stuck on '{page_text}' — {err_str}[/yellow]")
+                        return self._set_apply_outcome(
+                            "linkedin_stuck_on_required_field",
+                            f"Easy Apply stuck on page '{page_text}' after 3 Next clicks. "
+                            f"Validation errors: {err_str}. "
+                            "Add a resume file at ~/resume.pdf or check state/profile.json for missing fields.",
+                        )
+                else:
+                    _stuck_count = 0
+                _prev_page_text = page_text
 
                 # Check if modal is open
                 modal = None
@@ -748,15 +777,18 @@ class LinkedInScraper(BaseScraper):
                         continue
 
                 if submit_btn:
-                    # FINAL PAUSE — show user summary before submitting
+                    # FINAL REVIEW — submit or confirm
                     console.print("\n[bold yellow]══════════════════════════════════════[/bold yellow]")
                     console.print("[bold yellow]FINAL REVIEW — About to submit application:[/bold yellow]")
                     console.print(f"  Title:   {job.get('title')}")
                     console.print(f"  Company: {job.get('company')}")
                     console.print(f"  URL:     {job.get('url')}")
                     console.print("[bold yellow]══════════════════════════════════════[/bold yellow]")
-                    if auto_submit:
-                        console.print("[green]LinkedIn: Auto-submitting application (auto-submit active)![/green]")
+                    # Non-interactive runs (scheduled / web-triggered) auto-submit:
+                    # the user already approved this job in the web dashboard.
+                    non_interactive = not (sys.stdin and sys.stdin.isatty())
+                    if auto_submit or non_interactive:
+                        console.print("[green]LinkedIn: Submitting application (web-approved / auto-submit)[/green]")
                         confirm = "y"
                     else:
                         try:
@@ -1100,7 +1132,7 @@ class LinkedInScraper(BaseScraper):
                 continue
 
     async def _fill_text_questions(self, page) -> None:
-        """Fill short text answer boxes."""
+        """Fill short text answer boxes with profile-driven answers."""
         text_inputs = await page.query_selector_all('input[type="text"], textarea')
         for inp in text_inputs:
             try:
@@ -1111,12 +1143,33 @@ class LinkedInScraper(BaseScraper):
                 label_lower = label_text.lower()
 
                 answer = None
+                # Location
                 if "city" in label_lower:
                     answer = "Miami"
-                elif "state" in label_lower:
+                elif "state" in label_lower and "zip" not in label_lower:
                     answer = "Florida"
+                elif "zip" in label_lower or "postal" in label_lower:
+                    answer = "33101"
+                # Experience
                 elif "years" in label_lower and "experience" in label_lower:
                     answer = "18"
+                elif "years" in label_lower and any(w in label_lower for w in ["manage", "leader", "director", "vp", "engineer"]):
+                    answer = "18"
+                # Compensation
+                elif any(w in label_lower for w in ["salary", "compensation", "pay", "rate", "expected"]):
+                    answer = "200000"
+                # Notice period
+                elif "notice" in label_lower or "start" in label_lower and "available" in label_lower:
+                    answer = "2 weeks"
+                # LinkedIn profile
+                elif "linkedin" in label_lower and "profile" in label_lower:
+                    answer = "https://www.linkedin.com/in/anthonyclarkins"
+                # Website / portfolio
+                elif any(w in label_lower for w in ["website", "portfolio", "github", "url"]):
+                    answer = ""  # leave blank rather than guess
+                # Phone
+                elif "phone" in label_lower:
+                    answer = self._profile_value("personal_info", "phone") or ""
 
                 if answer:
                     await inp.fill(answer)
