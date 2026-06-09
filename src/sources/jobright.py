@@ -331,6 +331,10 @@ class JobrightScraper(BaseScraper):
         current_ui_result = await self._generate_tailored_resume_current_ui(page, job, before)
         if current_ui_result:
             return current_ui_result
+        # If the current-UI path marked Orion as unavailable, bail now — don't
+        # run the 10s wait_for_selector that follows.
+        if not JobrightScraper._orion_tailoring_available:
+            return ""
 
         try:
             tool_card = await page.wait_for_selector(
