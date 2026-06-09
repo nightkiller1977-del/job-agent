@@ -935,13 +935,15 @@ class LinkedInScraper(BaseScraper):
             await page.goto(target, wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
             if await self._needs_login(page):
+                # Session missing or expired — need manual login.
                 console.print("[yellow]LinkedIn needs login or challenge completion in this browser window.[/yellow]")
+                if sys.stdin and sys.stdin.isatty():
+                    input("Press Enter after LinkedIn session is ready > ")
+                else:
+                    console.print("[yellow]Non-interactive run: rerun from Terminal to sign in once.[/yellow]")
             else:
-                console.print("[green]LinkedIn session appears authenticated.[/green]")
-            if sys.stdin and sys.stdin.isatty():
-                input("Press Enter after LinkedIn session is ready > ")
-            else:
-                console.print("[yellow]Non-interactive run: rerun from Terminal to pause while signing in.[/yellow]")
+                # Session is already good — no interaction needed.
+                console.print("[green]LinkedIn session is authenticated — no action needed.[/green]")
         finally:
             await self._close_browser()
 
