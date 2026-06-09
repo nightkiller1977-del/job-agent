@@ -323,19 +323,14 @@ class Orchestrator:
             ats_url = ""
         all_urls = url + " " + ats_url
 
-        if source == "linkedin":
-            return ("needs-session", "LinkedIn Easy Apply requires a fresh authenticated LinkedIn browser session.")
         if source == "usajobs":
             return ("needs-session", "USAJobs requires a signed-in USAJobs/Login.gov browser session and a saved resume.")
-        if "myworkdayjobs.com" in all_urls or "myworkday.com" in all_urls:
-            return ("needs-session", "Workday jobs require a fresh authenticated browser profile before apply can complete.")
-        if "brassring.com" in all_urls or "lockheed" in company:
-            return ("needs-portal-login", "BrassRing often requires company portal login before submit is reachable.")
-        if "microsoft.com" in all_urls or "microsoft" in company:
-            return ("needs-review", "Microsoft portal may require manual account/session review before final submit.")
-        if any(name in company for name in ["cvs", "citi", "pfizer", "workday"]):
-            return ("needs-session", "Likely Workday-backed company; verify session/account state before apply.")
-        return ("unknown", "No known blocker detected, but ATS still needs runtime verification.")
+        # All other sources: attempt to apply — each scraper handles auth failures
+        # inline and returns a workday_session_expired / linkedin_authwall / etc.
+        # outcome if the session is missing, so the job re-enters the queue correctly.
+        # We no longer pre-block by source or company name here, because that would
+        # prevent legitimate applies when the Playwright profile already has a session.
+        return ("ready", "")
 
     async def preflight_approved(self, source: Optional[str] = None, company: Optional[str] = None) -> None:
         """Pull cloud-approved jobs and print production-readiness blockers."""
