@@ -755,51 +755,106 @@ class JobrightScraper(BaseScraper):
             filename = self._tailored_resume_filename(job)
             save_path = TAILORED_RESUMES_DIR / filename
             try:
-                async with page.expect_download(timeout=20000) as download_info:
+                async with page.expect_download(timeout=5000) as download_info:
                     await download_btn.click()
                 download = await download_info.value
                 await download.save_as(str(save_path))
-                console.print(f"[green]Jobright Tailor:[/green] Tailored resume saved: {save_path}")
-                return str(save_path)
-            except Exception as exc:
+                if save_path.exists() and save_path.stat().st_size > 0:
+                    console.print(f"[green]Jobright Tailor:[/green] Tailored resume saved: {save_path}")
+                    return str(save_path)
+                console.print(f"[yellow]Jobright Tailor:[/yellow] Download completed but saved file is empty: {save_path}")
+                return ""
+            except Exception:
+                try:
+                    await download_btn.click()
+                    await page.wait_for_timeout(750)
+                except Exception:
+                    pass
                 dropdown_result = await self._download_from_open_dropdown(page, job)
                 if dropdown_result:
                     return dropdown_result
-                console.print(f"[yellow]Jobright Tailor:[/yellow] Visible resume download failed: {exc}")
+                try:
+                    async with page.expect_download(timeout=10000) as download_info:
+                        await download_btn.click()
+                    download = await download_info.value
+                    await download.save_as(str(save_path))
+                    if save_path.exists() and save_path.stat().st_size > 0:
+                        console.print(f"[green]Jobright Tailor:[/green] Tailored resume saved: {save_path}")
+                        return str(save_path)
+                except Exception as exc:
+                    console.print(f"[yellow]Jobright Tailor:[/yellow] Visible resume download failed: {exc}")
         latest = self._latest_tailored_resume()
         if latest and (not before or latest != before or latest.stat().st_mtime > before.stat().st_mtime):
             return str(latest)
+        return ""
+
+    async def _save_resume_download_from_click(self, page, click_target, save_path: Path) -> str:
+        try:
+            async with page.expect_download(timeout=15000) as download_info:
+                await click_target.click()
+            download = await download_info.value
+            await download.save_as(str(save_path))
+            if save_path.exists() and save_path.stat().st_size > 0:
+                console.print(f"[green]Jobright Tailor:[/green] Tailored resume saved: {save_path}")
+                return str(save_path)
+            console.print(f"[yellow]Jobright Tailor:[/yellow] Dropdown download saved an empty file: {save_path}")
+        except Exception as exc:
+            console.print(f"[yellow]Jobright Tailor:[/yellow] Dropdown resume download failed: {exc}")
         return ""
 
     async def _download_from_open_dropdown(self, page, job: dict) -> str:
         """Handle Jobright's Ant dropdown under Download Resume."""
         filename = self._tailored_resume_filename(job)
         save_path = TAILORED_RESUMES_DIR / filename
-        option = None
-        for pat in [
-            'text=/PDF/i',
-            'text=/Download PDF/i',
-            'text=/Resume PDF/i',
-            'text=/Download/i',
-        ]:
+
+        for _ in range(10):
             try:
-                option = await page.query_selector(pat)
-                if option and await option.is_visible():
+                visible_dropdowns = page.locator(".ant-dropdown:not(.ant-dropdown-hidden), [role='menu']")
+                if await visible_dropdowns.count():
                     break
             except Exception:
-                continue
-        if not option:
-            return ""
+                pass
+            await page.wait_for_timeout(250)
+
+        dropdown_items = page.locator(
+            ".ant-dropdown:not(.ant-dropdown-hidden) [role='menuitem'], "
+            ".ant-dropdown:not(.ant-dropdown-hidden) li, "
+            ".ant-dropdown:not(.ant-dropdown-hidden) button, "
+            ".ant-dropdown:not(.ant-dropdown-hidden) a, "
+            "[role='menu'] [role='menuitem'], "
+            "[role='menu'] li, "
+            "[role='menu'] button, "
+            "[role='menu'] a"
+        )
+
+        candidates = []
         try:
-            async with page.expect_download(timeout=20000) as download_info:
-                await option.click()
-            download = await download_info.value
-            await download.save_as(str(save_path))
-            console.print(f"[green]Jobright Tailor:[/green] Tailored resume saved: {save_path}")
-            return str(save_path)
-        except Exception as exc:
-            console.print(f"[yellow]Jobright Tailor:[/yellow] Dropdown resume download failed: {exc}")
-            return ""
+            count = await dropdown_items.count()
+        except Exception:
+            count = 0
+        for idx in range(count):
+            item = dropdown_items.nth(idx)
+            try:
+                if not await item.is_visible(timeout=500):
+                    continue
+                text = ""
+                try:
+                    text = (await item.inner_text(timeout=500)).strip()
+                except Exception:
+                    pass
+                candidates.append((item, text))
+            except Exception:
+                continue
+
+        preferred = [
+            item for item, text in candidates
+            if re.search(r"\b(pdf|docx?|download|resume)\b", text or "", re.IGNORECASE)
+        ]
+        for item in preferred or [item for item, _text in candidates]:
+            result = await self._save_resume_download_from_click(page, item, save_path)
+            if result:
+                return result
+        return ""
 
     def _latest_tailored_resume(self) -> Path | None:
         candidates = [
@@ -912,6 +967,19 @@ class JobrightScraper(BaseScraper):
 
             # Scroll to load jobs
             jobs = await self._extract_jobs(page)
+
+            try:
+                await page.goto("https://jobright.ai/jobs/external", wait_until="domcontentloaded", timeout=30000)
+                await self._delay(2, 3)
+                await self._dismiss_jobright_popups(page)
+                external_jobs = await self._extract_jobs(page)
+                seen = {job["job_id"] for job in jobs}
+                new_external_jobs = [job for job in external_jobs if job["job_id"] not in seen]
+                if new_external_jobs:
+                    jobs.extend(new_external_jobs)
+                    console.print(f"[magenta]Jobright:[/magenta] Added {len(new_external_jobs)} external job(s).")
+            except Exception as exc:
+                console.print(f"[yellow]Jobright:[/yellow] External jobs scrape skipped: {exc}")
 
             console.print(f"[magenta]Jobright:[/magenta] Found {len(jobs)} jobs.")
         except Exception as exc:
@@ -1099,7 +1167,7 @@ class JobrightScraper(BaseScraper):
                     if (!title) continue;
                     const linkEl = card.querySelector('a[href*="/jobs/info/"]');
                     const href = linkEl ? linkEl.getAttribute('href') : '';
-                    const url = href ? JOBRIGHT_BASE + href : '';
+                    const url = href ? new URL(href, JOBRIGHT_BASE).href : '';
                     if (!url) continue;
                     // All leaf ant-typography text nodes
                     const leaves = [...card.querySelectorAll('.ant-typography')]
@@ -1331,6 +1399,21 @@ class JobrightScraper(BaseScraper):
                     "Could not extract the company ATS URL from the Jobright posting.",
                 )
 
+            # Validate the URL has a real hostname (guard against malformed extractions
+            # like "https://www./" that come from broad anchor-tag pattern matching).
+            try:
+                from urllib.parse import urlparse as _urlparse
+                _p = _urlparse(ext_url)
+                _host = _p.hostname or ""
+                if not _host or _host in ("www.", "www") or "." not in _host:
+                    console.print(f"[red]Jobright:[/red] ATS URL has no valid hostname ({ext_url!r}) — skipping.")
+                    return self._set_apply_outcome(
+                        "bad_ats_url",
+                        f"Extracted ATS URL has no valid hostname: {ext_url!r}. Check the Jobright posting manually.",
+                    )
+            except Exception:
+                pass
+
             console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
             company_page = await self._context.new_page()
             await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
@@ -1422,11 +1505,30 @@ class JobrightScraper(BaseScraper):
                     return False
                 family = await self._detect_portal_family(company_page)
                 controls = await self._visible_controls_snapshot(company_page)
+                controls_text = self._format_controls_snapshot(controls)
+
+                # Special case: Workday job listing page with "Sign In" button visible
+                # means the Playwright profile has no saved session for this company's
+                # Workday tenant.  Classify as session-expired so it shows up in the
+                # session-blocked queue rather than as a generic form_not_detected.
+                try:
+                    portal_url = company_page.url
+                except Exception:
+                    portal_url = ""
+                if "myworkdayjobs.com" in portal_url and "BUTTON Sign In" in controls_text:
+                    console.print("[yellow]Jobright:[/yellow] Workday portal requires sign-in — marking as session-needed.")
+                    self._workday_session_expired = True
+                    return self._set_apply_outcome(
+                        "workday_session_expired",
+                        f"Workday portal at {portal_url} requires sign-in. "
+                        "Run: python src/main.py prepare-sessions to authenticate this tenant.",
+                    )
+
                 return self._set_apply_outcome(
                     f"{family}_form_not_detected" if family != "generic" else "form_not_detected",
                     (
                         f"ATS page loaded but no application/review form was detected at "
-                        f"{company_page.url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                        f"{portal_url}. Visible controls: {controls_text}"
                     ),
                 )
             submitted = await self._confirm_and_submit(company_page, job, auto_submit=auto_submit)

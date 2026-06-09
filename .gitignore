@@ -11,6 +11,7 @@ build/
 *.egg
 
 # ── State & runtime data ──────────────────────────────────────────────────────
+state/
 state/jobs.db
 state/jobs.db-shm
 state/jobs.db-wal
