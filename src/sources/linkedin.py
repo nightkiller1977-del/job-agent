@@ -1088,10 +1088,26 @@ class LinkedInScraper(BaseScraper):
             except Exception:
                 pass
         except Exception:
-            pass
+            # Some LinkedIn variants navigate the current page to an interstitial
+            # instead of opening a popup. Capture that before reusing a stale
+            # ElementHandle in the fallback click path.
+            try:
+                if page.url != original_url:
+                    external = _strip_linkedin(page.url)
+                    if external:
+                        console.print(f"[dim]LinkedIn: Same-page interstitial ATS URL: {external[:80]}[/dim]")
+                        return external
+            except Exception:
+                pass
 
         # --- Pass 4: click without popup expectation, watch for navigation or new tab ---
         try:
+            if page.url != original_url:
+                external = _strip_linkedin(page.url)
+                if external:
+                    console.print(f"[dim]LinkedIn: Navigation ATS URL: {external[:80]}[/dim]")
+                    return external
+
             await apply_btn.click()
             await self._delay(2, 4)
 
