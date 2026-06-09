@@ -354,17 +354,22 @@ class LinkedInScraper(BaseScraper):
         return None
 
     async def _search_jobs(self, page, query: str, seen_ids: set) -> list[dict]:
-        """Search LinkedIn jobs for a query and return job dicts."""
+        """Search LinkedIn jobs for a query and return job dicts.
+
+        Searches BOTH Easy Apply and non-Easy-Apply jobs so the apply flow can
+        handle "Apply on company website" positions too.  The ``has_easy_apply``
+        flag is detected from each card and drives the apply path selection.
+        """
         jobs = []
         # Build search URL with filters:
         # f_TPR=r604800 = last 7 days
         # f_E=4,5 = Director and Executive level
-        # f_LF=f_AL = Easy Apply only — sometimes
+        # Note: f_LF=f_AL (Easy Apply only) intentionally removed so we capture
+        # all Director/VP/CTO/CIO postings, including "Apply on company website".
         search_url = (
             f"{LINKEDIN_JOBS_SEARCH}?keywords={quote_plus(query)}"
             f"&f_TPR=r604800"
             f"&f_E=4%2C5"
-            f"&f_LF=f_AL"   # Easy Apply only
             f"&sortBy=DD"
         )
         await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
@@ -629,31 +634,108 @@ class LinkedInScraper(BaseScraper):
                 raise JobExpiredError("LinkedIn: Job is closed or no longer accepting applications.")
 
 
+            # If the job was already scraped as non-Easy-Apply, skip the Easy Apply
+            # button search and go straight to external ATS capture.
+            # has_easy_apply is stored in extra_json (serialised dict from state_manager).
+            import json as _json
+            _extra: dict = {}
+            _raw_extra = job.get("extra_json") or {}
+            if isinstance(_raw_extra, str):
+                try:
+                    _extra = _json.loads(_raw_extra)
+                except Exception:
+                    _extra = {}
+            elif isinstance(_raw_extra, dict):
+                _extra = _raw_extra
+            # Prefer top-level key (set during scrape), then extra_json, default None
+            _has_easy_apply = job.get("has_easy_apply")
+            if _has_easy_apply is None:
+                _has_easy_apply = _extra.get("has_easy_apply")
+            explicitly_non_easy_apply = _has_easy_apply is False
+            if explicitly_non_easy_apply:
+                console.print("[dim]LinkedIn: Job flagged as non-Easy-Apply — looking for external apply URL…[/dim]")
+                external_url = await self._extract_external_apply_url(page)
+                if not external_url:
+                    return self._set_apply_outcome(
+                        "linkedin_external_apply_not_found",
+                        "Non-Easy-Apply LinkedIn job: no external ATS URL could be captured. "
+                        "The job may require manual application or use a login-gated ATS.",
+                    )
+                console.print(f"[blue]LinkedIn Apply:[/blue] External apply URL: {external_url[:100]}")
+                return await self._apply_external_ats(job, external_url, resume_path, auto_submit=auto_submit)
+
             # Find and click Easy Apply button
+            # First pass: fast CSS/text selectors
             easy_apply_btn = None
             for sel in [
                 'button.jobs-apply-button',
-                'a[href*="/jobs/view/"][href*="/apply/"]',
-                'a:text-matches("^Continue$", "i")',
-                'button:text-matches("^Continue$", "i")',
-                'button:text-matches("Easy Apply", "i")',
-                '[data-control-name="jobdetails_topcard_inapply"]',
                 '.jobs-apply-button--top-card',
+                '[data-control-name="jobdetails_topcard_inapply"]',
+                'button:text-matches("Easy Apply", "i")',
+                'a[href*="/jobs/view/"][href*="/apply/"]',
             ]:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=5000)
+                    btn = await page.wait_for_selector(sel, timeout=4000)
                     if btn:
                         try:
                             text = (await btn.inner_text()).strip().lower()
-                            href = (await btn.get_attribute("href") or "").lower()
-                            if text == "continue" and "/apply/" not in href:
-                                continue
+                            if "easy apply" in text or "apply" in text:
+                                easy_apply_btn = btn
+                                break
                         except Exception:
-                            pass
-                        easy_apply_btn = btn
-                        break
+                            easy_apply_btn = btn
+                            break
                 except Exception:
                     continue
+
+            # Second pass: JS-based search (catches LinkedIn DOM variants)
+            if not easy_apply_btn:
+                try:
+                    found = await page.evaluate(
+                        """
+                        () => {
+                            const cands = Array.from(document.querySelectorAll('button, a[role="button"], a[href]'));
+                            return cands.some(el => {
+                                const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                                return text === 'easy apply' || aria.includes('easy apply') ||
+                                       (el.className && /jobs-apply-button/i.test(el.className) && text !== 'save');
+                            });
+                        }
+                        """
+                    )
+                    if found:
+                        easy_apply_btn = await page.evaluate_handle(
+                            """
+                            () => {
+                                const cands = Array.from(document.querySelectorAll('button, a[role="button"], a[href]'));
+                                return cands.find(el => {
+                                    const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                                    return text === 'easy apply' || aria.includes('easy apply') ||
+                                           (el.className && /jobs-apply-button/i.test(el.className) && text !== 'save');
+                                });
+                            }
+                            """
+                        )
+                except Exception:
+                    pass
+
+            # Third pass: wait a bit longer and retry (page may still be loading)
+            if not easy_apply_btn:
+                await self._delay(2, 3)
+                for sel in [
+                    'button.jobs-apply-button',
+                    'button:text-matches("Easy Apply", "i")',
+                    '[class*="jobs-apply-button"]',
+                ]:
+                    try:
+                        btn = await page.wait_for_selector(sel, timeout=5000)
+                        if btn:
+                            easy_apply_btn = btn
+                            break
+                    except Exception:
+                        continue
 
             if not easy_apply_btn:
                 # Diagnose why — helps distinguish expired jobs from auth issues
@@ -893,62 +975,188 @@ class LinkedInScraper(BaseScraper):
         return resolve_resume_path(self.config)
 
     async def _extract_external_apply_url(self, page) -> str:
-        """Find or reveal the external company apply URL on a LinkedIn job page."""
+        """Find or reveal the external company apply URL on a LinkedIn job page.
+
+        Handles three LinkedIn "Apply on company website" patterns:
+        1. Static href in the DOM pointing to external ATS
+        2. Button click → new popup/tab opens with ATS URL
+        3. Button click → LinkedIn interstitial (redirect param or "Continue" link)
+        """
+        from urllib.parse import urlparse, parse_qs, unquote
+
+        def _strip_linkedin(u: str) -> str:
+            """Return u unchanged if it's external; extract redirect param if LinkedIn interstitial."""
+            if not u or "linkedin.com" not in u:
+                return u
+            parsed = urlparse(u)
+            qs = parse_qs(parsed.query)
+            for key in ("url", "redirect_url", "dest", "destination", "externalApplyUrl"):
+                if key in qs:
+                    candidate = unquote(qs[key][0])
+                    if candidate and "linkedin.com" not in candidate:
+                        return candidate
+            return ""
+
+        # --- Pass 1: static DOM scan ---
         url = await page.evaluate("""
         () => {
+            const ATS_RE = /workday|greenhouse|lever|icims|brassring|taleo|smartrecruiters|successfactors|ashby|apply|career|job/i;
             const direct = Array.from(document.querySelectorAll('a[href]'))
                 .map(a => a.href)
-                .find(h => h && !h.includes('linkedin.com') && /apply|job|career|workday|greenhouse|lever|icims|brassring|taleo|smartrecruiters|successfactors|ashby/i.test(h));
+                .find(h => h && !h.includes('linkedin.com') && ATS_RE.test(h));
             if (direct) return direct;
-
-            const buttons = Array.from(document.querySelectorAll('button,a,[role="button"]'));
-            const apply = buttons.find(el => /\\bapply\\b/i.test(el.innerText || el.textContent || el.getAttribute('aria-label') || ''));
-            return apply?.href || '';
+            return '';
         }
         """)
         if url and "linkedin.com" not in url:
             return url
 
+        # --- Pass 2: find the non-Easy-Apply button ---
         apply_btn = None
         for sel in [
-            'button:text-matches("^Apply$", "i")',
-            'a:text-matches("^Apply$", "i")',
             'button:text-matches("Apply on company site", "i")',
             'a:text-matches("Apply on company site", "i")',
+            'button:text-matches("Apply on company website", "i")',
+            'a:text-matches("Apply on company website", "i")',
+            'button:text-matches("^Apply$", "i")',
+            'a:text-matches("^Apply$", "i")',
+            '[class*="jobs-apply-button"]',
             '.jobs-apply-button',
         ]:
             try:
                 candidate = await page.query_selector(sel)
-                if candidate:
+                if candidate and await candidate.is_visible():
                     text = (await candidate.inner_text()).strip().lower()
                     if "easy apply" not in text:
                         apply_btn = candidate
                         break
             except Exception:
                 continue
+
+        if not apply_btn:
+            # JS fallback for non-Easy-Apply button
+            try:
+                apply_btn = await page.evaluate_handle(
+                    """
+                    () => {
+                        const els = Array.from(document.querySelectorAll('button, a[role="button"], a[href]'));
+                        return els.find(el => {
+                            const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                            const combined = text + ' ' + aria;
+                            return /apply on company/i.test(combined) ||
+                                   (text === 'apply' && !/easy/i.test(combined));
+                        }) || null;
+                    }
+                    """
+                )
+                if apply_btn and not await apply_btn.evaluate("el => !!el"):
+                    apply_btn = None
+            except Exception:
+                apply_btn = None
+
         if not apply_btn:
             return ""
 
-        original_pages = set(page.context.pages)
+        console.print("[dim]LinkedIn: Non-Easy-Apply button found — clicking to capture ATS URL…[/dim]")
+
+        # --- Pass 3: try popup capture ---
+        original_url = page.url
+        original_page_urls = {p.url for p in page.context.pages}
         try:
-            async with page.expect_popup(timeout=8000) as popup_info:
+            async with page.expect_popup(timeout=7000) as popup_info:
                 await apply_btn.click()
             popup = await popup_info.value
             await popup.wait_for_load_state("domcontentloaded", timeout=20000)
-            external = popup.url
-            if external and "linkedin.com" not in external:
+            external = _strip_linkedin(popup.url)
+            if external:
+                console.print(f"[dim]LinkedIn: Popup ATS URL: {external[:80]}[/dim]")
                 return external
-        except Exception:
+            # Popup is a LinkedIn interstitial — look for a "Continue" link
             try:
-                await apply_btn.click()
-                await self._delay(2, 3)
-                for opened in page.context.pages:
-                    if opened not in original_pages and "linkedin.com" not in opened.url:
-                        return opened.url
-                if page.url and "linkedin.com" not in page.url:
-                    return page.url
+                cont = await popup.query_selector('a[href]:not([href*="linkedin.com"]), a.apply-button--redirect')
+                if cont:
+                    href = await cont.get_attribute("href")
+                    if href and "linkedin.com" not in href:
+                        console.print(f"[dim]LinkedIn: Interstitial continue URL: {href[:80]}[/dim]")
+                        return href
+                # Wait for popup to auto-redirect
+                await asyncio.sleep(3)
+                external = _strip_linkedin(popup.url)
+                if external:
+                    return external
             except Exception:
-                return ""
+                pass
+        except Exception:
+            pass
+
+        # --- Pass 4: click without popup expectation, watch for navigation or new tab ---
+        try:
+            await apply_btn.click()
+            await self._delay(2, 4)
+
+            # Check for new tabs
+            for p in page.context.pages:
+                if p.url not in original_page_urls and p.url != "about:blank":
+                    external = _strip_linkedin(p.url)
+                    if external:
+                        console.print(f"[dim]LinkedIn: New-tab ATS URL: {external[:80]}[/dim]")
+                        return external
+
+            # Current page may have navigated
+            if page.url != original_url:
+                external = _strip_linkedin(page.url)
+                if external:
+                    console.print(f"[dim]LinkedIn: Navigation ATS URL: {external[:80]}[/dim]")
+                    return external
+
+            # LinkedIn interstitial modal — look for "Continue" button or external link
+            interstitial_selectors = [
+                'a.apply-button--redirect',
+                '.jobs-apply-button--redirect a[href]',
+                '.artdeco-modal a[href]:not([href*="linkedin.com"])',
+                'a[data-tracking-control-name*="redirect"]',
+                'a:text-matches("Continue to", "i")',
+                'button:text-matches("Continue to", "i")',
+            ]
+            for sel in interstitial_selectors:
+                try:
+                    elem = await page.query_selector(sel)
+                    if elem:
+                        href = await elem.get_attribute("href")
+                        if href and "linkedin.com" not in href:
+                            console.print(f"[dim]LinkedIn: Interstitial link: {href[:80]}[/dim]")
+                            return href
+                        # It's a button — click it and watch
+                        try:
+                            async with page.expect_popup(timeout=5000) as p2_info:
+                                await elem.click()
+                            p2 = await p2_info.value
+                            await p2.wait_for_load_state("domcontentloaded", timeout=15000)
+                            external = _strip_linkedin(p2.url)
+                            if external:
+                                return external
+                        except Exception:
+                            await elem.click()
+                            await self._delay(2, 3)
+                            if page.url != original_url:
+                                external = _strip_linkedin(page.url)
+                                if external:
+                                    return external
+                except Exception:
+                    continue
+
+            # One final check — any new tab that opened late
+            await self._delay(1, 2)
+            for p in page.context.pages:
+                if p.url not in original_page_urls and p.url != "about:blank":
+                    external = _strip_linkedin(p.url)
+                    if external:
+                        return external
+
+        except Exception as exc:
+            console.print(f"[dim]LinkedIn: External apply click error: {exc}[/dim]")
+
         return ""
 
     async def _apply_external_ats(self, job: dict, external_url: str, resume_path: str, auto_submit: bool = False) -> bool:
