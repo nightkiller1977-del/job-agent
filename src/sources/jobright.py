@@ -31,6 +31,10 @@ TAILORED_RESUMES_DIR.mkdir(parents=True, exist_ok=True)
 class JobrightScraper(BaseScraper):
     name = "jobright"
 
+    # Class-level flag: once Orion tailoring fails in a session, skip it for
+    # all subsequent jobs instead of waiting 2-4 minutes per job on timeouts.
+    _orion_tailoring_available: bool = True
+
     def _set_apply_outcome(self, status: str, detail: str) -> bool:
         self.last_apply_status = status
         self.last_apply_detail = detail
@@ -318,6 +322,10 @@ class JobrightScraper(BaseScraper):
 
     async def _generate_tailored_resume(self, page, job: dict) -> str:
         """Run Jobright's Orion resume tool on the current Jobright job page."""
+        # Skip immediately if Orion failed earlier in this session — avoids
+        # burning 2-4 minutes per job on timeouts that will never succeed.
+        if not JobrightScraper._orion_tailoring_available:
+            return ""
         console.print("[magenta]Jobright Tailor:[/magenta] Opening Orion AI resume modal…")
         before = self._latest_tailored_resume()
         current_ui_result = await self._generate_tailored_resume_current_ui(page, job, before)
@@ -351,6 +359,7 @@ class JobrightScraper(BaseScraper):
                 continue
         if not improve_btn:
             console.print("[yellow]Jobright Tailor:[/yellow] Improve Resume button not found.")
+            JobrightScraper._orion_tailoring_available = False
             return ""
 
         await improve_btn.click()
@@ -385,7 +394,7 @@ class JobrightScraper(BaseScraper):
 
         await gen_btn.click()
         console.print("[magenta]Jobright Tailor:[/magenta] Generating tailored resume…")
-        for _ in range(45):
+        for _ in range(15):
             await asyncio.sleep(2)
             buttons = await page.evaluate(
                 "Array.from(document.querySelectorAll('button')).map(b=>b.textContent.trim())"
@@ -464,13 +473,14 @@ class JobrightScraper(BaseScraper):
                 if result:
                     return result
 
-            for _ in range(12):
+            for _ in range(3):
                 result = await self._download_visible_resume(page, job, before)
                 if result:
                     return result
                 await asyncio.sleep(3)
 
             console.print("[yellow]Jobright Tailor:[/yellow] Orion opened, but no downloadable tailored resume was exposed.")
+            JobrightScraper._orion_tailoring_available = False
             return ""
         except Exception as exc:
             console.print(f"[yellow]Jobright Tailor:[/yellow] Current Orion UI path failed: {exc}")
@@ -714,7 +724,7 @@ class JobrightScraper(BaseScraper):
         console.print("[magenta]Jobright Tailor:[/magenta] Generating tailored resume (10–20 s)…")
 
         # ── Step 3: wait for Review step (Download Resume or APPLY NOW) ───────
-        for _ in range(60):
+        for _ in range(15):
             await asyncio.sleep(2)
             btns = await page.evaluate(
                 "Array.from(document.querySelectorAll('button, a'))"
@@ -725,6 +735,7 @@ class JobrightScraper(BaseScraper):
                 break
         else:
             console.print("[yellow]Jobright Tailor:[/yellow] Timed out waiting for Orion review step.")
+            JobrightScraper._orion_tailoring_available = False
             return ""
 
         await self._delay(1.0, 2.0)
