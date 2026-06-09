@@ -656,7 +656,26 @@ class LinkedInScraper(BaseScraper):
                     continue
 
             if not easy_apply_btn:
-                console.print("[yellow]LinkedIn: Easy Apply button not found. May not be an Easy Apply job.[/yellow]")
+                # Diagnose why — helps distinguish expired jobs from auth issues
+                try:
+                    page_text = (await page.evaluate("document.body?.innerText || ''")).lower()
+                    all_btns = await page.evaluate(
+                        "Array.from(document.querySelectorAll('button, a')).map(e => e.innerText?.trim()).filter(Boolean).slice(0, 20)"
+                    )
+                    console.print(f"[dim]LinkedIn: visible buttons: {all_btns[:10]}[/dim]")
+                    if "no longer accepting" in page_text or "job is closed" in page_text:
+                        raise JobExpiredError("LinkedIn: job is closed/no longer accepting applications.")
+                    if "sign in" in page_text and "apply" in page_text:
+                        console.print("[yellow]LinkedIn: 'Sign in to apply' detected — session may need refresh.[/yellow]")
+                        return self._set_apply_outcome(
+                            "linkedin_login_required",
+                            "LinkedIn job page shows 'Sign in to apply' — run prepare-sessions --source linkedin to refresh session.",
+                        )
+                except JobExpiredError:
+                    raise
+                except Exception:
+                    pass
+                console.print("[yellow]LinkedIn: No apply button found. May not be Easy Apply or page not fully loaded.[/yellow]")
                 external_url = await self._extract_external_apply_url(page)
                 if not external_url:
                     return self._set_apply_outcome(
