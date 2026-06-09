@@ -32,6 +32,7 @@ python src/main.py hydrate
 python src/main.py preflight
 python src/main.py preflight --source linkedin
 python src/main.py preflight --source jobright
+python src/main.py ops-check
 
 # Prepare authenticated browser sessions
 python src/main.py prepare-sessions --source linkedin
@@ -167,6 +168,7 @@ PYTHONPYCACHEPREFIX=/private/tmp/job-agent-pycache \
 
 git diff --check
 python src/main.py preflight
+.venv/bin/python src/main.py ops-check
 python src/main.py apply --source jobright --company Pfizer --no-auto-submit
 python src/main.py apply --source linkedin --limit 1 --no-auto-submit
 ```
