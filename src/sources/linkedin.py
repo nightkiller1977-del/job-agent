@@ -849,6 +849,20 @@ class LinkedInScraper(BaseScraper):
         return submitted
 
     async def _tailor_resume_with_jobright(self, job: dict) -> str:
+        # Skip entirely if Orion already failed in this session — no point
+        # opening a second browser and searching Jobright when we know there
+        # is no downloadable resume at the end.
+        try:
+            from .jobright import JobrightScraper
+            if not JobrightScraper._orion_tailoring_available:
+                return ""
+        except Exception:
+            pass
+        # Also skip if no resume file is configured — Jobright tailoring
+        # produces a PDF that then gets uploaded; without an existing resume
+        # on the Jobright account the Orion wizard always fails anyway.
+        if not self._configured_resume_path():
+            return ""
         try:
             from .jobright import JobrightScraper
             return await JobrightScraper(self.config).tailor_resume_for_external_job(job)
