@@ -339,9 +339,12 @@ class Orchestrator:
         except Exception:
             pass
 
+        # Only block on STATUS CODES THAT SCRAPERS ACTUALLY PRODUCE.
+        # "needs-session" and "needs-portal-login" were emitted by old preflight
+        # classification code (now removed) and never by scrapers themselves.
+        # Blocking on them permanently locked every Workday/BrassRing job after the
+        # first preflight run.  They are intentionally excluded here.
         session_statuses = {
-            "needs-session",
-            "needs-portal-login",
             "workday_session_expired",
             "brassring_login_required",
             "microsoft_login_required",
@@ -350,8 +353,15 @@ class Orchestrator:
         }
         if last_status in session_statuses:
             return ("needs-session", last_detail or "Portal session or credentials must be refreshed before applying.")
-        if last_status in {"needs-review", "workday_form_not_detected"}:
-            return ("needs-review", last_detail or "This application needs manual review before it can be auto-submitted.")
+        # "needs-review" was also set by old preflight code; "workday_form_not_detected"
+        # means the portal page loaded but looked like a job listing — worth retrying.
+        # Only block on "form_not_reached" outcomes that indicate a hard wall.
+        hard_blocks = {
+            "workday_account_required",
+            "brassring_registration_required",
+        }
+        if last_status in hard_blocks:
+            return ("needs-review", last_detail or "This application requires manual account setup before auto-submit.")
         if last_status in {"linkedin_stuck_on_required_field", "required_field_unanswered"}:
             return ("needs-answer", last_detail or "The apply form has a required field the agent cannot answer yet.")
         if last_status == "error" and (
