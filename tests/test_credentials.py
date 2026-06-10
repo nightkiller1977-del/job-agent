@@ -8,6 +8,8 @@ Covers:
   - load_credentials_from_dashboard() in the orchestrator
 """
 import os
+import json
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -256,6 +258,68 @@ class TestAgentCredentialsSync(unittest.IsolatedAsyncioTestCase):
             await orchestrator.load_credentials_from_dashboard()
         except Exception as exc:
             self.fail(f"load_credentials_from_dashboard raised unexpectedly: {exc}")
+
+    @patch("httpx.AsyncClient")
+    async def test_push_apply_attempt_syncs_extra_json_to_dashboard(self, mock_client_class):
+        from src.orchestrator import Orchestrator
+        from src.state_manager import StateManager
+
+        old_url    = os.environ.get("DASHBOARD_URL")
+        old_secret = os.environ.get("SYNC_SECRET")
+
+        os.environ["DASHBOARD_URL"] = "https://dashboard-test.com"
+        os.environ["SYNC_SECRET"]   = "testsecret"
+
+        try:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__  = AsyncMock(return_value=None)
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_client.post = AsyncMock(return_value=mock_response)
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                orchestrator = Orchestrator()
+                orchestrator.state = StateManager(os.path.join(tmpdir, "jobs.db"))
+                orchestrator.state.upsert_job({
+                    "job_id": "job-123",
+                    "source": "linkedin",
+                    "title": "Director Engineering",
+                    "company": "ExampleCo",
+                    "url": "https://www.linkedin.com/jobs/view/123/",
+                    "status": "approved",
+                    "score": 95,
+                })
+                orchestrator.state.record_apply_attempt(
+                    "job-123",
+                    "linkedin_stuck_on_required_field",
+                    "Required question needs an answer.",
+                )
+
+                await orchestrator._push_apply_attempt_to_cloud("job-123")
+
+            mock_client.post.assert_awaited_once()
+            url = mock_client.post.await_args.kwargs["url"] if "url" in mock_client.post.await_args.kwargs else mock_client.post.await_args.args[0]
+            payload = mock_client.post.await_args.kwargs["json"]
+            headers = mock_client.post.await_args.kwargs["headers"]
+
+            self.assertEqual(url, "https://dashboard-test.com/api/sync")
+            self.assertEqual(headers, {"X-Sync-Secret": "testsecret"})
+            self.assertEqual(len(payload), 1)
+            self.assertEqual(payload[0]["job_id"], "job-123")
+            self.assertEqual(payload[0]["status"], "approved")
+            extra = json.loads(payload[0]["extra_json"])
+            self.assertEqual(extra["apply_last_status"], "linkedin_stuck_on_required_field")
+            self.assertEqual(extra["apply_last_detail"], "Required question needs an answer.")
+            self.assertEqual(extra["apply_attempt_count"], 1)
+        finally:
+            for k, v in [("DASHBOARD_URL", old_url), ("SYNC_SECRET", old_secret)]:
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
 
 
 if __name__ == "__main__":
