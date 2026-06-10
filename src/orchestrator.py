@@ -325,11 +325,43 @@ class Orchestrator:
 
         if source == "usajobs":
             return ("needs-session", "USAJobs requires a signed-in USAJobs/Login.gov browser session and a saved resume.")
-        # All other sources: attempt to apply — each scraper handles auth failures
-        # inline and returns a workday_session_expired / linkedin_authwall / etc.
-        # outcome if the session is missing, so the job re-enters the queue correctly.
-        # We no longer pre-block by source or company name here, because that would
-        # prevent legitimate applies when the Playwright profile already has a session.
+        if "https://www./" in all_urls or url in {"", "https://", "http://"}:
+            return ("needs-hydration", "Job URL is missing or invalid; hydrate/refresh the job before applying.")
+
+        last_status = ""
+        last_detail = ""
+        try:
+            extra = job.get("extra_json") or {}
+            if isinstance(extra, str):
+                extra = _json.loads(extra)
+            last_status = str(extra.get("apply_last_status") or "")
+            last_detail = str(extra.get("apply_last_detail") or "")
+        except Exception:
+            pass
+
+        session_statuses = {
+            "needs-session",
+            "needs-portal-login",
+            "workday_session_expired",
+            "brassring_login_required",
+            "microsoft_login_required",
+            "linkedin_authwall",
+            "linkedin_login_required",
+        }
+        if last_status in session_statuses:
+            return ("needs-session", last_detail or "Portal session or credentials must be refreshed before applying.")
+        if last_status in {"needs-review", "workday_form_not_detected"}:
+            return ("needs-review", last_detail or "This application needs manual review before it can be auto-submitted.")
+        if last_status in {"linkedin_stuck_on_required_field", "required_field_unanswered"}:
+            return ("needs-answer", last_detail or "The apply form has a required field the agent cannot answer yet.")
+        if last_status == "error" and (
+            "err_name_not_resolved" in last_detail.lower()
+            or "https://www./" in last_detail.lower()
+        ):
+            return ("needs-hydration", last_detail or "The application URL could not be resolved.")
+
+        # All other sources: attempt to apply. Each scraper handles auth failures
+        # inline and records a specific block reason for the dashboard.
         return ("ready", "")
 
     async def preflight_approved(self, source: Optional[str] = None, company: Optional[str] = None) -> None:
@@ -351,7 +383,7 @@ class Orchestrator:
             readiness, detail = self._classify_apply_readiness(job)
             blockers[readiness] = blockers.get(readiness, 0) + 1
             console.print(
-                f"  • [{readiness}] {job.get('title')} @ {job.get('company')} "
+                f"  • {readiness}: {job.get('title')} @ {job.get('company')} "
                 f"({job.get('source')}, score={job.get('score')})"
             )
             console.print(f"    [dim]{detail}[/dim]")
@@ -449,7 +481,13 @@ class Orchestrator:
 
         # ── Pre-flight classification ──────────────────────────────────────────
         # Classify each job so session-blocked jobs don't waste a browser launch.
-        BLOCKED_READINESS = {"needs-session", "needs-portal-login", "needs-review"}
+        BLOCKED_READINESS = {
+            "needs-session",
+            "needs-portal-login",
+            "needs-review",
+            "needs-hydration",
+            "needs-answer",
+        }
         ready: list[dict]   = []
         blocked: list[tuple] = []  # (job, readiness, reason)
         for j in all_approved:
@@ -467,11 +505,12 @@ class Orchestrator:
             console.print("\n[yellow]Session-blocked (skipping in this run):[/yellow]")
             for bj, readiness, reason in blocked:
                 console.print(
-                    f"  • [{readiness}] {bj.get('title','?')[:50]} @ {bj.get('company','?')}"
+                    f"  • {readiness}: {bj.get('title','?')[:50]} @ {bj.get('company','?')}"
                 )
                 console.print(f"    [dim]{reason}[/dim]")
                 # Persist so dashboard and future runs can surface the reason
                 self.state.record_apply_attempt(bj["job_id"], readiness, reason)
+                await self._push_apply_attempt_to_cloud(bj["job_id"])
             if not is_interactive:
                 console.print(
                     "\n[cyan]To fix:[/cyan] Run  python src/main.py prepare-sessions\n"
@@ -503,6 +542,7 @@ class Orchestrator:
                 skipped_count += 1
                 outcomes.append({"job": job, "status": "skipped", "reason": f"unknown source {src}"})
                 self.state.record_apply_attempt(job["job_id"], "unknown_source", f"source '{src}' not in SOURCE_MAP")
+                await self._push_apply_attempt_to_cloud(job["job_id"])
                 continue
 
             scraper = SOURCE_MAP[src](self.config)
@@ -515,6 +555,7 @@ class Orchestrator:
                     outcomes.append({"job": job, "status": "applied", "reason": "submitted"})
                     console.print("[green]Applied! Status updated.[/green]")
                     await self._push_status_to_cloud(job["job_id"], "applied")
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
                 else:
                     reason = getattr(scraper, "last_apply_detail", "") or "not submitted"
                     code   = getattr(scraper, "last_apply_status",  "") or "blocked"
@@ -523,6 +564,7 @@ class Orchestrator:
                         console.print(f"[dim]{reason}[/dim]")
                     # Persist the specific block reason
                     self.state.record_apply_attempt(job["job_id"], code, reason)
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
                     skipped_count += 1
                     outcomes.append({"job": job, "status": code, "reason": reason})
             except JobExpiredError as exc:
@@ -531,9 +573,11 @@ class Orchestrator:
                 console.print("[red]Job no longer active (expired). Status updated to expired.[/red]")
                 outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
                 await self._push_status_to_cloud(job["job_id"], "expired")
+                await self._push_apply_attempt_to_cloud(job["job_id"])
             except Exception as exc:
                 console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")
                 self.state.record_apply_attempt(job["job_id"], "error", str(exc)[:400])
+                await self._push_apply_attempt_to_cloud(job["job_id"])
                 failed_count += 1
                 outcomes.append({"job": job, "status": "error", "reason": str(exc)})
 
@@ -608,6 +652,18 @@ class Orchestrator:
                     console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
         except Exception as e:
             console.print(f"[dim]Cloud status push failed (non-fatal): {e}[/dim]")
+
+    async def _push_apply_attempt_to_cloud(self, job_id: str) -> None:
+        """Sync the latest local apply attempt fields to the dashboard.
+
+        /api/action only changes the job status. The dashboard's approved queue
+        displays apply_last_* fields from extra_json, so blocked and failed
+        attempts need a normal sync after record_apply_attempt().
+        """
+        job = self.state.get_job(job_id)
+        if not job:
+            return
+        await self._sync_to_cloud([job])
 
     # ------------------------------------------------------------------
     # status command
