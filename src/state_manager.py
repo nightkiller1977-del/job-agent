@@ -184,6 +184,26 @@ class StateManager:
                 (json.dumps(extra), job_id),
             )
 
+    def record_application_analytics(self, job_id: str, analytics: dict) -> None:
+        """Merge analytics dict (atsScore, resumeVersion, applicationMethod, etc.) into extra_json.
+        Safe to call after record_apply_attempt — merges, does not overwrite.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            extra: dict = {}
+            if row and row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    pass
+            extra.update(analytics)
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
     # ------------------------------------------------------------------
     # Read helpers
     # ------------------------------------------------------------------

@@ -561,6 +561,10 @@ class Orchestrator:
                 if result:
                     self.state.set_status(job["job_id"], "applied")
                     self.state.record_apply_attempt(job["job_id"], "applied", "Application submitted successfully.")
+                    # Persist any analytics the scraper collected (atsScore, resumeVersion, etc.)
+                    _analytics = getattr(scraper, "_apply_analytics", None)
+                    if _analytics:
+                        self.state.record_application_analytics(job["job_id"], _analytics)
                     applied_count += 1
                     outcomes.append({"job": job, "status": "applied", "reason": "submitted"})
                     console.print("[green]Applied! Status updated.[/green]")
