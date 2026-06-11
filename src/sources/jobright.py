@@ -1403,16 +1403,15 @@ class JobrightScraper(BaseScraper):
             else:
                 console.print("[yellow]Jobright:[/yellow] No tailored or configured resume path available.")
 
-            # ── Step 6: Dismiss modal, open company ATS directly ──────────────
-            # Close the resume modal
+            # ── Step 6: Open ATS via Jobright Apply button (triggers extension autofill)
+            # Close the Orion resume modal first
             await page.evaluate(
                 "document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,bubbles:true}))"
             )
             await self._delay(1, 2)
 
-            # Navigate to the ATS URL in a new page within our context
+            # Last resort URL extraction if not yet captured
             if not ext_url:
-                # Last resort: try to read it from the page after modal close
                 ext_url = await self._extract_external_url(page)
 
             if not ext_url:
@@ -1422,8 +1421,7 @@ class JobrightScraper(BaseScraper):
                     "Could not extract the company ATS URL from the Jobright posting.",
                 )
 
-            # Validate the URL has a real hostname (guard against malformed extractions
-            # like "https://www./" that come from broad anchor-tag pattern matching).
+            # Validate the URL has a real hostname
             try:
                 from urllib.parse import urlparse as _urlparse
                 _p = _urlparse(ext_url)
@@ -1437,10 +1435,40 @@ class JobrightScraper(BaseScraper):
             except Exception:
                 pass
 
-            console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
-            company_page = await self._context.new_page()
-            await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
-            await self._delay(3, 5)
+            # ── Preferred: click Apply on the Jobright card to trigger extension ──
+            # The Jobright autofill extension fires its full form-fill routine when
+            # the ATS page is opened via the Jobright "Apply Now" button, rather than
+            # navigated directly.  Capture the new tab that opens.
+            company_page = None
+            console.print("[magenta]Jobright:[/magenta] Clicking Apply on Jobright card to trigger extension autofill…")
+            try:
+                async with self._context.expect_page(timeout=12000) as _new_page:
+                    # Try clicking "Apply Now" / "Apply" on the Jobright job card
+                    clicked = await self._click_visible_control_by_text(page, [
+                        r'^apply now$', r'^apply$', r'^quick apply$', r'^easy apply$', r'^start application$',
+                    ])
+                    if not clicked:
+                        await page.evaluate("""
+                            () => {
+                                const el = [...document.querySelectorAll('button,a')]
+                                    .find(b => /^apply( now)?$/i.test((b.textContent||'').trim()));
+                                if (el) el.click();
+                            }
+                        """)
+                company_page = await _new_page.value
+                await company_page.wait_for_load_state("domcontentloaded", timeout=30000)
+                await self._delay(8, 12)  # give extension time to inject and autofill
+                console.print(f"[green]Jobright:[/green] Extension opened ATS: {company_page.url[:80]}")
+            except Exception as _e:
+                console.print(f"[yellow]Jobright:[/yellow] Apply button didn't open new tab ({_e}); using direct navigation")
+
+            # ── Fallback: open ATS URL directly ──────────────────────────────────
+            if company_page is None:
+                console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
+                company_page = await self._context.new_page()
+                await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
+                await self._delay(3, 5)
+
             if resume_path:
                 await self._upload_resume_if_prompted(company_page, resume_path)
 
@@ -2497,6 +2525,42 @@ class JobrightScraper(BaseScraper):
             pass
         await self._delay(5, 7)  # extra buffer for JS rendering
 
+        # ── B0: Re-check sign-in AFTER the chooser click ─────────────────────
+        # Workday sometimes shows the chooser (Autofill / Apply Manually / Sign In)
+        # on the landing page even when the session is expired.  After clicking
+        # "Autofill with Resume" the page may still be at a sign-in gate rather
+        # than the application form.  Detect this by looking for a prominent
+        # "Sign In" button with no form fields present.
+        try:
+            session_gate = await page.evaluate(
+                """
+                () => {
+                    const url = location.href.toLowerCase();
+                    // Still on the login/SSO domain
+                    if (['/login','/signin','/sign-in','/auth','login.','sso.'].some(w => url.includes(w)))
+                        return true;
+                    // Primary CTA is Sign In and there are no form inputs
+                    const btns = [...document.querySelectorAll('button')];
+                    const signInBtn = btns.find(b => /^sign in$/i.test(b.textContent.trim()));
+                    const formInputs = document.querySelectorAll('input:not([type="hidden"]), textarea, select').length;
+                    return !!signInBtn && formInputs === 0;
+                }
+                """
+            )
+        except Exception:
+            session_gate = False
+
+        if session_gate:
+            console.print(
+                f"[bold red]Jobright: Workday session gate detected after chooser click[/bold red] — {page.url}"
+            )
+            self._workday_session_expired = True
+            notify_error(
+                "Workday session expired",
+                f"Run 'python src/main.py prepare-sessions' to refresh the Workday session.\nPortal: {page.url}",
+            )
+            return
+
         # The extension fills fields on each step; we click 'Next' until we
         # reach the Review/Submit page (where the button text becomes 'Submit').
         console.print("[magenta]Jobright:[/magenta] Navigating Workday wizard steps…")
@@ -2603,6 +2667,9 @@ class JobrightScraper(BaseScraper):
         """
         Find and click the Jobright extension's autofill button injected into the ATS page.
         The extension (built with Plasmo) injects a content UI into the page DOM.
+
+        If no explicit trigger button is found, wait up to 20 seconds for the extension
+        to auto-inject and fill fields silently (it often does this without needing a click).
         """
         selectors = [
             # Plasmo extension shadow host element
@@ -2653,6 +2720,26 @@ class JobrightScraper(BaseScraper):
             """)
             if found:
                 console.print("[green]Jobright:[/green] Extension autofill triggered via shadow DOM")
+                return True
+        except Exception:
+            pass
+
+        # ── No explicit trigger found — wait for extension to auto-inject ────────
+        # The Jobright extension often fills forms silently without a button click.
+        # When opened via the Jobright Apply button, it fires automatically.
+        # Wait up to 20 seconds for form fields to get populated.
+        console.print("[dim]Jobright: no autofill button found — waiting 20s for extension auto-fill…[/dim]")
+        try:
+            await asyncio.sleep(20)
+            # Check if any input fields got filled
+            filled = await page.evaluate("""
+                () => {
+                    const inputs = [...document.querySelectorAll('input:not([type="hidden"]):not([type="file"]), textarea')];
+                    return inputs.some(i => (i.value || '').trim().length > 0);
+                }
+            """)
+            if filled:
+                console.print("[green]Jobright:[/green] Extension auto-filled form fields")
                 return True
         except Exception:
             pass
