@@ -83,9 +83,13 @@ class JobrightScraper(BaseScraper):
                 jobs = await self._js_extract(page)
                 match = self._best_jobright_match(job, jobs)
             if not match:
+                self._jobright_available = False
+                self._jobright_url = ""
                 console.print("[yellow]Jobright Tailor:[/yellow] No credible Jobright match found; using existing resume.")
                 return ""
 
+            self._jobright_available = True
+            self._jobright_url = match.get("url", "")
             console.print(
                 f"[magenta]Jobright Tailor:[/magenta] Matched '{match.get('title')}' @ {match.get('company')}"
             )
@@ -246,6 +250,45 @@ class JobrightScraper(BaseScraper):
                 console.print("[magenta]Jobright ATS:[/magenta] Login required — attempting configured portal login.")
                 await self._company_portal_login(page)
                 await self._delay(4, 6)
+
+            # ── Claude ATS scoring + resume tailoring fallback ────────────────
+            # Run regardless of whether Orion produced a resume. Gives us a score
+            # and a tailored PDF when Orion failed (the ~60% failure rate case).
+            self._last_ats_score = 0
+            self._last_ats_missing_keywords: list = []
+            self._last_application_method = "Direct ATS"
+            try:
+                _jd_text = await self._extract_job_description(page)
+                if _jd_text:
+                    console.print("[cyan]Claude:[/cyan] Calculating ATS score…")
+                    _tailored = await self._claude_ats_and_tailor(job, _jd_text)
+                    if _tailored:
+                        self._last_ats_score = _tailored.get("ats_score", 0)
+                        self._last_ats_missing_keywords = _tailored.get("missing_keywords", [])
+                        _score_color = (
+                            "green" if self._last_ats_score >= 85
+                            else "yellow" if self._last_ats_score >= 60
+                            else "red"
+                        )
+                        console.print(f"[{_score_color}]Claude ATS Score: {self._last_ats_score}/100[/{_score_color}]")
+                        if self._last_ats_missing_keywords:
+                            console.print(f"[dim]Missing keywords: {', '.join(self._last_ats_missing_keywords[:8])}[/dim]")
+                        # If Orion didn't produce a tailored resume, generate one via Claude
+                        _base_resume = resolve_resume_path(self.config)
+                        if not resolved_resume or resolved_resume == _base_resume:
+                            _claude_pdf = await self._generate_tailored_resume_pdf(job, _tailored)
+                            if _claude_pdf:
+                                resolved_resume = _claude_pdf
+                                self._last_tailored_resume_path = _claude_pdf
+                                self._last_application_method = "Claude Tailored"
+                        # ATS gate: warn when score is low under auto-submit
+                        if self._last_ats_score > 0 and self._last_ats_score < 85 and auto_submit:
+                            console.print(
+                                f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
+                                "application may be filtered by ATS. Proceeding with caution.[/yellow]"
+                            )
+            except Exception as _ce:
+                console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
 
             if resolved_resume:
                 await self._upload_resume_if_prompted(page, resolved_resume)
@@ -1538,6 +1581,43 @@ class JobrightScraper(BaseScraper):
                             f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
                         ),
                     )
+                # ── Claude ATS scoring + resume tailoring fallback (Jobright path) ──
+                self._last_ats_score = 0
+                self._last_ats_missing_keywords = []
+                self._last_application_method = "Jobright Assisted"
+                try:
+                    _jd_text = await self._extract_job_description(company_page)
+                    if _jd_text:
+                        console.print("[cyan]Claude:[/cyan] Calculating ATS score…")
+                        _tailored = await self._claude_ats_and_tailor(job, _jd_text)
+                        if _tailored:
+                            self._last_ats_score = _tailored.get("ats_score", 0)
+                            self._last_ats_missing_keywords = _tailored.get("missing_keywords", [])
+                            _score_color = (
+                                "green" if self._last_ats_score >= 85
+                                else "yellow" if self._last_ats_score >= 60
+                                else "red"
+                            )
+                            console.print(f"[{_score_color}]Claude ATS Score: {self._last_ats_score}/100[/{_score_color}]")
+                            if self._last_ats_missing_keywords:
+                                console.print(f"[dim]Missing keywords: {', '.join(self._last_ats_missing_keywords[:8])}[/dim]")
+                            # If Orion didn't produce a tailored resume, generate one via Claude
+                            if not resume_path or resume_path == resolve_resume_path(self.config):
+                                _claude_pdf = await self._generate_tailored_resume_pdf(job, _tailored)
+                                if _claude_pdf:
+                                    resume_path = _claude_pdf
+                                    self._last_tailored_resume_path = _claude_pdf
+                                    self._last_application_method = "Claude Tailored"
+                                    if resume_path:
+                                        await self._upload_resume_if_prompted(company_page, resume_path)
+                            if self._last_ats_score > 0 and self._last_ats_score < 85 and auto_submit:
+                                console.print(
+                                    f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
+                                    "application may be filtered by ATS. Proceeding with caution.[/yellow]"
+                                )
+                except Exception as _ce:
+                    console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
+
                 console.print("[magenta]Jobright:[/magenta] Triggering Jobright autofill extension…")
                 autofill_triggered = await self._trigger_autofill(company_page)
                 if autofill_triggered:
@@ -2340,6 +2420,28 @@ class JobrightScraper(BaseScraper):
             except Exception:
                 continue
 
+        # SmartRecruiters: JS click handles both straight and curly apostrophe variants
+        # (selector text-matches won't find "I'm interested" if the HTML uses a curly apostrophe)
+        try:
+            _sr_url = page.url.lower()
+            if 'smartrecruiters.com' in _sr_url:
+                _sr_clicked = await page.evaluate("""
+                    () => {
+                        const els = [...document.querySelectorAll('a, button')];
+                        const btn = els.find(el => /i[‘’']m interested/i.test(
+                            (el.textContent || '').trim()
+                        ));
+                        if (btn) { btn.click(); return true; }
+                        return false;
+                    }
+                """)
+                if _sr_clicked:
+                    console.print("[magenta]Jobright:[/magenta] SmartRecruiters — clicked 'I'm interested' (JS) → waiting for form…")
+                    await self._delay(5, 8)
+                    return True
+        except Exception:
+            pass
+
         clicked = await self._click_visible_control_by_text(page, [
             '^apply now$',
             '^apply$',
@@ -2778,6 +2880,285 @@ class JobrightScraper(BaseScraper):
 
         return False
 
+    # ── Claude-powered helpers ─────────────────────────────────────────────────
+
+    async def _extract_job_description(self, page) -> str:
+        """Scrape the full job description text from the current ATS page."""
+        jd_selectors = [
+            '[data-automation-id="jobPostingDescription"]',  # Workday
+            '.sr-job-description',                           # SmartRecruiters
+            '[class*="jobDescription"]',
+            '[class*="job-description"]',
+            '#job-description',
+            '#jobDescriptionText',
+            '.jobsearch-jobDescriptionText',
+            '.description__text',
+            '.show-more-less-html__markup',
+            'section.job-details',
+        ]
+        for sel in jd_selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if len(text) > 200:
+                        return text[:6000]
+            except Exception:
+                pass
+        try:
+            return ((await page.evaluate("document.body.innerText")) or "")[:6000]
+        except Exception:
+            return ""
+
+    def _extract_resume_text(self) -> str:
+        """Extract plain text from the configured resume PDF, or fall back to profile.json."""
+        resume_path = resolve_resume_path(self.config)
+        if resume_path and resume_path.lower().endswith('.pdf') and os.path.isfile(resume_path):
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(resume_path)
+                text = "\n".join(p.extract_text() or "" for p in reader.pages).strip()
+                if len(text) > 100:
+                    return text[:6000]
+            except Exception:
+                pass
+        profile_path = os.path.join("state", "profile.json")
+        if os.path.isfile(profile_path):
+            try:
+                import json as _json
+                with open(profile_path) as f:
+                    return _json.dumps(_json.load(f), indent=2)[:4000]
+            except Exception:
+                pass
+        return ""
+
+    async def _claude_ats_and_tailor(self, job: dict, jd_text: str) -> dict:
+        """Use Claude API (haiku) to score ATS match and generate tailored resume content.
+
+        Returns dict with: ats_score, missing_keywords, matching_keywords,
+        tailored_summary, tailored_bullets, cover_letter, recommendation.
+        Returns empty dict on failure.
+        """
+        if not jd_text or len(jd_text) < 100:
+            return {}
+        try:
+            import anthropic as _anthropic
+            _api_key = os.environ.get("ANTHROPIC_API_KEY")
+            _client = _anthropic.Anthropic(api_key=_api_key) if _api_key else _anthropic.Anthropic()
+            resume_text = self._extract_resume_text()
+            _prompt = (
+                "You are an expert resume writer and ATS specialist. "
+                "Analyze this job description against the candidate resume, then produce tailored content.\n\n"
+                f"JOB: {job.get('title', '')} @ {job.get('company', '')}\n\n"
+                f"JOB DESCRIPTION (truncated):\n{jd_text[:3000]}\n\n"
+                f"CANDIDATE RESUME / PROFILE:\n{resume_text[:3000]}\n\n"
+                "Respond ONLY with valid JSON in exactly this structure:\n"
+                "{\n"
+                '  "ats_score": <integer 0-100, 85+ means strong match>,\n'
+                '  "missing_keywords": ["keyword1", "keyword2"],\n'
+                '  "matching_keywords": ["keyword1", "keyword2"],\n'
+                '  "recommendation": "one-line advice",\n'
+                '  "tailored_summary": "2-3 sentence professional summary tailored to this role",\n'
+                '  "tailored_bullets": [\n'
+                '    {"role": "Most Recent Role Title", "bullets": ["Achievement 1", "Achievement 2"]},\n'
+                '    {"role": "Second Role Title", "bullets": ["Achievement 1", "Achievement 2"]}\n'
+                "  ],\n"
+                '  "cover_letter": "3-paragraph cover letter for this specific role and company"\n'
+                "}"
+            )
+            _msg = _client.messages.create(
+                model="claude-3-haiku-20240307",
+                max_tokens=1800,
+                messages=[{"role": "user", "content": _prompt}],
+            )
+            import json as _json
+            _text = _msg.content[0].text.strip()
+            if _text.startswith("```"):
+                _text = re.sub(r"^```[a-z]*\n?", "", _text)
+                _text = re.sub(r"\n?```$", "", _text)
+            result = _json.loads(_text)
+            return {
+                "ats_score": int(result.get("ats_score", 0)),
+                "missing_keywords": result.get("missing_keywords", []),
+                "matching_keywords": result.get("matching_keywords", []),
+                "recommendation": result.get("recommendation", ""),
+                "tailored_summary": result.get("tailored_summary", ""),
+                "tailored_bullets": result.get("tailored_bullets", []),
+                "cover_letter": result.get("cover_letter", ""),
+            }
+        except Exception as _e:
+            console.print(f"[dim]Claude ATS/tailor failed: {_e}[/dim]")
+            return {}
+
+    async def _generate_tailored_resume_pdf(self, job: dict, tailored: dict) -> str:
+        """Render a tailored resume to PDF using Playwright's print engine (Jinja2-free).
+
+        Returns the path to the generated PDF, or '' on failure.
+        """
+        try:
+            import json as _json
+            profile: dict = {}
+            _ppath = os.path.join("state", "profile.json")
+            if os.path.isfile(_ppath):
+                with open(_ppath) as _f:
+                    profile = _json.load(_f)
+            info = profile.get("personal_info", {})
+            name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or "Candidate"
+            email = info.get("email", "")
+            phone = info.get("phone", "")
+            linkedin = profile.get("social_links", {}).get("linkedin", "")
+            city = info.get("city", "")
+            state_abbr = info.get("state", "")
+            location = ", ".join(p for p in [city, state_abbr] if p)
+            skills = list(profile.get("skills", []))
+            for kw in tailored.get("missing_keywords", []):
+                if kw and kw not in skills:
+                    skills.append(kw)
+            education = profile.get("education", [])
+            work_history = profile.get("work_history", [])
+            tailored_bullets = tailored.get("tailored_bullets", [])
+            experience_html = ""
+            for i, role in enumerate(tailored_bullets[:3]):
+                wh = work_history[i] if i < len(work_history) else {}
+                company = wh.get("company_name", "")
+                title = wh.get("job_title", role.get("role", ""))
+                start = wh.get("start_date", "")
+                end = wh.get("end_date", "Present")
+                bullets_html = "".join(f"<li>{b}</li>" for b in role.get("bullets", []))
+                experience_html += (
+                    f'<div class="exp-item">'
+                    f'<div class="exp-header"><span class="exp-title">{title}</span>'
+                    f'<span class="exp-dates">{start} – {end}</span></div>'
+                    f'<div class="exp-company">{company}</div>'
+                    f"<ul>{bullets_html}</ul></div>"
+                )
+            if not experience_html:
+                for wh in work_history[:3]:
+                    experience_html += (
+                        f'<div class="exp-item">'
+                        f'<div class="exp-header"><span class="exp-title">{wh.get("job_title","")}</span>'
+                        f'<span class="exp-dates">{wh.get("start_date","")} – {wh.get("end_date","Present")}</span></div>'
+                        f'<div class="exp-company">{wh.get("company_name","")}</div>'
+                        f'<ul><li>{wh.get("description","")}</li></ul></div>'
+                    )
+            edu_html = ""
+            for ed in education:
+                edu_html += (
+                    f'<div class="exp-item">'
+                    f'<div class="exp-header"><span class="exp-title">{ed.get("degree","")} — {ed.get("major","")}</span>'
+                    f'<span class="exp-dates">{ed.get("start_date","")} – {ed.get("end_date","")}</span></div>'
+                    f'<div class="exp-company">{ed.get("school_name","")}</div></div>'
+                )
+            summary = (
+                tailored.get("tailored_summary", "")
+                or "Experienced technology leader with 18+ years delivering enterprise solutions "
+                   "in government, defense, and commercial sectors."
+            )
+            skills_html = " &bull; ".join(skills[:20])
+            contact_html = " | ".join(p for p in [email, phone, location, linkedin] if p)
+            html = (
+                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                "<style>"
+                "body{font-family:Arial,sans-serif;font-size:11pt;color:#222;margin:0;padding:20px 30px}"
+                "h1{font-size:20pt;margin:0 0 2px}"
+                ".contact{font-size:9pt;color:#555;margin-bottom:10px}"
+                "h2{font-size:12pt;border-bottom:1px solid #999;padding-bottom:2px;"
+                "margin:12px 0 6px;text-transform:uppercase;letter-spacing:.05em}"
+                ".summary,.skills{margin-bottom:8px;line-height:1.5}"
+                ".exp-item{margin-bottom:10px}"
+                ".exp-header{display:flex;justify-content:space-between;font-weight:bold}"
+                ".exp-dates{font-weight:normal;font-size:10pt;color:#555}"
+                ".exp-company{font-style:italic;font-size:10pt;margin-bottom:3px}"
+                "ul{margin:4px 0 0 18px;padding:0}li{margin-bottom:2px;line-height:1.4}"
+                "</style></head><body>"
+                f"<h1>{name}</h1>"
+                f"<div class='contact'>{contact_html}</div>"
+                "<h2>Professional Summary</h2>"
+                f"<div class='summary'>{summary}</div>"
+                "<h2>Core Competencies</h2>"
+                f"<div class='skills'>{skills_html}</div>"
+                "<h2>Professional Experience</h2>"
+                f"{experience_html}"
+                "<h2>Education</h2>"
+                f"{edu_html}"
+                "</body></html>"
+            )
+            safe_title = re.sub(r'[^\w\-]', '_', (job.get('title') or 'role'))[:40]
+            safe_co = re.sub(r'[^\w\-]', '_', (job.get('company') or 'co'))[:25]
+            pdf_path = str(TAILORED_RESUMES_DIR / f"{safe_title}_{safe_co}_claude.pdf")
+            _pdf_page = await self._context.new_page()
+            try:
+                await _pdf_page.set_content(html, wait_until="domcontentloaded")
+                await _pdf_page.pdf(
+                    path=pdf_path,
+                    format="Letter",
+                    margin={"top": "0.5in", "bottom": "0.5in", "left": "0.5in", "right": "0.5in"},
+                )
+                console.print(f"[green]Claude Resume:[/green] Tailored PDF → {pdf_path}")
+                return pdf_path
+            finally:
+                await _pdf_page.close()
+        except Exception as _e:
+            console.print(f"[dim]Claude resume PDF generation failed: {_e}[/dim]")
+            return ""
+
+    async def _run_pre_submission_validation(self, page) -> dict:
+        """Check form state before submitting. Prints a checklist. Returns a dict of results."""
+        results: dict = {}
+        try:
+            checks = await page.evaluate("""
+                () => {
+                    const inputs = [...document.querySelectorAll(
+                        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select'
+                    )];
+                    const fileInputs = [...document.querySelectorAll('input[type="file"]')];
+                    const requiredEls = [...document.querySelectorAll('[required], [aria-required="true"]')];
+                    const invalidEls = [...document.querySelectorAll(':invalid')].filter(e => e.tagName !== 'FORM');
+                    const resumeUploaded = fileInputs.some(f => f.files && f.files.length > 0);
+                    const hasName = inputs.some(i =>
+                        /name|first|last/i.test(i.name || i.id || i.placeholder || '') &&
+                        (i.value || '').trim()
+                    );
+                    const hasEmail = inputs.some(i =>
+                        /email/i.test(i.name || i.id || i.type || i.placeholder || '') &&
+                        (i.value || '').trim()
+                    );
+                    const hasPhone = inputs.some(i =>
+                        /phone|tel/i.test(i.name || i.id || i.type || i.placeholder || '') &&
+                        (i.value || '').trim()
+                    );
+                    const requiredFilled = requiredEls.every(el => {
+                        if (el.type === 'checkbox' || el.type === 'radio') return el.checked;
+                        return (el.value || '').trim().length > 0;
+                    });
+                    return {
+                        resumeUploaded, hasName, hasEmail, hasPhone,
+                        requiredFilled, invalidCount: invalidEls.length,
+                        totalInputs: inputs.length
+                    };
+                }
+            """)
+            results = checks
+
+            def _tick(ok: bool) -> str:
+                return "✓" if ok else "?"
+
+            def _col(ok: bool) -> str:
+                return "green" if ok else "yellow"
+
+            console.print("\n[bold cyan]── Pre-Submit Checklist ──[/bold cyan]")
+            console.print(f"  [{_col(checks['resumeUploaded'])}]{_tick(checks['resumeUploaded'])}[/{_col(checks['resumeUploaded'])}] Resume uploaded")
+            console.print(f"  [{_col(checks['hasName'])}]{_tick(checks['hasName'])}[/{_col(checks['hasName'])}] Name filled")
+            console.print(f"  [{_col(checks['hasEmail'])}]{_tick(checks['hasEmail'])}[/{_col(checks['hasEmail'])}] Email filled")
+            console.print(f"  [{_col(checks['hasPhone'])}]{_tick(checks['hasPhone'])}[/{_col(checks['hasPhone'])}] Phone filled")
+            req_ok = checks['requiredFilled']
+            console.print(f"  [{'green' if req_ok else 'red'}]{'✓' if req_ok else '✗'}[/{'green' if req_ok else 'red'}] Required questions answered")
+            if checks['invalidCount'] > 0:
+                console.print(f"  [yellow]⚠  {checks['invalidCount']} field(s) have validation errors[/yellow]")
+        except Exception as _e:
+            console.print(f"[dim]Validation checklist error (non-fatal): {_e}[/dim]")
+        return results
+
     async def _confirm_and_submit(self, page, job: dict, auto_submit: bool = False) -> bool:
         """
         Find the final Submit / Apply button on the ATS page, show a preview,
@@ -2800,10 +3181,9 @@ class JobrightScraper(BaseScraper):
             'button:text-matches("Apply Now", "i")',
             'button:text-matches("Apply for this job", "i")',
             'button:text-matches("Apply for Job", "i")',
-            # SmartRecruiters "I'm interested" — only a link on the job card, safe as submit
-            'a:text-matches("I\'m interested", "i")',
-            'button:text-matches("I\'m interested", "i")',
             # aria-label submit (reliable signal)
+            # NOTE: "I'm interested" is intentionally NOT here — it is a SmartRecruiters
+            # entry CTA on the job listing page, handled by _click_ats_apply_button.
             '[aria-label*="submit" i]',
             # NOTE: Removed broad a:text-matches("Apply*") and partial-match fallbacks.
             # Those matched "Apply" entry buttons on job listing pages, causing false submits.
@@ -2880,6 +3260,9 @@ class JobrightScraper(BaseScraper):
                 ),
             )
 
+        # Run pre-submission validation checklist before showing the submit banner
+        await self._run_pre_submission_validation(page)
+
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
         console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
         console.print(f"  Portal: {portal_url}")
@@ -2913,6 +3296,19 @@ class JobrightScraper(BaseScraper):
                     btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
                 }""", submit_btn)
             await self._delay(3, 5)
+            # ── Record analytics for orchestrator to persist via extra_json ──
+            self._apply_analytics = {
+                "submitted": True,
+                "submissionTime": datetime.utcnow().isoformat(),
+                "applicationMethod": getattr(self, "_last_application_method", "Unknown"),
+                "atsScore": getattr(self, "_last_ats_score", None),
+                "resumeVersion": os.path.basename(getattr(self, "_last_tailored_resume_path", "") or ""),
+                "missingKeywords": getattr(self, "_last_ats_missing_keywords", []),
+                "jobrightAvailable": getattr(self, "_jobright_available", False),
+                "jobrightUrl": getattr(self, "_jobright_url", ""),
+                "interviewReceived": False,
+                "offerReceived": False,
+            }
             console.print("[green]✓ Application submitted![/green]")
             return True
         else:
