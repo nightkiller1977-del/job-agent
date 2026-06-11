@@ -2302,7 +2302,7 @@ class JobrightScraper(BaseScraper):
         if 'brassring.com' in current.lower():
             return await self._handle_brassring_apply(page)
 
-        # ── Other ATS: click the Apply / Apply Now button ────────────────────
+        # ── Other ATS: click the Apply / Apply Now / entry CTA button ─────────
         apply_selectors = [
             # Workday fallback (data-automation-id only, not broad text matches)
             '[data-automation-id="jobPostingApplyButton"]',
@@ -2310,11 +2310,23 @@ class JobrightScraper(BaseScraper):
             '#apply_button',
             'a.btn-apply',
             '.apply-button',
-            # Text-match on button elements only (not anchors, to avoid nav links)
+            # Text-match on button elements
             'button:text-matches("^Apply Now$", "i")',
             'button:text-matches("^Apply$", "i")',
             'button:text-matches("Apply for This Job", "i")',
             'button:text-matches("Apply for Job", "i")',
+            # SmartRecruiters / NBCUniversal — "I'm interested" is the entry CTA
+            # that opens the one-click application form (not a nav link)
+            'a:text-matches("I\'m interested", "i")',
+            'button:text-matches("I\'m interested", "i")',
+            # HRMDirect / SERVPRO — "START YOUR APPLICATION" anchor link
+            'a:text-matches("START YOUR APPLICATION", "i")',
+            'a:text-matches("Start Your Application", "i")',
+            'a:text-matches("Start Application", "i")',
+            # Broad anchor fallback — many ATS portals use <a> not <button> for Apply
+            'a:text-matches("^Apply Now$", "i")',
+            'a:text-matches("^Apply$", "i")',
+            'a:text-matches("Apply for This Job", "i")',
         ]
 
         for sel in apply_selectors:
@@ -2322,9 +2334,8 @@ class JobrightScraper(BaseScraper):
                 btn = await page.wait_for_selector(sel, timeout=4000)
                 if btn:
                     await btn.click()
-                    from rich.markup import escape
                     console.print(f"[magenta]Jobright:[/magenta] Clicked Apply button → waiting for form…")
-                    await self._delay(4, 6)
+                    await self._delay(5, 8)
                     return True
             except Exception:
                 continue
@@ -2336,6 +2347,8 @@ class JobrightScraper(BaseScraper):
             'apply for job',
             'start application',
             'begin application',
+            "i'm interested",
+            'start your application',
         ])
         if clicked:
             console.print("[magenta]Jobright:[/magenta] Clicked Apply control → waiting for form…")
