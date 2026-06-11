@@ -149,15 +149,21 @@ class JobrightScraper(BaseScraper):
             clicked = await self._click_first_button_text(page, [r"^Add Job$", r"^Import$", r"^Submit$"])
             if not clicked:
                 await input_box.press("Enter")
-            await self._delay(10, 14)
+            await self._delay(12, 18)
 
-            for _ in range(8):
+            for attempt in range(18):
                 jobs = await self._js_extract(page)
                 match = self._best_jobright_match(job, jobs)
                 if match:
                     console.print("[green]Jobright Tailor:[/green] External job added/found in Jobright.")
                     return match
-                await asyncio.sleep(3)
+                # After ~44 seconds total, refresh the page — Jobright sometimes
+                # needs a reload before the newly-added external card appears.
+                if attempt == 8:
+                    console.print("[dim]Jobright Tailor: reloading page to surface new card…[/dim]")
+                    await page.reload(wait_until="domcontentloaded")
+                    await self._delay(3, 4)
+                await asyncio.sleep(4)
 
             console.print("[yellow]Jobright Tailor:[/yellow] External job was submitted to Jobright, but no matching card appeared yet.")
             return None
@@ -1348,6 +1354,8 @@ class JobrightScraper(BaseScraper):
         if "jobright.ai" not in url:
             console.print(f"[magenta]Jobright ATS:[/magenta] Delegating external URL apply: {url}")
             tailored_path = await self.tailor_resume_for_external_job(job)
+            # Persist so _confirm_and_submit / outcome messages can reference it
+            self._last_tailored_resume_path = tailored_path
             return await self.apply_external_ats_job(
                 job,
                 url,
@@ -2662,14 +2670,32 @@ class JobrightScraper(BaseScraper):
             '[data-automation-id*="submit" i]',
             'input[type="submit"][value*="Submit" i]',
             'input[type="button"][value*="Submit" i]',
-            # Generic text-based
+            # Generic button text — Submit variants
             'button:text-matches("^Submit$", "i")',
             'button:text-matches("Submit Application", "i")',
-            'button:text-matches("^Apply$", "i")',
             'button:text-matches("Send Application", "i")',
             'button:text-matches("Complete Application", "i")',
-            '[role="button"]:text-matches("Submit|Send Application|Complete Application", "i")',
+            # Generic button text — Apply variants (many portals use Apply not Submit)
+            'button:text-matches("^Apply$", "i")',
+            'button:text-matches("Apply Now", "i")',
+            'button:text-matches("Apply for this job", "i")',
+            'button:text-matches("Apply for Job", "i")',
+            # Anchor/link apply buttons — GDIT, Bayview, and others use <a> not <button>
+            'a:text-matches("^Apply$", "i")',
+            'a:text-matches("Apply Now", "i")',
+            'a:text-matches("Apply for this job", "i")',
+            'a:text-matches("Apply for Job", "i")',
+            # SmartRecruiters / NBCUniversal "I'm interested" CTA
+            'a:text-matches("I\'m interested", "i")',
+            'button:text-matches("I\'m interested", "i")',
+            # role="button" fallback
+            '[role="button"]:text-matches("Submit|Apply|Apply Now|Send Application|Complete Application", "i")',
             '[aria-label*="submit" i]',
+            '[aria-label*="apply" i]',
+            # Broad partial-match fallbacks — catch "Apply Apply Apply for <Role>" style labels
+            # (Dayforce/LabConnect, iCIMS, and others embed role name in button text)
+            'button:text-matches("Apply", "i")',
+            'a:text-matches("Apply", "i")',
         ]
 
         submit_btn = None
@@ -2695,11 +2721,15 @@ class JobrightScraper(BaseScraper):
             )
             console.print(f"[dim]Portal: {portal_url}[/dim]")
             controls = await self._visible_controls_snapshot(page)
+            tailored_hint = getattr(self, "_last_tailored_resume_path", "") or ""
+            if tailored_hint:
+                console.print(f"[green]Jobright:[/green] Tailored resume ready for manual apply → {tailored_hint}")
             return self._set_apply_outcome(
                 f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
                 (
                     f"Reached portal but could not find a final Submit/Apply button at "
                     f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                    + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
                 ),
             )
 
@@ -2743,11 +2773,15 @@ class JobrightScraper(BaseScraper):
             if auto_submit:
                 console.print("[red]Jobright: Submit button not found — cannot auto-submit. Skipping.[/red]")
                 controls = await self._visible_controls_snapshot(page)
+                tailored_hint = getattr(self, "_last_tailored_resume_path", "") or ""
+                if tailored_hint:
+                    console.print(f"[green]Jobright:[/green] Tailored resume ready for manual apply → {tailored_hint}")
                 return self._set_apply_outcome(
                     f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
                     (
                         f"Auto-submit requested, but no submit button was found at "
                         f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                        + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
                     ),
                 )
             console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")
