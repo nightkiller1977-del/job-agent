@@ -2235,7 +2235,26 @@ class JobrightScraper(BaseScraper):
         # This skips the "Start Your Application" chooser entirely.
         # If the Workday session is active → opens the application form.
         # If session expired → Workday shows its sign-in page; we handle that below.
-        if 'myworkdayjobs.com' in current_url and '/apply' not in current_url:
+        #
+        # Also handles company-branded Workday domains (CVS Health uses jobs.cvshealth.com,
+        # Palo Alto uses wd5.myworkdayjobs.com, etc.) — detect via Workday-specific
+        # DOM attribute data-automation-id which is exclusively used by Workday's framework.
+        _is_workday_page = 'myworkdayjobs.com' in current_url
+        if not _is_workday_page:
+            try:
+                _is_workday_page = await page.evaluate("""
+                    () => !!(
+                        document.querySelector('[data-automation-id="jobPostingApplyButton"]') ||
+                        document.querySelector('[data-automation-id="candidateHomeLink"]') ||
+                        document.querySelector('[data-automation-id="text-input"]') ||
+                        document.querySelector('[class*="wd-Button-"]') ||
+                        document.querySelector('[class*="wd-Text-"]') ||
+                        (document.body?.innerHTML || '').includes('myworkdayjobs')
+                    )
+                """)
+            except Exception:
+                pass
+        if _is_workday_page and '/apply' not in current_url:
             apply_url = current_url.rstrip('/') + '/apply/autofillWithResume'
             console.print(f"[magenta]Jobright:[/magenta] Workday — navigating to autofillWithResume…")
             try:
@@ -2256,9 +2275,9 @@ class JobrightScraper(BaseScraper):
             current = page.url
         except Exception:
             current = ""
-        # After navigating to autofillWithResume: handle sign-in if needed,
-        # then auto-navigate the wizard steps.
-        if 'myworkdayjobs.com' in current:
+        # After navigating to autofillWithResume (or on a company-branded Workday
+        # portal), handle the "Start Your Application" chooser and sign-in gate.
+        if _is_workday_page or 'myworkdayjobs.com' in current:
             await self._click_visible_control_by_text(page, [
                 '^use my last application$',
                 '^autofill with resume$',
