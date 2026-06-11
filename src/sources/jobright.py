@@ -2784,37 +2784,30 @@ class JobrightScraper(BaseScraper):
         optionally ask for confirmation, then click.
         """
         submit_selectors = [
-            # Workday final-step submit (data-automation-id)
+            # Workday final-step submit (data-automation-id) — highly specific, safe
             '[data-automation-id="bottom-navigation-next-button"]',
             '[data-automation-id*="submit" i]',
             'input[type="submit"][value*="Submit" i]',
             'input[type="button"][value*="Submit" i]',
-            # Generic button text — Submit variants
+            # Generic button text — Submit variants (unambiguous, final-step only)
             'button:text-matches("^Submit$", "i")',
             'button:text-matches("Submit Application", "i")',
             'button:text-matches("Send Application", "i")',
             'button:text-matches("Complete Application", "i")',
-            # Generic button text — Apply variants (many portals use Apply not Submit)
+            'button:text-matches("Submit My Application", "i")',
+            # Apply variants on BUTTONS (buttons inside forms are usually final-step)
             'button:text-matches("^Apply$", "i")',
             'button:text-matches("Apply Now", "i")',
             'button:text-matches("Apply for this job", "i")',
             'button:text-matches("Apply for Job", "i")',
-            # Anchor/link apply buttons — GDIT, Bayview, and others use <a> not <button>
-            'a:text-matches("^Apply$", "i")',
-            'a:text-matches("Apply Now", "i")',
-            'a:text-matches("Apply for this job", "i")',
-            'a:text-matches("Apply for Job", "i")',
-            # SmartRecruiters / NBCUniversal "I'm interested" CTA
+            # SmartRecruiters "I'm interested" — only a link on the job card, safe as submit
             'a:text-matches("I\'m interested", "i")',
             'button:text-matches("I\'m interested", "i")',
-            # role="button" fallback
-            '[role="button"]:text-matches("Submit|Apply|Apply Now|Send Application|Complete Application", "i")',
+            # aria-label submit (reliable signal)
             '[aria-label*="submit" i]',
-            '[aria-label*="apply" i]',
-            # Broad partial-match fallbacks — catch "Apply Apply Apply for <Role>" style labels
-            # (Dayforce/LabConnect, iCIMS, and others embed role name in button text)
-            'button:text-matches("Apply", "i")',
-            'a:text-matches("Apply", "i")',
+            # NOTE: Removed broad a:text-matches("Apply*") and partial-match fallbacks.
+            # Those matched "Apply" entry buttons on job listing pages, causing false submits.
+            # Portal-specific <a> Apply buttons are handled by _click_ats_apply_button first.
         ]
 
         submit_btn = None
@@ -2832,6 +2825,41 @@ class JobrightScraper(BaseScraper):
         except Exception:
             portal_url = "(unknown)"
         family = await self._detect_portal_family(page)
+
+        # ── Guard: refuse to submit if no form fields appear to be filled ────
+        # This prevents false "Application submitted!" when the agent is on a
+        # job listing page (not the actual application form) — the broad Apply
+        # button selectors above can match entry CTAs on listing pages.
+        if submit_btn:
+            try:
+                has_filled_fields = await page.evaluate("""
+                    () => {
+                        const inputs = [...document.querySelectorAll(
+                            'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="file"]):not([type="checkbox"]):not([type="radio"]),' +
+                            'textarea, select'
+                        )];
+                        // At least one visible input must have a non-empty value
+                        return inputs.some(el => {
+                            const val = (el.value || el.textContent || '').trim();
+                            return val.length > 0 && !el.disabled;
+                        });
+                    }
+                """)
+            except Exception:
+                has_filled_fields = True  # assume filled if we can't check
+
+            if not has_filled_fields:
+                console.print(
+                    "[yellow]Jobright: Submit button found but form appears empty — "
+                    "autofill did not run or this is a listing page, not the application form.[/yellow]"
+                )
+                console.print(f"[dim]Portal: {portal_url}[/dim]")
+                return self._set_apply_outcome(
+                    "form_empty_not_submitted",
+                    f"Submit button was found at {portal_url} but all form fields were empty. "
+                    "Jobright autofill did not populate the form — ensure the extension is active "
+                    "and the Jobright session is logged in, then re-run.",
+                )
 
         if not submit_btn and (auto_submit or not (sys.stdin and sys.stdin.isatty())):
             console.print(
