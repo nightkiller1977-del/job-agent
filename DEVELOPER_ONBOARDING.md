@@ -41,16 +41,22 @@ After that, the extension loads automatically from the profile on every run.
 
 ## Credential and Login Flow
 
-Credentials live in `.env`:
-```
-LINKEDIN_EMAIL / LINKEDIN_PASSWORD
-JOBRIGHT_EMAIL / JOBRIGHT_PASSWORD
-INDEED_EMAIL / INDEED_PASSWORD
-```
+Credentials live in `.env` — all set and working as of June 2026:
 
-Each scraper checks on startup whether it's logged in. If not, `_auto_login()` fills the login form programmatically. No manual interaction is needed for scheduled runs.
+| Variable | Used by | Method |
+|---|---|---|
+| `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` | `linkedin.py` | `_auto_login()` — fills form programmatically |
+| `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | `jobright.py` | `_auto_login()` — fills form programmatically |
+| `INDEED_EMAIL` / `INDEED_PASSWORD` | `indeed.py` | `_auto_login()` — fills form programmatically |
+| `COMPANY_EMAIL` / `COMPANY_PASSWORD` | `jobright.py` `_company_portal_login()` | Auto-login attempt on company ATS portals (Workday, BrassRing) |
+| `ANTHROPIC_API_KEY` | `scorer.py`, `jobright.py` | Claude scoring + ATS analysis |
+| `DASHBOARD_URL` / `SYNC_SECRET` | `orchestrator.py` | Cloud dashboard sync |
 
-The cloud dashboard (`DASHBOARD_URL` / `SYNC_SECRET`) syncs job approvals from the web UI to local SQLite. `orchestrator.load_credentials_from_dashboard()` also pulls credentials from the dashboard at runtime.
+Each scraper checks on startup whether it is logged in. If not, `_auto_login()` fills the login form using `.env` credentials automatically. No manual interaction needed for scheduled runs.
+
+**USAJobs is the exception** — no `_auto_login()` exists. USAJobs authentication goes through login.gov (which involves 2FA), so it requires a one-time manual session via `prepare-sessions`. Once the session is saved in the Chrome profile, it persists for the run.
+
+`orchestrator.load_credentials_from_dashboard()` also pulls credentials from the cloud dashboard at runtime, setting them as environment variables.
 
 ---
 
@@ -212,19 +218,22 @@ The file is gitignored. Do not commit it.
 
 ## Session Management
 
-Most logins are fully automatic. Exceptions:
+Most logins are fully automatic from `.env`. Two exceptions:
 
-**Workday portals** — each company (CVS Health, UMCareerStaff, Simpro, etc.) has its own Workday instance. These require a one-time manual login:
+**USAJobs** — uses login.gov (2FA), no auto-login implemented. Requires one-time manual session:
+```bash
+python src/main.py prepare-sessions --source usajobs
+```
 
+**Workday portals where `COMPANY_EMAIL`/`COMPANY_PASSWORD` don't work** — some company Workday instances require a company-specific account or SSO. These need a one-time manual login per company:
 ```bash
 python src/main.py prepare-sessions
 python src/main.py prepare-sessions --source jobright --company "CVS"
 ```
 
-Jobs blocked on Workday session show status `needs-session` in preflight output.
+Jobs blocked on session show status `needs-session` in preflight output.
 
 **Jobright extension** — install once via `setup`, then auto-loads from Chrome profile:
-
 ```bash
 python src/main.py setup
 ```
