@@ -48,13 +48,15 @@ Credentials live in `.env` — all set and working as of June 2026:
 | `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` | `linkedin.py` | `_auto_login()` — fills form programmatically |
 | `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | `jobright.py` | `_auto_login()` — fills form programmatically |
 | `INDEED_EMAIL` / `INDEED_PASSWORD` | `indeed.py` | `_auto_login()` — fills form programmatically |
-| `COMPANY_EMAIL` / `COMPANY_PASSWORD` | `jobright.py` `_company_portal_login()` | Auto-login attempt on company ATS portals (Workday, BrassRing) |
+| `USAJOBS_EMAIL` / `USAJOBS_PASSWORD` | `usajobs.py` | `_auto_login()` via login.gov; pauses for 2FA if triggered |
+| `COMPANY_EMAIL` / `COMPANY_PASSWORD` | `jobright.py` `_company_portal_login()` | Primary ATS portal auto-login — `alarkins.jsearch@yahoo.com` (Motorola, Booz Allen, Greenhouse, SAIC, PNC, Capital One, ManTech) |
+| `COMPANY_EMAIL_ALT` / `COMPANY_PASSWORD_ALT` | `jobright.py` `_company_portal_login()` | Fallback ATS portal login — `anthonyclarkins@icloud.com` (GDIT, government portals); tried automatically if primary login fails |
 | `ANTHROPIC_API_KEY` | `scorer.py`, `jobright.py` | Claude scoring + ATS analysis |
 | `DASHBOARD_URL` / `SYNC_SECRET` | `orchestrator.py` | Cloud dashboard sync |
 
 Each scraper checks on startup whether it is logged in. If not, `_auto_login()` fills the login form using `.env` credentials automatically. No manual interaction needed for scheduled runs.
 
-**USAJobs is the exception** — no `_auto_login()` exists. USAJobs authentication goes through login.gov (which involves 2FA), so it requires a one-time manual session via `prepare-sessions`. Once the session is saved in the Chrome profile, it persists for the run.
+**USAJobs** — uses login.gov. `_auto_login()` fills email and password automatically, then waits up to 90 seconds if 2FA is triggered (user completes it in the open browser window). Once past 2FA, the session is saved in the Chrome profile and won't require 2FA again for weeks.
 
 `orchestrator.load_credentials_from_dashboard()` also pulls credentials from the cloud dashboard at runtime, setting them as environment variables.
 

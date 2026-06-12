@@ -5,6 +5,8 @@ User is assumed to be logged in with a saved resume.
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 import sys
 from datetime import datetime
@@ -56,18 +58,29 @@ class USAJobsScraper(BaseScraper):
             await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
 
-            # Check login
+            # Check login — attempt auto-login from .env if not authenticated
             if not await self._is_logged_in(page):
-                if not (sys.stdin and sys.stdin.isatty()):
-                    console.print("[red]USAJobs: Not logged in and running non-interactively. Skipping USAJobs scrape.[/red]")
-                    return []
-                console.print(
-                    "[red]USAJobs:[/red] Not logged in. Please log in at https://www.usajobs.gov "
-                    "in the opened browser window."
-                )
-                input("  Press Enter once logged in > ")
-                await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=30000)
-                await self._delay(2, 3)
+                email = os.environ.get("USAJOBS_EMAIL", "")
+                password = os.environ.get("USAJOBS_PASSWORD", "")
+                if email and password:
+                    console.print("[cyan]USAJobs:[/cyan] Not logged in — attempting auto-login…")
+                    logged_in = await self._auto_login(page, email, password)
+                    if not logged_in:
+                        if not (sys.stdin and sys.stdin.isatty()):
+                            console.print("[red]USAJobs: Auto-login failed (non-interactive). Skipping.[/red]")
+                            return []
+                        console.print("[yellow]USAJobs:[/yellow] Auto-login failed. Complete login in the browser window.")
+                        input("  Press Enter once logged in > ")
+                        await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=30000)
+                        await self._delay(2, 3)
+                else:
+                    if not (sys.stdin and sys.stdin.isatty()):
+                        console.print("[red]USAJobs: Not logged in and no credentials in .env. Skipping.[/red]")
+                        return []
+                    console.print("[red]USAJobs:[/red] Not logged in. Add USAJOBS_EMAIL/USAJOBS_PASSWORD to .env, or log in manually.")
+                    input("  Press Enter once logged in > ")
+                    await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=30000)
+                    await self._delay(2, 3)
 
             for search in USAJOBS_SEARCHES:
                 if len(all_jobs) >= self.max_jobs:
@@ -107,6 +120,82 @@ class USAJobsScraper(BaseScraper):
                     return True
             return False
         except Exception:
+            return False
+
+    async def _auto_login(self, page, email: str, password: str) -> bool:
+        """Auto-login to USAJobs via login.gov.
+
+        login.gov uses a two-step flow: email → password, then optionally 2FA.
+        If 2FA appears, this method prints a prompt and waits up to 90 seconds
+        for the user to complete it in the open browser window, then returns.
+        Once logged in, the Chrome profile saves the session so 2FA won't be
+        needed again for weeks.
+        """
+        try:
+            # Click the Sign In link on the USAJobs homepage
+            for sel in ['a:text-matches("Sign In", "i")', 'a[href*="login"]', 'button:text-matches("Sign In", "i")']:
+                try:
+                    btn = await page.wait_for_selector(sel, timeout=4000)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await self._delay(2, 3)
+                        break
+                except Exception:
+                    continue
+
+            # If not yet on login.gov, navigate there directly
+            if "login.gov" not in page.url:
+                await page.goto("https://secure.login.gov/en/", wait_until="domcontentloaded", timeout=15000)
+                await self._delay(1, 2)
+
+            # Step 1: Fill email
+            try:
+                email_input = await page.wait_for_selector(
+                    'input[type="email"], input[name*="email" i]', timeout=8000
+                )
+                if email_input:
+                    await email_input.fill(email)
+                    await self._delay(0.5, 1)
+                    submit = await page.query_selector('button[type="submit"], input[type="submit"]')
+                    if submit:
+                        await submit.click()
+                        await self._delay(2, 3)
+            except Exception:
+                pass
+
+            # Step 2: Fill password
+            try:
+                pwd = await page.wait_for_selector('input[type="password"]', timeout=8000)
+                if pwd:
+                    await pwd.fill(password)
+                    await self._delay(0.5, 1)
+                    submit = await page.query_selector('button[type="submit"], input[type="submit"]')
+                    if submit:
+                        await submit.click()
+                        await self._delay(3, 5)
+            except Exception:
+                pass
+
+            # Step 3: If still on login.gov, likely hit 2FA — wait for manual completion
+            if "login.gov" in page.url:
+                console.print("[cyan]USAJobs:[/cyan] 2FA required — complete it in the browser window (waiting up to 90s)…")
+                for _ in range(45):
+                    await asyncio.sleep(2)
+                    if "login.gov" not in page.url:
+                        break
+
+            # Verify logged in
+            await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=15000)
+            await self._delay(2, 3)
+            if await self._is_logged_in(page):
+                console.print("[green]USAJobs: ✓ Logged in successfully.[/green]")
+                return True
+
+            console.print("[yellow]USAJobs:[/yellow] Auto-login did not complete.")
+            return False
+
+        except Exception as exc:
+            console.print(f"[yellow]USAJobs:[/yellow] Auto-login error: {exc}")
             return False
 
     async def _search(self, page, keyword: str, grade: str, seen_ids: set) -> list[dict]:

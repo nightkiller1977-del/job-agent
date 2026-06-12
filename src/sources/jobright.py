@@ -2200,6 +2200,13 @@ class JobrightScraper(BaseScraper):
     async def _company_portal_login(self, page) -> None:
         """
         Log into a company ATS portal using COMPANY_EMAIL / COMPANY_PASSWORD from .env.
+        Falls back to COMPANY_EMAIL_ALT / COMPANY_PASSWORD_ALT if the primary fails.
+
+        Two credential sets are configured:
+          COMPANY_EMAIL       — alarkins.jsearch@yahoo.com (most portals: Motorola, Booz Allen,
+                                Greenhouse, SAIC, PNC, Capital One, ManTech, etc.)
+          COMPANY_EMAIL_ALT   — anthonyclarkins@icloud.com (government/contractor: GDIT, etc.)
+
         Uses page.type() (real keystroke simulation) instead of fill() to avoid
         bot-detection triggers on Workday and similar ATS portals.
         """
@@ -2296,10 +2303,63 @@ class JobrightScraper(BaseScraper):
                 except Exception:
                     continue
 
-            console.print(f"[green]Jobright:[/green] Login attempted → {page.url}")
+            console.print(f"[green]Jobright:[/green] Login attempted with {email} → {page.url}")
+
+            # If the page still looks like a login page, retry with the alt email
+            login_indicators = ["login", "signin", "sign-in", "auth", "create-account"]
+            still_on_login = any(w in page.url.lower() for w in login_indicators)
+            if still_on_login:
+                alt_email = os.environ.get("COMPANY_EMAIL_ALT", "")
+                alt_password = os.environ.get("COMPANY_PASSWORD_ALT", password)
+                if alt_email and alt_email != email:
+                    console.print(f"[yellow]Jobright:[/yellow] Primary login may have failed — retrying with alt email {alt_email}…")
+                    await self._company_portal_login_with(page, alt_email, alt_password)
 
         except Exception as e:
             console.print(f"[yellow]Jobright:[/yellow] Portal login attempt failed: {e}")
+
+    async def _company_portal_login_with(self, page, email: str, password: str) -> None:
+        """Re-run the portal login form with a specific email/password (alt-credential retry)."""
+        try:
+            for sel in ['input[type="email"]', 'input[name*="email" i]', 'input[placeholder*="email" i]']:
+                try:
+                    elem = await page.wait_for_selector(sel, timeout=3000)
+                    if elem:
+                        await elem.triple_click()
+                        await elem.type(email, delay=80)
+                        await self._delay(0.5, 1)
+                        break
+                except Exception:
+                    continue
+            for sel in ['button:text-matches("^Next$","i")', 'button:text-matches("^Continue$","i")', 'button[type="submit"]']:
+                try:
+                    btn = await page.wait_for_selector(sel, timeout=2000)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await self._delay(2, 3)
+                        break
+                except Exception:
+                    continue
+            try:
+                pwd = await page.wait_for_selector('input[type="password"]', timeout=6000)
+                if pwd:
+                    await pwd.triple_click()
+                    await pwd.type(password, delay=80)
+                    await self._delay(0.5, 1)
+            except Exception:
+                return
+            for sel in ['button:text-matches("^Sign In$","i")', 'button:text-matches("^Log In$","i")', 'button[type="submit"]']:
+                try:
+                    btn = await page.wait_for_selector(sel, timeout=2000)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await self._delay(5, 8)
+                        break
+                except Exception:
+                    continue
+            console.print(f"[green]Jobright:[/green] Alt login attempted with {email} → {page.url}")
+        except Exception as e:
+            console.print(f"[yellow]Jobright:[/yellow] Alt portal login failed: {e}")
 
     async def _click_ats_apply_button(self, page) -> bool:
         """
