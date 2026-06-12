@@ -402,42 +402,38 @@ class Orchestrator:
             console.print(f"  {key}: {count}")
 
     async def browser_setup(self) -> None:
-        """Open Chrome with the job-agent profile so you can sign in once.
+        """Install the Jobright Chrome extension into the job-agent profile.
 
-        Opens LinkedIn, Jobright, and the Chrome Web Store in the dedicated
-        job-agent Chrome profile. macOS Keychain passwords autofill so you
-        just confirm the logins. Install the Jobright extension from the Web
-        Store tab, then close the browser window — sessions persist forever.
+        LinkedIn, Jobright, and Indeed all auto-login from .env credentials
+        at run-time — no manual sign-in needed. The only thing that requires
+        a one-time browser action is installing the Jobright AI autofill
+        extension from the Chrome Web Store. Run this once, install the
+        extension, close the window, and every future run picks it up.
         """
         console.print("\n[bold cyan]Job-Agent Browser Setup[/bold cyan]")
-        console.print("[dim]Opening Chrome with the job-agent profile...[/dim]")
+        console.print("[dim]LinkedIn/Jobright/Indeed log in automatically from .env — no manual sign-in needed.[/dim]")
+        console.print("[dim]Opening Chrome to install the Jobright AI extension from the Web Store...[/dim]\n")
 
         scraper = JobrightScraper(self.config)
         page = await scraper._start_browser(load_extensions=True)
         ctx = scraper._context
 
-        await page.goto("https://www.linkedin.com", wait_until="domcontentloaded")
-
-        jr_page = await ctx.new_page()
-        await jr_page.goto("https://jobright.ai", wait_until="domcontentloaded")
-
-        ext_page = await ctx.new_page()
-        await ext_page.goto(
+        # Go straight to the Jobright extension on the Chrome Web Store
+        await page.goto(
             "https://chromewebstore.google.com/search/jobright%20ai",
             wait_until="domcontentloaded",
         )
 
-        console.print("[green]Browser open.[/green] Saved passwords will autofill — just confirm each login.")
-        console.print("[dim]Install the Jobright AI extension from the Web Store tab, then close the browser window to finish.[/dim]\n")
+        console.print("[green]Browser open.[/green] Click [bold]'Add to Chrome'[/bold] on the Jobright AI extension, then close the window.")
 
-        # Wait until the user closes the browser window — no terminal input needed.
+        # Wait until the user closes the browser window
         try:
             while ctx.pages:
                 await asyncio.sleep(2)
         except Exception:
             pass
 
-        console.print("[green]Setup complete.[/green] Sessions saved — all future runs use these logins automatically.\n")
+        console.print("[green]Setup complete.[/green] Extension installed — all future apply runs will use it.\n")
 
     async def prepare_sessions(
         self,
