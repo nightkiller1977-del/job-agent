@@ -40,6 +40,8 @@ JOBRIGHT_EMAIL=...
 JOBRIGHT_PASSWORD=...
 INDEED_EMAIL=...
 INDEED_PASSWORD=...
+COMPANY_EMAIL=...             # Used for company ATS portal auto-login (Workday, BrassRing, etc.)
+COMPANY_PASSWORD=...
 DASHBOARD_URL=...             # Render.com cloud dashboard URL
 SYNC_SECRET=...
 ```
@@ -100,11 +102,13 @@ python src/main.py status
 | LinkedIn login | ✅ Auto from `.env` |
 | Jobright login | ✅ Auto from `.env` |
 | Indeed login | ✅ Auto from `.env` |
+| Company ATS portals (Workday, BrassRing) | ✅ Auto attempt via `COMPANY_EMAIL`/`COMPANY_PASSWORD` in `.env` |
 | ATS score + resume tailoring | ✅ Claude Haiku API |
 | Tailored resume PDF generation | ✅ Playwright + HTML template |
 | Form autofill (Jobright extension) | ✅ Extension in Chrome profile |
 | Final application submit | ✅ With `--auto-submit` |
-| Workday company portals | ⚠️ One-time per company via `prepare-sessions` |
+| USAJobs login | ⚠️ One-time manual via `prepare-sessions` (uses login.gov, no auto-login) |
+| Workday portals that reject `COMPANY_EMAIL` | ⚠️ One-time per company via `prepare-sessions` |
 | Jobright extension install | ⚠️ One-time via `setup` |
 
 ---
