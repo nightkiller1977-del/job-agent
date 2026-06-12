@@ -156,9 +156,9 @@ async def test_mock_indeed_ats_handoff():
               <h1>Greenhouse Mock Form</h1>
               <button id="apply_button" onclick="this.style.display='none';">Apply</button>
               <form id="apply-form">
-                <input type="text" id="first_name" name="first_name" placeholder="First Name">
-                <input type="text" id="last_name" name="last_name" placeholder="Last Name">
-                <input type="email" id="email" name="email" placeholder="Email">
+                <input type="text" id="first_name" name="first_name" placeholder="First Name" value="John">
+                <input type="text" id="last_name" name="last_name" placeholder="Last Name" value="Doe">
+                <input type="email" id="email" name="email" placeholder="Email" value="john.doe@example.com">
                 <input type="file" id="resume" name="resume">
                 <button type="submit" data-automation-id="bottom-navigation-next-button">Submit Application</button>
               </form>
