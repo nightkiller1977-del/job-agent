@@ -281,12 +281,14 @@ class JobrightScraper(BaseScraper):
                                 resolved_resume = _claude_pdf
                                 self._last_tailored_resume_path = _claude_pdf
                                 self._last_application_method = "Claude Tailored"
-                        # ATS gate: warn when score is low under auto-submit
+                        # ATS gate: disable auto-submit when score is low (flags for review)
                         if self._last_ats_score > 0 and self._last_ats_score < 85 and auto_submit:
                             console.print(
                                 f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
-                                "application may be filtered by ATS. Proceeding with caution.[/yellow]"
+                                "auto-submit disabled. Flagging for manual review.[/yellow]"
                             )
+                            auto_submit = False
+                            self.auto_submit = False
             except Exception as _ce:
                 console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
 
@@ -1613,8 +1615,10 @@ class JobrightScraper(BaseScraper):
                             if self._last_ats_score > 0 and self._last_ats_score < 85 and auto_submit:
                                 console.print(
                                     f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
-                                    "application may be filtered by ATS. Proceeding with caution.[/yellow]"
+                                    "auto-submit disabled. Flagging for manual review.[/yellow]"
                                 )
+                                auto_submit = False
+                                self.auto_submit = False
                 except Exception as _ce:
                     console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
 
