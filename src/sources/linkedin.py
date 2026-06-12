@@ -41,7 +41,7 @@ LOGIN_URL_MARKERS = ("/login", "/authwall", "uas/login", "checkpoint", "challeng
 
 # User profile answers for Easy Apply forms
 USER_ANSWERS = {
-    "years_experience": "18",
+    "years_experience": "20",
     "current_title": "Director of Software Engineering",
     "clearance": "Top Secret",
     "authorized_us": "Yes",
