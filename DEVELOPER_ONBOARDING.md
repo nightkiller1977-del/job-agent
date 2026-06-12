@@ -47,7 +47,7 @@ Credentials live in `.env` — all set and working as of June 2026:
 |---|---|---|
 | `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` | `linkedin.py` | `_auto_login()` — fills form programmatically |
 | `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | `jobright.py` | `_auto_login()` — fills form programmatically |
-| `INDEED_EMAIL` / `INDEED_PASSWORD` | `indeed.py` | `_auto_login()` — fills form programmatically |
+| `INDEED_EMAIL` / `INDEED_PASSWORD` | `indeed.py` | `_auto_login()` — fills form programmatically (`shoalinwu@gmail.com`) |
 | `USAJOBS_EMAIL` / `USAJOBS_PASSWORD` | `usajobs.py` | `_auto_login()` via login.gov; pauses for 2FA if triggered |
 | `COMPANY_EMAIL` / `COMPANY_PASSWORD` | `jobright.py` `_company_portal_login()` | Primary ATS portal auto-login — `alarkins.jsearch@yahoo.com` (Motorola, Booz Allen, Greenhouse, SAIC, PNC, Capital One, ManTech) |
 | `COMPANY_EMAIL_ALT` / `COMPANY_PASSWORD_ALT` | `jobright.py` `_company_portal_login()` | Fallback ATS portal login — `anthonyclarkins@icloud.com` (GDIT, government portals); tried automatically if primary login fails |
