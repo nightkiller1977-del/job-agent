@@ -231,6 +231,11 @@ class JobrightScraper(BaseScraper):
         submitted = False
         resolved_resume = resolve_resume_path(self.config, preferred=resume_path)
 
+        # Clean and rewrite Teamtailor URLs to load the application form directly
+        if "teamtailor.com" in external_url.lower() and "/applications/new" not in external_url.lower():
+            base_url = external_url.split('?')[0].rstrip('/')
+            external_url = f"{base_url}/applications/new"
+
         console.print(f"[magenta]Jobright ATS:[/magenta] External apply for {job.get('title')} @ {job.get('company')}")
         page = await self._start_browser(load_extensions=True)
         try:
@@ -281,14 +286,12 @@ class JobrightScraper(BaseScraper):
                                 resolved_resume = _claude_pdf
                                 self._last_tailored_resume_path = _claude_pdf
                                 self._last_application_method = "Claude Tailored"
-                        # ATS gate: disable auto-submit when score is low (flags for review)
+                        # ATS gate: warn only — never block auto-submit
                         if self._last_ats_score > 0 and self._last_ats_score < 85 and auto_submit:
                             console.print(
                                 f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
-                                "auto-submit disabled. Flagging for manual review.[/yellow]"
+                                "proceeding anyway (warn-only gate).[/yellow]"
                             )
-                            auto_submit = False
-                            self.auto_submit = False
             except Exception as _ce:
                 console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
 
@@ -319,6 +322,10 @@ class JobrightScraper(BaseScraper):
             if resolved_resume:
                 await self._upload_resume_if_prompted(page, resolved_resume)
             await self._field_fixer.fix_fields(page)
+
+            # Teamtailor-specific form filling (Crunchbase, etc.)
+            if "teamtailor.com" in page.url.lower():
+                await self._fill_teamtailor_form(page)
 
             if not await self._looks_like_application_form(page):
                 family = await self._detect_portal_family(page)
@@ -1503,12 +1510,19 @@ class JobrightScraper(BaseScraper):
                 company_page = await _new_page.value
                 await company_page.wait_for_load_state("domcontentloaded", timeout=30000)
                 await self._delay(8, 12)  # give extension time to inject and autofill
+                if company_page and "teamtailor.com" in company_page.url.lower() and "/applications/new" not in company_page.url.lower():
+                    base_url = company_page.url.split('?')[0].rstrip('/')
+                    await company_page.goto(f"{base_url}/applications/new", wait_until="domcontentloaded", timeout=30000)
+                    await self._delay(3, 5)
                 console.print(f"[green]Jobright:[/green] Extension opened ATS: {company_page.url[:80]}")
             except Exception as _e:
                 console.print(f"[yellow]Jobright:[/yellow] Apply button didn't open new tab ({_e}); using direct navigation")
 
             # ── Fallback: open ATS URL directly ──────────────────────────────────
             if company_page is None:
+                if ext_url and "teamtailor.com" in ext_url.lower() and "/applications/new" not in ext_url.lower():
+                    base_url = ext_url.split('?')[0].rstrip('/')
+                    ext_url = f"{base_url}/applications/new"
                 console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
                 company_page = await self._context.new_page()
                 await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
@@ -1615,10 +1629,8 @@ class JobrightScraper(BaseScraper):
                             if self._last_ats_score > 0 and self._last_ats_score < 85 and auto_submit:
                                 console.print(
                                     f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
-                                    "auto-submit disabled. Flagging for manual review.[/yellow]"
+                                    "proceeding anyway (warn-only gate).[/yellow]"
                                 )
-                                auto_submit = False
-                                self.auto_submit = False
                 except Exception as _ce:
                     console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
 
@@ -2361,6 +2373,129 @@ class JobrightScraper(BaseScraper):
         except Exception as e:
             console.print(f"[yellow]Jobright:[/yellow] Alt portal login failed: {e}")
 
+    async def _fill_teamtailor_form(self, page) -> None:
+        """Fill Teamtailor application form fields that Jobright autofill misses.
+
+        Covers: LinkedIn Profile URL, work-auth radio (Yes), sponsorship radio (No),
+        and any other visible text/select inputs left empty.
+        """
+        import os
+        linkedin_url = "https://www.linkedin.com/in/anthonyclarkins"
+
+        # Wait briefly for the form to settle after autofill
+        await asyncio.sleep(1)
+
+        # --- LinkedIn Profile URL ---
+        linkedin_selectors = [
+            "input[name*='linkedin' i]",
+            "input[placeholder*='linkedin' i]",
+            "input[id*='linkedin' i]",
+            "input[aria-label*='linkedin' i]",
+        ]
+        for sel in linkedin_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.count() and await el.is_visible():
+                    current_val = await el.input_value()
+                    if not current_val:
+                        await el.fill(linkedin_url)
+                    break
+            except Exception:
+                pass
+
+        # --- Work authorization radio (Yes) ---
+        work_auth_yes_selectors = [
+            # Teamtailor often renders label text next to a radio input
+            "label:has-text('Yes')",
+            "input[type='radio'][value='true']",
+            "input[type='radio'][value='yes' i]",
+            "input[type='radio'][value='1']",
+        ]
+        # We need the one near "authorized" / "legal" / "work in" context
+        try:
+            # Preferred: find all radio labels, pick the "Yes" near work-auth question
+            await page.evaluate("""() => {
+                const labels = Array.from(document.querySelectorAll('label'));
+                const workSection = labels.find(l =>
+                    /authorized|legally|work in the us/i.test(l.closest('fieldset,div,section')?.textContent || '')
+                    && /^yes$/i.test(l.textContent.trim())
+                );
+                if (workSection) {
+                    const radio = workSection.querySelector('input[type=radio]') ||
+                        document.querySelector('#' + workSection.htmlFor);
+                    if (radio) radio.click();
+                }
+            }""")
+        except Exception:
+            pass
+        # Fallback: click any visible "Yes" radio inside a fieldset
+        for sel in work_auth_yes_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.count() and await el.is_visible():
+                    await el.click()
+                    break
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+
+        # --- Sponsorship required radio (No) ---
+        try:
+            await page.evaluate("""() => {
+                const labels = Array.from(document.querySelectorAll('label'));
+                const sponsorSection = labels.find(l =>
+                    /sponsor/i.test(l.closest('fieldset,div,section')?.textContent || '')
+                    && /^no$/i.test(l.textContent.trim())
+                );
+                if (sponsorSection) {
+                    const radio = sponsorSection.querySelector('input[type=radio]') ||
+                        document.querySelector('#' + sponsorSection.htmlFor);
+                    if (radio) radio.click();
+                }
+            }""")
+        except Exception:
+            pass
+        # Fallback: value="false" / value="no"
+        for sel in ["input[type='radio'][value='false']", "input[type='radio'][value='no' i]", "input[type='radio'][value='0']"]:
+            try:
+                el = page.locator(sel).first
+                if await el.count() and await el.is_visible():
+                    await el.click()
+                    break
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+
+        # --- Any remaining required text inputs left blank ---
+        import json as _json
+        profile_path = Path(__file__).parent.parent.parent / "state" / "profile.json"
+        profile: dict = {}
+        if profile_path.exists():
+            try:
+                profile = _json.loads(profile_path.read_text())
+            except Exception:
+                pass
+        personal = profile.get("personal_info", {})
+        fill_map = {
+            "phone": personal.get("phone", ""),
+            "city": personal.get("city", ""),
+            "zip": personal.get("zip", ""),
+        }
+        for keyword, value in fill_map.items():
+            if not value:
+                continue
+            try:
+                el = page.locator(f"input[name*='{keyword}' i]:visible, input[placeholder*='{keyword}' i]:visible").first
+                if await el.count() and await el.is_visible():
+                    if not await el.input_value():
+                        await el.fill(value)
+            except Exception:
+                pass
+
+        console.print("[cyan]Teamtailor:[/cyan] form fields filled (LinkedIn, work auth, sponsorship)")
+
     async def _click_ats_apply_button(self, page) -> bool:
         """
         Navigate to / click into the application form on an ATS job listing page.
@@ -2467,6 +2602,10 @@ class JobrightScraper(BaseScraper):
             'a:text-matches("START YOUR APPLICATION", "i")',
             'a:text-matches("Start Your Application", "i")',
             'a:text-matches("Start Application", "i")',
+            # Teamtailor (Crunchbase, etc.)
+            'button:text-matches("^Apply here$", "i")',
+            'a:text-matches("^Apply here$", "i")',
+            '.careersite-button',
             # Broad anchor fallback — many ATS portals use <a> not <button> for Apply
             'a:text-matches("^Apply Now$", "i")',
             'a:text-matches("^Apply$", "i")',

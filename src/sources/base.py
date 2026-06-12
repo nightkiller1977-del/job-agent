@@ -69,13 +69,32 @@ class BaseScraper(ABC):
         return d
 
     def _clear_profile_locks(self) -> None:
-        """Remove stale Chromium lock files that prevent re-launching the profile."""
+        """Remove stale Chrome lock files and kill orphaned Chrome processes
+        holding the profile before re-launching."""
+        import subprocess, shutil
+        # Kill any Chrome processes still holding this profile directory
+        try:
+            subprocess.run(
+                ["pkill", "-f", str(self._profile_dir)],
+                capture_output=True, timeout=5
+            )
+        except Exception:
+            pass
+
+        # Remove Singleton lock files
         for lockfile in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-            p = self._profile_dir / lockfile
             try:
-                p.unlink(missing_ok=True)
+                (self._profile_dir / lockfile).unlink(missing_ok=True)
             except Exception:
                 pass
+
+        # Remove database lock files that persist after a hard kill
+        for pattern in ("*.lock", "lockfile"):
+            for p in self._profile_dir.rglob(pattern):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     async def _start_browser(self, load_extensions: bool = False) -> Page:
         """
@@ -95,6 +114,10 @@ class BaseScraper(ABC):
         args = [
             "--start-maximized",
             "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            "--disable-profile-error-dialogs",
         ]
 
         if load_extensions:
