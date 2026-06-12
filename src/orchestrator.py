@@ -404,19 +404,13 @@ class Orchestrator:
     async def browser_setup(self) -> None:
         """Open Chrome with the job-agent profile so you can sign in once.
 
-        Opens LinkedIn, Jobright, and the Chrome Web Store search for the
-        Jobright extension — all in the dedicated job-agent Chrome profile.
-        Sign in to each site, install the Jobright extension, then press
-        Enter here. All sessions persist across every future run.
+        Opens LinkedIn, Jobright, and the Chrome Web Store in the dedicated
+        job-agent Chrome profile. macOS Keychain passwords autofill so you
+        just confirm the logins. Install the Jobright extension from the Web
+        Store tab, then close the browser window — sessions persist forever.
         """
         console.print("\n[bold cyan]Job-Agent Browser Setup[/bold cyan]")
         console.print("[dim]Opening Chrome with the job-agent profile...[/dim]")
-        console.print()
-        console.print("  1. Sign in to [bold]LinkedIn[/bold]")
-        console.print("  2. Sign in to [bold]Jobright[/bold]")
-        console.print("  3. Install the [bold]Jobright AI[/bold] extension from the Chrome Web Store tab")
-        console.print("  4. Sign in to any other portals (Workday, etc.) as needed")
-        console.print()
 
         scraper = JobrightScraper(self.config)
         page = await scraper._start_browser(load_extensions=True)
@@ -433,19 +427,17 @@ class Orchestrator:
             wait_until="domcontentloaded",
         )
 
-        console.print("[green]Browser is open.[/green] Sign in and install the extension.")
-        console.print("[dim]When you're done, press Enter here to save sessions and exit.[/dim]\n")
+        console.print("[green]Browser open.[/green] Saved passwords will autofill — just confirm each login.")
+        console.print("[dim]Install the Jobright AI extension from the Web Store tab, then close the browser window to finish.[/dim]\n")
 
+        # Wait until the user closes the browser window — no terminal input needed.
         try:
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: input("Press Enter when done → ")
-            )
-        except (EOFError, KeyboardInterrupt):
+            while ctx.pages:
+                await asyncio.sleep(2)
+        except Exception:
             pass
 
-        await scraper._close_browser()
-        console.print("\n[green]Setup complete.[/green] Sessions saved to the job-agent Chrome profile.")
-        console.print("[dim]All future apply runs will use these logins automatically.[/dim]\n")
+        console.print("[green]Setup complete.[/green] Sessions saved — all future runs use these logins automatically.\n")
 
     async def prepare_sessions(
         self,
