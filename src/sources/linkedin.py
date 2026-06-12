@@ -1077,7 +1077,7 @@ class LinkedInScraper(BaseScraper):
                 cont = await popup.query_selector('a[href]:not([href*="linkedin.com"]), a.apply-button--redirect')
                 if cont:
                     href = await cont.get_attribute("href")
-                    if href and "linkedin.com" not in href:
+                    if href and href.startswith("http") and "linkedin.com" not in href:
                         console.print(f"[dim]LinkedIn: Interstitial continue URL: {href[:80]}[/dim]")
                         return href
                 # Wait for popup to auto-redirect
@@ -1140,7 +1140,7 @@ class LinkedInScraper(BaseScraper):
                     elem = await page.query_selector(sel)
                     if elem:
                         href = await elem.get_attribute("href")
-                        if href and "linkedin.com" not in href:
+                        if href and href.startswith("http") and "linkedin.com" not in href:
                             console.print(f"[dim]LinkedIn: Interstitial link: {href[:80]}[/dim]")
                             return href
                         # It's a button — click it and watch
