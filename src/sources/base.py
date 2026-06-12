@@ -100,27 +100,23 @@ class BaseScraper(ABC):
         if load_extensions:
             ext_path = EXT_DIR / "jobright-autofill"
             if ext_path.exists():
-                ext_str = str(ext_path)
-                args += [
-                    f"--load-extension={ext_str}",
-                    f"--disable-extensions-except={ext_str}",
-                ]
-            else:
-                print(f"[warning] Extension not found at {ext_path} — skipping extension load")
+                # Load local extension as fallback; don't disable-extensions-except
+                # so extensions installed via Chrome Web Store in the profile also load.
+                args.append(f"--load-extension={str(ext_path)}")
+            # Extensions already installed in the Chrome profile load automatically.
 
-        # launch_persistent_context keeps cookies/localStorage across restarts
+        # channel="chrome" uses the real installed Chrome binary so Chrome Web Store
+        # extensions, saved logins, and Chrome's cookie encryption all work correctly.
+        # The dedicated profile dir keeps job-agent sessions separate from the main
+        # Chrome profile — no locking conflicts, no risk to personal data.
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(self._profile_dir),
+            channel="chrome",
             headless=False,
             accept_downloads=True,
             args=args,
             slow_mo=80,
             viewport={"width": 1400, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
         )
         # Get or create a page
         pages = self._context.pages

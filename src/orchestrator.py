@@ -401,6 +401,52 @@ class Orchestrator:
         for key, count in sorted(blockers.items()):
             console.print(f"  {key}: {count}")
 
+    async def browser_setup(self) -> None:
+        """Open Chrome with the job-agent profile so you can sign in once.
+
+        Opens LinkedIn, Jobright, and the Chrome Web Store search for the
+        Jobright extension — all in the dedicated job-agent Chrome profile.
+        Sign in to each site, install the Jobright extension, then press
+        Enter here. All sessions persist across every future run.
+        """
+        console.print("\n[bold cyan]Job-Agent Browser Setup[/bold cyan]")
+        console.print("[dim]Opening Chrome with the job-agent profile...[/dim]")
+        console.print()
+        console.print("  1. Sign in to [bold]LinkedIn[/bold]")
+        console.print("  2. Sign in to [bold]Jobright[/bold]")
+        console.print("  3. Install the [bold]Jobright AI[/bold] extension from the Chrome Web Store tab")
+        console.print("  4. Sign in to any other portals (Workday, etc.) as needed")
+        console.print()
+
+        scraper = JobrightScraper(self.config)
+        page = await scraper._start_browser(load_extensions=True)
+        ctx = scraper._context
+
+        await page.goto("https://www.linkedin.com", wait_until="domcontentloaded")
+
+        jr_page = await ctx.new_page()
+        await jr_page.goto("https://jobright.ai", wait_until="domcontentloaded")
+
+        ext_page = await ctx.new_page()
+        await ext_page.goto(
+            "https://chromewebstore.google.com/search/jobright%20ai",
+            wait_until="domcontentloaded",
+        )
+
+        console.print("[green]Browser is open.[/green] Sign in and install the extension.")
+        console.print("[dim]When you're done, press Enter here to save sessions and exit.[/dim]\n")
+
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: input("Press Enter when done → ")
+            )
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+        await scraper._close_browser()
+        console.print("\n[green]Setup complete.[/green] Sessions saved to the job-agent Chrome profile.")
+        console.print("[dim]All future apply runs will use these logins automatically.[/dim]\n")
+
     async def prepare_sessions(
         self,
         source: Optional[str] = None,

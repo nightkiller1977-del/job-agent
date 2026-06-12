@@ -373,3 +373,239 @@ async def test_live_indeed_dry_run():
     # Assert it completed without error and was stopped before final click
     assert success is False
     assert scraper.last_apply_status in ("submission_cancelled", "blocked")
+
+
+# ── Option 1: ATS Score Gate Negative Test ──────────────────────────────────
+@pytest.mark.asyncio
+async def test_mock_ats_score_gate_negative():
+    config = {
+        "local_resume_path": str(Path(__file__).parent / "dummy_resume.pdf"),
+    }
+    
+    async def route_handler(route):
+        url = route.request.url
+        if "indeed.com/viewjob" in url:
+            html = """
+            <html>
+            <body>
+              <h1>Software Architect</h1>
+              <a href="https://mock-company.greenhouse.io/jobs/apply">Apply on company site</a>
+            </body>
+            </html>
+            """
+            await route.fulfill(status=200, content_type="text/html", body=html)
+        elif "greenhouse.io/jobs/apply" in url:
+            html = """
+            <html>
+            <body>
+              <h1>Greenhouse Mock Form</h1>
+              <button id="apply_button" onclick="this.style.display='none';">Apply</button>
+              <form id="apply-form">
+                <input type="text" id="first_name" name="first_name" placeholder="First Name" value="John">
+                <input type="text" id="last_name" name="last_name" placeholder="Last Name" value="Doe">
+                <input type="email" id="email" name="email" placeholder="Email" value="john@example.com">
+                <button type="submit" data-automation-id="bottom-navigation-next-button">Submit Application</button>
+              </form>
+            </body>
+            </html>
+            """
+            await route.fulfill(status=200, content_type="text/html", body=html)
+        else:
+            await route.abort()
+
+    class InterceptingIndeedScraper(IndeedScraper):
+        async def _start_browser(self, load_extensions: bool = False):
+            page = await super()._start_browser(load_extensions)
+            await page.route("**/*", route_handler)
+            return page
+
+    scraper = InterceptingIndeedScraper(config)
+    job = {
+        "job_id": "low_score_job",
+        "title": "Low Fit Job",
+        "company": "LowCorp",
+        "url": "https://www.indeed.com/viewjob?jk=789",
+        "source": "indeed"
+    }
+
+    # Patch the Claude API call to return a low ATS score (75)
+    mock_claude_data = {
+        "ats_score": 75,
+        "missing_keywords": ["Scala", "Hadoop"],
+        "matching_keywords": ["Python"],
+        "recommendation": "Weak match",
+        "tailored_summary": "Tailored summary here",
+        "tailored_bullets": [],
+        "cover_letter": "Cover letter here"
+    }
+
+    original_jobright_start = JobrightScraper._start_browser
+    async def intercepting_jobright_start(self, load_extensions: bool = False):
+        page = await original_jobright_start(self, load_extensions)
+        await page.route("**/*", route_handler)
+        return page
+
+    with patch("src.sources.jobright.JobrightScraper._start_browser", intercepting_jobright_start), \
+         patch("src.sources.jobright.JobrightScraper._claude_ats_and_tailor", AsyncMock(return_value=mock_claude_data)), \
+         patch("src.sources.jobright.JobrightScraper._generate_tailored_resume_pdf", AsyncMock(return_value=config["local_resume_path"])), \
+         patch("src.resume_helper.ResumeFieldFixer.load_profile") as mock_load, \
+         patch("src.resume_helper.ResumeFieldFixer.fix_fields", AsyncMock()) as mock_fix:
+        
+        # Run with auto_submit=True (should be overridden to False by the gate)
+        success = await scraper.apply(job, auto_submit=True)
+        # It should NOT submit because non-interactive run with auto_submit overridden to False skips the final submit prompt.
+        assert success is False
+        assert scraper.auto_submit is False  # Verify auto_submit was disabled!
+
+
+# ── Option 1: ATS Score Gate Positive Test ──────────────────────────────────
+@pytest.mark.asyncio
+async def test_mock_ats_score_gate_positive():
+    config = {
+        "local_resume_path": str(Path(__file__).parent / "dummy_resume.pdf"),
+    }
+    
+    async def route_handler(route):
+        url = route.request.url
+        if "indeed.com/viewjob" in url:
+            html = """
+            <html>
+            <body>
+              <h1>Software Architect</h1>
+              <a href="https://mock-company.greenhouse.io/jobs/apply">Apply on company site</a>
+            </body>
+            </html>
+            """
+            await route.fulfill(status=200, content_type="text/html", body=html)
+        elif "greenhouse.io/jobs/apply" in url:
+            html = """
+            <html>
+            <body>
+              <h1>Greenhouse Mock Form</h1>
+              <button id="apply_button" onclick="this.style.display='none';">Apply</button>
+              <form id="apply-form">
+                <input type="text" id="first_name" name="first_name" placeholder="First Name" value="John">
+                <input type="text" id="last_name" name="last_name" placeholder="Last Name" value="Doe">
+                <input type="email" id="email" name="email" placeholder="Email" value="john@example.com">
+                <button type="submit" data-automation-id="bottom-navigation-next-button">Submit Application</button>
+              </form>
+            </body>
+            </html>
+            """
+            await route.fulfill(status=200, content_type="text/html", body=html)
+        else:
+            await route.abort()
+
+    class InterceptingIndeedScraper(IndeedScraper):
+        async def _start_browser(self, load_extensions: bool = False):
+            page = await super()._start_browser(load_extensions)
+            await page.route("**/*", route_handler)
+            return page
+
+    scraper = InterceptingIndeedScraper(config)
+    job = {
+        "job_id": "high_score_job",
+        "title": "High Fit Job",
+        "company": "HighCorp",
+        "url": "https://www.indeed.com/viewjob?jk=456",
+        "source": "indeed"
+    }
+
+    # Patch the Claude API call to return a high ATS score (90)
+    mock_claude_data = {
+        "ats_score": 90,
+        "missing_keywords": [],
+        "matching_keywords": ["Python", "Management"],
+        "recommendation": "Strong match",
+        "tailored_summary": "Tailored summary here",
+        "tailored_bullets": [],
+        "cover_letter": "Cover letter here"
+    }
+
+    original_jobright_start = JobrightScraper._start_browser
+    async def intercepting_jobright_start(self, load_extensions: bool = False):
+        page = await original_jobright_start(self, load_extensions)
+        await page.route("**/*", route_handler)
+        return page
+
+    with patch("src.sources.jobright.JobrightScraper._start_browser", intercepting_jobright_start), \
+         patch("src.sources.jobright.JobrightScraper._claude_ats_and_tailor", AsyncMock(return_value=mock_claude_data)), \
+         patch("src.sources.jobright.JobrightScraper._generate_tailored_resume_pdf", AsyncMock(return_value=config["local_resume_path"])), \
+         patch("src.resume_helper.ResumeFieldFixer.load_profile") as mock_load, \
+         patch("src.resume_helper.ResumeFieldFixer.fix_fields", AsyncMock()) as mock_fix:
+        
+        # Run with auto_submit=True (should remain True since score is 90)
+        success = await scraper.apply(job, auto_submit=True)
+        assert success is True
+        assert scraper.auto_submit is True  # Verify auto_submit remained True!
+
+
+# ── Option 1: Pre-Submission Empty Form Validation Negative Test ──────────────
+@pytest.mark.asyncio
+async def test_mock_pre_submission_validation_empty_form():
+    config = {
+        "local_resume_path": str(Path(__file__).parent / "dummy_resume.pdf"),
+    }
+    
+    async def route_handler(route):
+        url = route.request.url
+        if "indeed.com/viewjob" in url:
+            html = """
+            <html>
+            <body>
+              <h1>Software Architect</h1>
+              <a href="https://mock-company.greenhouse.io/jobs/apply">Apply on company site</a>
+            </body>
+            </html>
+            """
+            await route.fulfill(status=200, content_type="text/html", body=html)
+        elif "greenhouse.io/jobs/apply" in url:
+            html = """
+            <html>
+            <body>
+              <h1>Greenhouse Mock Form</h1>
+              <button id="apply_button" onclick="this.style.display='none';">Apply</button>
+              <form id="apply-form">
+                <input type="text" id="first_name" name="first_name" placeholder="First Name">
+                <input type="text" id="last_name" name="last_name" placeholder="Last Name">
+                <input type="email" id="email" name="email" placeholder="Email">
+                <button type="submit" data-automation-id="bottom-navigation-next-button">Submit Application</button>
+              </form>
+            </body>
+            </html>
+            """
+            await route.fulfill(status=200, content_type="text/html", body=html)
+        else:
+            await route.abort()
+
+    class InterceptingIndeedScraper(IndeedScraper):
+        async def _start_browser(self, load_extensions: bool = False):
+            page = await super()._start_browser(load_extensions)
+            await page.route("**/*", route_handler)
+            return page
+
+    scraper = InterceptingIndeedScraper(config)
+    job = {
+        "job_id": "empty_form_job",
+        "title": "Empty Form Job",
+        "company": "EmptyCorp",
+        "url": "https://www.indeed.com/viewjob?jk=222",
+        "source": "indeed"
+    }
+
+    # Patch dependencies
+    original_jobright_start = JobrightScraper._start_browser
+    async def intercepting_jobright_start(self, load_extensions: bool = False):
+        page = await original_jobright_start(self, load_extensions)
+        await page.route("**/*", route_handler)
+        return page
+
+    with patch("src.sources.jobright.JobrightScraper._start_browser", intercepting_jobright_start), \
+         patch("src.resume_helper.ResumeFieldFixer.load_profile") as mock_load, \
+         patch("src.resume_helper.ResumeFieldFixer.fix_fields", AsyncMock()) as mock_fix:
+        
+        # Run with auto_submit=True. Form guard should refuse to submit empty form fields.
+        success = await scraper.apply(job, auto_submit=True)
+        assert success is False
+        assert scraper.last_apply_status == "form_empty_not_submitted"
+

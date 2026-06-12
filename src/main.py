@@ -3,6 +3,7 @@
 job-agent CLI entry point.
 
 Usage:
+  python src/main.py setup                     # First-time: open Chrome profile, sign in to LinkedIn/Jobright, install extension
   python src/main.py discover                  # Scrape all sources, score, show review queue
   python src/main.py discover --source linkedin
   python src/main.py discover --source linkedin-saved
@@ -147,6 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of approved jobs to open for session preparation",
     )
 
+    # setup
+    subparsers.add_parser(
+        "setup",
+        help="First-time setup: open Chrome with job-agent profile to sign in and install extensions",
+    )
+
     # status
     subparsers.add_parser(
         "status",
@@ -203,6 +210,9 @@ async def main_async(args: argparse.Namespace) -> int:
             company=args.company,
             limit=args.limit,
         )
+
+    elif args.command == "setup":
+        await orchestrator.browser_setup()
 
     elif args.command == "status":
         orchestrator.show_status()
