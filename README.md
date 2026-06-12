@@ -107,7 +107,7 @@ python src/main.py status
 | Tailored resume PDF generation | ✅ Playwright + HTML template |
 | Form autofill (Jobright extension) | ✅ Extension in Chrome profile |
 | Final application submit | ✅ With `--auto-submit` |
-| USAJobs login | ⚠️ One-time manual via `prepare-sessions` (uses login.gov, no auto-login) |
+| USAJobs login | ✅ Auto from `.env` via login.gov — pauses for 2FA the first time only |
 | Workday portals that reject `COMPANY_EMAIL` | ⚠️ One-time per company via `prepare-sessions` |
 | Jobright extension install | ⚠️ One-time via `setup` |
 
