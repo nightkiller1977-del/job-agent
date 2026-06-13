@@ -617,11 +617,9 @@ class Orchestrator:
                     outcomes.append({"job": job, "status": code, "reason": reason})
             except JobExpiredError as exc:
                 self.state.set_status(job["job_id"], "expired")
-                self.state.record_apply_attempt(job["job_id"], "expired", str(exc))
-                console.print("[red]Job no longer active (expired). Status updated to expired.[/red]")
+                console.print("[red]Job no longer active (expired). Removed from database.[/red]")
                 outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
                 await self._push_status_to_cloud(job["job_id"], "expired")
-                await self._push_apply_attempt_to_cloud(job["job_id"])
             except Exception as exc:
                 console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")
                 self.state.record_apply_attempt(job["job_id"], "error", str(exc)[:400])
