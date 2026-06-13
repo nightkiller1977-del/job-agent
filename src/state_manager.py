@@ -53,6 +53,8 @@ class StateManager:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(DB_SCHEMA)
+            # Remove any existing expired jobs
+            conn.execute("DELETE FROM jobs WHERE status = 'expired'")
 
     # ------------------------------------------------------------------
     # Write helpers
@@ -105,6 +107,10 @@ class StateManager:
             return True
 
     def set_status(self, job_id: str, status: str) -> None:
+        if status == "expired":
+            self.delete_job(job_id)
+            return
+
         now = datetime.utcnow().isoformat()
         ts_field = {
             "reviewed": "reviewed_at",
@@ -124,6 +130,11 @@ class StateManager:
                     "UPDATE jobs SET status = ? WHERE job_id = ?",
                     (status, job_id),
                 )
+
+    def delete_job(self, job_id: str) -> None:
+        """Delete a job record completely from the database."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
 
     def update_score(self, job_id: str, score: int, reason: str, flags: str = "") -> None:
         with self._connect() as conn:
