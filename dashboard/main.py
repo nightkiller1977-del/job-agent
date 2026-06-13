@@ -470,10 +470,15 @@ async def job_action(body: ActionRequest):
                 )
                 if not cur.fetchone():
                     raise HTTPException(status_code=404, detail="Job not found")
-                cur.execute(
-                    "UPDATE jobs SET status = %s, updated_at = NOW() WHERE job_id = %s",
-                    (body.action, body.job_id),
-                )
+                if body.action == "expired":
+                    cur.execute(
+                        "DELETE FROM jobs WHERE job_id = %s", (body.job_id,)
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE jobs SET status = %s, updated_at = NOW() WHERE job_id = %s",
+                        (body.action, body.job_id),
+                    )
             conn.commit()
     except HTTPException:
         raise
