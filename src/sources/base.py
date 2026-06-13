@@ -63,15 +63,15 @@ class BaseScraper(ABC):
 
     @property
     def _profile_dir(self) -> Path:
-        """Persistent Chrome profile directory for this source (isolated from the user's
-        main Chrome so the two don't fight over profile locks)."""
-        d = SESSIONS_DIR / f"{self.name}_profile"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        """Persistent Chrome profile directory. Configured to use the user's
+        main Chrome profile directory."""
+        return Path("/Users/alarkins/Library/Application Support/Google/Chrome")
 
     def _clear_profile_locks(self) -> None:
         """Remove stale Chrome lock files and kill orphaned Chrome processes
         holding the profile before re-launching."""
+        if "Application Support/Google/Chrome" in str(self._profile_dir):
+            return
         import subprocess, time
         # Kill any Chrome processes still holding this profile directory
         try:
@@ -123,6 +123,7 @@ class BaseScraper(ABC):
             "--no-default-browser-check",
             "--disable-sync",
             "--disable-profile-error-dialogs",
+            "--profile-directory=Default",
         ]
 
         if load_extensions:
