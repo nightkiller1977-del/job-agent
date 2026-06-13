@@ -231,19 +231,46 @@ class JobrightScraper(BaseScraper):
         submitted = False
         resolved_resume = resolve_resume_path(self.config, preferred=resume_path)
 
-        # Clean and rewrite Teamtailor URLs to load the application form directly
-        if "teamtailor.com" in external_url.lower() and "/applications/new" not in external_url.lower():
+        _is_teamtailor = "teamtailor.com" in external_url.lower()
+
+        # Rewrite Teamtailor URLs to load the application form directly.
+        # Don't load the Jobright extension for Teamtailor — we have _fill_teamtailor_form,
+        # and the extension's content scripts can crash the Teamtailor renderer tab.
+        if _is_teamtailor and "/applications/new" not in external_url.lower():
             base_url = external_url.split('?')[0].rstrip('/')
             external_url = f"{base_url}/applications/new"
 
         console.print(f"[magenta]Jobright ATS:[/magenta] External apply for {job.get('title')} @ {job.get('company')}")
-        page = await self._start_browser(load_extensions=True)
+        page = await self._start_browser(load_extensions=not _is_teamtailor)
         try:
             await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
-            await self._delay(3, 5)
+            # For Teamtailor: wait for the SPA to finish its initial auth check and
+            # settle on the form page before trying to interact. Teamtailor's JS does
+            # a brief redirect/validation pass that invalidates the page handle if we
+            # call page.evaluate too soon.
+            if _is_teamtailor:
+                await asyncio.sleep(4)
+                # Wait for the actual form fields to appear
+                for _form_sel in [
+                    'input[name="job_application[name]"]',
+                    'input[name*="name"]',
+                    'input[type="email"]',
+                    'form',
+                ]:
+                    try:
+                        await page.wait_for_selector(_form_sel, timeout=8000)
+                        break
+                    except Exception:
+                        continue
+            else:
+                await self._delay(3, 5)
             console.print(f"[magenta]Jobright ATS:[/magenta] Company portal loaded: {page.url}")
 
-            entered_form = await self._click_ats_apply_button(page)
+            # Skip _click_ats_apply_button for Teamtailor — we're already on /applications/new
+            if _is_teamtailor:
+                entered_form = True
+            else:
+                entered_form = await self._click_ats_apply_button(page)
             await self._delay(3, 5)
             if getattr(self, "_workday_session_expired", False):
                 return self._set_apply_outcome(
@@ -251,7 +278,9 @@ class JobrightScraper(BaseScraper):
                     "Workday redirected to sign-in. Re-authenticate this company Workday portal, then rerun apply.",
                 )
 
-            if await self._portal_needs_login(page):
+            # Teamtailor forms are public — their email field is for the applicant,
+            # not a login form. Skip the login-wall check to avoid a false positive.
+            if not _is_teamtailor and await self._portal_needs_login(page):
                 console.print("[magenta]Jobright ATS:[/magenta] Login required — attempting configured portal login.")
                 await self._company_portal_login(page)
                 await self._delay(4, 6)
@@ -301,6 +330,7 @@ class JobrightScraper(BaseScraper):
                 console.print("[yellow]Jobright ATS:[/yellow] No local resume file found for upload fallback.")
 
             current_portal = page.url
+            _on_teamtailor = "teamtailor.com" in current_portal.lower()
             if "myworkdayjobs.com" not in current_portal:
                 if not entered_form and not await self._looks_like_application_form(page):
                     family = await self._detect_portal_family(page)
@@ -312,22 +342,25 @@ class JobrightScraper(BaseScraper):
                             f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
                         ),
                     )
-                console.print("[magenta]Jobright ATS:[/magenta] Triggering Jobright autofill extension…")
-                if await self._trigger_autofill(page):
-                    await self._delay(10, 15)
-                else:
-                    console.print("[yellow]Jobright ATS:[/yellow] Autofill trigger not found; trying generic fill/upload fallback.")
-                    await self._delay(3, 5)
+                # Skip Jobright extension autofill for Teamtailor — extension not loaded,
+                # and _fill_teamtailor_form handles field filling below.
+                if not _on_teamtailor:
+                    console.print("[magenta]Jobright ATS:[/magenta] Triggering Jobright autofill extension…")
+                    if await self._trigger_autofill(page):
+                        await self._delay(10, 15)
+                    else:
+                        console.print("[yellow]Jobright ATS:[/yellow] Autofill trigger not found; trying generic fill/upload fallback.")
+                        await self._delay(3, 5)
 
             if resolved_resume:
                 await self._upload_resume_if_prompted(page, resolved_resume)
             await self._field_fixer.fix_fields(page)
 
             # Teamtailor-specific form filling (Crunchbase, etc.)
-            if "teamtailor.com" in page.url.lower():
+            if _on_teamtailor:
                 await self._fill_teamtailor_form(page)
 
-            if not await self._looks_like_application_form(page):
+            if not _on_teamtailor and not await self._looks_like_application_form(page):
                 family = await self._detect_portal_family(page)
                 controls = await self._visible_controls_snapshot(page)
                 return self._set_apply_outcome(
