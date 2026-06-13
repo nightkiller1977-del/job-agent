@@ -65,7 +65,7 @@ class JobrightScraper(BaseScraper):
                 # Verify page is still valid before navigating — _add_external_job_to_jobright
                 # catches its own exceptions but may leave the page handle invalid.
                 try:
-                    _ = page.url  # raises if page/context is closed
+                    await page.evaluate("1")  # async ping — raises if page/context is closed
                 except Exception:
                     return ""  # page is gone; skip fallback search
                 await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=30000)
@@ -162,17 +162,23 @@ class JobrightScraper(BaseScraper):
             await self._delay(12, 18)
 
             for attempt in range(18):
-                jobs = await self._js_extract(page)
+                try:
+                    jobs = await self._js_extract(page)
+                except Exception:
+                    break  # page closed; give up polling
                 match = self._best_jobright_match(job, jobs)
                 if match:
                     console.print("[green]Jobright Tailor:[/green] External job added/found in Jobright.")
                     return match
-                # After ~44 seconds total, refresh the page — Jobright sometimes
-                # needs a reload before the newly-added external card appears.
+                # After ~44 seconds total, navigate back to the page — reload() can
+                # crash the renderer on some Chrome+SPA combinations; goto() is safer.
                 if attempt == 8:
                     console.print("[dim]Jobright Tailor: reloading page to surface new card…[/dim]")
-                    await page.reload(wait_until="domcontentloaded")
-                    await self._delay(3, 4)
+                    try:
+                        await page.goto("https://jobright.ai/jobs/external", wait_until="domcontentloaded", timeout=20000)
+                        await self._delay(3, 4)
+                    except Exception:
+                        break  # page closed; give up
                 await asyncio.sleep(4)
 
             console.print("[yellow]Jobright Tailor:[/yellow] External job was submitted to Jobright, but no matching card appeared yet.")
