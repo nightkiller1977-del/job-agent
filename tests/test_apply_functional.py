@@ -26,6 +26,9 @@ def force_headless(request):
     async def mock_launch_persistent_context(self, user_data_dir, **kwargs):
         kwargs["headless"] = True
         kwargs["slow_mo"] = 0
+        # channel="chrome" hands off to an already-running Chrome on macOS,
+        # causing ProcessSingleton failures in headless/test mode.
+        kwargs.pop("channel", None)
         return await original_launch(self, user_data_dir, **kwargs)
 
     with patch("playwright.async_api._generated.BrowserType.launch_persistent_context", mock_launch_persistent_context):
