@@ -64,20 +64,22 @@ class BaseScraper(ABC):
     @property
     def _profile_dir(self) -> Path:
         """Persistent Chromium profile directory for this source (survives restarts)."""
-        d = SESSIONS_DIR / f"{self.name}_profile"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return Path("/Users/alarkins/Library/Application Support/Google/Chrome")
 
     def _clear_profile_locks(self) -> None:
         """Remove stale Chrome lock files and kill orphaned Chrome processes
         holding the profile before re-launching."""
-        import subprocess, shutil
+        import subprocess, time
         # Kill any Chrome processes still holding this profile directory
         try:
             subprocess.run(
                 ["pkill", "-f", str(self._profile_dir)],
                 capture_output=True, timeout=5
             )
+            # Give Chrome time to fully release its SQLite databases before
+            # we open the profile again. Without this, rapid open→close→open
+            # sequences cause 'database is locked' / renderer crashes.
+            time.sleep(2)
         except Exception:
             pass
 
@@ -89,12 +91,13 @@ class BaseScraper(ABC):
                 pass
 
         # Remove database lock files that persist after a hard kill
-        for pattern in ("*.lock", "lockfile"):
-            for p in self._profile_dir.rglob(pattern):
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        if "job-agent" in str(self._profile_dir):
+            for pattern in ("*.lock", "lockfile"):
+                for p in self._profile_dir.rglob(pattern):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
     async def _start_browser(self, load_extensions: bool = False) -> Page:
         """
@@ -118,6 +121,7 @@ class BaseScraper(ABC):
             "--no-default-browser-check",
             "--disable-sync",
             "--disable-profile-error-dialogs",
+            "--profile-directory=Default",
         ]
 
         if load_extensions:
@@ -169,6 +173,10 @@ class BaseScraper(ABC):
         self._context = None
         self._page = None
         self._playwright = None
+        # Wait for Chrome to finish flushing its SQLite databases to disk.
+        # Without this, rapid close→open on the same profile causes database
+        # lock errors and renderer crashes in the next session.
+        await asyncio.sleep(2)
 
     async def _delay(self, extra_min: float = 0, extra_max: float = 0) -> None:
         """Random human-like delay between actions."""
