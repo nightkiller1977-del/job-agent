@@ -63,8 +63,11 @@ class BaseScraper(ABC):
 
     @property
     def _profile_dir(self) -> Path:
-        """Persistent Chromium profile directory for this source (survives restarts)."""
-        return Path("/Users/alarkins/Library/Application Support/Google/Chrome")
+        """Persistent Chrome profile directory for this source (isolated from the user's
+        main Chrome so the two don't fight over profile locks)."""
+        d = SESSIONS_DIR / f"{self.name}_profile"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def _clear_profile_locks(self) -> None:
         """Remove stale Chrome lock files and kill orphaned Chrome processes
@@ -91,13 +94,12 @@ class BaseScraper(ABC):
                 pass
 
         # Remove database lock files that persist after a hard kill
-        if "job-agent" in str(self._profile_dir):
-            for pattern in ("*.lock", "lockfile"):
-                for p in self._profile_dir.rglob(pattern):
-                    try:
-                        p.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+        for pattern in ("*.lock", "lockfile"):
+            for p in self._profile_dir.rglob(pattern):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     async def _start_browser(self, load_extensions: bool = False) -> Page:
         """
@@ -121,7 +123,6 @@ class BaseScraper(ABC):
             "--no-default-browser-check",
             "--disable-sync",
             "--disable-profile-error-dialogs",
-            "--profile-directory=Default",
         ]
 
         if load_extensions:
