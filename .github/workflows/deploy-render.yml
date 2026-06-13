@@ -1,0 +1,30 @@
+name: Deploy to Render
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dashboard/**"
+      - ".github/workflows/deploy-render.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Trigger Render redeploy
+    steps:
+      - name: Trigger Render deploy
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}/deploys" \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d '{"clearCache":"do_not_clear"}')
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -1)
+          echo "HTTP $HTTP_CODE: $BODY"
+          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" ]]; then
+            echo "Deploy trigger failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Deploy triggered successfully"

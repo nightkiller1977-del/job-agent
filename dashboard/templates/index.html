@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Job Agent Dashboard</title>
+  <!-- Self-hosted Tailwind — avoids Safari ITP blocking cdn.tailwindcss.com -->
+  <link rel="stylesheet" href="/static/css/tailwind.min.css">
+  <!-- Fallback: if static file fails (e.g. first deploy), try CDN -->
+  <script>
+    document.querySelector('link[href="/static/css/tailwind.min.css"]').onerror = function() {
+      var s = document.createElement('script');
+      s.src = 'https://cdn.tailwindcss.com';
+      document.head.appendChild(s);
+    };
+  </script>
+  <style>
+    body { font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; }
+    .score-green  { background: #16a34a; color: #fff; }
+    .score-yellow { background: #ca8a04; color: #fff; }
+    .score-orange { background: #ea580c; color: #fff; }
+    .score-red    { background: #dc2626; color: #fff; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+    .card-fade { transition: opacity 0.3s, transform 0.3s, box-shadow 0.3s; }
+    .card-fade.removing { opacity: 0; transform: scale(0.97); }
+    .card-fade:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+    }
+    details[open] .details-arrow { transform: rotate(180deg); }
+    .flag-ts { background: #7c3aed; color: #fff; }
+    .flag-fed { background: #1d4ed8; color: #fff; }
+    .flag-generic { background: #6b7280; color: #fff; }
+    summary { cursor: pointer; }
+    summary::-webkit-details-marker { display: none; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-800 min-h-screen">
+
+<!-- Header -->
+<header class="bg-white border-b border-gray-200 shadow-sm">
+  <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+    <div>
+      <h1 class="text-2xl font-bold text-gray-900 tracking-tight">Job Agent Dashboard</h1>
+      <p class="text-sm text-gray-500 mt-0.5">
+        {{ now.strftime('%A, %B %-d, %Y') }}
+        {% if last_sync %}
+          &nbsp;·&nbsp; Last sync: <span class="font-medium text-gray-700">{{ last_sync.strftime('%-I:%M %p UTC') if last_sync else 'Never' }}</span>
+        {% else %}
+          &nbsp;·&nbsp; <span class="text-yellow-600">No syncs yet</span>
+        {% endif %}
+      </p>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="refresh-badge" class="text-xs text-gray-400">Auto-refresh in <span id="countdown">60</span>s</span>
+      <button onclick="window.location.reload()" class="text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1.5 rounded-lg font-medium transition">Refresh Now</button>
+    </div>
+  </div>
+</header>
+
+<!-- Stats Bar -->
+<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+    {% set new_today = stats.get('today', 0) %}
+    {% set pending_count = stats.get('discovered', 0) %}
+    {% set applied_count = stats.get('applied', 0) %}
+    {% set approved_count = stats.get('approved', 0) %}
+
+    <div class="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-4">
+      <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider">New Today</p>
+      <p class="text-3xl font-bold text-blue-600 mt-1">{{ new_today }}</p>
+    </div>
+    <div class="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-4">
+      <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Pending Review</p>
+      <p class="text-3xl font-bold text-amber-500 mt-1">{{ pending_count }}</p>
+    </div>
+    <div class="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-4">
+      <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Approved</p>
+      <p class="text-3xl font-bold text-green-600 mt-1">{{ approved_count }}</p>
+    </div>
+    <div class="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-4">
+      <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Applied</p>
+      <p class="text-3xl font-bold text-purple-600 mt-1">{{ applied_count }}</p>
+    </div>
+  </div>
+</div>
+
+<!-- Pending Review Section -->
+<main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-8">
+
+  <!-- Add External Job Ingestion Form -->
+  <div class="bg-white rounded-xl border border-gray-200 p-5 mb-8 shadow-sm">
+    <h3 class="text-sm font-semibold text-gray-700 mb-2">Add External Job URL</h3>
+    <form id="external-job-form" onsubmit="addExternalJob(event)" class="flex gap-2">
+      <input type="url" id="external-url" required placeholder="Paste LinkedIn, Indeed, or company portal job URL..." class="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500" />
+      <button type="submit" id="add-job-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition flex items-center gap-1.5">
+        <span>+ Add Job</span>
+      </button>
+    </form>
+  </div>
+
+  <!-- Credentials Panel -->
+  <details class="bg-white rounded-xl border border-gray-200 shadow-sm mb-8 overflow-hidden group">
+    <summary class="flex items-center justify-between p-5 font-semibold text-gray-700 select-none cursor-pointer hover:bg-gray-50 transition-colors">
+      <div class="flex items-center gap-2">
+        <span class="text-lg">🔐</span>
+        <span class="text-sm font-semibold">Credentials & Session Settings (Alternative 1: Direct Login)</span>
+      </div>
+      <svg class="w-4 h-4 text-gray-400 ml-auto transition-transform duration-200 details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+    </summary>
+    <div class="px-5 pb-5 pt-3 border-t border-gray-100 grid gap-6 md:grid-cols-2 lg:grid-cols-4 bg-gray-50/20">
+      <!-- Indeed Form -->
+      <form onsubmit="saveCredentials(event, 'indeed')" class="flex flex-col gap-2.5 p-4 rounded-xl border border-gray-100 bg-white shadow-sm transition-all duration-200 hover:shadow-md">
+        <div class="flex items-center justify-between border-b border-gray-100 pb-1.5 mb-1">
+          <span class="text-xs font-bold text-blue-600 tracking-wide uppercase flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full bg-blue-600"></span>
+            Indeed
+          </span>
+          <span class="text-[10px] font-medium text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">Direct</span>
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Email</label>
+          <input type="email" id="creds-indeed-email" required placeholder="Indeed email" value="{{ credentials.get('indeed', {}).get('email', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-blue-500 focus:border-blue-500 focus:outline-none transition-all" />
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Password</label>
+          <input type="password" id="creds-indeed-password" required placeholder="Indeed password" value="{{ credentials.get('indeed', {}).get('password', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-blue-500 focus:border-blue-500 focus:outline-none transition-all" />
+        </div>
+        <button type="submit" class="mt-2 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg text-xs font-bold shadow-sm hover:shadow transition-all duration-150 active:scale-[0.98]">Save Credentials</button>
+      </form>
+
+      <!-- LinkedIn Form -->
+      <form onsubmit="saveCredentials(event, 'linkedin')" class="flex flex-col gap-2.5 p-4 rounded-xl border border-gray-100 bg-white shadow-sm transition-all duration-200 hover:shadow-md">
+        <div class="flex items-center justify-between border-b border-gray-100 pb-1.5 mb-1">
+          <span class="text-xs font-bold text-sky-600 tracking-wide uppercase flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full bg-sky-500"></span>
+            LinkedIn
+          </span>
+          <span class="text-[10px] font-medium text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">Direct</span>
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Email</label>
+          <input type="email" id="creds-linkedin-email" required placeholder="LinkedIn email" value="{{ credentials.get('linkedin', {}).get('email', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-sky-500 focus:border-sky-500 focus:outline-none transition-all" />
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Password</label>
+          <input type="password" id="creds-linkedin-password" required placeholder="LinkedIn password" value="{{ credentials.get('linkedin', {}).get('password', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-sky-500 focus:border-sky-500 focus:outline-none transition-all" />
+        </div>
+        <button type="submit" class="mt-2 bg-sky-600 hover:bg-sky-700 text-white py-2 rounded-lg text-xs font-bold shadow-sm hover:shadow transition-all duration-150 active:scale-[0.98]">Save Credentials</button>
+      </form>
+
+      <!-- Jobright Form -->
+      <form onsubmit="saveCredentials(event, 'jobright')" class="flex flex-col gap-2.5 p-4 rounded-xl border border-gray-100 bg-white shadow-sm transition-all duration-200 hover:shadow-md">
+        <div class="flex items-center justify-between border-b border-gray-100 pb-1.5 mb-1">
+          <span class="text-xs font-bold text-purple-600 tracking-wide uppercase flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full bg-purple-600"></span>
+            Jobright
+          </span>
+          <span class="text-[10px] font-medium text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">Direct</span>
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Email</label>
+          <input type="email" id="creds-jobright-email" required placeholder="Jobright email" value="{{ credentials.get('jobright', {}).get('email', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-purple-500 focus:border-purple-500 focus:outline-none transition-all" />
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Password</label>
+          <input type="password" id="creds-jobright-password" required placeholder="Jobright password" value="{{ credentials.get('jobright', {}).get('password', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-purple-500 focus:border-purple-500 focus:outline-none transition-all" />
+        </div>
+        <button type="submit" class="mt-2 bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-lg text-xs font-bold shadow-sm hover:shadow transition-all duration-150 active:scale-[0.98]">Save Credentials</button>
+      </form>
+
+      <!-- ATS Session Status Panel — replaces the broken "Company ATS" credential form.
+           Each company ATS uses enterprise SSO; you can't store a single email/password for them.
+           Instead this panel shows which approved jobs are blocked and what command to run. -->
+      {% set _SESS_BLOCKED = ["needs-session","needs-portal-login","needs-review",
+                              "linkedin_login_required","workday_session_expired",
+                              "brassring_login_required","microsoft_login_required"] %}
+      {% set blocked_jobs = approved | selectattr("apply_last_status", "in", _SESS_BLOCKED) | list %}
+      <div class="flex flex-col gap-2.5 p-4 rounded-xl border border-amber-200 bg-amber-50/60 shadow-sm">
+        <div class="flex items-center justify-between border-b border-amber-200 pb-1.5 mb-1">
+          <span class="text-xs font-bold text-amber-700 tracking-wide uppercase flex items-center gap-1.5">
+            <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+            ATS Session Status
+          </span>
+          {% if blocked_jobs %}
+            <span class="text-[10px] font-bold text-amber-700 bg-amber-200 px-2 py-0.5 rounded-full">{{ blocked_jobs | length }} blocked</span>
+          {% else %}
+            <span class="text-[10px] font-bold text-green-700 bg-green-100 px-2 py-0.5 rounded-full">All ready ✓</span>
+          {% endif %}
+        </div>
+
+        {% if blocked_jobs %}
+          <p class="text-[11px] text-amber-800 leading-relaxed">
+            These approved jobs need a fresh ATS browser session before the agent can submit.
+            Company portals (Workday, BrassRing, etc.) use enterprise SSO — a saved email/password
+            won't work without an active session cookie.
+          </p>
+          <ul class="flex flex-col gap-1 mt-0.5 max-h-32 overflow-y-auto pr-0.5">
+            {% for j in blocked_jobs %}
+              <li class="flex items-center justify-between text-[11px] bg-white rounded-lg px-2.5 py-1.5 border border-amber-100">
+                <span class="font-medium text-gray-800 truncate max-w-[55%]">{{ j.company or '?' }}</span>
+                <span class="text-amber-600 font-mono text-[10px] truncate ml-2 flex-shrink-0">{{ j.apply_last_status }}</span>
+              </li>
+            {% endfor %}
+          </ul>
+          <div class="mt-1.5 bg-white rounded-lg px-3 py-2 border border-amber-200">
+            <p class="text-[10px] font-semibold text-amber-800 mb-0.5">Run to open blocked portals for manual login:</p>
+            <code class="text-[10px] text-amber-900 font-mono select-all">python src/main.py prepare-sessions</code>
+          </div>
+        {% else %}
+          <p class="text-[11px] text-green-700 leading-relaxed">
+            No approved jobs are blocked by ATS session issues.
+            Ready to run <code class="font-mono bg-green-100 px-1 rounded text-[10px]">python src/main.py apply</code>.
+          </p>
+        {% endif %}
+      </div>
+    </div>
+  </details>
+  <h2 class="text-lg font-bold text-gray-900 mb-4">
+    Pending Review
+    <span class="ml-2 text-sm font-normal text-gray-400">({{ pending | length }} jobs)</span>
+  </h2>
+
+  {% if not pending %}
+  <div class="bg-white border border-gray-200 rounded-xl p-10 text-center text-gray-400">
+    <svg class="mx-auto mb-3 w-10 h-10 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+    <p class="font-medium">No jobs pending review.</p>
+    <p class="text-sm mt-1">Run the agent to discover new positions.</p>
+  </div>
+  {% else %}
+  <div id="pending-list" class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+    {% for job in pending %}
+      {% set src = (job.source or '').lower() %}
+      {% if src == 'indeed' %}
+        {% set accent_border = 'border-t-4 border-t-blue-600' %}
+      {% elif src == 'linkedin' %}
+        {% set accent_border = 'border-t-4 border-t-sky-500' %}
+      {% elif src == 'jobright' %}
+        {% set accent_border = 'border-t-4 border-t-purple-600' %}
+      {% elif src == 'usajobs' %}
+        {% set accent_border = 'border-t-4 border-t-red-600' %}
+      {% else %}
+        {% set accent_border = 'border-t-4 border-t-gray-400' %}
+      {% endif %}
+    <div id="card-{{ job.job_id }}" class="card-fade bg-white border border-gray-200 {{ accent_border }} rounded-xl shadow-sm flex flex-col p-5">
+      <!-- Score + Title Row -->
+      <div class="flex items-start justify-between gap-3 mb-2">
+        <div class="flex-1 min-w-0">
+          <a href="{{ job.url or '#' }}" target="_blank" rel="noopener"
+             class="text-base font-semibold text-gray-900 hover:text-blue-600 leading-snug block truncate"
+             title="{{ job.title }}">
+            {{ job.title or 'Untitled' }}
+          </a>
+          <p class="text-sm text-gray-600 truncate mt-0.5">{{ job.company or '—' }}</p>
+        </div>
+        {% if job.score is not none %}
+          {% if job.score >= 80 %}
+            <span class="badge score-green flex-shrink-0">{{ job.score }}</span>
+          {% elif job.score >= 60 %}
+            <span class="badge score-yellow flex-shrink-0">{{ job.score }}</span>
+          {% elif job.score >= 40 %}
+            <span class="badge score-orange flex-shrink-0">{{ job.score }}</span>
+          {% else %}
+            <span class="badge score-red flex-shrink-0">{{ job.score }}</span>
+          {% endif %}
+        {% else %}
+          <span class="badge bg-gray-200 text-gray-500 flex-shrink-0">–</span>
+        {% endif %}
+      </div>
+
+      <!-- Location + Salary -->
+      <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 mb-3">
+        {% if job.location %}
+          <span>📍 {{ job.location }}</span>
+        {% endif %}
+        {% if job.salary_raw %}
+          <span>💰 {{ job.salary_raw }}</span>
+        {% endif %}
+        {% if job.remote_type %}
+          <span class="badge bg-blue-50 text-blue-700">{{ job.remote_type }}</span>
+        {% endif %}
+        {% if job.source %}
+          {% set src_lower = job.source.lower() %}
+          {% if src_lower == 'indeed' %}
+            <span class="badge bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1">
+              <svg class="w-3.5 h-3.5 text-blue-600" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+              Indeed
+            </span>
+          {% elif src_lower == 'linkedin' %}
+            <span class="badge bg-sky-50 text-sky-700 border border-sky-200 flex items-center gap-1">
+              <svg class="w-3 h-3 text-sky-600" viewBox="0 0 24 24" fill="currentColor"><path d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.761 2.239 5 5 5h14c2.762 0 5-2.239 5-5v-14c0-2.761-2.238-5-5-5zm-11 19h-3v-11h3v11zm-1.5-12.268c-.966 0-1.75-.779-1.75-1.75s.784-1.75 1.75-1.75 1.75.779 1.75 1.75-.784 1.75-1.75 1.75zm13.5 12.268h-3v-5.604c0-3.368-4-3.113-4 0v5.604h-3v-11h3v1.765c1.396-2.586 7-2.777 7 2.476v6.759z"/></svg>
+              LinkedIn
+            </span>
+          {% elif src_lower == 'jobright' %}
+            <span class="badge bg-purple-50 text-purple-700 border border-purple-200 flex items-center gap-1.5">
+              <span class="w-1.5 h-1.5 rounded-full bg-purple-600"></span>
+              Jobright
+            </span>
+          {% elif src_lower == 'usajobs' %}
+            <span class="badge bg-red-50 text-red-700 border border-red-200 flex items-center gap-1.5">
+              <span class="w-1.5 h-1.5 rounded-full bg-red-600"></span>
+              USAJobs
+            </span>
+          {% else %}
+            <span class="badge bg-gray-50 text-gray-700 border border-gray-200 flex items-center gap-1.5">
+              <span class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
+              {{ job.source|capitalize }}
+            </span>
+          {% endif %}
+        {% endif %}
+      </div>
+
+      <!-- Flags -->
+      {% if job.flags %}
+      <div class="flex flex-wrap gap-1 mb-3">
+        {% for flag in job.flags.split(',') %}
+          {% set f = flag.strip() %}
+          {% if f %}
+            {% if 'TS' in f or 'CLEARED' in f or 'CLEARANCE' in f %}
+              <span class="badge flag-ts">{{ f }}</span>
+            {% elif 'FEDERAL' in f or 'GOV' in f or 'SES' in f %}
+              <span class="badge flag-fed">{{ f }}</span>
+            {% else %}
+              <span class="badge flag-generic">{{ f }}</span>
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      <!-- Score reason -->
+      {% if job.score_reason %}
+      <p class="text-xs text-gray-500 italic leading-relaxed mb-3 line-clamp-2" title="{{ job.score_reason }}">
+        {{ job.score_reason }}
+      </p>
+      {% endif %}
+
+      <!-- Action Buttons -->
+      <div class="mt-auto flex gap-2 pt-2 border-t border-gray-100">
+        {% if job.flags and 'needs_hydration' in job.flags %}
+          <div class="flex-1 flex items-center justify-center gap-2 text-xs font-semibold py-2 text-gray-500 bg-gray-50 rounded-lg select-none">
+            <svg class="animate-spin h-3.5 w-3.5 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" fill="none"></circle>
+              <path class="opacity-75" fill="none" d="M4 12a8 8 0 018-8"></path>
+            </svg>
+            <span>Hydrating locally...</span>
+          </div>
+        {% else %}
+          <button onclick="doAction('{{ job.job_id }}', 'approved')"
+                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-green-600 hover:bg-green-700 text-white transition">
+            Apply
+          </button>
+          <button onclick="doAction('{{ job.job_id }}', 'bookmarked')"
+                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-blue-500 hover:bg-blue-600 text-white transition">
+            Bookmark
+          </button>
+          <button onclick="doAction('{{ job.job_id }}', 'skipped')"
+                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 transition">
+            Skip
+          </button>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <!-- Approved (not yet applied) Section -->
+  {% if approved %}
+  <details class="mt-10" open>
+    <summary class="flex items-center gap-2 mb-4 select-none">
+      <h2 class="text-lg font-bold text-gray-900">Approved — Pending Application</h2>
+      <span class="text-sm font-normal text-gray-400">({{ approved | length }})</span>
+      <svg class="w-4 h-4 text-gray-400 ml-auto transition-transform details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+    </summary>
+    <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      {% for job in approved %}
+        {% set src = (job.source or '').lower() %}
+        {% if src == 'indeed' %}
+          {% set accent_border = 'border-t-4 border-t-blue-600' %}
+        {% elif src == 'linkedin' %}
+          {% set accent_border = 'border-t-4 border-t-sky-500' %}
+        {% elif src == 'jobright' %}
+          {% set accent_border = 'border-t-4 border-t-purple-600' %}
+        {% elif src == 'usajobs' %}
+          {% set accent_border = 'border-t-4 border-t-red-600' %}
+        {% else %}
+          {% set accent_border = 'border-t-4 border-t-gray-400' %}
+        {% endif %}
+      <div id="card-{{ job.job_id }}" class="card-fade bg-white border border-green-200 {{ accent_border }} rounded-xl shadow-sm flex flex-col p-5">
+        <div class="flex items-start justify-between gap-3 mb-2">
+          <div class="flex-1 min-w-0">
+            <a href="{{ job.url or '#' }}" target="_blank" rel="noopener"
+               class="text-base font-semibold text-gray-900 hover:text-blue-600 leading-snug block truncate">
+              {{ job.title or 'Untitled' }}
+            </a>
+            <p class="text-sm text-gray-600 truncate mt-0.5">{{ job.company or '—' }}</p>
+          </div>
+          {% if job.score is not none %}
+            {% if job.score >= 80 %}
+              <span class="badge score-green flex-shrink-0">{{ job.score }}</span>
+            {% elif job.score >= 60 %}
+              <span class="badge score-yellow flex-shrink-0">{{ job.score }}</span>
+            {% elif job.score >= 40 %}
+              <span class="badge score-orange flex-shrink-0">{{ job.score }}</span>
+            {% else %}
+              <span class="badge score-red flex-shrink-0">{{ job.score }}</span>
+            {% endif %}
+          {% endif %}
+        </div>
+        <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 mb-3">
+          {% if job.location %}<span>📍 {{ job.location }}</span>{% endif %}
+          {% if job.salary_raw %}<span>💰 {{ job.salary_raw }}</span>{% endif %}
+          {% if job.remote_type %}<span class="badge bg-blue-50 text-blue-700">{{ job.remote_type }}</span>{% endif %}
+          {% if job.source %}
+            {% set src_lower = job.source.lower() %}
+            {% if src_lower == 'indeed' %}
+              <span class="badge bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1">
+                <svg class="w-3.5 h-3.5 text-blue-600" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                Indeed
+              </span>
+            {% elif src_lower == 'linkedin' %}
+              <span class="badge bg-sky-50 text-sky-700 border border-sky-200 flex items-center gap-1">
+                <svg class="w-3.5 h-3.5 text-sky-600" viewBox="0 0 24 24" fill="currentColor"><path d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.761 2.239 5 5 5h14c2.762 0 5-2.239 5-5v-14c0-2.761-2.238-5-5-5zm-11 19h-3v-11h3v11zm-1.5-12.268c-.966 0-1.75-.779-1.75-1.75s.784-1.75 1.75-1.75 1.75.779 1.75 1.75-.784 1.75-1.75 1.75zm13.5 12.268h-3v-5.604c0-3.368-4-3.113-4 0v5.604h-3v-11h3v1.765c1.396-2.586 7-2.777 7 2.476v6.759z"/></svg>
+                LinkedIn
+              </span>
+            {% elif src_lower == 'jobright' %}
+              <span class="badge bg-purple-50 text-purple-700 border border-purple-200 flex items-center gap-1.5">
+                <span class="w-1.5 h-1.5 rounded-full bg-purple-600"></span>
+                Jobright
+              </span>
+            {% elif src_lower == 'usajobs' %}
+              <span class="badge bg-red-50 text-red-700 border border-red-200 flex items-center gap-1.5">
+                <span class="w-1.5 h-1.5 rounded-full bg-red-600"></span>
+                USAJobs
+              </span>
+            {% else %}
+              <span class="badge bg-gray-50 text-gray-700 border border-gray-200 flex items-center gap-1.5">
+                <span class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
+                {{ job.source|capitalize }}
+              </span>
+            {% endif %}
+          {% endif %}
+        </div>
+        {% set _BLOCKED = ["needs-session","needs-portal-login","needs-review",
+                           "linkedin_login_required","workday_session_expired",
+                           "brassring_login_required","microsoft_login_required"] %}
+        {% if job.apply_last_status and job.apply_last_status in _BLOCKED %}
+        <div class="flex items-start gap-1.5 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3 text-xs text-amber-800">
+          <span class="flex-shrink-0 mt-0.5">🔒</span>
+          <div>
+            <span class="font-semibold">Session required</span>
+            {% if job.apply_last_detail %}
+              <span class="text-amber-700 ml-1">— {{ job.apply_last_detail[:120] }}</span>
+            {% endif %}
+            <div class="text-amber-600 mt-0.5 font-mono">python src/main.py prepare-sessions</div>
+          </div>
+        </div>
+        {% elif job.apply_last_status and job.apply_last_status not in ["applied","started",""] %}
+        <div class="flex items-start gap-1.5 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3 text-xs text-red-800">
+          <span class="flex-shrink-0 mt-0.5">⚠️</span>
+          <div>
+            <span class="font-semibold">{{ job.apply_last_status }}</span>
+            {% if job.apply_last_detail %}<span class="text-red-700 ml-1">— {{ job.apply_last_detail[:120] }}</span>{% endif %}
+            {% if job.apply_attempt_count %}<div class="text-red-500 mt-0.5">{{ job.apply_attempt_count }} attempt(s)</div>{% endif %}
+          </div>
+        </div>
+        {% endif %}
+        <div class="mt-auto flex gap-2 pt-2 border-t border-gray-100">
+          <button onclick="doAction('{{ job.job_id }}', 'applied')"
+                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition">
+            Mark Applied
+          </button>
+          <button onclick="doAction('{{ job.job_id }}', 'skipped')"
+                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 transition">
+            Skip
+          </button>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+
+  <!-- Applied Section -->
+  <details class="mt-10">
+    <summary class="flex items-center gap-2 mb-4 select-none">
+      <h2 class="text-lg font-bold text-gray-900">Applied</h2>
+      <span class="text-sm font-normal text-gray-400">(last 10)</span>
+      <svg class="w-4 h-4 text-gray-400 ml-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+    </summary>
+    {% if not applied %}
+    <p class="text-sm text-gray-400 pl-1">No applications submitted yet.</p>
+    {% else %}
+    <div class="overflow-x-auto rounded-xl border border-gray-200">
+      <table class="min-w-full text-sm">
+        <thead class="bg-gray-50 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+          <tr>
+            <th class="px-4 py-3 text-left">Job</th>
+            <th class="px-4 py-3 text-left">Company</th>
+            <th class="px-4 py-3 text-left">Source</th>
+            <th class="px-4 py-3 text-left">Score</th>
+            <th class="px-4 py-3 text-left">Applied</th>
+          </tr>
+        </thead>
+        <tbody class="bg-white divide-y divide-gray-100">
+          {% for job in applied %}
+          <tr class="hover:bg-gray-50">
+            <td class="px-4 py-3">
+              <a href="{{ job.url or '#' }}" target="_blank" rel="noopener"
+                 class="font-medium text-gray-900 hover:text-blue-600">
+                {{ job.title or 'Untitled' }}
+              </a>
+            </td>
+            <td class="px-4 py-3 text-gray-600">{{ job.company or '—' }}</td>
+            <td class="px-4 py-3">
+              {% if job.source %}
+                {% set src_lower = job.source.lower() %}
+                {% if src_lower == 'indeed' %}
+                  <span class="badge bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1 w-max">
+                    <svg class="w-3.5 h-3.5 text-blue-600" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                    Indeed
+                  </span>
+                {% elif src_lower == 'linkedin' %}
+                  <span class="badge bg-sky-50 text-sky-700 border border-sky-200 flex items-center gap-1 w-max">
+                    <svg class="w-3.5 h-3.5 text-sky-600" viewBox="0 0 24 24" fill="currentColor"><path d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.761 2.239 5 5 5h14c2.762 0 5-2.239 5-5v-14c0-2.761-2.238-5-5-5zm-11 19h-3v-11h3v11zm-1.5-12.268c-.966 0-1.75-.779-1.75-1.75s.784-1.75 1.75-1.75 1.75.779 1.75 1.75-.784 1.75-1.75 1.75zm13.5 12.268h-3v-5.604c0-3.368-4-3.113-4 0v5.604h-3v-11h3v1.765c1.396-2.586 7-2.777 7 2.476v6.759z"/></svg>
+                    LinkedIn
+                  </span>
+                {% elif src_lower == 'jobright' %}
+                  <span class="badge bg-purple-50 text-purple-700 border border-purple-200 flex items-center gap-1.5 w-max">
+                    <span class="w-1.5 h-1.5 rounded-full bg-purple-600"></span>
+                    Jobright
+                  </span>
+                {% elif src_lower == 'usajobs' %}
+                  <span class="badge bg-red-50 text-red-700 border border-red-200 flex items-center gap-1.5 w-max">
+                    <span class="w-1.5 h-1.5 rounded-full bg-red-600"></span>
+                    USAJobs
+                  </span>
+                {% else %}
+                  <span class="badge bg-gray-50 text-gray-700 border border-gray-200 flex items-center gap-1.5 w-max">
+                    <span class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
+                    {{ job.source|capitalize }}
+                  </span>
+                {% endif %}
+              {% endif %}
+            </td>
+            <td class="px-4 py-3">
+              {% if job.score is not none %}
+                {% if job.score >= 80 %}
+                  <span class="badge score-green">{{ job.score }}</span>
+                {% elif job.score >= 60 %}
+                  <span class="badge score-yellow">{{ job.score }}</span>
+                {% elif job.score >= 40 %}
+                  <span class="badge score-orange">{{ job.score }}</span>
+                {% else %}
+                  <span class="badge score-red">{{ job.score }}</span>
+                {% endif %}
+              {% else %}—{% endif %}
+            </td>
+            <td class="px-4 py-3 text-gray-500 text-xs">
+              {{ job.updated_at.strftime('%b %-d, %Y') if job.updated_at else '—' }}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </details>
+
+  <!-- Sync Log Section -->
+  <section class="mt-10 mb-16">
+    <h2 class="text-lg font-bold text-gray-900 mb-4">Sync Log <span class="text-sm font-normal text-gray-400">(last 5)</span></h2>
+    {% if not sync_log %}
+    <p class="text-sm text-gray-400 pl-1">No syncs recorded yet.</p>
+    {% else %}
+    <div class="overflow-x-auto rounded-xl border border-gray-200">
+      <table class="min-w-full text-sm">
+        <thead class="bg-gray-50 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+          <tr>
+            <th class="px-4 py-3 text-left">Time</th>
+            <th class="px-4 py-3 text-left">Jobs</th>
+            <th class="px-4 py-3 text-left">Sources</th>
+            <th class="px-4 py-3 text-left">Notes</th>
+          </tr>
+        </thead>
+        <tbody class="bg-white divide-y divide-gray-100">
+          {% for entry in sync_log %}
+          <tr>
+            <td class="px-4 py-3 text-gray-600 text-xs whitespace-nowrap">
+              {{ entry.synced_at.strftime('%b %-d %Y, %-I:%M %p UTC') if entry.synced_at else '—' }}
+            </td>
+            <td class="px-4 py-3 font-semibold text-gray-800">{{ entry.job_count or 0 }}</td>
+            <td class="px-4 py-3 text-gray-600">{{ entry.source or '—' }}</td>
+            <td class="px-4 py-3 text-xs text-gray-500">{{ entry.notes or '' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>
+</main>
+
+<!-- Toast notification -->
+<div id="toast" class="fixed bottom-6 right-6 hidden z-50">
+  <div id="toast-inner" class="px-5 py-3 rounded-xl shadow-lg text-white text-sm font-medium transition-all"></div>
+</div>
+
+<script>
+  // ---- Action handler ----
+  async function doAction(jobId, action) {
+    const card = document.getElementById('card-' + jobId);
+    if (card) {
+      card.classList.add('removing');
+    }
+
+    try {
+      const resp = await fetch('/api/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, action: action })
+      });
+
+      const data = await resp.json();
+
+      if (resp.ok) {
+        showToast(
+          action === 'approved'   ? 'Marked for application!' :
+          action === 'bookmarked' ? 'Bookmarked!'             :
+          action === 'applied'    ? 'Marked as applied!'      :
+                                    'Skipped.',
+          action === 'skipped' ? '#6b7280' : '#16a34a'
+        );
+        if (card) {
+          setTimeout(() => card.remove(), 300);
+        }
+      } else {
+        if (card) card.classList.remove('removing');
+        showToast('Error: ' + (data.detail || 'Unknown error'), '#dc2626');
+      }
+    } catch (err) {
+      if (card) card.classList.remove('removing');
+      showToast('Network error: ' + err.message, '#dc2626');
+    }
+  }
+
+  // ---- Toast helper ----
+  let toastTimer = null;
+  function showToast(msg, color) {
+    const toast = document.getElementById('toast');
+    const inner = document.getElementById('toast-inner');
+    inner.textContent = msg;
+    inner.style.background = color || '#1f2937';
+    toast.classList.remove('hidden');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.add('hidden'), 3000);
+  }
+
+  // ---- Auto-refresh countdown ----
+  let seconds = 60;
+  const countdownEl = document.getElementById('countdown');
+
+  function tick() {
+    seconds -= 1;
+    if (countdownEl) countdownEl.textContent = seconds;
+    if (seconds <= 0) {
+      window.location.reload();
+    } else {
+      setTimeout(tick, 1000);
+    }
+  }
+  setTimeout(tick, 1000);
+
+  // ---- Save Credentials ----
+  async function saveCredentials(event, platform) {
+    event.preventDefault();
+    const email = document.getElementById(`creds-${platform}-email`).value.trim();
+    const password = document.getElementById(`creds-${platform}-password`).value.trim();
+    const btn = event.target.querySelector('button[type="submit"]');
+
+    if (!email || !password) return;
+
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+
+    try {
+      const resp = await fetch('/api/credentials', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platform, email, password })
+      });
+
+      const data = await resp.json();
+      if (resp.ok) {
+        showToast('Credentials saved for ' + platform.toUpperCase() + '!', '#16a34a');
+      } else {
+        showToast('Error: ' + (data.detail || 'Could not save credentials'), '#dc2626');
+      }
+    } catch (err) {
+      showToast('Network error: ' + err.message, '#dc2626');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  }
+
+  // ---- Add External Job ----
+  async function addExternalJob(event) {
+    event.preventDefault();
+    const urlInput = document.getElementById('external-url');
+    const btn = document.getElementById('add-job-btn');
+    const url = urlInput.value.trim();
+    if (!url) return;
+
+    btn.disabled = true;
+    btn.innerHTML = '<span>Adding...</span>';
+
+    try {
+      const resp = await fetch('/api/jobs/external', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: url })
+      });
+
+      const data = await resp.json();
+
+      if (resp.ok) {
+        showToast('External job added! Hydration in progress.', '#1d4ed8');
+        urlInput.value = '';
+        setTimeout(() => window.location.reload(), 1500);
+      } else {
+        showToast('Error: ' + (data.detail || 'Could not add job'), '#dc2626');
+      }
+    } catch (err) {
+      showToast('Network error: ' + err.message, '#dc2626');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '<span>+ Add Job</span>';
+    }
+  }
+</script>
+</body>
+</html>
