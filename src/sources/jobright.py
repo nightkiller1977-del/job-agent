@@ -62,6 +62,12 @@ class JobrightScraper(BaseScraper):
             if not match and job.get("url"):
                 match = await self._add_external_job_to_jobright(page, job)
             if not match:
+                # Verify page is still valid before navigating — _add_external_job_to_jobright
+                # catches its own exceptions but may leave the page handle invalid.
+                try:
+                    _ = page.url  # raises if page/context is closed
+                except Exception:
+                    return ""  # page is gone; skip fallback search
                 await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=30000)
                 await self._delay(2, 3)
                 await self._dismiss_jobright_popups(page)
