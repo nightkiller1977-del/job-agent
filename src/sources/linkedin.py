@@ -41,7 +41,7 @@ LOGIN_URL_MARKERS = ("/login", "/authwall", "uas/login", "checkpoint", "challeng
 
 # User profile answers for Easy Apply forms
 USER_ANSWERS = {
-    "years_experience": "18",
+    "years_experience": "20",
     "current_title": "Director of Software Engineering",
     "clearance": "Top Secret",
     "authorized_us": "Yes",
@@ -621,6 +621,20 @@ class LinkedInScraper(BaseScraper):
         try:
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
+            # Wait for LinkedIn job detail panel to render (LinkedIn loads job content async)
+            for _detail_sel in [
+                '.jobs-unified-top-card__job-title',
+                '.job-details-jobs-unified-top-card__job-title',
+                'h1.t-24',
+                '[class*="jobs-unified-top-card"]',
+                '.jobs-apply-button--top-card',
+                '[data-job-id]',
+            ]:
+                try:
+                    await page.wait_for_selector(_detail_sel, timeout=8000)
+                    break
+                except Exception:
+                    continue
             if await self._needs_login(page):
                 return self._set_apply_outcome(
                     "linkedin_login_required",
@@ -654,6 +668,20 @@ class LinkedInScraper(BaseScraper):
             explicitly_non_easy_apply = _has_easy_apply is False
             if explicitly_non_easy_apply:
                 console.print("[dim]LinkedIn: Job flagged as non-Easy-Apply — looking for external apply URL…[/dim]")
+                # Wait for job detail panel to fully render before scanning for apply button
+                for detail_sel in [
+                    '.jobs-unified-top-card__job-title',
+                    '.job-details-jobs-unified-top-card__job-title',
+                    'h1.t-24',
+                    '[class*="jobs-unified-top-card"]',
+                    '.jobs-apply-button',
+                    '[data-job-id]',
+                ]:
+                    try:
+                        await page.wait_for_selector(detail_sel, timeout=8000)
+                        break
+                    except Exception:
+                        continue
                 external_url = await self._extract_external_apply_url(page)
                 if not external_url:
                     return self._set_apply_outcome(
@@ -1000,7 +1028,7 @@ class LinkedInScraper(BaseScraper):
         # --- Pass 1: static DOM scan ---
         url = await page.evaluate("""
         () => {
-            const ATS_RE = /workday|greenhouse|lever|icims|brassring|taleo|smartrecruiters|successfactors|ashby|apply|career|job/i;
+            const ATS_RE = /workday|greenhouse|lever|icims|brassring|taleo|smartrecruiters|successfactors|ashby|teamtailor|apply|career|job/i;
             const direct = Array.from(document.querySelectorAll('a[href]'))
                 .map(a => a.href)
                 .find(h => h && !h.includes('linkedin.com') && ATS_RE.test(h));
@@ -1077,7 +1105,7 @@ class LinkedInScraper(BaseScraper):
                 cont = await popup.query_selector('a[href]:not([href*="linkedin.com"]), a.apply-button--redirect')
                 if cont:
                     href = await cont.get_attribute("href")
-                    if href and "linkedin.com" not in href:
+                    if href and href.startswith("http") and "linkedin.com" not in href:
                         console.print(f"[dim]LinkedIn: Interstitial continue URL: {href[:80]}[/dim]")
                         return href
                 # Wait for popup to auto-redirect
@@ -1140,7 +1168,7 @@ class LinkedInScraper(BaseScraper):
                     elem = await page.query_selector(sel)
                     if elem:
                         href = await elem.get_attribute("href")
-                        if href and "linkedin.com" not in href:
+                        if href and href.startswith("http") and "linkedin.com" not in href:
                             console.print(f"[dim]LinkedIn: Interstitial link: {href[:80]}[/dim]")
                             return href
                         # It's a button — click it and watch

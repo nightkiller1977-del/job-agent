@@ -63,19 +63,44 @@ class BaseScraper(ABC):
 
     @property
     def _profile_dir(self) -> Path:
-        """Persistent Chromium profile directory for this source (survives restarts)."""
+        # DO NOT change this to the main Chrome profile — it causes database
+        # lock failures because Chrome holds an exclusive lock on that directory.
+        # Each scraper gets its own isolated profile under state/sessions/.
         d = SESSIONS_DIR / f"{self.name}_profile"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
     def _clear_profile_locks(self) -> None:
-        """Remove stale Chromium lock files that prevent re-launching the profile."""
+        """Remove stale Chrome lock files and kill orphaned Chrome processes
+        holding the profile before re-launching."""
+        import subprocess, time
+        # Kill any Chrome processes still holding this profile directory
+        try:
+            subprocess.run(
+                ["pkill", "-f", str(self._profile_dir)],
+                capture_output=True, timeout=5
+            )
+            # Give Chrome time to fully release its SQLite databases before
+            # we open the profile again. Without this, rapid open→close→open
+            # sequences cause 'database is locked' / renderer crashes.
+            time.sleep(2)
+        except Exception:
+            pass
+
+        # Remove Singleton lock files
         for lockfile in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-            p = self._profile_dir / lockfile
             try:
-                p.unlink(missing_ok=True)
+                (self._profile_dir / lockfile).unlink(missing_ok=True)
             except Exception:
                 pass
+
+        # Remove database lock files that persist after a hard kill
+        for pattern in ("*.lock", "lockfile"):
+            for p in self._profile_dir.rglob(pattern):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     async def _start_browser(self, load_extensions: bool = False) -> Page:
         """
@@ -95,32 +120,32 @@ class BaseScraper(ABC):
         args = [
             "--start-maximized",
             "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            "--disable-profile-error-dialogs",
         ]
 
         if load_extensions:
             ext_path = EXT_DIR / "jobright-autofill"
             if ext_path.exists():
-                ext_str = str(ext_path)
-                args += [
-                    f"--load-extension={ext_str}",
-                    f"--disable-extensions-except={ext_str}",
-                ]
-            else:
-                print(f"[warning] Extension not found at {ext_path} — skipping extension load")
+                # Load local extension as fallback; don't disable-extensions-except
+                # so extensions installed via Chrome Web Store in the profile also load.
+                args.append(f"--load-extension={str(ext_path)}")
+            # Extensions already installed in the Chrome profile load automatically.
 
-        # launch_persistent_context keeps cookies/localStorage across restarts
+        # channel="chrome" uses the real installed Chrome binary so Chrome Web Store
+        # extensions, saved logins, and Chrome's cookie encryption all work correctly.
+        # The dedicated profile dir keeps job-agent sessions separate from the main
+        # Chrome profile — no locking conflicts, no risk to personal data.
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(self._profile_dir),
+            channel="chrome",
             headless=False,
             accept_downloads=True,
             args=args,
             slow_mo=80,
             viewport={"width": 1400, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
         )
         # Get or create a page
         pages = self._context.pages
@@ -150,6 +175,10 @@ class BaseScraper(ABC):
         self._context = None
         self._page = None
         self._playwright = None
+        # Wait for Chrome to finish flushing its SQLite databases to disk.
+        # Without this, rapid close→open on the same profile causes database
+        # lock errors and renderer crashes in the next session.
+        await asyncio.sleep(2)
 
     async def _delay(self, extra_min: float = 0, extra_max: float = 0) -> None:
         """Random human-like delay between actions."""
