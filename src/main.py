@@ -3,6 +3,7 @@
 job-agent CLI entry point.
 
 Usage:
+  python src/main.py setup                     # One-time: install Jobright Chrome extension (logins auto-handled from .env)
   python src/main.py discover                  # Scrape all sources, score, show review queue
   python src/main.py discover --source linkedin
   python src/main.py discover --source linkedin-saved
@@ -147,6 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of approved jobs to open for session preparation",
     )
 
+    # setup
+    subparsers.add_parser(
+        "setup",
+        help="One-time: install Jobright AI Chrome extension (logins auto-handled from .env credentials)",
+    )
+
     # status
     subparsers.add_parser(
         "status",
@@ -203,6 +210,9 @@ async def main_async(args: argparse.Namespace) -> int:
             company=args.company,
             limit=args.limit,
         )
+
+    elif args.command == "setup":
+        await orchestrator.browser_setup()
 
     elif args.command == "status":
         orchestrator.show_status()
