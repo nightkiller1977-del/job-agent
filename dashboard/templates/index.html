@@ -172,10 +172,8 @@
       <!-- ATS Session Status Panel — replaces the broken "Company ATS" credential form.
            Each company ATS uses enterprise SSO; you can't store a single email/password for them.
            Instead this panel shows which approved jobs are blocked and what command to run. -->
-      {% set _SESS_BLOCKED = ["needs-session","needs-portal-login","needs-review",
-                              "linkedin_login_required","workday_session_expired",
-                              "brassring_login_required","microsoft_login_required"] %}
-      {% set blocked_jobs = approved | selectattr("apply_last_status", "in", _SESS_BLOCKED) | list %}
+      {# approved_needs_prep is the set of jobs blocked by expired ATS sessions #}
+      {% set blocked_jobs = approved_needs_prep %}
       <div class="flex flex-col gap-2.5 p-4 rounded-xl border border-amber-200 bg-amber-50/60 shadow-sm">
         <div class="flex items-center justify-between border-b border-amber-200 pb-1.5 mb-1">
           <span class="text-xs font-bold text-amber-700 tracking-wide uppercase flex items-center gap-1.5">
@@ -365,47 +363,38 @@
   </div>
   {% endif %}
 
-  <!-- Approved (not yet applied) Section -->
-  {% if approved %}
-  <details class="mt-10" open>
-    <summary class="flex items-center gap-2 mb-4 select-none">
-      <h2 class="text-lg font-bold text-gray-900">Approved — Pending Application</h2>
-      <span class="text-sm font-normal text-gray-400">({{ approved | length }})</span>
-      <svg class="w-4 h-4 text-gray-400 ml-auto transition-transform details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-    </summary>
-    <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-      {% for job in approved %}
-        {% set src = (job.source or '').lower() %}
-        {% if src == 'indeed' %}
-          {% set accent_border = 'border-t-4 border-t-blue-600' %}
-        {% elif src == 'linkedin' %}
-          {% set accent_border = 'border-t-4 border-t-sky-500' %}
-        {% elif src == 'jobright' %}
-          {% set accent_border = 'border-t-4 border-t-purple-600' %}
-        {% elif src == 'usajobs' %}
-          {% set accent_border = 'border-t-4 border-t-red-600' %}
-        {% else %}
-          {% set accent_border = 'border-t-4 border-t-gray-400' %}
-        {% endif %}
-      <div id="card-{{ job.job_id }}" class="card-fade bg-white border border-green-200 {{ accent_border }} rounded-xl shadow-sm flex flex-col p-5">
+  <!-- ── Approved Queue (4 categories) ─────────────────────────────────── -->
+  {% set total_approved = (approved_ready|length) + (approved_needs_prep|length) + (approved_needs_you|length) %}
+  {% if total_approved > 0 %}
+  <div class="mt-10">
+    <h2 class="text-lg font-bold text-gray-900 mb-1">
+      Approved — Pending Application
+      <span class="ml-2 text-sm font-normal text-gray-400">({{ total_approved }})</span>
+    </h2>
+    <p class="text-xs text-gray-500 mb-6">Jobs you approved. The agent handles <span class="font-semibold text-green-700">Ready</span> automatically — <span class="font-semibold text-orange-600">Needs You</span> jobs require manual action.</p>
+
+    {# ── Macro: job card body (reused across all 3 sections) ── #}
+    {% macro job_card(job, card_border, show_status_badge=true) %}
+      {% set src = (job.source or '').lower() %}
+      {% if src == 'indeed' %}{% set accent = 'border-t-blue-600' %}
+      {% elif src == 'linkedin' %}{% set accent = 'border-t-sky-500' %}
+      {% elif src == 'jobright' %}{% set accent = 'border-t-purple-600' %}
+      {% elif src == 'usajobs' %}{% set accent = 'border-t-red-600' %}
+      {% else %}{% set accent = 'border-t-gray-400' %}{% endif %}
+      <div id="card-{{ job.job_id }}" class="card-fade bg-white border {{ card_border }} border-t-4 {{ accent }} rounded-xl shadow-sm flex flex-col p-5">
         <div class="flex items-start justify-between gap-3 mb-2">
           <div class="flex-1 min-w-0">
             <a href="{{ job.url or '#' }}" target="_blank" rel="noopener"
-               class="text-base font-semibold text-gray-900 hover:text-blue-600 leading-snug block truncate">
+               class="text-base font-semibold text-gray-900 hover:text-blue-600 leading-snug block truncate" title="{{ job.title }}">
               {{ job.title or 'Untitled' }}
             </a>
             <p class="text-sm text-gray-600 truncate mt-0.5">{{ job.company or '—' }}</p>
           </div>
           {% if job.score is not none %}
-            {% if job.score >= 80 %}
-              <span class="badge score-green flex-shrink-0">{{ job.score }}</span>
-            {% elif job.score >= 60 %}
-              <span class="badge score-yellow flex-shrink-0">{{ job.score }}</span>
-            {% elif job.score >= 40 %}
-              <span class="badge score-orange flex-shrink-0">{{ job.score }}</span>
-            {% else %}
-              <span class="badge score-red flex-shrink-0">{{ job.score }}</span>
-            {% endif %}
+            {% if job.score >= 80 %}<span class="badge score-green flex-shrink-0">{{ job.score }}</span>
+            {% elif job.score >= 60 %}<span class="badge score-yellow flex-shrink-0">{{ job.score }}</span>
+            {% elif job.score >= 40 %}<span class="badge score-orange flex-shrink-0">{{ job.score }}</span>
+            {% else %}<span class="badge score-red flex-shrink-0">{{ job.score }}</span>{% endif %}
           {% endif %}
         </div>
         <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 mb-3">
@@ -413,73 +402,120 @@
           {% if job.salary_raw %}<span>💰 {{ job.salary_raw }}</span>{% endif %}
           {% if job.remote_type %}<span class="badge bg-blue-50 text-blue-700">{{ job.remote_type }}</span>{% endif %}
           {% if job.source %}
-            {% set src_lower = job.source.lower() %}
-            {% if src_lower == 'indeed' %}
-              <span class="badge bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1">
-                <svg class="w-3.5 h-3.5 text-blue-600" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
-                Indeed
-              </span>
-            {% elif src_lower == 'linkedin' %}
-              <span class="badge bg-sky-50 text-sky-700 border border-sky-200 flex items-center gap-1">
-                <svg class="w-3.5 h-3.5 text-sky-600" viewBox="0 0 24 24" fill="currentColor"><path d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.761 2.239 5 5 5h14c2.762 0 5-2.239 5-5v-14c0-2.761-2.238-5-5-5zm-11 19h-3v-11h3v11zm-1.5-12.268c-.966 0-1.75-.779-1.75-1.75s.784-1.75 1.75-1.75 1.75.779 1.75 1.75-.784 1.75-1.75 1.75zm13.5 12.268h-3v-5.604c0-3.368-4-3.113-4 0v5.604h-3v-11h3v1.765c1.396-2.586 7-2.777 7 2.476v6.759z"/></svg>
-                LinkedIn
-              </span>
-            {% elif src_lower == 'jobright' %}
-              <span class="badge bg-purple-50 text-purple-700 border border-purple-200 flex items-center gap-1.5">
-                <span class="w-1.5 h-1.5 rounded-full bg-purple-600"></span>
-                Jobright
-              </span>
-            {% elif src_lower == 'usajobs' %}
-              <span class="badge bg-red-50 text-red-700 border border-red-200 flex items-center gap-1.5">
-                <span class="w-1.5 h-1.5 rounded-full bg-red-600"></span>
-                USAJobs
-              </span>
-            {% else %}
-              <span class="badge bg-gray-50 text-gray-700 border border-gray-200 flex items-center gap-1.5">
-                <span class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
-                {{ job.source|capitalize }}
-              </span>
-            {% endif %}
+            {% set sl = job.source.lower() %}
+            {% if sl == 'indeed' %}<span class="badge bg-blue-50 text-blue-700 border border-blue-200">Indeed</span>
+            {% elif sl == 'linkedin' %}<span class="badge bg-sky-50 text-sky-700 border border-sky-200">LinkedIn</span>
+            {% elif sl == 'jobright' %}<span class="badge bg-purple-50 text-purple-700 border border-purple-200">Jobright</span>
+            {% elif sl == 'usajobs' %}<span class="badge bg-red-50 text-red-700 border border-red-200">USAJobs</span>
+            {% else %}<span class="badge bg-gray-50 text-gray-700 border border-gray-200">{{ job.source|capitalize }}</span>{% endif %}
           {% endif %}
         </div>
-        {% set _BLOCKED = ["needs-session","needs-portal-login","needs-review",
-                           "linkedin_login_required","workday_session_expired",
-                           "brassring_login_required","microsoft_login_required"] %}
-        {% if job.apply_last_status and job.apply_last_status in _BLOCKED %}
-        <div class="flex items-start gap-1.5 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3 text-xs text-amber-800">
-          <span class="flex-shrink-0 mt-0.5">🔒</span>
-          <div>
-            <span class="font-semibold">Session required</span>
-            {% if job.apply_last_detail %}
-              <span class="text-amber-700 ml-1">— {{ job.apply_last_detail[:120] }}</span>
-            {% endif %}
-            <div class="text-amber-600 mt-0.5 font-mono">python src/main.py prepare-sessions</div>
-          </div>
-        </div>
-        {% elif job.apply_last_status and job.apply_last_status not in ["applied","started",""] %}
-        <div class="flex items-start gap-1.5 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3 text-xs text-red-800">
-          <span class="flex-shrink-0 mt-0.5">⚠️</span>
-          <div>
-            <span class="font-semibold">{{ job.apply_last_status }}</span>
-            {% if job.apply_last_detail %}<span class="text-red-700 ml-1">— {{ job.apply_last_detail[:120] }}</span>{% endif %}
-            {% if job.apply_attempt_count %}<div class="text-red-500 mt-0.5">{{ job.apply_attempt_count }} attempt(s)</div>{% endif %}
-          </div>
+        {% if show_status_badge and job.apply_last_status and job.apply_last_status not in ["","applied","started"] %}
+        <div class="flex items-start gap-1.5 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 mb-3 text-xs text-gray-600">
+          <span class="font-mono text-gray-500">{{ job.apply_last_status }}</span>
+          {% if job.apply_attempt_count %}<span class="ml-auto text-gray-400">{{ job.apply_attempt_count }}×</span>{% endif %}
         </div>
         {% endif %}
-        <div class="mt-auto flex gap-2 pt-2 border-t border-gray-100">
-          <button onclick="doAction('{{ job.job_id }}', 'applied')"
-                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition">
-            Mark Applied
-          </button>
-          <button onclick="doAction('{{ job.job_id }}', 'skipped')"
-                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 transition">
-            Skip
-          </button>
+    {% endmacro %}
+
+    {# ── 1. READY TO APPLY ── #}
+    {% if approved_ready %}
+    <details open class="mb-6">
+      <summary class="flex items-center gap-2 mb-3 cursor-pointer select-none group">
+        <span class="w-2.5 h-2.5 rounded-full bg-green-500 flex-shrink-0"></span>
+        <h3 class="text-sm font-bold text-green-700">Ready to Apply</h3>
+        <span class="text-xs text-gray-400">({{ approved_ready|length }}) — agent will submit these automatically</span>
+        <svg class="w-4 h-4 text-gray-400 ml-auto transition-transform details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+      </summary>
+      <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {% for job in approved_ready %}
+          {{ job_card(job, 'border-green-200', false) }}
+          <div class="mt-auto flex gap-2 pt-2 border-t border-gray-100">
+            <button onclick="doAction('{{ job.job_id }}', 'applied')"
+                    class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition">
+              Mark Applied
+            </button>
+            <button onclick="doAction('{{ job.job_id }}', 'archive')"
+                    class="text-xs font-semibold py-1.5 px-3 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-500 transition">
+              Archive
+            </button>
+          </div>
         </div>
+        {% endfor %}
       </div>
-      {% endfor %}
-    </div>
-  </details>
+    </details>
+    {% endif %}
+
+    {# ── 2. NEEDS PREP ── #}
+    {% if approved_needs_prep %}
+    <details open class="mb-6">
+      <summary class="flex items-center gap-2 mb-3 cursor-pointer select-none group">
+        <span class="w-2.5 h-2.5 rounded-full bg-yellow-400 flex-shrink-0"></span>
+        <h3 class="text-sm font-bold text-yellow-700">Needs Prep</h3>
+        <span class="text-xs text-gray-400">({{ approved_needs_prep|length }}) — session expired, run prepare-sessions first</span>
+        <svg class="w-4 h-4 text-gray-400 ml-auto transition-transform details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+      </summary>
+      <div class="mb-3 flex items-center gap-2 bg-yellow-50 border border-yellow-200 rounded-lg px-4 py-2.5 text-xs text-yellow-800">
+        <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+        <span>Run <code class="font-mono bg-yellow-100 px-1 rounded">python src/main.py prepare-sessions</code> to refresh ATS sessions, then re-run apply.</span>
+      </div>
+      <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {% for job in approved_needs_prep %}
+          {{ job_card(job, 'border-yellow-200') }}
+          <div class="mt-auto flex gap-2 pt-2 border-t border-gray-100">
+            <a href="{{ job.url or '#' }}" target="_blank" rel="noopener"
+               class="flex-1 text-center text-xs font-semibold py-1.5 rounded-lg bg-yellow-500 hover:bg-yellow-600 text-white transition">
+              Apply Manually
+            </a>
+            <button onclick="doAction('{{ job.job_id }}', 'applied')"
+                    class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition">
+              Mark Applied
+            </button>
+            <button onclick="doAction('{{ job.job_id }}', 'archive')"
+                    class="text-xs font-semibold py-1.5 px-3 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-500 transition">
+              Archive
+            </button>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </details>
+    {% endif %}
+
+    {# ── 3. NEEDS YOU ── #}
+    {% if approved_needs_you %}
+    <details open class="mb-6">
+      <summary class="flex items-center gap-2 mb-3 cursor-pointer select-none group">
+        <span class="w-2.5 h-2.5 rounded-full bg-orange-500 flex-shrink-0"></span>
+        <h3 class="text-sm font-bold text-orange-700">Needs You</h3>
+        <span class="text-xs text-gray-400">({{ approved_needs_you|length }}) — agent can't handle these, click to apply manually</span>
+        <svg class="w-4 h-4 text-gray-400 ml-auto transition-transform details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+      </summary>
+      <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {% for job in approved_needs_you %}
+          {{ job_card(job, 'border-orange-200') }}
+          <div class="mt-auto flex gap-2 pt-2 border-t border-gray-100">
+            <a href="{{ job.url or '#' }}" target="_blank" rel="noopener"
+               class="flex-1 text-center text-xs font-semibold py-1.5 rounded-lg bg-orange-500 hover:bg-orange-600 text-white transition flex items-center justify-center gap-1.5">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+              Apply Manually
+            </a>
+            <button onclick="doAction('{{ job.job_id }}', 'applied')"
+                    class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition">
+              Mark Applied
+            </button>
+            <button onclick="doAction('{{ job.job_id }}', 'archive')"
+                    class="text-xs font-semibold py-1.5 px-3 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-500 transition">
+              Archive
+            </button>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </details>
+    {% endif %}
+
+  </div>
   {% endif %}
 
   <!-- Applied Section -->
