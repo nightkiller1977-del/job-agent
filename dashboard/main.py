@@ -312,6 +312,7 @@ async def index(request: Request):
         "workday_account_required", "brassring_registration_required",
         "required_field_unanswered", "linkedin_stuck_on_required_field",
         "needs-answer", "needs-review",
+        "needs-hydration",  # placeholder/invalid URL — run hydrate or fix the URL
     }
     import json as _json
     approved_ready:     list[dict] = []
