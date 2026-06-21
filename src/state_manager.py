@@ -53,6 +53,8 @@ class StateManager:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(DB_SCHEMA)
+            # Remove any existing expired jobs
+            conn.execute("DELETE FROM jobs WHERE status = 'expired'")
 
     # ------------------------------------------------------------------
     # Write helpers
@@ -105,6 +107,10 @@ class StateManager:
             return True
 
     def set_status(self, job_id: str, status: str) -> None:
+        if status == "expired":
+            self.delete_job(job_id)
+            return
+
         now = datetime.utcnow().isoformat()
         ts_field = {
             "reviewed": "reviewed_at",
@@ -124,6 +130,11 @@ class StateManager:
                     "UPDATE jobs SET status = ? WHERE job_id = ?",
                     (status, job_id),
                 )
+
+    def delete_job(self, job_id: str) -> None:
+        """Delete a job record completely from the database."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
 
     def update_score(self, job_id: str, score: int, reason: str, flags: str = "") -> None:
         with self._connect() as conn:
@@ -179,6 +190,26 @@ class StateManager:
             extra["apply_last_status"]  = status
             extra["apply_last_detail"]  = (detail or "")[:500]
             extra["apply_attempt_count"] = extra.get("apply_attempt_count", 0) + 1
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
+    def record_application_analytics(self, job_id: str, analytics: dict) -> None:
+        """Merge analytics dict (atsScore, resumeVersion, applicationMethod, etc.) into extra_json.
+        Safe to call after record_apply_attempt — merges, does not overwrite.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            extra: dict = {}
+            if row and row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    pass
+            extra.update(analytics)
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
                 (json.dumps(extra), job_id),

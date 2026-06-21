@@ -1,165 +1,298 @@
 # Developer Onboarding
 
-This file is the engineering handoff for the job-agent apply workflow. Read it before changing apply automation.
+Engineering reference for the job-agent apply workflow. Read this before changing any apply automation. Keep it current after every significant change.
 
-## Current Goal
+**Last updated:** June 2026
 
-The production goal is not just discovery. The app must:
+---
 
-1. Pull approved jobs from local SQLite and the cloud dashboard.
-2. For LinkedIn and external jobs, use local browser sessions on the user's Mac.
-3. Add external URLs to Jobright when needed.
-4. Generate a Jobright custom resume for the specific job.
-5. Download the tailored resume to `state/tailored_resumes/`.
-6. Use that tailored resume for LinkedIn Easy Apply, LinkedIn full-page apply, or company ATS upload.
-7. Use Jobright Autofill on company ATS pages.
-8. Stop before final submit unless `--auto-submit` is explicitly provided.
+## System Overview
 
-## Key Commands
+The agent has three phases that run independently:
+
+1. **Discover** — Playwright scrapes LinkedIn/Jobright/USAJobs, Claude scores each job, results go into SQLite
+2. **Review** — Terminal queue (Rich UI) where the user approves/skips/bookmarks each scored job
+3. **Apply** — Fully automated: per-job ATS scoring via Claude Haiku, resume tailoring, form autofill, submit
+
+All site logins are automated via credentials in `.env`. Workday company portals are the exception (one-time manual login per company via `prepare-sessions`).
+
+---
+
+## Browser Architecture
+
+**All Playwright runs use real Chrome** (`channel="chrome"` in `BaseScraper._start_browser()`), not Playwright's bundled Chromium.
+
+Reasons:
+- Chrome Web Store extensions (Jobright AI autofill) work correctly
+- macOS Keychain password autofill works
+- Chrome-specific cookie encryption works
+
+Each source scraper gets its own persistent Chrome profile directory at `state/sessions/{source}_profile/`. This keeps the job-agent sessions isolated from the user's personal Chrome profile — no locking, no corruption risk.
+
+Sessions persist in the profile directory between runs. When a session expires, the scraper's `_auto_login()` method re-authenticates automatically using `.env` credentials before continuing.
+
+The Jobright autofill Chrome extension is installed once into the job-agent Chrome profile via:
+```bash
+python src/main.py setup
+```
+After that, the extension loads automatically from the profile on every run.
+
+---
+
+## Credential and Login Flow
+
+Credentials live in `.env` — all set and working as of June 2026:
+
+| Variable | Used by | Method |
+|---|---|---|
+| `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` | `linkedin.py` | `_auto_login()` — fills form programmatically |
+| `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | `jobright.py` | `_auto_login()` — fills form programmatically |
+| `INDEED_EMAIL` / `INDEED_PASSWORD` | `indeed.py` | `_auto_login()` — fills form programmatically (`shoalinwu@gmail.com`) |
+| `USAJOBS_EMAIL` / `USAJOBS_PASSWORD` | `usajobs.py` | `_auto_login()` via login.gov; pauses for 2FA if triggered |
+| `COMPANY_EMAIL` / `COMPANY_PASSWORD` | `jobright.py` `_company_portal_login()` | Primary ATS portal auto-login — `alarkins.jsearch@yahoo.com` (Motorola, Booz Allen, Greenhouse, SAIC, PNC, Capital One, ManTech) |
+| `COMPANY_EMAIL_ALT` / `COMPANY_PASSWORD_ALT` | `jobright.py` `_company_portal_login()` | Fallback ATS portal login — `anthonyclarkins@icloud.com` (GDIT, government portals); tried automatically if primary login fails |
+| `ANTHROPIC_API_KEY` | `scorer.py`, `jobright.py` | Claude scoring + ATS analysis |
+| `DASHBOARD_URL` / `SYNC_SECRET` | `orchestrator.py` | Cloud dashboard sync |
+
+Each scraper checks on startup whether it is logged in. If not, `_auto_login()` fills the login form using `.env` credentials automatically. No manual interaction needed for scheduled runs.
+
+**USAJobs** — uses login.gov. `_auto_login()` fills email and password automatically, then waits up to 90 seconds if 2FA is triggered (user completes it in the open browser window). Once past 2FA, the session is saved in the Chrome profile and won't require 2FA again for weeks.
+
+`orchestrator.load_credentials_from_dashboard()` also pulls credentials from the cloud dashboard at runtime, setting them as environment variables.
+
+---
+
+## Key Files
+
+| File | Role |
+|---|---|
+| `src/main.py` | CLI command definitions and argument parsing |
+| `src/orchestrator.py` | Top-level flow: discover, apply loop, setup, prepare-sessions, analytics wiring |
+| `src/sources/base.py` | `BaseScraper`: Chrome launch, persistent profile, session lock cleanup, delay helpers |
+| `src/sources/jobright.py` | Jobright discovery, Orion tailoring, Claude ATS scoring, external ATS autofill/apply |
+| `src/sources/linkedin.py` | LinkedIn discovery, saved-job import, Easy Apply, full-page apply, external ATS fallback |
+| `src/sources/usajobs.py` | USAJobs.gov discovery and application |
+| `src/scorer.py` | Claude-powered job scoring against role/comp criteria |
+| `src/state_manager.py` | SQLite CRUD, `record_apply_attempt()`, `record_application_analytics()` |
+| `src/review_queue.py` | Rich terminal review UI |
+| `src/resume_helper.py` | Resume path resolution and form-field fallback filler |
+| `dashboard/main.py` | Cloud dashboard API, sync, external placeholder jobs, credential endpoints |
+| `state/profile.json` | Real resume data for LinkedIn Easy Apply autofill (gitignored) |
+| `config.json` | Scoring config, search settings, local resume path |
+| `.env` | Credentials + API keys (never committed) |
+
+---
+
+## Apply Architecture
+
+### Entry Point
+
+`orchestrator.apply_approved()` → iterates approved jobs from SQLite → calls `scraper.apply(job, auto_submit)` for each.
+
+### Jobright External ATS Jobs
+
+`JobrightScraper.apply_external_ats_job(job, auto_submit)`:
+
+1. Open company ATS URL
+2. **Claude ATS scoring** — extract job description, call `_claude_ats_and_tailor(job, jd_text)`, get score/keywords/tailored content
+3. If ATS score < 85 and `auto_submit=True` → print yellow warning, continue
+4. If no Orion tailored resume available → generate Claude tailored PDF via `_generate_tailored_resume_pdf()`
+5. Click the ATS entry button via `_click_ats_apply_button()` (SmartRecruiters: JS click fallback)
+6. Trigger Jobright autofill extension via `_trigger_autofill()`
+7. Run pre-submit validation checklist via `_run_pre_submission_validation()`
+8. Final submit via `_confirm_and_submit()` — sets `self._apply_analytics`
+
+### LinkedIn Jobs
+
+`LinkedInScraper.apply(job, auto_submit)`:
+
+1. Attempt Jobright resume tailoring via `JobrightScraper.tailor_resume_for_external_job(job)`
+2. Fall back to `resolve_resume_path(config)`
+3. Open LinkedIn job URL
+4. Support both legacy modal Easy Apply and newer full-page `/jobs/view/<id>/apply/` flows
+5. Fill contact/profile fields from `state/profile.json` via `ResumeFieldFixer`
+6. Upload tailored or fallback resume when LinkedIn exposes `input[type=file]`
+7. If LinkedIn has no hosted apply flow → extract external URL → delegate to `JobrightScraper.apply_external_ats_job()`
+
+### Jobright Orion Resume Tailoring
+
+`_generate_tailored_resume()` (called before external ATS apply):
+
+1. Navigate to `https://jobright.ai/jobs/external`
+2. Find or add the external job URL via `_find_external_jobright_match()` / `_add_external_job_to_jobright()`
+3. Open `CUSTOM RESUME` drawer
+4. Run Orion wizard: `Improve My Resume for This Job` → `Full Edit` → `Select all` → `Generate My New Resume`
+5. Download tailored PDF to `state/tailored_resumes/`
+6. Sets `self._jobright_available = True` on success
+
+Orion has ~60% failure rate. When it fails, `_generate_tailored_resume_pdf()` generates a Claude-based PDF instead.
+
+### Claude ATS Scoring (`_claude_ats_and_tailor`)
+
+Model: `claude-haiku-4-5-20251001`
+
+Input: job description text (up to 6000 chars, extracted via `_extract_job_description()`) + resume text (from `pypdf` on the configured PDF, fallback to `state/profile.json`)
+
+Returns JSON:
+```json
+{
+  "ats_score": 87,
+  "missing_keywords": ["FedRAMP", "Zero Trust"],
+  "matching_keywords": ["Agile", "AWS", "Python"],
+  "tailored_summary": "...",
+  "tailored_bullets": [{"role": "...", "bullets": ["..."]}],
+  "cover_letter": "...",
+  "recommendation": "..."
+}
+```
+
+Score and missing keywords are stored in `self._last_ats_score` / `self._last_ats_missing_keywords` for analytics.
+
+### Claude Tailored PDF Generation (`_generate_tailored_resume_pdf`)
+
+Used as fallback when Orion fails. Builds an HTML resume from `state/profile.json` + Claude tailored content, renders to PDF via Playwright `page.pdf()`, saves to `state/tailored_resumes/{title}_{company}_claude.pdf`. Zero external dependencies beyond Playwright (already installed).
+
+### Analytics
+
+On successful submit, `_confirm_and_submit()` sets `self._apply_analytics`:
+```python
+{
+    "submitted": True,
+    "submissionTime": "...",
+    "applicationMethod": "Direct ATS" | "LinkedIn Easy Apply" | ...,
+    "atsScore": 87,
+    "resumeVersion": "resume_claude.pdf",
+    "missingKeywords": [...],
+    "jobrightAvailable": True,
+    "jobrightUrl": "https://...",
+    "interviewReceived": False,
+    "offerReceived": False,
+}
+```
+
+`orchestrator.apply_approved()` calls `state.record_application_analytics(job_id, analytics)` after each successful submit, merging into the `extra_json` column in SQLite.
+
+---
+
+## Resume Priority Order
+
+1. Claude-generated tailored PDF: `state/tailored_resumes/<title>_<company>_claude.pdf`
+2. Jobright Orion tailored PDF: `state/tailored_resumes/` (newest match)
+3. `local_resume_path` in `config.json`
+4. `LOCAL_RESUME_PATH` / `RESUME_PATH` env vars
+5. Common folders: `state/resumes/`, `~/Documents/Job App/`, `~/Downloads/`, `~/Desktop/`
+
+Stable base resume location: `state/resumes/resume.pdf` — place a copy here for consistent fallback.
+
+---
+
+## SmartRecruiters Fix
+
+SmartRecruiters "I'm interested" button uses Unicode right single quote (U+2019) in the HTML. Standard `text-matches()` Playwright selector fails. Fixed in `_click_ats_apply_button()` via JS:
+
+```javascript
+const btn = els.find(el => /i[''']m interested/i.test((el.textContent || '').trim()));
+```
+
+"I'm interested" is **not** in `submit_selectors` — it's a page-entry CTA, not a final submit.
+
+---
+
+## Critical Safety Rules
+
+- **Never remove `form_empty_not_submitted` guard** — protects against false-submit on GDIT and similar ATS pages where the form appears empty but a submit button is present
+- **Never relax `submit_selectors` anchors** — removing `^`/`$` regex anchors re-introduces false-submit on buttons like "Apply Now" that appear before the form
+- **`--auto-submit` is required for real submission** — runs without it stop before the final click
+- Never commit `.env`, `state/jobs.db`, `state/profile.json`, `state/sessions/`, or `state/tailored_resumes/`
+- Browser runs headed (non-headless) — Chrome extensions don't work in headless mode
+
+---
+
+## profile.json
+
+`state/profile.json` feeds `ResumeFieldFixer` for LinkedIn Easy Apply form autofill. It must contain real data or LinkedIn validation will fail.
+
+Required fields: `personal_info` (name, email, phone, city, state, zip), `work_history` (with real company names, titles, dates, descriptions), `education`, `skills`, `certifications`.
+
+The file is gitignored. Do not commit it.
+
+---
+
+## Session Management
+
+Most logins are fully automatic from `.env`. Two exceptions:
+
+**USAJobs** — uses login.gov (2FA), no auto-login implemented. Requires one-time manual session:
+```bash
+python src/main.py prepare-sessions --source usajobs
+```
+
+**Workday portals where `COMPANY_EMAIL`/`COMPANY_PASSWORD` don't work** — some company Workday instances require a company-specific account or SSO. These need a one-time manual login per company:
+```bash
+python src/main.py prepare-sessions
+python src/main.py prepare-sessions --source jobright --company "CVS"
+```
+
+Jobs blocked on session show status `needs-session` in preflight output.
+
+**Jobright extension** — install once via `setup`, then auto-loads from Chrome profile:
+```bash
+python src/main.py setup
+```
+
+---
+
+## Scheduling
+
+The apply run is safe to schedule — all logins are automatic, Chrome windows open and close unattended:
+
+```bash
+# crontab -e
+0 8 * * 1-5 cd /Users/alarkins/Dev/Projects/job-agent && source .venv/bin/activate && python src/main.py apply --auto-submit >> /tmp/job-agent.log 2>&1
+```
+
+---
+
+## Key Commands Reference
 
 ```bash
 source .venv/bin/activate
+
+# One-time setup (install Jobright extension)
+python src/main.py setup
 
 # Discovery
 python src/main.py discover --source linkedin --no-review
 python src/main.py discover --source linkedin-saved --no-review
 python src/main.py discover --source jobright --no-review
-
-# External URL hydration from dashboard placeholders
+python src/main.py discover --source usajobs --no-review
 python src/main.py hydrate
 
 # Preflight before any apply run
 python src/main.py preflight
-python src/main.py preflight --source linkedin
-python src/main.py preflight --source jobright
 python src/main.py ops-check
 
-# Prepare authenticated browser sessions
-python src/main.py prepare-sessions --source linkedin
-python src/main.py prepare-sessions --source jobright
+# Session prep (Workday portals only)
+python src/main.py prepare-sessions
+python src/main.py prepare-sessions --source jobright --company "CVS"
 
-# Safe apply tests
-python src/main.py apply --source jobright --company Pfizer --no-auto-submit
-python src/main.py apply --source linkedin --limit 1 --no-auto-submit
+# Apply
+python src/main.py apply --auto-submit                        # full queue
+python src/main.py apply --source jobright --limit 1 --no-auto-submit  # safe test
+python src/main.py apply --job-id <id> --auto-submit           # single job
 
-# Final submit mode, only after targeted safe runs verify the form path
-python src/main.py apply --auto-submit
+# Stats
+python src/main.py status
 ```
 
-## Important Files
-
-- `src/main.py` - CLI command definitions.
-- `src/orchestrator.py` - Pulls cloud-approved jobs, preflight filtering, session prep, apply loop, external hydration.
-- `src/sources/jobright.py` - Jobright discovery, custom resume generation, external ATS extraction, autofill/apply.
-- `src/sources/linkedin.py` - LinkedIn discovery, saved jobs, Easy Apply/full-page apply, Jobright tailoring fallback.
-- `src/resume_helper.py` - Resume path resolution and form-field fallback filler.
-- `src/state_manager.py` - SQLite job state and timestamps.
-- `dashboard/main.py` - Cloud dashboard API, sync, external placeholder jobs, credentials endpoints.
-- `dashboard/templates/index.html` - Dashboard UI, external job add form, credential forms.
-- `README.md` - User-facing operation guide.
-
-## Jobright Apply Architecture
-
-Jobright has two related apply paths.
-
-### Jobright Job Apply
-
-`JobrightScraper.apply(job, auto_submit=False)` handles approved Jobright jobs.
-
-Expected sequence:
-
-1. Open the Jobright job detail page.
-2. Extract the company ATS URL using `_extract_external_url()`.
-3. Generate/download a tailored resume using `_generate_tailored_resume()`.
-4. Resolve a resume path with `resolve_resume_path()`.
-5. Open the ATS URL.
-6. Upload the resume when a file input is available.
-7. Click the ATS apply/start control.
-8. Trigger Jobright Autofill or fallback field filling.
-9. Stop at final submit unless `auto_submit=True`.
-
-### Jobright External Custom Resume Flow
-
-For external jobs, Jobright's current UI is:
-
-`/jobs/external` -> `CUSTOM RESUME` -> `Improve My Resume for This Job` -> `Full Edit` -> `Select all` -> `Generate My New Resume` -> `Download Resume`.
-
-Relevant helpers:
-
-- `_find_external_jobright_match(page, job)`
-- `_add_external_job_to_jobright(page, job)`
-- `_download_custom_resume_from_external_list(page, match, job)`
-- `_generate_tailored_resume_current_ui(page, job, before)`
-- `_run_orion_resume_wizard(page, job, before)`
-- `_download_visible_resume(page, job, before)`
-
-Jobright's `Download Resume` button is an Ant Design dropdown trigger in some states. `_download_visible_resume()` and `_download_from_open_dropdown()` must handle both immediate downloads and dropdown menu downloads.
-
-## LinkedIn Apply Architecture
-
-`LinkedInScraper.apply(job, auto_submit=False)` first attempts Jobright tailoring.
-
-Expected sequence:
-
-1. Call `JobrightScraper.tailor_resume_for_external_job(job)`.
-2. Use tailored resume path if available.
-3. Fall back to `resolve_resume_path(config)`.
-4. Open LinkedIn job URL.
-5. Support both:
-   - legacy modal Easy Apply controls
-   - newer full-page `/jobs/view/<id>/apply/` flow with a `Continue` link
-6. Fill phone/contact fields from `state/profile.json`.
-7. Upload resume if LinkedIn exposes `input[type=file]`.
-8. Stop at final submit unless `auto_submit=True`.
-
-If LinkedIn does not expose a LinkedIn-hosted apply flow, `_extract_external_apply_url()` tries to find/click the external apply URL and delegates to `JobrightScraper.apply_external_ats_job()`.
-
-## Resume Handling
-
-The preferred resume path is a newly downloaded tailored resume under:
-
-```text
-state/tailored_resumes/
-```
-
-Fallback resolution order is implemented in `src/resume_helper.py`:
-
-1. Explicit tailored/downloaded resume path.
-2. `LOCAL_RESUME_PATH` or `RESUME_PATH`.
-3. `local_resume_path` or `resume_path` in `config.json`.
-4. Common folders including `state/resumes`, `~/Documents/Job App`, `~/Downloads`, and `~/Desktop`.
-
-For stable local testing, place a base resume here:
-
-```text
-state/resumes/resume.pdf
-```
-
-Do not commit real resumes or personal session state.
-
-## Session Prep
-
-Most failed apply runs are session problems, not code problems.
-
-Run:
-
-```bash
-python src/main.py prepare-sessions --source jobright
-python src/main.py prepare-sessions --source linkedin
-```
-
-Known patterns:
-
-- Workday portals often show `Create Account` / `Sign In` before the form is reachable.
-- BrassRing often requires manual portal login.
-- Microsoft may require account/session review.
-- LinkedIn may require a fresh authenticated browser profile or challenge completion.
+---
 
 ## Verification Checklist
 
-Use these before claiming the apply workflow is working:
+Run before claiming the apply workflow is working:
 
 ```bash
+# Syntax check
 PYTHONPYCACHEPREFIX=/private/tmp/job-agent-pycache \
   .venv/bin/python -m py_compile \
   src/main.py src/orchestrator.py src/resume_helper.py \
@@ -168,28 +301,17 @@ PYTHONPYCACHEPREFIX=/private/tmp/job-agent-pycache \
 
 git diff --check
 python src/main.py preflight
-.venv/bin/python src/main.py ops-check
+python src/main.py ops-check
 python src/main.py apply --source jobright --company Pfizer --no-auto-submit
 python src/main.py apply --source linkedin --limit 1 --no-auto-submit
 ```
 
-For real submission testing, use a single known-safe job and only then run:
+---
 
-```bash
-python src/main.py apply --job-id <approved_job_id> --auto-submit
-```
+## Known Issues (as of June 2026)
 
-## Current Known Blockers
-
-- Approved jobs can be skipped by preflight if their ATS needs a refreshed session.
-- A Workday job that lands on `Create Account` / `Sign In` is not ready to apply until session prep is completed.
-- Jobright custom resume generation can take several minutes and sometimes returns a dropdown under `Download Resume`.
-- If no tailored resume is downloaded and no fallback resume exists, upload prompts cannot be satisfied.
-
-## Safety Rules For Developers
-
-- Never commit `.env`, real credentials, session profiles, downloaded resumes, or `state/jobs.db`.
-- Do not remove final-submit confirmation behavior unless the CLI flag is explicitly `--auto-submit`.
-- Prefer targeted runs with `--job-id`, `--company`, `--source`, and `--limit`.
-- Keep browser automation headed/non-headless for apply workflows so the user can see what is happening.
-- Treat `applied` status as authoritative: only set it after an application is actually submitted.
+- **FICO LinkedIn Easy Apply** — stuck on page 2/3 with unknown validation error; `state/profile.json` real data may resolve it; not yet confirmed
+- **Netflix (EightFold AI), Bayview, LabConnect (DayForce HCM)** — new ATS types, not fully handled
+- **Workday sessions** — CVS Health, UMCareerStaff, Simpro need `prepare-sessions` before they can be applied to
+- **Jobright Orion ~60% failure rate** — Claude PDF fallback handles this automatically
+- **ATS score gate is non-blocking** — score < 85 prints a warning but does not stop `--auto-submit` runs (by design, can be tightened)

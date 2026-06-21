@@ -62,6 +62,12 @@ class JobrightScraper(BaseScraper):
             if not match and job.get("url"):
                 match = await self._add_external_job_to_jobright(page, job)
             if not match:
+                # Verify page is still valid before navigating — _add_external_job_to_jobright
+                # catches its own exceptions but may leave the page handle invalid.
+                try:
+                    await page.evaluate("1")  # async ping — raises if page/context is closed
+                except Exception:
+                    return ""  # page is gone; skip fallback search
                 await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=30000)
                 await self._delay(2, 3)
                 await self._dismiss_jobright_popups(page)
@@ -83,9 +89,13 @@ class JobrightScraper(BaseScraper):
                 jobs = await self._js_extract(page)
                 match = self._best_jobright_match(job, jobs)
             if not match:
+                self._jobright_available = False
+                self._jobright_url = ""
                 console.print("[yellow]Jobright Tailor:[/yellow] No credible Jobright match found; using existing resume.")
                 return ""
 
+            self._jobright_available = True
+            self._jobright_url = match.get("url", "")
             console.print(
                 f"[magenta]Jobright Tailor:[/magenta] Matched '{match.get('title')}' @ {match.get('company')}"
             )
@@ -149,15 +159,27 @@ class JobrightScraper(BaseScraper):
             clicked = await self._click_first_button_text(page, [r"^Add Job$", r"^Import$", r"^Submit$"])
             if not clicked:
                 await input_box.press("Enter")
-            await self._delay(10, 14)
+            await self._delay(12, 18)
 
-            for _ in range(8):
-                jobs = await self._js_extract(page)
+            for attempt in range(18):
+                try:
+                    jobs = await self._js_extract(page)
+                except Exception:
+                    break  # page closed; give up polling
                 match = self._best_jobright_match(job, jobs)
                 if match:
                     console.print("[green]Jobright Tailor:[/green] External job added/found in Jobright.")
                     return match
-                await asyncio.sleep(3)
+                # After ~44 seconds total, navigate back to the page — reload() can
+                # crash the renderer on some Chrome+SPA combinations; goto() is safer.
+                if attempt == 8:
+                    console.print("[dim]Jobright Tailor: reloading page to surface new card…[/dim]")
+                    try:
+                        await page.goto("https://jobright.ai/jobs/external", wait_until="domcontentloaded", timeout=20000)
+                        await self._delay(3, 4)
+                    except Exception:
+                        break  # page closed; give up
+                await asyncio.sleep(4)
 
             console.print("[yellow]Jobright Tailor:[/yellow] External job was submitted to Jobright, but no matching card appeared yet.")
             return None
@@ -221,14 +243,46 @@ class JobrightScraper(BaseScraper):
         submitted = False
         resolved_resume = resolve_resume_path(self.config, preferred=resume_path)
 
+        _is_teamtailor = "teamtailor.com" in external_url.lower()
+
+        # Rewrite Teamtailor URLs to load the application form directly.
+        # Don't load the Jobright extension for Teamtailor — we have _fill_teamtailor_form,
+        # and the extension's content scripts can crash the Teamtailor renderer tab.
+        if _is_teamtailor and "/applications/new" not in external_url.lower():
+            base_url = external_url.split('?')[0].rstrip('/')
+            external_url = f"{base_url}/applications/new"
+
         console.print(f"[magenta]Jobright ATS:[/magenta] External apply for {job.get('title')} @ {job.get('company')}")
-        page = await self._start_browser(load_extensions=True)
+        page = await self._start_browser(load_extensions=not _is_teamtailor)
         try:
             await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
-            await self._delay(3, 5)
+            # For Teamtailor: wait for the SPA to finish its initial auth check and
+            # settle on the form page before trying to interact. Teamtailor's JS does
+            # a brief redirect/validation pass that invalidates the page handle if we
+            # call page.evaluate too soon.
+            if _is_teamtailor:
+                await asyncio.sleep(4)
+                # Wait for the actual form fields to appear
+                for _form_sel in [
+                    'input[name="job_application[name]"]',
+                    'input[name*="name"]',
+                    'input[type="email"]',
+                    'form',
+                ]:
+                    try:
+                        await page.wait_for_selector(_form_sel, timeout=8000)
+                        break
+                    except Exception:
+                        continue
+            else:
+                await self._delay(3, 5)
             console.print(f"[magenta]Jobright ATS:[/magenta] Company portal loaded: {page.url}")
 
-            entered_form = await self._click_ats_apply_button(page)
+            # Skip _click_ats_apply_button for Teamtailor — we're already on /applications/new
+            if _is_teamtailor:
+                entered_form = True
+            else:
+                entered_form = await self._click_ats_apply_button(page)
             await self._delay(3, 5)
             if getattr(self, "_workday_session_expired", False):
                 return self._set_apply_outcome(
@@ -236,10 +290,51 @@ class JobrightScraper(BaseScraper):
                     "Workday redirected to sign-in. Re-authenticate this company Workday portal, then rerun apply.",
                 )
 
-            if await self._portal_needs_login(page):
+            # Teamtailor forms are public — their email field is for the applicant,
+            # not a login form. Skip the login-wall check to avoid a false positive.
+            if not _is_teamtailor and await self._portal_needs_login(page):
                 console.print("[magenta]Jobright ATS:[/magenta] Login required — attempting configured portal login.")
                 await self._company_portal_login(page)
                 await self._delay(4, 6)
+
+            # ── Claude ATS scoring + resume tailoring fallback ────────────────
+            # Run regardless of whether Orion produced a resume. Gives us a score
+            # and a tailored PDF when Orion failed (the ~60% failure rate case).
+            self._last_ats_score = 0
+            self._last_ats_missing_keywords: list = []
+            self._last_application_method = "Direct ATS"
+            try:
+                _jd_text = await self._extract_job_description(page)
+                if _jd_text:
+                    console.print("[cyan]Claude:[/cyan] Calculating ATS score…")
+                    _tailored = await self._claude_ats_and_tailor(job, _jd_text)
+                    if _tailored:
+                        self._last_ats_score = _tailored.get("ats_score", 0)
+                        self._last_ats_missing_keywords = _tailored.get("missing_keywords", [])
+                        _score_color = (
+                            "green" if self._last_ats_score >= 85
+                            else "yellow" if self._last_ats_score >= 60
+                            else "red"
+                        )
+                        console.print(f"[{_score_color}]Claude ATS Score: {self._last_ats_score}/100[/{_score_color}]")
+                        if self._last_ats_missing_keywords:
+                            console.print(f"[dim]Missing keywords: {', '.join(self._last_ats_missing_keywords[:8])}[/dim]")
+                        # If Orion didn't produce a tailored resume, generate one via Claude
+                        _base_resume = resolve_resume_path(self.config)
+                        if not resolved_resume or resolved_resume == _base_resume:
+                            _claude_pdf = await self._generate_tailored_resume_pdf(job, _tailored)
+                            if _claude_pdf:
+                                resolved_resume = _claude_pdf
+                                self._last_tailored_resume_path = _claude_pdf
+                                self._last_application_method = "Claude Tailored"
+                        # ATS gate: warn only — never block auto-submit
+                        if self._last_ats_score > 0 and self._last_ats_score < 85 and auto_submit:
+                            console.print(
+                                f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
+                                "proceeding anyway (warn-only gate).[/yellow]"
+                            )
+            except Exception as _ce:
+                console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
 
             if resolved_resume:
                 await self._upload_resume_if_prompted(page, resolved_resume)
@@ -247,6 +342,7 @@ class JobrightScraper(BaseScraper):
                 console.print("[yellow]Jobright ATS:[/yellow] No local resume file found for upload fallback.")
 
             current_portal = page.url
+            _on_teamtailor = "teamtailor.com" in current_portal.lower()
             if "myworkdayjobs.com" not in current_portal:
                 if not entered_form and not await self._looks_like_application_form(page):
                     family = await self._detect_portal_family(page)
@@ -258,18 +354,25 @@ class JobrightScraper(BaseScraper):
                             f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
                         ),
                     )
-                console.print("[magenta]Jobright ATS:[/magenta] Triggering Jobright autofill extension…")
-                if await self._trigger_autofill(page):
-                    await self._delay(10, 15)
-                else:
-                    console.print("[yellow]Jobright ATS:[/yellow] Autofill trigger not found; trying generic fill/upload fallback.")
-                    await self._delay(3, 5)
+                # Skip Jobright extension autofill for Teamtailor — extension not loaded,
+                # and _fill_teamtailor_form handles field filling below.
+                if not _on_teamtailor:
+                    console.print("[magenta]Jobright ATS:[/magenta] Triggering Jobright autofill extension…")
+                    if await self._trigger_autofill(page):
+                        await self._delay(10, 15)
+                    else:
+                        console.print("[yellow]Jobright ATS:[/yellow] Autofill trigger not found; trying generic fill/upload fallback.")
+                        await self._delay(3, 5)
 
             if resolved_resume:
                 await self._upload_resume_if_prompted(page, resolved_resume)
             await self._field_fixer.fix_fields(page)
 
-            if not await self._looks_like_application_form(page):
+            # Teamtailor-specific form filling (Crunchbase, etc.)
+            if _on_teamtailor:
+                await self._fill_teamtailor_form(page)
+
+            if not _on_teamtailor and not await self._looks_like_application_form(page):
                 family = await self._detect_portal_family(page)
                 controls = await self._visible_controls_snapshot(page)
                 return self._set_apply_outcome(
@@ -1348,6 +1451,8 @@ class JobrightScraper(BaseScraper):
         if "jobright.ai" not in url:
             console.print(f"[magenta]Jobright ATS:[/magenta] Delegating external URL apply: {url}")
             tailored_path = await self.tailor_resume_for_external_job(job)
+            # Persist so _confirm_and_submit / outcome messages can reference it
+            self._last_tailored_resume_path = tailored_path
             return await self.apply_external_ats_job(
                 job,
                 url,
@@ -1395,16 +1500,15 @@ class JobrightScraper(BaseScraper):
             else:
                 console.print("[yellow]Jobright:[/yellow] No tailored or configured resume path available.")
 
-            # ── Step 6: Dismiss modal, open company ATS directly ──────────────
-            # Close the resume modal
+            # ── Step 6: Open ATS via Jobright Apply button (triggers extension autofill)
+            # Close the Orion resume modal first
             await page.evaluate(
                 "document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,bubbles:true}))"
             )
             await self._delay(1, 2)
 
-            # Navigate to the ATS URL in a new page within our context
+            # Last resort URL extraction if not yet captured
             if not ext_url:
-                # Last resort: try to read it from the page after modal close
                 ext_url = await self._extract_external_url(page)
 
             if not ext_url:
@@ -1414,8 +1518,7 @@ class JobrightScraper(BaseScraper):
                     "Could not extract the company ATS URL from the Jobright posting.",
                 )
 
-            # Validate the URL has a real hostname (guard against malformed extractions
-            # like "https://www./" that come from broad anchor-tag pattern matching).
+            # Validate the URL has a real hostname
             try:
                 from urllib.parse import urlparse as _urlparse
                 _p = _urlparse(ext_url)
@@ -1429,10 +1532,47 @@ class JobrightScraper(BaseScraper):
             except Exception:
                 pass
 
-            console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
-            company_page = await self._context.new_page()
-            await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
-            await self._delay(3, 5)
+            # ── Preferred: click Apply on the Jobright card to trigger extension ──
+            # The Jobright autofill extension fires its full form-fill routine when
+            # the ATS page is opened via the Jobright "Apply Now" button, rather than
+            # navigated directly.  Capture the new tab that opens.
+            company_page = None
+            console.print("[magenta]Jobright:[/magenta] Clicking Apply on Jobright card to trigger extension autofill…")
+            try:
+                async with self._context.expect_page(timeout=12000) as _new_page:
+                    # Try clicking "Apply Now" / "Apply" on the Jobright job card
+                    clicked = await self._click_visible_control_by_text(page, [
+                        r'^apply now$', r'^apply$', r'^quick apply$', r'^easy apply$', r'^start application$',
+                    ])
+                    if not clicked:
+                        await page.evaluate("""
+                            () => {
+                                const el = [...document.querySelectorAll('button,a')]
+                                    .find(b => /^apply( now)?$/i.test((b.textContent||'').trim()));
+                                if (el) el.click();
+                            }
+                        """)
+                company_page = await _new_page.value
+                await company_page.wait_for_load_state("domcontentloaded", timeout=30000)
+                await self._delay(8, 12)  # give extension time to inject and autofill
+                if company_page and "teamtailor.com" in company_page.url.lower() and "/applications/new" not in company_page.url.lower():
+                    base_url = company_page.url.split('?')[0].rstrip('/')
+                    await company_page.goto(f"{base_url}/applications/new", wait_until="domcontentloaded", timeout=30000)
+                    await self._delay(3, 5)
+                console.print(f"[green]Jobright:[/green] Extension opened ATS: {company_page.url[:80]}")
+            except Exception as _e:
+                console.print(f"[yellow]Jobright:[/yellow] Apply button didn't open new tab ({_e}); using direct navigation")
+
+            # ── Fallback: open ATS URL directly ──────────────────────────────────
+            if company_page is None:
+                if ext_url and "teamtailor.com" in ext_url.lower() and "/applications/new" not in ext_url.lower():
+                    base_url = ext_url.split('?')[0].rstrip('/')
+                    ext_url = f"{base_url}/applications/new"
+                console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
+                company_page = await self._context.new_page()
+                await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
+                await self._delay(3, 5)
+
             if resume_path:
                 await self._upload_resume_if_prompted(company_page, resume_path)
 
@@ -1502,6 +1642,43 @@ class JobrightScraper(BaseScraper):
                             f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
                         ),
                     )
+                # ── Claude ATS scoring + resume tailoring fallback (Jobright path) ──
+                self._last_ats_score = 0
+                self._last_ats_missing_keywords = []
+                self._last_application_method = "Jobright Assisted"
+                try:
+                    _jd_text = await self._extract_job_description(company_page)
+                    if _jd_text:
+                        console.print("[cyan]Claude:[/cyan] Calculating ATS score…")
+                        _tailored = await self._claude_ats_and_tailor(job, _jd_text)
+                        if _tailored:
+                            self._last_ats_score = _tailored.get("ats_score", 0)
+                            self._last_ats_missing_keywords = _tailored.get("missing_keywords", [])
+                            _score_color = (
+                                "green" if self._last_ats_score >= 85
+                                else "yellow" if self._last_ats_score >= 60
+                                else "red"
+                            )
+                            console.print(f"[{_score_color}]Claude ATS Score: {self._last_ats_score}/100[/{_score_color}]")
+                            if self._last_ats_missing_keywords:
+                                console.print(f"[dim]Missing keywords: {', '.join(self._last_ats_missing_keywords[:8])}[/dim]")
+                            # If Orion didn't produce a tailored resume, generate one via Claude
+                            if not resume_path or resume_path == resolve_resume_path(self.config):
+                                _claude_pdf = await self._generate_tailored_resume_pdf(job, _tailored)
+                                if _claude_pdf:
+                                    resume_path = _claude_pdf
+                                    self._last_tailored_resume_path = _claude_pdf
+                                    self._last_application_method = "Claude Tailored"
+                                    if resume_path:
+                                        await self._upload_resume_if_prompted(company_page, resume_path)
+                            if self._last_ats_score > 0 and self._last_ats_score < 85 and auto_submit:
+                                console.print(
+                                    f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
+                                    "proceeding anyway (warn-only gate).[/yellow]"
+                                )
+                except Exception as _ce:
+                    console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
+
                 console.print("[magenta]Jobright:[/magenta] Triggering Jobright autofill extension…")
                 autofill_triggered = await self._trigger_autofill(company_page)
                 if autofill_triggered:
@@ -2080,6 +2257,13 @@ class JobrightScraper(BaseScraper):
     async def _company_portal_login(self, page) -> None:
         """
         Log into a company ATS portal using COMPANY_EMAIL / COMPANY_PASSWORD from .env.
+        Falls back to COMPANY_EMAIL_ALT / COMPANY_PASSWORD_ALT if the primary fails.
+
+        Two credential sets are configured:
+          COMPANY_EMAIL       — alarkins.jsearch@yahoo.com (most portals: Motorola, Booz Allen,
+                                Greenhouse, SAIC, PNC, Capital One, ManTech, etc.)
+          COMPANY_EMAIL_ALT   — anthonyclarkins@icloud.com (government/contractor: GDIT, etc.)
+
         Uses page.type() (real keystroke simulation) instead of fill() to avoid
         bot-detection triggers on Workday and similar ATS portals.
         """
@@ -2176,10 +2360,187 @@ class JobrightScraper(BaseScraper):
                 except Exception:
                     continue
 
-            console.print(f"[green]Jobright:[/green] Login attempted → {page.url}")
+            console.print(f"[green]Jobright:[/green] Login attempted with {email} → {page.url}")
+
+            # If the page still looks like a login page, retry with the alt email
+            login_indicators = ["login", "signin", "sign-in", "auth", "create-account"]
+            still_on_login = any(w in page.url.lower() for w in login_indicators)
+            if still_on_login:
+                alt_email = os.environ.get("COMPANY_EMAIL_ALT", "")
+                alt_password = os.environ.get("COMPANY_PASSWORD_ALT", password)
+                if alt_email and alt_email != email:
+                    console.print(f"[yellow]Jobright:[/yellow] Primary login may have failed — retrying with alt email {alt_email}…")
+                    await self._company_portal_login_with(page, alt_email, alt_password)
 
         except Exception as e:
             console.print(f"[yellow]Jobright:[/yellow] Portal login attempt failed: {e}")
+
+    async def _company_portal_login_with(self, page, email: str, password: str) -> None:
+        """Re-run the portal login form with a specific email/password (alt-credential retry)."""
+        try:
+            for sel in ['input[type="email"]', 'input[name*="email" i]', 'input[placeholder*="email" i]']:
+                try:
+                    elem = await page.wait_for_selector(sel, timeout=3000)
+                    if elem:
+                        await elem.triple_click()
+                        await elem.type(email, delay=80)
+                        await self._delay(0.5, 1)
+                        break
+                except Exception:
+                    continue
+            for sel in ['button:text-matches("^Next$","i")', 'button:text-matches("^Continue$","i")', 'button[type="submit"]']:
+                try:
+                    btn = await page.wait_for_selector(sel, timeout=2000)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await self._delay(2, 3)
+                        break
+                except Exception:
+                    continue
+            try:
+                pwd = await page.wait_for_selector('input[type="password"]', timeout=6000)
+                if pwd:
+                    await pwd.triple_click()
+                    await pwd.type(password, delay=80)
+                    await self._delay(0.5, 1)
+            except Exception:
+                return
+            for sel in ['button:text-matches("^Sign In$","i")', 'button:text-matches("^Log In$","i")', 'button[type="submit"]']:
+                try:
+                    btn = await page.wait_for_selector(sel, timeout=2000)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await self._delay(5, 8)
+                        break
+                except Exception:
+                    continue
+            console.print(f"[green]Jobright:[/green] Alt login attempted with {email} → {page.url}")
+        except Exception as e:
+            console.print(f"[yellow]Jobright:[/yellow] Alt portal login failed: {e}")
+
+    async def _fill_teamtailor_form(self, page) -> None:
+        """Fill Teamtailor application form fields that Jobright autofill misses.
+
+        Covers: LinkedIn Profile URL, work-auth radio (Yes), sponsorship radio (No),
+        and any other visible text/select inputs left empty.
+        """
+        import json as _json
+        profile_path = Path(__file__).parent.parent.parent / "state" / "profile.json"
+        profile: dict = {}
+        if profile_path.exists():
+            try:
+                profile = _json.loads(profile_path.read_text())
+            except Exception:
+                pass
+
+        linkedin_url = profile.get("social_links", {}).get("linkedin", "")
+
+        # Wait briefly for the form to settle after autofill
+        await asyncio.sleep(1)
+
+        # --- LinkedIn Profile URL ---
+        if linkedin_url:
+            linkedin_selectors = [
+                "input[name*='linkedin' i]",
+                "input[placeholder*='linkedin' i]",
+                "input[id*='linkedin' i]",
+                "input[aria-label*='linkedin' i]",
+            ]
+            for sel in linkedin_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() and await el.is_visible():
+                        current_val = await el.input_value()
+                        if not current_val:
+                            await el.fill(linkedin_url)
+                        break
+                except Exception:
+                    pass
+
+        # --- Work authorization radio (Yes) ---
+        work_auth_yes_selectors = [
+            # Teamtailor often renders label text next to a radio input
+            "label:has-text('Yes')",
+            "input[type='radio'][value='true']",
+            "input[type='radio'][value='yes' i]",
+            "input[type='radio'][value='1']",
+        ]
+        # We need the one near "authorized" / "legal" / "work in" context
+        try:
+            # Preferred: find all radio labels, pick the "Yes" near work-auth question
+            await page.evaluate("""() => {
+                const labels = Array.from(document.querySelectorAll('label'));
+                const workSection = labels.find(l =>
+                    /authorized|legally|work in the us/i.test(l.closest('fieldset,div,section')?.textContent || '')
+                    && /^yes$/i.test(l.textContent.trim())
+                );
+                if (workSection) {
+                    const radio = workSection.querySelector('input[type=radio]') ||
+                        document.querySelector('#' + workSection.htmlFor);
+                    if (radio) radio.click();
+                }
+            }""")
+        except Exception:
+            pass
+        # Fallback: click any visible "Yes" radio inside a fieldset
+        for sel in work_auth_yes_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.count() and await el.is_visible():
+                    await el.click()
+                    break
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+
+        # --- Sponsorship required radio (No) ---
+        try:
+            await page.evaluate("""() => {
+                const labels = Array.from(document.querySelectorAll('label'));
+                const sponsorSection = labels.find(l =>
+                    /sponsor/i.test(l.closest('fieldset,div,section')?.textContent || '')
+                    && /^no$/i.test(l.textContent.trim())
+                );
+                if (sponsorSection) {
+                    const radio = sponsorSection.querySelector('input[type=radio]') ||
+                        document.querySelector('#' + sponsorSection.htmlFor);
+                    if (radio) radio.click();
+                }
+            }""")
+        except Exception:
+            pass
+        # Fallback: value="false" / value="no"
+        for sel in ["input[type='radio'][value='false']", "input[type='radio'][value='no' i]", "input[type='radio'][value='0']"]:
+            try:
+                el = page.locator(sel).first
+                if await el.count() and await el.is_visible():
+                    await el.click()
+                    break
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+
+        # --- Any remaining required text inputs left blank ---
+        personal = profile.get("personal_info", {})
+        fill_map = {
+            "phone": personal.get("phone", ""),
+            "city": personal.get("city", ""),
+            "zip": personal.get("zip", ""),
+        }
+        for keyword, value in fill_map.items():
+            if not value:
+                continue
+            try:
+                el = page.locator(f"input[name*='{keyword}' i]:visible, input[placeholder*='{keyword}' i]:visible").first
+                if await el.count() and await el.is_visible():
+                    if not await el.input_value():
+                        await el.fill(value)
+            except Exception:
+                pass
+
+        console.print("[cyan]Teamtailor:[/cyan] form fields filled (LinkedIn, work auth, sponsorship)")
 
     async def _click_ats_apply_button(self, page) -> bool:
         """
@@ -2199,7 +2560,26 @@ class JobrightScraper(BaseScraper):
         # This skips the "Start Your Application" chooser entirely.
         # If the Workday session is active → opens the application form.
         # If session expired → Workday shows its sign-in page; we handle that below.
-        if 'myworkdayjobs.com' in current_url and '/apply' not in current_url:
+        #
+        # Also handles company-branded Workday domains (CVS Health uses jobs.cvshealth.com,
+        # Palo Alto uses wd5.myworkdayjobs.com, etc.) — detect via Workday-specific
+        # DOM attribute data-automation-id which is exclusively used by Workday's framework.
+        _is_workday_page = 'myworkdayjobs.com' in current_url
+        if not _is_workday_page:
+            try:
+                _is_workday_page = await page.evaluate("""
+                    () => !!(
+                        document.querySelector('[data-automation-id="jobPostingApplyButton"]') ||
+                        document.querySelector('[data-automation-id="candidateHomeLink"]') ||
+                        document.querySelector('[data-automation-id="text-input"]') ||
+                        document.querySelector('[class*="wd-Button-"]') ||
+                        document.querySelector('[class*="wd-Text-"]') ||
+                        (document.body?.innerHTML || '').includes('myworkdayjobs')
+                    )
+                """)
+            except Exception:
+                pass
+        if _is_workday_page and '/apply' not in current_url:
             apply_url = current_url.rstrip('/') + '/apply/autofillWithResume'
             console.print(f"[magenta]Jobright:[/magenta] Workday — navigating to autofillWithResume…")
             try:
@@ -2220,9 +2600,9 @@ class JobrightScraper(BaseScraper):
             current = page.url
         except Exception:
             current = ""
-        # After navigating to autofillWithResume: handle sign-in if needed,
-        # then auto-navigate the wizard steps.
-        if 'myworkdayjobs.com' in current:
+        # After navigating to autofillWithResume (or on a company-branded Workday
+        # portal), handle the "Start Your Application" chooser and sign-in gate.
+        if _is_workday_page or 'myworkdayjobs.com' in current:
             await self._click_visible_control_by_text(page, [
                 '^use my last application$',
                 '^autofill with resume$',
@@ -2247,7 +2627,7 @@ class JobrightScraper(BaseScraper):
         if 'brassring.com' in current.lower():
             return await self._handle_brassring_apply(page)
 
-        # ── Other ATS: click the Apply / Apply Now button ────────────────────
+        # ── Other ATS: click the Apply / Apply Now / entry CTA button ─────────
         apply_selectors = [
             # Workday fallback (data-automation-id only, not broad text matches)
             '[data-automation-id="jobPostingApplyButton"]',
@@ -2255,11 +2635,27 @@ class JobrightScraper(BaseScraper):
             '#apply_button',
             'a.btn-apply',
             '.apply-button',
-            # Text-match on button elements only (not anchors, to avoid nav links)
+            # Text-match on button elements
             'button:text-matches("^Apply Now$", "i")',
             'button:text-matches("^Apply$", "i")',
             'button:text-matches("Apply for This Job", "i")',
             'button:text-matches("Apply for Job", "i")',
+            # SmartRecruiters / NBCUniversal — "I'm interested" is the entry CTA
+            # that opens the one-click application form (not a nav link)
+            'a:text-matches("I\'m interested", "i")',
+            'button:text-matches("I\'m interested", "i")',
+            # HRMDirect / SERVPRO — "START YOUR APPLICATION" anchor link
+            'a:text-matches("START YOUR APPLICATION", "i")',
+            'a:text-matches("Start Your Application", "i")',
+            'a:text-matches("Start Application", "i")',
+            # Teamtailor (Crunchbase, etc.)
+            'button:text-matches("^Apply here$", "i")',
+            'a:text-matches("^Apply here$", "i")',
+            '.careersite-button',
+            # Broad anchor fallback — many ATS portals use <a> not <button> for Apply
+            'a:text-matches("^Apply Now$", "i")',
+            'a:text-matches("^Apply$", "i")',
+            'a:text-matches("Apply for This Job", "i")',
         ]
 
         for sel in apply_selectors:
@@ -2267,12 +2663,33 @@ class JobrightScraper(BaseScraper):
                 btn = await page.wait_for_selector(sel, timeout=4000)
                 if btn:
                     await btn.click()
-                    from rich.markup import escape
                     console.print(f"[magenta]Jobright:[/magenta] Clicked Apply button → waiting for form…")
-                    await self._delay(4, 6)
+                    await self._delay(5, 8)
                     return True
             except Exception:
                 continue
+
+        # SmartRecruiters: JS click handles both straight and curly apostrophe variants
+        # (selector text-matches won't find "I'm interested" if the HTML uses a curly apostrophe)
+        try:
+            _sr_url = page.url.lower()
+            if 'smartrecruiters.com' in _sr_url:
+                _sr_clicked = await page.evaluate("""
+                    () => {
+                        const els = [...document.querySelectorAll('a, button')];
+                        const btn = els.find(el => /i[‘’']m interested/i.test(
+                            (el.textContent || '').trim()
+                        ));
+                        if (btn) { btn.click(); return true; }
+                        return false;
+                    }
+                """)
+                if _sr_clicked:
+                    console.print("[magenta]Jobright:[/magenta] SmartRecruiters — clicked 'I'm interested' (JS) → waiting for form…")
+                    await self._delay(5, 8)
+                    return True
+        except Exception:
+            pass
 
         clicked = await self._click_visible_control_by_text(page, [
             '^apply now$',
@@ -2281,6 +2698,8 @@ class JobrightScraper(BaseScraper):
             'apply for job',
             'start application',
             'begin application',
+            "i'm interested",
+            'start your application',
         ])
         if clicked:
             console.print("[magenta]Jobright:[/magenta] Clicked Apply control → waiting for form…")
@@ -2489,6 +2908,42 @@ class JobrightScraper(BaseScraper):
             pass
         await self._delay(5, 7)  # extra buffer for JS rendering
 
+        # ── B0: Re-check sign-in AFTER the chooser click ─────────────────────
+        # Workday sometimes shows the chooser (Autofill / Apply Manually / Sign In)
+        # on the landing page even when the session is expired.  After clicking
+        # "Autofill with Resume" the page may still be at a sign-in gate rather
+        # than the application form.  Detect this by looking for a prominent
+        # "Sign In" button with no form fields present.
+        try:
+            session_gate = await page.evaluate(
+                """
+                () => {
+                    const url = location.href.toLowerCase();
+                    // Still on the login/SSO domain
+                    if (['/login','/signin','/sign-in','/auth','login.','sso.'].some(w => url.includes(w)))
+                        return true;
+                    // Primary CTA is Sign In and there are no form inputs
+                    const btns = [...document.querySelectorAll('button')];
+                    const signInBtn = btns.find(b => /^sign in$/i.test(b.textContent.trim()));
+                    const formInputs = document.querySelectorAll('input:not([type="hidden"]), textarea, select').length;
+                    return !!signInBtn && formInputs === 0;
+                }
+                """
+            )
+        except Exception:
+            session_gate = False
+
+        if session_gate:
+            console.print(
+                f"[bold red]Jobright: Workday session gate detected after chooser click[/bold red] — {page.url}"
+            )
+            self._workday_session_expired = True
+            notify_error(
+                "Workday session expired",
+                f"Run 'python src/main.py prepare-sessions' to refresh the Workday session.\nPortal: {page.url}",
+            )
+            return
+
         # The extension fills fields on each step; we click 'Next' until we
         # reach the Review/Submit page (where the button text becomes 'Submit').
         console.print("[magenta]Jobright:[/magenta] Navigating Workday wizard steps…")
@@ -2595,6 +3050,9 @@ class JobrightScraper(BaseScraper):
         """
         Find and click the Jobright extension's autofill button injected into the ATS page.
         The extension (built with Plasmo) injects a content UI into the page DOM.
+
+        If no explicit trigger button is found, wait up to 20 seconds for the extension
+        to auto-inject and fill fields silently (it often does this without needing a click).
         """
         selectors = [
             # Plasmo extension shadow host element
@@ -2649,7 +3107,306 @@ class JobrightScraper(BaseScraper):
         except Exception:
             pass
 
+        # ── No explicit trigger found — wait for extension to auto-inject ────────
+        # The Jobright extension often fills forms silently without a button click.
+        # When opened via the Jobright Apply button, it fires automatically.
+        # Wait up to 20 seconds for form fields to get populated.
+        console.print("[dim]Jobright: no autofill button found — waiting 20s for extension auto-fill…[/dim]")
+        try:
+            await asyncio.sleep(20)
+            # Check if any input fields got filled
+            filled = await page.evaluate("""
+                () => {
+                    const inputs = [...document.querySelectorAll('input:not([type="hidden"]):not([type="file"]), textarea')];
+                    return inputs.some(i => (i.value || '').trim().length > 0);
+                }
+            """)
+            if filled:
+                console.print("[green]Jobright:[/green] Extension auto-filled form fields")
+                return True
+        except Exception:
+            pass
+
         return False
+
+    # ── Claude-powered helpers ─────────────────────────────────────────────────
+
+    async def _extract_job_description(self, page) -> str:
+        """Scrape the full job description text from the current ATS page."""
+        jd_selectors = [
+            '[data-automation-id="jobPostingDescription"]',  # Workday
+            '.sr-job-description',                           # SmartRecruiters
+            '[class*="jobDescription"]',
+            '[class*="job-description"]',
+            '#job-description',
+            '#jobDescriptionText',
+            '.jobsearch-jobDescriptionText',
+            '.description__text',
+            '.show-more-less-html__markup',
+            'section.job-details',
+        ]
+        for sel in jd_selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if len(text) > 200:
+                        return text[:6000]
+            except Exception:
+                pass
+        try:
+            return ((await page.evaluate("document.body.innerText")) or "")[:6000]
+        except Exception:
+            return ""
+
+    def _extract_resume_text(self) -> str:
+        """Extract plain text from the configured resume PDF, or fall back to profile.json."""
+        resume_path = resolve_resume_path(self.config)
+        if resume_path and resume_path.lower().endswith('.pdf') and os.path.isfile(resume_path):
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(resume_path)
+                text = "\n".join(p.extract_text() or "" for p in reader.pages).strip()
+                if len(text) > 100:
+                    return text[:6000]
+            except Exception:
+                pass
+        profile_path = os.path.join("state", "profile.json")
+        if os.path.isfile(profile_path):
+            try:
+                import json as _json
+                with open(profile_path) as f:
+                    return _json.dumps(_json.load(f), indent=2)[:4000]
+            except Exception:
+                pass
+        return ""
+
+    async def _claude_ats_and_tailor(self, job: dict, jd_text: str) -> dict:
+        """Use Claude API (haiku) to score ATS match and generate tailored resume content.
+
+        Returns dict with: ats_score, missing_keywords, matching_keywords,
+        tailored_summary, tailored_bullets, cover_letter, recommendation.
+        Returns empty dict on failure.
+        """
+        if not jd_text or len(jd_text) < 100:
+            return {}
+        try:
+            import anthropic as _anthropic
+            _api_key = os.environ.get("ANTHROPIC_API_KEY")
+            _client = _anthropic.Anthropic(api_key=_api_key) if _api_key else _anthropic.Anthropic()
+            resume_text = self._extract_resume_text()
+            _prompt = (
+                "You are an expert resume writer and ATS specialist. "
+                "Analyze this job description against the candidate resume, then produce tailored content.\n\n"
+                f"JOB: {job.get('title', '')} @ {job.get('company', '')}\n\n"
+                f"JOB DESCRIPTION (truncated):\n{jd_text[:3000]}\n\n"
+                f"CANDIDATE RESUME / PROFILE:\n{resume_text[:3000]}\n\n"
+                "Respond ONLY with valid JSON in exactly this structure:\n"
+                "{\n"
+                '  "ats_score": <integer 0-100, 85+ means strong match>,\n'
+                '  "missing_keywords": ["keyword1", "keyword2"],\n'
+                '  "matching_keywords": ["keyword1", "keyword2"],\n'
+                '  "recommendation": "one-line advice",\n'
+                '  "tailored_summary": "2-3 sentence professional summary tailored to this role",\n'
+                '  "tailored_bullets": [\n'
+                '    {"role": "Most Recent Role Title", "bullets": ["Achievement 1", "Achievement 2"]},\n'
+                '    {"role": "Second Role Title", "bullets": ["Achievement 1", "Achievement 2"]}\n'
+                "  ],\n"
+                '  "cover_letter": "3-paragraph cover letter for this specific role and company"\n'
+                "}"
+            )
+            _msg = _client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1800,
+                messages=[{"role": "user", "content": _prompt}],
+            )
+            import json as _json
+            _text = _msg.content[0].text.strip()
+            if _text.startswith("```"):
+                _text = re.sub(r"^```[a-z]*\n?", "", _text)
+                _text = re.sub(r"\n?```$", "", _text)
+            result = _json.loads(_text)
+            return {
+                "ats_score": int(result.get("ats_score", 0)),
+                "missing_keywords": result.get("missing_keywords", []),
+                "matching_keywords": result.get("matching_keywords", []),
+                "recommendation": result.get("recommendation", ""),
+                "tailored_summary": result.get("tailored_summary", ""),
+                "tailored_bullets": result.get("tailored_bullets", []),
+                "cover_letter": result.get("cover_letter", ""),
+            }
+        except Exception as _e:
+            console.print(f"[dim]Claude ATS/tailor failed: {_e}[/dim]")
+            return {}
+
+    async def _generate_tailored_resume_pdf(self, job: dict, tailored: dict) -> str:
+        """Render a tailored resume to PDF using Playwright's print engine (Jinja2-free).
+
+        Returns the path to the generated PDF, or '' on failure.
+        """
+        try:
+            import json as _json
+            profile: dict = {}
+            _ppath = os.path.join("state", "profile.json")
+            if os.path.isfile(_ppath):
+                with open(_ppath) as _f:
+                    profile = _json.load(_f)
+            info = profile.get("personal_info", {})
+            name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or "Candidate"
+            email = info.get("email", "")
+            phone = info.get("phone", "")
+            linkedin = profile.get("social_links", {}).get("linkedin", "")
+            city = info.get("city", "")
+            state_abbr = info.get("state", "")
+            location = ", ".join(p for p in [city, state_abbr] if p)
+            skills = list(profile.get("skills", []))
+            for kw in tailored.get("missing_keywords", []):
+                if kw and kw not in skills:
+                    skills.append(kw)
+            education = profile.get("education", [])
+            work_history = profile.get("work_history", [])
+            tailored_bullets = tailored.get("tailored_bullets", [])
+            experience_html = ""
+            for i, role in enumerate(tailored_bullets[:3]):
+                wh = work_history[i] if i < len(work_history) else {}
+                company = wh.get("company_name", "")
+                title = wh.get("job_title", role.get("role", ""))
+                start = wh.get("start_date", "")
+                end = wh.get("end_date", "Present")
+                bullets_html = "".join(f"<li>{b}</li>" for b in role.get("bullets", []))
+                experience_html += (
+                    f'<div class="exp-item">'
+                    f'<div class="exp-header"><span class="exp-title">{title}</span>'
+                    f'<span class="exp-dates">{start} – {end}</span></div>'
+                    f'<div class="exp-company">{company}</div>'
+                    f"<ul>{bullets_html}</ul></div>"
+                )
+            if not experience_html:
+                for wh in work_history[:3]:
+                    experience_html += (
+                        f'<div class="exp-item">'
+                        f'<div class="exp-header"><span class="exp-title">{wh.get("job_title","")}</span>'
+                        f'<span class="exp-dates">{wh.get("start_date","")} – {wh.get("end_date","Present")}</span></div>'
+                        f'<div class="exp-company">{wh.get("company_name","")}</div>'
+                        f'<ul><li>{wh.get("description","")}</li></ul></div>'
+                    )
+            edu_html = ""
+            for ed in education:
+                edu_html += (
+                    f'<div class="exp-item">'
+                    f'<div class="exp-header"><span class="exp-title">{ed.get("degree","")} — {ed.get("major","")}</span>'
+                    f'<span class="exp-dates">{ed.get("start_date","")} – {ed.get("end_date","")}</span></div>'
+                    f'<div class="exp-company">{ed.get("school_name","")}</div></div>'
+                )
+            summary = (
+                tailored.get("tailored_summary", "")
+                or "Experienced technology leader with 18+ years delivering enterprise solutions "
+                   "in government, defense, and commercial sectors."
+            )
+            skills_html = " &bull; ".join(skills[:20])
+            contact_html = " | ".join(p for p in [email, phone, location, linkedin] if p)
+            html = (
+                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                "<style>"
+                "body{font-family:Arial,sans-serif;font-size:11pt;color:#222;margin:0;padding:20px 30px}"
+                "h1{font-size:20pt;margin:0 0 2px}"
+                ".contact{font-size:9pt;color:#555;margin-bottom:10px}"
+                "h2{font-size:12pt;border-bottom:1px solid #999;padding-bottom:2px;"
+                "margin:12px 0 6px;text-transform:uppercase;letter-spacing:.05em}"
+                ".summary,.skills{margin-bottom:8px;line-height:1.5}"
+                ".exp-item{margin-bottom:10px}"
+                ".exp-header{display:flex;justify-content:space-between;font-weight:bold}"
+                ".exp-dates{font-weight:normal;font-size:10pt;color:#555}"
+                ".exp-company{font-style:italic;font-size:10pt;margin-bottom:3px}"
+                "ul{margin:4px 0 0 18px;padding:0}li{margin-bottom:2px;line-height:1.4}"
+                "</style></head><body>"
+                f"<h1>{name}</h1>"
+                f"<div class='contact'>{contact_html}</div>"
+                "<h2>Professional Summary</h2>"
+                f"<div class='summary'>{summary}</div>"
+                "<h2>Core Competencies</h2>"
+                f"<div class='skills'>{skills_html}</div>"
+                "<h2>Professional Experience</h2>"
+                f"{experience_html}"
+                "<h2>Education</h2>"
+                f"{edu_html}"
+                "</body></html>"
+            )
+            safe_title = re.sub(r'[^\w\-]', '_', (job.get('title') or 'role'))[:40]
+            safe_co = re.sub(r'[^\w\-]', '_', (job.get('company') or 'co'))[:25]
+            pdf_path = str(TAILORED_RESUMES_DIR / f"{safe_title}_{safe_co}_claude.pdf")
+            _pdf_page = await self._context.new_page()
+            try:
+                await _pdf_page.set_content(html, wait_until="domcontentloaded")
+                await _pdf_page.pdf(
+                    path=pdf_path,
+                    format="Letter",
+                    margin={"top": "0.5in", "bottom": "0.5in", "left": "0.5in", "right": "0.5in"},
+                )
+                console.print(f"[green]Claude Resume:[/green] Tailored PDF → {pdf_path}")
+                return pdf_path
+            finally:
+                await _pdf_page.close()
+        except Exception as _e:
+            console.print(f"[dim]Claude resume PDF generation failed: {_e}[/dim]")
+            return ""
+
+    async def _run_pre_submission_validation(self, page) -> dict:
+        """Check form state before submitting. Prints a checklist. Returns a dict of results."""
+        results: dict = {}
+        try:
+            checks = await page.evaluate("""
+                () => {
+                    const inputs = [...document.querySelectorAll(
+                        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select'
+                    )];
+                    const fileInputs = [...document.querySelectorAll('input[type="file"]')];
+                    const requiredEls = [...document.querySelectorAll('[required], [aria-required="true"]')];
+                    const invalidEls = [...document.querySelectorAll(':invalid')].filter(e => e.tagName !== 'FORM');
+                    const resumeUploaded = fileInputs.some(f => f.files && f.files.length > 0);
+                    const hasName = inputs.some(i =>
+                        /name|first|last/i.test(i.name || i.id || i.placeholder || '') &&
+                        (i.value || '').trim()
+                    );
+                    const hasEmail = inputs.some(i =>
+                        /email/i.test(i.name || i.id || i.type || i.placeholder || '') &&
+                        (i.value || '').trim()
+                    );
+                    const hasPhone = inputs.some(i =>
+                        /phone|tel/i.test(i.name || i.id || i.type || i.placeholder || '') &&
+                        (i.value || '').trim()
+                    );
+                    const requiredFilled = requiredEls.every(el => {
+                        if (el.type === 'checkbox' || el.type === 'radio') return el.checked;
+                        return (el.value || '').trim().length > 0;
+                    });
+                    return {
+                        resumeUploaded, hasName, hasEmail, hasPhone,
+                        requiredFilled, invalidCount: invalidEls.length,
+                        totalInputs: inputs.length
+                    };
+                }
+            """)
+            results = checks
+
+            def _tick(ok: bool) -> str:
+                return "✓" if ok else "?"
+
+            def _col(ok: bool) -> str:
+                return "green" if ok else "yellow"
+
+            console.print("\n[bold cyan]── Pre-Submit Checklist ──[/bold cyan]")
+            console.print(f"  [{_col(checks['resumeUploaded'])}]{_tick(checks['resumeUploaded'])}[/{_col(checks['resumeUploaded'])}] Resume uploaded")
+            console.print(f"  [{_col(checks['hasName'])}]{_tick(checks['hasName'])}[/{_col(checks['hasName'])}] Name filled")
+            console.print(f"  [{_col(checks['hasEmail'])}]{_tick(checks['hasEmail'])}[/{_col(checks['hasEmail'])}] Email filled")
+            console.print(f"  [{_col(checks['hasPhone'])}]{_tick(checks['hasPhone'])}[/{_col(checks['hasPhone'])}] Phone filled")
+            req_ok = checks['requiredFilled']
+            console.print(f"  [{'green' if req_ok else 'red'}]{'✓' if req_ok else '✗'}[/{'green' if req_ok else 'red'}] Required questions answered")
+            if checks['invalidCount'] > 0:
+                console.print(f"  [yellow]⚠  {checks['invalidCount']} field(s) have validation errors[/yellow]")
+        except Exception as _e:
+            console.print(f"[dim]Validation checklist error (non-fatal): {_e}[/dim]")
+        return results
 
     async def _confirm_and_submit(self, page, job: dict, auto_submit: bool = False) -> bool:
         """
@@ -2657,19 +3414,29 @@ class JobrightScraper(BaseScraper):
         optionally ask for confirmation, then click.
         """
         submit_selectors = [
-            # Workday final-step submit (data-automation-id)
+            # Workday final-step submit (data-automation-id) — highly specific, safe
             '[data-automation-id="bottom-navigation-next-button"]',
             '[data-automation-id*="submit" i]',
             'input[type="submit"][value*="Submit" i]',
             'input[type="button"][value*="Submit" i]',
-            # Generic text-based
+            # Generic button text — Submit variants (unambiguous, final-step only)
             'button:text-matches("^Submit$", "i")',
             'button:text-matches("Submit Application", "i")',
-            'button:text-matches("^Apply$", "i")',
             'button:text-matches("Send Application", "i")',
             'button:text-matches("Complete Application", "i")',
-            '[role="button"]:text-matches("Submit|Send Application|Complete Application", "i")',
+            'button:text-matches("Submit My Application", "i")',
+            # Apply variants on BUTTONS (buttons inside forms are usually final-step)
+            'button:text-matches("^Apply$", "i")',
+            'button:text-matches("Apply Now", "i")',
+            'button:text-matches("Apply for this job", "i")',
+            'button:text-matches("Apply for Job", "i")',
+            # aria-label submit (reliable signal)
+            # NOTE: "I'm interested" is intentionally NOT here — it is a SmartRecruiters
+            # entry CTA on the job listing page, handled by _click_ats_apply_button.
             '[aria-label*="submit" i]',
+            # NOTE: Removed broad a:text-matches("Apply*") and partial-match fallbacks.
+            # Those matched "Apply" entry buttons on job listing pages, causing false submits.
+            # Portal-specific <a> Apply buttons are handled by _click_ats_apply_button first.
         ]
 
         submit_btn = None
@@ -2688,6 +3455,41 @@ class JobrightScraper(BaseScraper):
             portal_url = "(unknown)"
         family = await self._detect_portal_family(page)
 
+        # ── Guard: refuse to submit if no form fields appear to be filled ────
+        # This prevents false "Application submitted!" when the agent is on a
+        # job listing page (not the actual application form) — the broad Apply
+        # button selectors above can match entry CTAs on listing pages.
+        if submit_btn:
+            try:
+                has_filled_fields = await page.evaluate("""
+                    () => {
+                        const inputs = [...document.querySelectorAll(
+                            'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="file"]):not([type="checkbox"]):not([type="radio"]),' +
+                            'textarea, select'
+                        )];
+                        // At least one visible input must have a non-empty value
+                        return inputs.some(el => {
+                            const val = (el.value || el.textContent || '').trim();
+                            return val.length > 0 && !el.disabled;
+                        });
+                    }
+                """)
+            except Exception:
+                has_filled_fields = True  # assume filled if we can't check
+
+            if not has_filled_fields:
+                console.print(
+                    "[yellow]Jobright: Submit button found but form appears empty — "
+                    "autofill did not run or this is a listing page, not the application form.[/yellow]"
+                )
+                console.print(f"[dim]Portal: {portal_url}[/dim]")
+                return self._set_apply_outcome(
+                    "form_empty_not_submitted",
+                    f"Submit button was found at {portal_url} but all form fields were empty. "
+                    "Jobright autofill did not populate the form — ensure the extension is active "
+                    "and the Jobright session is logged in, then re-run.",
+                )
+
         if not submit_btn and (auto_submit or not (sys.stdin and sys.stdin.isatty())):
             console.print(
                 "[yellow]Jobright: Submit button not found and this run is non-interactive — "
@@ -2695,13 +3497,20 @@ class JobrightScraper(BaseScraper):
             )
             console.print(f"[dim]Portal: {portal_url}[/dim]")
             controls = await self._visible_controls_snapshot(page)
+            tailored_hint = getattr(self, "_last_tailored_resume_path", "") or ""
+            if tailored_hint:
+                console.print(f"[green]Jobright:[/green] Tailored resume ready for manual apply → {tailored_hint}")
             return self._set_apply_outcome(
                 f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
                 (
                     f"Reached portal but could not find a final Submit/Apply button at "
                     f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                    + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
                 ),
             )
+
+        # Run pre-submission validation checklist before showing the submit banner
+        await self._run_pre_submission_validation(page)
 
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
         console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
@@ -2736,6 +3545,19 @@ class JobrightScraper(BaseScraper):
                     btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
                 }""", submit_btn)
             await self._delay(3, 5)
+            # ── Record analytics for orchestrator to persist via extra_json ──
+            self._apply_analytics = {
+                "submitted": True,
+                "submissionTime": datetime.utcnow().isoformat(),
+                "applicationMethod": getattr(self, "_last_application_method", "Unknown"),
+                "atsScore": getattr(self, "_last_ats_score", None),
+                "resumeVersion": os.path.basename(getattr(self, "_last_tailored_resume_path", "") or ""),
+                "missingKeywords": getattr(self, "_last_ats_missing_keywords", []),
+                "jobrightAvailable": getattr(self, "_jobright_available", False),
+                "jobrightUrl": getattr(self, "_jobright_url", ""),
+                "interviewReceived": False,
+                "offerReceived": False,
+            }
             console.print("[green]✓ Application submitted![/green]")
             return True
         else:
@@ -2743,11 +3565,15 @@ class JobrightScraper(BaseScraper):
             if auto_submit:
                 console.print("[red]Jobright: Submit button not found — cannot auto-submit. Skipping.[/red]")
                 controls = await self._visible_controls_snapshot(page)
+                tailored_hint = getattr(self, "_last_tailored_resume_path", "") or ""
+                if tailored_hint:
+                    console.print(f"[green]Jobright:[/green] Tailored resume ready for manual apply → {tailored_hint}")
                 return self._set_apply_outcome(
                     f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
                     (
                         f"Auto-submit requested, but no submit button was found at "
                         f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                        + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
                     ),
                 )
             console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")
