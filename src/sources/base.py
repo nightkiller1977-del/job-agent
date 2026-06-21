@@ -162,7 +162,16 @@ class BaseScraper(ABC):
         # Chrome launch and hands it off to the existing instance (which uses the
         # user's default profile, not our isolated one). Detect this and fall back
         # to bundled Chromium + a previously exported JSON session file instead.
-        if self._chrome_is_running() and self._session_export_path.exists():
+        #
+        # Guard: only use the fallback for unattended (background) runs — i.e. when
+        # there is no TTY. Interactive runs (prepare-sessions, apply) must stay on
+        # the persistent Chrome profile so that:
+        #   1. freshly-refreshed cookies are written to the profile (not just the JSON),
+        #   2. Chrome Web Store extensions in the profile remain available for apply.
+        import sys
+        in_background = not sys.stdout.isatty()
+
+        if in_background and self._chrome_is_running() and self._session_export_path.exists():
             self._browser = await self._playwright.chromium.launch(
                 headless=False,
                 args=args,
@@ -178,7 +187,7 @@ class BaseScraper(ABC):
             # Store extensions, saved logins, and Chrome's cookie encryption all
             # work correctly. The dedicated profile dir keeps sessions separate from
             # the main Chrome profile — no locking conflicts, no risk to personal data.
-            if self._chrome_is_running():
+            if in_background and self._chrome_is_running():
                 import logging
                 logging.getLogger(__name__).warning(
                     "%s: Chrome is running but no session export exists — "
