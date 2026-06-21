@@ -35,17 +35,17 @@
     "IC"
   ],
   "compensation_thresholds": {
-    "remote": {"min_comp": 180000},
-    "miami_onsite": {"min_comp": 230000},
-    "dc_onsite": {"min_comp": 260000, "max_comp": 320000},
-    "other_onsite": {"action": "skip"},
-    "cleared_dod_remote": {"min_comp": 170000},
-    "cleared_dod_hybrid": {"min_comp": 250000},
-    "federal_gs15": {"action": "always_apply"},
-    "federal_ses": {"action": "always_apply"},
-    "federal_sl": {"action": "always_apply"},
-    "contract_remote": {"min_comp": 180000},
-    "contract_hybrid": {"action": "flag_for_review"}
+    "remote": { "min_comp": 180000 },
+    "miami_onsite": { "min_comp": 230000 },
+    "dc_onsite": { "min_comp": 260000, "max_comp": 320000 },
+    "other_onsite": { "action": "skip" },
+    "cleared_dod_remote": { "min_comp": 170000 },
+    "cleared_dod_hybrid": { "min_comp": 230000 },
+    "federal_gs15": { "action": "always_apply" },
+    "federal_ses": { "action": "always_apply" },
+    "federal_sl": { "action": "always_apply" },
+    "contract_remote": { "min_comp": 170000 },
+    "contract_hybrid": { "action": "flag_for_review" }
   },
   "search_settings": {
     "keywords": "Director VP Engineering CTO CIO Software",
