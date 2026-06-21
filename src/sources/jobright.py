@@ -2424,29 +2424,38 @@ class JobrightScraper(BaseScraper):
         Covers: LinkedIn Profile URL, work-auth radio (Yes), sponsorship radio (No),
         and any other visible text/select inputs left empty.
         """
-        import os
-        linkedin_url = "https://www.linkedin.com/in/anthonyclarkins"
+        import json as _json
+        profile_path = Path(__file__).parent.parent.parent / "state" / "profile.json"
+        profile: dict = {}
+        if profile_path.exists():
+            try:
+                profile = _json.loads(profile_path.read_text())
+            except Exception:
+                pass
+
+        linkedin_url = profile.get("social_links", {}).get("linkedin", "")
 
         # Wait briefly for the form to settle after autofill
         await asyncio.sleep(1)
 
         # --- LinkedIn Profile URL ---
-        linkedin_selectors = [
-            "input[name*='linkedin' i]",
-            "input[placeholder*='linkedin' i]",
-            "input[id*='linkedin' i]",
-            "input[aria-label*='linkedin' i]",
-        ]
-        for sel in linkedin_selectors:
-            try:
-                el = page.locator(sel).first
-                if await el.count() and await el.is_visible():
-                    current_val = await el.input_value()
-                    if not current_val:
-                        await el.fill(linkedin_url)
-                    break
-            except Exception:
-                pass
+        if linkedin_url:
+            linkedin_selectors = [
+                "input[name*='linkedin' i]",
+                "input[placeholder*='linkedin' i]",
+                "input[id*='linkedin' i]",
+                "input[aria-label*='linkedin' i]",
+            ]
+            for sel in linkedin_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() and await el.is_visible():
+                        current_val = await el.input_value()
+                        if not current_val:
+                            await el.fill(linkedin_url)
+                        break
+                except Exception:
+                    pass
 
         # --- Work authorization radio (Yes) ---
         work_auth_yes_selectors = [
@@ -2514,14 +2523,6 @@ class JobrightScraper(BaseScraper):
         await asyncio.sleep(0.5)
 
         # --- Any remaining required text inputs left blank ---
-        import json as _json
-        profile_path = Path(__file__).parent.parent.parent / "state" / "profile.json"
-        profile: dict = {}
-        if profile_path.exists():
-            try:
-                profile = _json.loads(profile_path.read_text())
-            except Exception:
-                pass
         personal = profile.get("personal_info", {})
         fill_map = {
             "phone": personal.get("phone", ""),
