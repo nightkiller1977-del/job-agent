@@ -302,14 +302,23 @@ async def index(request: Request):
             f"<h1>Database error</h1><pre>{exc}</pre>", status_code=500
         )
 
-    # Parse extra_json for approved jobs and inject apply attempt fields
-    _BLOCKED_STATUSES = {
-        "needs-session", "needs-portal-login", "needs-review",
-        "linkedin_login_required", "workday_session_expired",
-        "brassring_login_required", "microsoft_login_required",
+    # Parse extra_json and classify approved jobs into 3 action categories
+    _NEEDS_PREP = {
+        "workday_session_expired", "brassring_login_required",
+        "microsoft_login_required", "linkedin_authwall",
+        "linkedin_login_required", "needs-session", "needs-portal-login",
+    }
+    _NEEDS_YOU = {
+        "workday_account_required", "brassring_registration_required",
+        "required_field_unanswered", "linkedin_stuck_on_required_field",
+        "needs-answer", "needs-review",
+        "needs-hydration",  # placeholder/invalid URL — run hydrate or fix the URL
     }
     import json as _json
-    approved_dicts: list[dict] = []
+    approved_ready:     list[dict] = []
+    approved_needs_prep: list[dict] = []
+    approved_needs_you:  list[dict] = []
+
     for row in approved:
         d = dict(row)
         extra_raw = d.get("extra_json")
@@ -319,13 +328,20 @@ async def index(request: Request):
                 extra = _json.loads(extra_raw)
             except Exception:
                 pass
-        d["apply_last_status"]  = extra.get("apply_last_status", "")
-        d["apply_last_detail"]  = extra.get("apply_last_detail", "")
+        d["apply_last_status"]   = extra.get("apply_last_status", "")
+        d["apply_last_detail"]   = extra.get("apply_last_detail", "")
         d["apply_attempt_count"] = extra.get("apply_attempt_count", 0)
-        approved_dicts.append(d)
 
-    # Sort: session-blocked last, ready first
-    approved_dicts.sort(key=lambda j: 1 if j.get("apply_last_status") in _BLOCKED_STATUSES else 0)
+        s = d["apply_last_status"]
+        attempts = d["apply_attempt_count"] or 0
+        if s in _NEEDS_PREP:
+            approved_needs_prep.append(d)
+        elif s in _NEEDS_YOU or (s == "form_not_detected" and attempts >= 3):
+            approved_needs_you.append(d)
+        else:
+            approved_ready.append(d)
+
+    approved_ready.sort(key=lambda j: -(j.get("score") or 0))
 
     return templates.TemplateResponse(
         request=request,
@@ -334,7 +350,9 @@ async def index(request: Request):
             "stats": stats,
             "pending": [dict(r) for r in pending],
             "applied": [dict(r) for r in applied],
-            "approved": approved_dicts,
+            "approved_ready":      approved_ready,
+            "approved_needs_prep": approved_needs_prep,
+            "approved_needs_you":  approved_needs_you,
             "sync_log": [dict(r) for r in sync_log],
             "last_sync": last_sync,
             "now": datetime.now(timezone.utc),
@@ -452,7 +470,7 @@ async def sync_jobs(
 @app.post("/api/action")
 async def job_action(body: ActionRequest):
     """Update a job's status (approved / skipped / bookmarked / applied / expired)."""
-    valid_actions = {"approved", "skipped", "bookmarked", "applied", "expired"}
+    valid_actions = {"approved", "skipped", "bookmarked", "applied", "expired", "archive"}
     if body.action not in valid_actions:
         raise HTTPException(
             status_code=400,
@@ -470,10 +488,20 @@ async def job_action(body: ActionRequest):
                 )
                 if not cur.fetchone():
                     raise HTTPException(status_code=404, detail="Job not found")
-                cur.execute(
-                    "UPDATE jobs SET status = %s, updated_at = NOW() WHERE job_id = %s",
-                    (body.action, body.job_id),
-                )
+                if body.action == "expired":
+                    cur.execute(
+                        "DELETE FROM jobs WHERE job_id = %s", (body.job_id,)
+                    )
+                elif body.action == "archive":
+                    cur.execute(
+                        "UPDATE jobs SET status = 'skipped', updated_at = NOW() WHERE job_id = %s",
+                        (body.job_id,),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE jobs SET status = %s, updated_at = NOW() WHERE job_id = %s",
+                        (body.action, body.job_id),
+                    )
             conn.commit()
     except HTTPException:
         raise

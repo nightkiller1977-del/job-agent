@@ -3,741 +3,856 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Job Agent Dashboard</title>
-  <!-- Self-hosted Tailwind — avoids Safari ITP blocking cdn.tailwindcss.com -->
+  <title>Job Agent</title>
   <link rel="stylesheet" href="/static/css/tailwind.min.css">
-  <!-- Fallback: if static file fails (e.g. first deploy), try CDN -->
   <script>
-    document.querySelector('link[href="/static/css/tailwind.min.css"]').onerror = function() {
-      var s = document.createElement('script');
-      s.src = 'https://cdn.tailwindcss.com';
-      document.head.appendChild(s);
-    };
+    window.addEventListener('load', function() {
+      var link = document.querySelector('link[href="/static/css/tailwind.min.css"]');
+      if (link && !link.sheet) {
+        var s = document.createElement('script'); s.src = 'https://cdn.tailwindcss.com'; document.head.appendChild(s);
+      }
+    });
   </script>
   <style>
-    body { font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; }
-    .score-green  { background: #16a34a; color: #fff; }
-    .score-yellow { background: #ca8a04; color: #fff; }
-    .score-orange { background: #ea580c; color: #fff; }
-    .score-red    { background: #dc2626; color: #fff; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
-    .card-fade { transition: opacity 0.3s, transform 0.3s, box-shadow 0.3s; }
-    .card-fade.removing { opacity: 0; transform: scale(0.97); }
-    .card-fade:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+    *,*::before,*::after{box-sizing:border-box;}
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',system-ui,sans-serif;background:#F0F4F8;color:#1A202C;display:flex;min-height:100vh;}
+
+    /* ── Sidebar ─────────────────────────────────────── */
+    .sidebar{width:228px;background:#111827;min-height:100vh;position:fixed;top:0;left:0;display:flex;flex-direction:column;z-index:40;overflow-y:auto;}
+    .sb-logo{padding:18px 16px 14px;border-bottom:1px solid rgba(255,255,255,.07);}
+    .sb-logo-row{display:flex;align-items:center;gap:9px;}
+    .sb-icon{width:30px;height:30px;background:linear-gradient(135deg,#4F46E5,#7C3AED);border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+    .sb-name{font-size:15px;font-weight:800;color:#fff;letter-spacing:-.02em;}
+    .sb-sub{font-size:11px;color:#6B7280;margin-top:3px;}
+    .sb-nav{padding:10px 8px;flex:1;}
+    .sb-section{font-size:10px;font-weight:600;color:#6B7280;text-transform:uppercase;letter-spacing:.08em;padding:10px 8px 4px;}
+    .nb{width:100%;display:flex;align-items:center;gap:8px;padding:8px 10px;border:none;background:transparent;border-radius:8px;cursor:pointer;font-size:13px;font-weight:500;color:#9CA3AF;transition:all .15s;text-align:left;margin-bottom:1px;}
+    .nb svg{width:15px;height:15px;flex-shrink:0;opacity:.75;}
+    .nb:hover{background:rgba(255,255,255,.06);color:#D1D5DB;}
+    .nb.active{background:rgba(99,102,241,.22);color:#C7D2FE;}
+    .nb.active svg{opacity:1;}
+    .ncount{margin-left:auto;font-size:11px;font-weight:700;padding:1px 7px;border-radius:20px;min-width:20px;text-align:center;}
+    .nc-def{background:rgba(255,255,255,.09);color:#9CA3AF;}
+    .nc-blue{background:rgba(99,102,241,.28);color:#A5B4FC;}
+    .nc-green{background:rgba(16,185,129,.28);color:#6EE7B7;}
+    .nc-yellow{background:rgba(245,158,11,.28);color:#FCD34D;}
+    .nc-orange{background:rgba(249,115,22,.28);color:#FB923C;}
+    .sb-divider{margin:6px 10px;border:none;border-top:1px solid rgba(255,255,255,.07);}
+    .sb-footer{padding:12px 16px;border-top:1px solid rgba(255,255,255,.07);}
+    .rf-row{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#6B7280;}
+    .rf-btn{font-size:11px;font-weight:600;color:#818CF8;background:none;border:none;cursor:pointer;padding:0;}
+
+    /* ── Main ────────────────────────────────────────── */
+    .main{margin-left:228px;flex:1;display:flex;flex-direction:column;min-height:100vh;}
+
+    /* ── Top bar ─────────────────────────────────────── */
+    .topbar{background:#fff;border-bottom:1px solid #E5E7EB;padding:0 24px;height:54px;display:flex;align-items:center;gap:8px;position:sticky;top:0;z-index:30;flex-shrink:0;}
+    .schip{display:inline-flex;align-items:center;gap:5px;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600;white-space:nowrap;}
+    .schip .v{font-size:15px;font-weight:800;line-height:1;}
+    .sc-blue{background:#EEF2FF;color:#4338CA;} .sc-blue .v{color:#4F46E5;}
+    .sc-amber{background:#FFFBEB;color:#92400E;} .sc-amber .v{color:#D97706;}
+    .sc-green{background:#ECFDF5;color:#065F46;} .sc-green .v{color:#059669;}
+    .sc-purple{background:#F5F3FF;color:#5B21B6;} .sc-purple .v{color:#7C3AED;}
+    .tb-right{margin-left:auto;font-size:12px;color:#9CA3AF;display:flex;align-items:center;gap:12px;}
+    .tb-sync-time{font-weight:600;color:#374151;}
+
+    /* ── Content ─────────────────────────────────────── */
+    .content{padding:22px 24px;flex:1;}
+    .tab-panel{display:none;}
+    .tab-panel.active{display:block;}
+    .pg-title{font-size:20px;font-weight:800;color:#111827;letter-spacing:-.02em;margin-bottom:3px;}
+    .pg-sub{font-size:13px;color:#6B7280;margin-bottom:20px;}
+
+    /* ── Add URL bar ─────────────────────────────────── */
+    .add-bar{background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:14px 16px;display:flex;gap:10px;margin-bottom:22px;align-items:center;}
+    .add-bar input{flex:1;border:1px solid #E5E7EB;border-radius:8px;padding:9px 14px;font-size:13px;color:#111827;outline:none;transition:all .15s;}
+    .add-bar input:focus{border-color:#818CF8;box-shadow:0 0 0 3px rgba(99,102,241,.12);}
+
+    /* ── Category banner ─────────────────────────────── */
+    .cat-bar{display:flex;align-items:center;gap:10px;padding:11px 16px;border-radius:10px;margin-bottom:14px;}
+    .cat-bar.green{background:#F0FDF4;border:1px solid #A7F3D0;}
+    .cat-bar.yellow{background:#FFFBEB;border:1px solid #FDE68A;}
+    .cat-bar.orange{background:#FFF7ED;border:1px solid #FED7AA;}
+    .cat-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+    .cat-dot.green{background:#10B981;}
+    .cat-dot.yellow{background:#F59E0B;}
+    .cat-dot.orange{background:#F97316;}
+    .cat-title{font-size:13px;font-weight:700;}
+    .cat-title.green{color:#065F46;} .cat-title.yellow{color:#78350F;} .cat-title.orange{color:#7C2D12;}
+    .cat-desc{font-size:12px;color:#6B7280;}
+    .cat-count{margin-left:auto;font-size:12px;font-weight:700;padding:2px 10px;border-radius:20px;}
+    .cat-count.green{background:#D1FAE5;color:#065F46;} .cat-count.yellow{background:#FEF3C7;color:#78350F;} .cat-count.orange{background:#FFEDD5;color:#7C2D12;}
+
+    /* ── Info banner ─────────────────────────────────── */
+    .info-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:10px;font-size:12px;margin-bottom:14px;}
+    .info-bar.yellow{background:#FFFBEB;border:1px solid #FDE68A;color:#92400E;}
+    .info-bar code{background:rgba(0,0,0,.07);padding:2px 6px;border-radius:4px;font-size:11px;font-family:'SF Mono','Fira Code',monospace;}
+
+    /* ── Jobs grid ───────────────────────────────────── */
+    .jgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(296px,1fr));gap:12px;margin-bottom:32px;}
+
+    /* ── Job card ────────────────────────────────────── */
+    .jcard{background:#fff;border-radius:12px;border:1px solid #E5E7EB;display:flex;flex-direction:column;overflow:hidden;transition:box-shadow .2s,transform .2s,opacity .3s;}
+    .jcard:hover{box-shadow:0 6px 24px rgba(0,0,0,.09);transform:translateY(-2px);}
+    .jcard.removing{opacity:0;transform:scale(0.96);pointer-events:none;}
+    .jcard-acc{height:3px;width:100%;flex-shrink:0;}
+    .acc-indeed{background:linear-gradient(90deg,#2563EB,#3B82F6);}
+    .acc-linkedin{background:linear-gradient(90deg,#0369A1,#0EA5E9);}
+    .acc-jobright{background:linear-gradient(90deg,#6D28D9,#8B5CF6);}
+    .acc-usajobs{background:linear-gradient(90deg,#DC2626,#EF4444);}
+    .acc-other{background:linear-gradient(90deg,#6B7280,#9CA3AF);}
+    .jcard-body{padding:14px;flex:1;display:flex;flex-direction:column;}
+    .jcard-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:8px;}
+    .jcard-info{flex:1;min-width:0;}
+    .jcard-title{font-size:14px;font-weight:600;color:#111827;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+    .jcard-title a{color:inherit;text-decoration:none;}
+    .jcard-title a:hover{color:#4F46E5;}
+    .jcard-co{font-size:12px;color:#6B7280;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+    .sbox{flex-shrink:0;width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;}
+    .sb-hi{background:#DCFCE7;color:#14532D;} .sb-go{background:#FEF9C3;color:#713F12;} .sb-me{background:#FFEDD5;color:#7C2D12;} .sb-lo{background:#FEE2E2;color:#7F1D1D;} .sb-no{background:#F3F4F6;color:#9CA3AF;font-size:16px;}
+    .jcard-meta{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;}
+    .mpill{font-size:11px;padding:2px 8px;border-radius:20px;font-weight:500;white-space:nowrap;}
+    .mp-loc{background:#F3F4F6;color:#4B5563;}
+    .mp-sal{background:#F0FDF4;color:#15803D;}
+    .mp-rem{background:#EFF6FF;color:#1D4ED8;}
+    .mp-indeed{background:#EFF6FF;color:#1E40AF;border:1px solid #BFDBFE;}
+    .mp-linkedin{background:#E0F2FE;color:#0C4A6E;border:1px solid #BAE6FD;}
+    .mp-jobright{background:#F5F3FF;color:#4C1D95;border:1px solid #DDD6FE;}
+    .mp-usajobs{background:#FEF2F2;color:#7F1D1D;border:1px solid #FECACA;}
+    .mp-other{background:#F9FAFB;color:#374151;border:1px solid #E5E7EB;}
+    .jcard-reason{font-size:11px;color:#9CA3AF;font-style:italic;line-height:1.5;margin-bottom:8px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+    .jcard-flags{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;}
+    .jflag{font-size:10px;font-weight:700;padding:1px 7px;border-radius:20px;}
+    .jf-ts{background:#5B21B6;color:#fff;} .jf-fed{background:#1D4ED8;color:#fff;} .jf-gen{background:#374151;color:#fff;}
+    .jcard-status{font-size:11px;padding:6px 10px;border-radius:8px;margin-bottom:8px;display:flex;gap:6px;align-items:center;}
+    .jcs-yellow{background:#FFFBEB;border:1px solid #FDE68A;color:#92400E;}
+    .jcs-orange{background:#FFF7ED;border:1px solid #FED7AA;color:#9A3412;}
+    .jcard-actions{margin-top:auto;padding-top:10px;border-top:1px solid #F3F4F6;display:flex;gap:6px;}
+    .jbtn{font-size:12px;font-weight:600;padding:7px 10px;border-radius:8px;border:none;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;justify-content:center;gap:4px;text-decoration:none;flex:1;color:#fff;}
+    .jbtn:active{transform:scale(.97);}
+    .jb-green{background:#059669;} .jb-green:hover{background:#047857;}
+    .jb-yellow{background:#D97706;} .jb-yellow:hover{background:#B45309;}
+    .jb-orange{background:#EA580C;} .jb-orange:hover{background:#C2410C;}
+    .jb-purple{background:#7C3AED;} .jb-purple:hover{background:#6D28D9;}
+    .jb-indigo{background:#4F46E5;} .jb-indigo:hover{background:#4338CA;}
+    .jb-blue{background:#2563EB;} .jb-blue:hover{background:#1D4ED8;}
+    .jb-ghost{background:transparent;color:#9CA3AF;border:1px solid #E5E7EB;flex:0;padding:7px 9px;}
+    .jb-ghost:hover{background:#F9FAFB;color:#374151;}
+    .hydrating{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;font-size:12px;color:#6B7280;background:#F9FAFB;border-radius:8px;padding:8px;}
+
+    /* ── Empty state ─────────────────────────────────── */
+    .empty{text-align:center;padding:60px 0;color:#9CA3AF;}
+    .empty svg{margin:0 auto 14px;display:block;}
+    .empty h3{font-size:15px;font-weight:600;color:#6B7280;margin-bottom:4px;}
+    .empty p{font-size:13px;}
+
+    /* ── Data table ──────────────────────────────────── */
+    .twrap{background:#fff;border:1px solid #E5E7EB;border-radius:12px;overflow:hidden;overflow-x:auto;}
+    .dtbl{width:100%;border-collapse:collapse;font-size:13px;}
+    .dtbl th{text-align:left;padding:10px 14px;font-size:11px;font-weight:600;color:#6B7280;text-transform:uppercase;letter-spacing:.06em;background:#F9FAFB;border-bottom:1px solid #E5E7EB;}
+    .dtbl td{padding:11px 14px;border-bottom:1px solid #F3F4F6;color:#374151;}
+    .dtbl tr:last-child td{border-bottom:none;}
+    .dtbl tr:hover td{background:#F9FAFB;}
+    .dtbl a{color:#4F46E5;text-decoration:none;font-weight:500;}
+    .dtbl a:hover{text-decoration:underline;}
+
+    /* ── Credentials ─────────────────────────────────── */
+    .creds-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(258px,1fr));gap:14px;margin-bottom:24px;}
+    .ccard{background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px;}
+    .ccard-head{display:flex;align-items:center;gap:8px;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid #F3F4F6;font-size:13px;font-weight:700;color:#111827;}
+    .cdot{width:8px;height:8px;border-radius:50%;}
+    .cdot-indeed{background:#2563EB;} .cdot-linkedin{background:#0369A1;} .cdot-jobright{background:#6D28D9;}
+    .frow{margin-bottom:10px;}
+    .frow label{display:block;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:#6B7280;margin-bottom:4px;}
+    .frow input{width:100%;padding:8px 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;outline:none;transition:all .15s;}
+    .frow input:focus{border-color:#818CF8;box-shadow:0 0 0 3px rgba(99,102,241,.1);}
+    .ats-panel{background:#FFFBEB;border:1px solid #FDE68A;border-radius:12px;padding:16px;}
+    .ats-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
+    .ats-title{font-size:13px;font-weight:700;color:#78350F;display:flex;align-items:center;gap:7px;}
+    .ats-badge{font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;}
+    .ats-blocked{background:#FDE68A;color:#78350F;} .ats-ok{background:#D1FAE5;color:#065F46;}
+    .ats-list{display:flex;flex-direction:column;gap:4px;max-height:140px;overflow-y:auto;margin:8px 0;}
+    .ats-row{display:flex;align-items:center;justify-content:space-between;background:#fff;border:1px solid #FDE68A;border-radius:8px;padding:6px 10px;font-size:11px;}
+    .ats-row-co{font-weight:600;color:#374151;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%;}
+    .ats-row-st{color:#D97706;font-family:'SF Mono','Fira Code',monospace;font-size:10px;}
+
+    /* ── Toast ───────────────────────────────────────── */
+    #toast{position:fixed;bottom:22px;right:22px;z-index:1000;opacity:0;transform:translateY(8px);transition:all .2s ease;pointer-events:none;}
+    #toast.show{opacity:1;transform:translateY(0);}
+    #toast-inner{padding:11px 18px;border-radius:10px;color:#fff;font-size:13px;font-weight:600;box-shadow:0 8px 30px rgba(0,0,0,.18);}
+
+    /* ── Scrollbar ───────────────────────────────────── */
+    ::-webkit-scrollbar{width:5px;height:5px;}
+    ::-webkit-scrollbar-track{background:transparent;}
+    ::-webkit-scrollbar-thumb{background:#D1D5DB;border-radius:9999px;}
+
+    @media(max-width:768px){
+      .sidebar{width:100%;min-height:auto;position:relative;}
+      .main{margin-left:0;}
     }
-    details[open] .details-arrow { transform: rotate(180deg); }
-    .flag-ts { background: #7c3aed; color: #fff; }
-    .flag-fed { background: #1d4ed8; color: #fff; }
-    .flag-generic { background: #6b7280; color: #fff; }
-    summary { cursor: pointer; }
-    summary::-webkit-details-marker { display: none; }
   </style>
 </head>
-<body class="bg-gray-50 text-gray-800 min-h-screen">
+<body>
 
-<!-- Header -->
-<header class="bg-white border-b border-gray-200 shadow-sm">
-  <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-    <div>
-      <h1 class="text-2xl font-bold text-gray-900 tracking-tight">Job Agent Dashboard</h1>
-      <p class="text-sm text-gray-500 mt-0.5">
-        {{ now.strftime('%A, %B %-d, %Y') }}
-        {% if last_sync %}
-          &nbsp;·&nbsp; Last sync: <span class="font-medium text-gray-700">{{ last_sync.strftime('%-I:%M %p UTC') if last_sync else 'Never' }}</span>
-        {% else %}
-          &nbsp;·&nbsp; <span class="text-yellow-600">No syncs yet</span>
-        {% endif %}
-      </p>
-    </div>
-    <div class="flex items-center gap-2">
-      <span id="refresh-badge" class="text-xs text-gray-400">Auto-refresh in <span id="countdown">60</span>s</span>
-      <button onclick="window.location.reload()" class="text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1.5 rounded-lg font-medium transition">Refresh Now</button>
-    </div>
-  </div>
-</header>
-
-<!-- Stats Bar -->
-<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
-  <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
-    {% set new_today = stats.get('today', 0) %}
-    {% set pending_count = stats.get('discovered', 0) %}
-    {% set applied_count = stats.get('applied', 0) %}
-    {% set approved_count = stats.get('approved', 0) %}
-
-    <div class="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-4">
-      <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider">New Today</p>
-      <p class="text-3xl font-bold text-blue-600 mt-1">{{ new_today }}</p>
-    </div>
-    <div class="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-4">
-      <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Pending Review</p>
-      <p class="text-3xl font-bold text-amber-500 mt-1">{{ pending_count }}</p>
-    </div>
-    <div class="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-4">
-      <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Approved</p>
-      <p class="text-3xl font-bold text-green-600 mt-1">{{ approved_count }}</p>
-    </div>
-    <div class="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-4">
-      <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider">Applied</p>
-      <p class="text-3xl font-bold text-purple-600 mt-1">{{ applied_count }}</p>
-    </div>
-  </div>
-</div>
-
-<!-- Pending Review Section -->
-<main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-8">
-
-  <!-- Add External Job Ingestion Form -->
-  <div class="bg-white rounded-xl border border-gray-200 p-5 mb-8 shadow-sm">
-    <h3 class="text-sm font-semibold text-gray-700 mb-2">Add External Job URL</h3>
-    <form id="external-job-form" onsubmit="addExternalJob(event)" class="flex gap-2">
-      <input type="url" id="external-url" required placeholder="Paste LinkedIn, Indeed, or company portal job URL..." class="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500" />
-      <button type="submit" id="add-job-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition flex items-center gap-1.5">
-        <span>+ Add Job</span>
-      </button>
-    </form>
-  </div>
-
-  <!-- Credentials Panel -->
-  <details class="bg-white rounded-xl border border-gray-200 shadow-sm mb-8 overflow-hidden group">
-    <summary class="flex items-center justify-between p-5 font-semibold text-gray-700 select-none cursor-pointer hover:bg-gray-50 transition-colors">
-      <div class="flex items-center gap-2">
-        <span class="text-lg">🔐</span>
-        <span class="text-sm font-semibold">Credentials & Session Settings (Alternative 1: Direct Login)</span>
+<!-- ═══════════════════════════════ SIDEBAR ═══════════════════════════════ -->
+<nav class="sidebar">
+  <div class="sb-logo">
+    <div class="sb-logo-row">
+      <div class="sb-icon">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>
+          <path d="M8 14h.01M12 14h.01M16 14h.01"/>
+        </svg>
       </div>
-      <svg class="w-4 h-4 text-gray-400 ml-auto transition-transform duration-200 details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-    </summary>
-    <div class="px-5 pb-5 pt-3 border-t border-gray-100 grid gap-6 md:grid-cols-2 lg:grid-cols-4 bg-gray-50/20">
-      <!-- Indeed Form -->
-      <form onsubmit="saveCredentials(event, 'indeed')" class="flex flex-col gap-2.5 p-4 rounded-xl border border-gray-100 bg-white shadow-sm transition-all duration-200 hover:shadow-md">
-        <div class="flex items-center justify-between border-b border-gray-100 pb-1.5 mb-1">
-          <span class="text-xs font-bold text-blue-600 tracking-wide uppercase flex items-center gap-1.5">
-            <span class="w-2 h-2 rounded-full bg-blue-600"></span>
-            Indeed
-          </span>
-          <span class="text-[10px] font-medium text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">Direct</span>
-        </div>
-        <div class="flex flex-col gap-1">
-          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Email</label>
-          <input type="email" id="creds-indeed-email" required placeholder="Indeed email" value="{{ credentials.get('indeed', {}).get('email', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-blue-500 focus:border-blue-500 focus:outline-none transition-all" />
-        </div>
-        <div class="flex flex-col gap-1">
-          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Password</label>
-          <input type="password" id="creds-indeed-password" required placeholder="Indeed password" value="{{ credentials.get('indeed', {}).get('password', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-blue-500 focus:border-blue-500 focus:outline-none transition-all" />
-        </div>
-        <button type="submit" class="mt-2 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg text-xs font-bold shadow-sm hover:shadow transition-all duration-150 active:scale-[0.98]">Save Credentials</button>
-      </form>
-
-      <!-- LinkedIn Form -->
-      <form onsubmit="saveCredentials(event, 'linkedin')" class="flex flex-col gap-2.5 p-4 rounded-xl border border-gray-100 bg-white shadow-sm transition-all duration-200 hover:shadow-md">
-        <div class="flex items-center justify-between border-b border-gray-100 pb-1.5 mb-1">
-          <span class="text-xs font-bold text-sky-600 tracking-wide uppercase flex items-center gap-1.5">
-            <span class="w-2 h-2 rounded-full bg-sky-500"></span>
-            LinkedIn
-          </span>
-          <span class="text-[10px] font-medium text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">Direct</span>
-        </div>
-        <div class="flex flex-col gap-1">
-          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Email</label>
-          <input type="email" id="creds-linkedin-email" required placeholder="LinkedIn email" value="{{ credentials.get('linkedin', {}).get('email', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-sky-500 focus:border-sky-500 focus:outline-none transition-all" />
-        </div>
-        <div class="flex flex-col gap-1">
-          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Password</label>
-          <input type="password" id="creds-linkedin-password" required placeholder="LinkedIn password" value="{{ credentials.get('linkedin', {}).get('password', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-sky-500 focus:border-sky-500 focus:outline-none transition-all" />
-        </div>
-        <button type="submit" class="mt-2 bg-sky-600 hover:bg-sky-700 text-white py-2 rounded-lg text-xs font-bold shadow-sm hover:shadow transition-all duration-150 active:scale-[0.98]">Save Credentials</button>
-      </form>
-
-      <!-- Jobright Form -->
-      <form onsubmit="saveCredentials(event, 'jobright')" class="flex flex-col gap-2.5 p-4 rounded-xl border border-gray-100 bg-white shadow-sm transition-all duration-200 hover:shadow-md">
-        <div class="flex items-center justify-between border-b border-gray-100 pb-1.5 mb-1">
-          <span class="text-xs font-bold text-purple-600 tracking-wide uppercase flex items-center gap-1.5">
-            <span class="w-2 h-2 rounded-full bg-purple-600"></span>
-            Jobright
-          </span>
-          <span class="text-[10px] font-medium text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">Direct</span>
-        </div>
-        <div class="flex flex-col gap-1">
-          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Email</label>
-          <input type="email" id="creds-jobright-email" required placeholder="Jobright email" value="{{ credentials.get('jobright', {}).get('email', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-purple-500 focus:border-purple-500 focus:outline-none transition-all" />
-        </div>
-        <div class="flex flex-col gap-1">
-          <label class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Password</label>
-          <input type="password" id="creds-jobright-password" required placeholder="Jobright password" value="{{ credentials.get('jobright', {}).get('password', '') }}" class="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-purple-500 focus:border-purple-500 focus:outline-none transition-all" />
-        </div>
-        <button type="submit" class="mt-2 bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-lg text-xs font-bold shadow-sm hover:shadow transition-all duration-150 active:scale-[0.98]">Save Credentials</button>
-      </form>
-
-      <!-- ATS Session Status Panel — replaces the broken "Company ATS" credential form.
-           Each company ATS uses enterprise SSO; you can't store a single email/password for them.
-           Instead this panel shows which approved jobs are blocked and what command to run. -->
-      {% set _SESS_BLOCKED = ["needs-session","needs-portal-login","needs-review",
-                              "linkedin_login_required","workday_session_expired",
-                              "brassring_login_required","microsoft_login_required"] %}
-      {% set blocked_jobs = approved | selectattr("apply_last_status", "in", _SESS_BLOCKED) | list %}
-      <div class="flex flex-col gap-2.5 p-4 rounded-xl border border-amber-200 bg-amber-50/60 shadow-sm">
-        <div class="flex items-center justify-between border-b border-amber-200 pb-1.5 mb-1">
-          <span class="text-xs font-bold text-amber-700 tracking-wide uppercase flex items-center gap-1.5">
-            <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
-            ATS Session Status
-          </span>
-          {% if blocked_jobs %}
-            <span class="text-[10px] font-bold text-amber-700 bg-amber-200 px-2 py-0.5 rounded-full">{{ blocked_jobs | length }} blocked</span>
-          {% else %}
-            <span class="text-[10px] font-bold text-green-700 bg-green-100 px-2 py-0.5 rounded-full">All ready ✓</span>
-          {% endif %}
-        </div>
-
-        {% if blocked_jobs %}
-          <p class="text-[11px] text-amber-800 leading-relaxed">
-            These approved jobs need a fresh ATS browser session before the agent can submit.
-            Company portals (Workday, BrassRing, etc.) use enterprise SSO — a saved email/password
-            won't work without an active session cookie.
-          </p>
-          <ul class="flex flex-col gap-1 mt-0.5 max-h-32 overflow-y-auto pr-0.5">
-            {% for j in blocked_jobs %}
-              <li class="flex items-center justify-between text-[11px] bg-white rounded-lg px-2.5 py-1.5 border border-amber-100">
-                <span class="font-medium text-gray-800 truncate max-w-[55%]">{{ j.company or '?' }}</span>
-                <span class="text-amber-600 font-mono text-[10px] truncate ml-2 flex-shrink-0">{{ j.apply_last_status }}</span>
-              </li>
-            {% endfor %}
-          </ul>
-          <div class="mt-1.5 bg-white rounded-lg px-3 py-2 border border-amber-200">
-            <p class="text-[10px] font-semibold text-amber-800 mb-0.5">Run to open blocked portals for manual login:</p>
-            <code class="text-[10px] text-amber-900 font-mono select-all">python src/main.py prepare-sessions</code>
-          </div>
-        {% else %}
-          <p class="text-[11px] text-green-700 leading-relaxed">
-            No approved jobs are blocked by ATS session issues.
-            Ready to run <code class="font-mono bg-green-100 px-1 rounded text-[10px]">python src/main.py apply</code>.
-          </p>
-        {% endif %}
-      </div>
+      <span class="sb-name">Job Agent</span>
     </div>
-  </details>
-  <h2 class="text-lg font-bold text-gray-900 mb-4">
-    Pending Review
-    <span class="ml-2 text-sm font-normal text-gray-400">({{ pending | length }} jobs)</span>
-  </h2>
-
-  {% if not pending %}
-  <div class="bg-white border border-gray-200 rounded-xl p-10 text-center text-gray-400">
-    <svg class="mx-auto mb-3 w-10 h-10 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
-    <p class="font-medium">No jobs pending review.</p>
-    <p class="text-sm mt-1">Run the agent to discover new positions.</p>
+    <div class="sb-sub">{{ now.strftime('%a, %b %-d, %Y') }}</div>
   </div>
-  {% else %}
-  <div id="pending-list" class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-    {% for job in pending %}
-      {% set src = (job.source or '').lower() %}
-      {% if src == 'indeed' %}
-        {% set accent_border = 'border-t-4 border-t-blue-600' %}
-      {% elif src == 'linkedin' %}
-        {% set accent_border = 'border-t-4 border-t-sky-500' %}
-      {% elif src == 'jobright' %}
-        {% set accent_border = 'border-t-4 border-t-purple-600' %}
-      {% elif src == 'usajobs' %}
-        {% set accent_border = 'border-t-4 border-t-red-600' %}
+
+  <div class="sb-nav">
+    <div class="sb-section">Review Queue</div>
+
+    <button class="nb active" id="nav-review" onclick="showTab('review')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12h6m-6 4h6M7 4h10a2 2 0 012 2v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z"/></svg>
+      Pending Review
+      <span class="ncount nc-blue" id="badge-review">{{ pending|length }}</span>
+    </button>
+
+    <div class="sb-section">Approved Jobs</div>
+
+    <button class="nb" id="nav-ready" onclick="showTab('ready')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+      Ready to Apply
+      <span class="ncount nc-green" id="badge-ready">{{ approved_ready|length }}</span>
+    </button>
+
+    <button class="nb" id="nav-prep" onclick="showTab('prep')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+      Needs Prep
+      <span class="ncount nc-yellow" id="badge-prep">{{ approved_needs_prep|length }}</span>
+    </button>
+
+    <button class="nb" id="nav-you" onclick="showTab('you')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      Needs You
+      <span class="ncount nc-orange" id="badge-you">{{ approved_needs_you|length }}</span>
+    </button>
+
+    <hr class="sb-divider">
+
+    <button class="nb" id="nav-applied" onclick="showTab('applied')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+      Applied
+      <span class="ncount nc-def">{{ applied|length }}</span>
+    </button>
+
+    <button class="nb" id="nav-log" onclick="showTab('log')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      Sync Log
+    </button>
+
+    <hr class="sb-divider">
+
+    <button class="nb" id="nav-settings" onclick="showTab('settings')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+      Settings
+    </button>
+  </div>
+
+  <div class="sb-footer">
+    <div class="rf-row">
+      <span>Refresh in <strong id="countdown">60</strong>s</span>
+      <button class="rf-btn" onclick="window.location.reload()">↺ Now</button>
+    </div>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════════ MAIN ═══════════════════════════════════ -->
+<div class="main">
+
+  <!-- Top stats bar -->
+  <header class="topbar">
+    <div class="schip sc-blue"><span class="v">{{ stats.get('today', 0) }}</span> New Today</div>
+    <div class="schip sc-amber"><span class="v">{{ pending|length }}</span> Pending</div>
+    <div class="schip sc-green"><span class="v">{{ stats.get('approved', 0) }}</span> Approved</div>
+    <div class="schip sc-purple"><span class="v">{{ stats.get('applied', 0) }}</span> Applied</div>
+    <div class="tb-right">
+      {% if last_sync %}
+        <span>Last sync: <span class="tb-sync-time">{{ last_sync.strftime('%-I:%M %p UTC') }}</span></span>
       {% else %}
-        {% set accent_border = 'border-t-4 border-t-gray-400' %}
+        <span style="color:#F59E0B;font-weight:600;">No syncs yet</span>
       {% endif %}
-    <div id="card-{{ job.job_id }}" class="card-fade bg-white border border-gray-200 {{ accent_border }} rounded-xl shadow-sm flex flex-col p-5">
-      <!-- Score + Title Row -->
-      <div class="flex items-start justify-between gap-3 mb-2">
-        <div class="flex-1 min-w-0">
-          <a href="{{ job.url or '#' }}" target="_blank" rel="noopener"
-             class="text-base font-semibold text-gray-900 hover:text-blue-600 leading-snug block truncate"
-             title="{{ job.title }}">
-            {{ job.title or 'Untitled' }}
-          </a>
-          <p class="text-sm text-gray-600 truncate mt-0.5">{{ job.company or '—' }}</p>
-        </div>
-        {% if job.score is not none %}
-          {% if job.score >= 80 %}
-            <span class="badge score-green flex-shrink-0">{{ job.score }}</span>
-          {% elif job.score >= 60 %}
-            <span class="badge score-yellow flex-shrink-0">{{ job.score }}</span>
-          {% elif job.score >= 40 %}
-            <span class="badge score-orange flex-shrink-0">{{ job.score }}</span>
-          {% else %}
-            <span class="badge score-red flex-shrink-0">{{ job.score }}</span>
-          {% endif %}
-        {% else %}
-          <span class="badge bg-gray-200 text-gray-500 flex-shrink-0">–</span>
-        {% endif %}
+    </div>
+  </header>
+
+  <div class="content">
+
+    <!-- ═══════════════ TAB: PENDING REVIEW ═══════════════ -->
+    <div class="tab-panel active" id="tab-review">
+      <div class="pg-title">Pending Review</div>
+      <div class="pg-sub">{{ pending|length }} job{{ 's' if pending|length != 1 else '' }} waiting — approve to queue for the agent, or skip to dismiss.</div>
+
+      <div class="add-bar">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="url" id="external-url" placeholder="Paste a LinkedIn, Indeed, or company portal URL to add a job manually…" />
+        <button class="jbtn jb-indigo" style="flex:0;padding:8px 16px;white-space:nowrap;" id="add-job-btn" onclick="addExternalJob(event)">+ Add Job</button>
       </div>
 
-      <!-- Location + Salary -->
-      <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 mb-3">
-        {% if job.location %}
-          <span>📍 {{ job.location }}</span>
-        {% endif %}
-        {% if job.salary_raw %}
-          <span>💰 {{ job.salary_raw }}</span>
-        {% endif %}
-        {% if job.remote_type %}
-          <span class="badge bg-blue-50 text-blue-700">{{ job.remote_type }}</span>
-        {% endif %}
-        {% if job.source %}
-          {% set src_lower = job.source.lower() %}
-          {% if src_lower == 'indeed' %}
-            <span class="badge bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1">
-              <svg class="w-3.5 h-3.5 text-blue-600" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
-              Indeed
-            </span>
-          {% elif src_lower == 'linkedin' %}
-            <span class="badge bg-sky-50 text-sky-700 border border-sky-200 flex items-center gap-1">
-              <svg class="w-3 h-3 text-sky-600" viewBox="0 0 24 24" fill="currentColor"><path d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.761 2.239 5 5 5h14c2.762 0 5-2.239 5-5v-14c0-2.761-2.238-5-5-5zm-11 19h-3v-11h3v11zm-1.5-12.268c-.966 0-1.75-.779-1.75-1.75s.784-1.75 1.75-1.75 1.75.779 1.75 1.75-.784 1.75-1.75 1.75zm13.5 12.268h-3v-5.604c0-3.368-4-3.113-4 0v5.604h-3v-11h3v1.765c1.396-2.586 7-2.777 7 2.476v6.759z"/></svg>
-              LinkedIn
-            </span>
-          {% elif src_lower == 'jobright' %}
-            <span class="badge bg-purple-50 text-purple-700 border border-purple-200 flex items-center gap-1.5">
-              <span class="w-1.5 h-1.5 rounded-full bg-purple-600"></span>
-              Jobright
-            </span>
-          {% elif src_lower == 'usajobs' %}
-            <span class="badge bg-red-50 text-red-700 border border-red-200 flex items-center gap-1.5">
-              <span class="w-1.5 h-1.5 rounded-full bg-red-600"></span>
-              USAJobs
-            </span>
-          {% else %}
-            <span class="badge bg-gray-50 text-gray-700 border border-gray-200 flex items-center gap-1.5">
-              <span class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
-              {{ job.source|capitalize }}
-            </span>
-          {% endif %}
-        {% endif %}
+      {% if not pending %}
+      <div class="empty">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#D1D5DB" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12h6m-6 4h6M7 4h10a2 2 0 012 2v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z"/></svg>
+        <h3>Queue is clear</h3>
+        <p>No jobs pending review. Run the agent to discover new positions.</p>
       </div>
-
-      <!-- Flags -->
-      {% if job.flags %}
-      <div class="flex flex-wrap gap-1 mb-3">
-        {% for flag in job.flags.split(',') %}
-          {% set f = flag.strip() %}
-          {% if f %}
-            {% if 'TS' in f or 'CLEARED' in f or 'CLEARANCE' in f %}
-              <span class="badge flag-ts">{{ f }}</span>
-            {% elif 'FEDERAL' in f or 'GOV' in f or 'SES' in f %}
-              <span class="badge flag-fed">{{ f }}</span>
-            {% else %}
-              <span class="badge flag-generic">{{ f }}</span>
-            {% endif %}
-          {% endif %}
+      {% else %}
+      <div class="jgrid" id="pending-list">
+        {% for job in pending %}
+          {% set src = (job.source or 'other').lower() %}
+          {% set src_c = src if src in ['indeed','linkedin','jobright','usajobs'] else 'other' %}
+          {% if job.score is not none %}
+            {% if job.score >= 80 %}{% set sc = 'sb-hi' %}
+            {% elif job.score >= 60 %}{% set sc = 'sb-go' %}
+            {% elif job.score >= 40 %}{% set sc = 'sb-me' %}
+            {% else %}{% set sc = 'sb-lo' %}{% endif %}
+          {% else %}{% set sc = 'sb-no' %}{% endif %}
+          <div id="card-{{ job.job_id }}" class="jcard">
+            <div class="jcard-acc acc-{{ src_c }}"></div>
+            <div class="jcard-body">
+              <div class="jcard-top">
+                <div class="jcard-info">
+                  <div class="jcard-title"><a href="{{ job.url or '#' }}" target="_blank" rel="noopener" title="{{ job.title }}">{{ job.title or 'Untitled' }}</a></div>
+                  <div class="jcard-co">{{ job.company or '—' }}</div>
+                </div>
+                <div class="sbox {{ sc }}">{% if job.score is not none %}{{ job.score }}{% else %}–{% endif %}</div>
+              </div>
+              <div class="jcard-meta">
+                {% if job.location %}<span class="mpill mp-loc">📍 {{ job.location }}</span>{% endif %}
+                {% if job.salary_raw %}<span class="mpill mp-sal">💰 {{ job.salary_raw }}</span>{% endif %}
+                {% if job.remote_type %}<span class="mpill mp-rem">{{ job.remote_type }}</span>{% endif %}
+                {% if job.source %}<span class="mpill mp-{{ src_c }}">{{ job.source|capitalize }}</span>{% endif %}
+              </div>
+              {% if job.score_reason %}<div class="jcard-reason">{{ job.score_reason }}</div>{% endif %}
+              {% if job.flags %}
+              <div class="jcard-flags">
+                {% for flag in job.flags.split(',') %}{% set f = flag.strip() %}{% if f %}
+                  {% if 'TS' in f or 'CLEARED' in f or 'CLEARANCE' in f %}<span class="jflag jf-ts">{{ f }}</span>
+                  {% elif 'FEDERAL' in f or 'GOV' in f or 'SES' in f %}<span class="jflag jf-fed">{{ f }}</span>
+                  {% else %}<span class="jflag jf-gen">{{ f }}</span>{% endif %}
+                {% endif %}{% endfor %}
+              </div>
+              {% endif %}
+              <div class="jcard-actions">
+                {% if job.flags and 'needs_hydration' in job.flags %}
+                  <div class="hydrating">
+                    <svg class="spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+                    Hydrating…
+                  </div>
+                {% else %}
+                  <button class="jbtn jb-green" onclick="doAction('{{ job.job_id }}', 'approved')">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    Approve
+                  </button>
+                  <button class="jbtn jb-blue" onclick="doAction('{{ job.job_id }}', 'bookmarked')">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z"/></svg>
+                    Save
+                  </button>
+                  <button class="jbtn jb-ghost" onclick="doAction('{{ job.job_id }}', 'skipped')" title="Skip">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                  </button>
+                {% endif %}
+              </div>
+            </div>
+          </div>
         {% endfor %}
       </div>
       {% endif %}
+    </div><!-- /tab-review -->
 
-      <!-- Score reason -->
-      {% if job.score_reason %}
-      <p class="text-xs text-gray-500 italic leading-relaxed mb-3 line-clamp-2" title="{{ job.score_reason }}">
-        {{ job.score_reason }}
-      </p>
-      {% endif %}
 
-      <!-- Action Buttons -->
-      <div class="mt-auto flex gap-2 pt-2 border-t border-gray-100">
-        {% if job.flags and 'needs_hydration' in job.flags %}
-          <div class="flex-1 flex items-center justify-center gap-2 text-xs font-semibold py-2 text-gray-500 bg-gray-50 rounded-lg select-none">
-            <svg class="animate-spin h-3.5 w-3.5 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
-              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" fill="none"></circle>
-              <path class="opacity-75" fill="none" d="M4 12a8 8 0 018-8"></path>
-            </svg>
-            <span>Hydrating locally...</span>
-          </div>
-        {% else %}
-          <button onclick="doAction('{{ job.job_id }}', 'approved')"
-                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-green-600 hover:bg-green-700 text-white transition">
-            Apply
-          </button>
-          <button onclick="doAction('{{ job.job_id }}', 'bookmarked')"
-                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-blue-500 hover:bg-blue-600 text-white transition">
-            Bookmark
-          </button>
-          <button onclick="doAction('{{ job.job_id }}', 'skipped')"
-                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 transition">
-            Skip
-          </button>
-        {% endif %}
+    <!-- ═══════════════ TAB: READY TO APPLY ═══════════════ -->
+    <div class="tab-panel" id="tab-ready">
+      <div class="pg-title">Ready to Apply</div>
+      <div class="pg-sub">The agent will submit these automatically on the next apply run.</div>
+
+      {% if not approved_ready %}
+      <div class="empty">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#D1D5DB" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+        <h3>Nothing ready</h3>
+        <p>Approve jobs from the review queue to populate this list.</p>
       </div>
-    </div>
-    {% endfor %}
-  </div>
-  {% endif %}
-
-  <!-- Approved (not yet applied) Section -->
-  {% if approved %}
-  <details class="mt-10" open>
-    <summary class="flex items-center gap-2 mb-4 select-none">
-      <h2 class="text-lg font-bold text-gray-900">Approved — Pending Application</h2>
-      <span class="text-sm font-normal text-gray-400">({{ approved | length }})</span>
-      <svg class="w-4 h-4 text-gray-400 ml-auto transition-transform details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-    </summary>
-    <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-      {% for job in approved %}
-        {% set src = (job.source or '').lower() %}
-        {% if src == 'indeed' %}
-          {% set accent_border = 'border-t-4 border-t-blue-600' %}
-        {% elif src == 'linkedin' %}
-          {% set accent_border = 'border-t-4 border-t-sky-500' %}
-        {% elif src == 'jobright' %}
-          {% set accent_border = 'border-t-4 border-t-purple-600' %}
-        {% elif src == 'usajobs' %}
-          {% set accent_border = 'border-t-4 border-t-red-600' %}
-        {% else %}
-          {% set accent_border = 'border-t-4 border-t-gray-400' %}
-        {% endif %}
-      <div id="card-{{ job.job_id }}" class="card-fade bg-white border border-green-200 {{ accent_border }} rounded-xl shadow-sm flex flex-col p-5">
-        <div class="flex items-start justify-between gap-3 mb-2">
-          <div class="flex-1 min-w-0">
-            <a href="{{ job.url or '#' }}" target="_blank" rel="noopener"
-               class="text-base font-semibold text-gray-900 hover:text-blue-600 leading-snug block truncate">
-              {{ job.title or 'Untitled' }}
-            </a>
-            <p class="text-sm text-gray-600 truncate mt-0.5">{{ job.company or '—' }}</p>
-          </div>
+      {% else %}
+      <div class="cat-bar green">
+        <span class="cat-dot green"></span>
+        <span class="cat-title green">Ready to Apply</span>
+        <span class="cat-desc">— no action needed, agent handles these</span>
+        <span class="cat-count green">{{ approved_ready|length }}</span>
+      </div>
+      <div class="jgrid">
+        {% for job in approved_ready %}
+          {% set src = (job.source or 'other').lower() %}
+          {% set src_c = src if src in ['indeed','linkedin','jobright','usajobs'] else 'other' %}
           {% if job.score is not none %}
-            {% if job.score >= 80 %}
-              <span class="badge score-green flex-shrink-0">{{ job.score }}</span>
-            {% elif job.score >= 60 %}
-              <span class="badge score-yellow flex-shrink-0">{{ job.score }}</span>
-            {% elif job.score >= 40 %}
-              <span class="badge score-orange flex-shrink-0">{{ job.score }}</span>
-            {% else %}
-              <span class="badge score-red flex-shrink-0">{{ job.score }}</span>
-            {% endif %}
-          {% endif %}
-        </div>
-        <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 mb-3">
-          {% if job.location %}<span>📍 {{ job.location }}</span>{% endif %}
-          {% if job.salary_raw %}<span>💰 {{ job.salary_raw }}</span>{% endif %}
-          {% if job.remote_type %}<span class="badge bg-blue-50 text-blue-700">{{ job.remote_type }}</span>{% endif %}
-          {% if job.source %}
-            {% set src_lower = job.source.lower() %}
-            {% if src_lower == 'indeed' %}
-              <span class="badge bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1">
-                <svg class="w-3.5 h-3.5 text-blue-600" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
-                Indeed
-              </span>
-            {% elif src_lower == 'linkedin' %}
-              <span class="badge bg-sky-50 text-sky-700 border border-sky-200 flex items-center gap-1">
-                <svg class="w-3.5 h-3.5 text-sky-600" viewBox="0 0 24 24" fill="currentColor"><path d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.761 2.239 5 5 5h14c2.762 0 5-2.239 5-5v-14c0-2.761-2.238-5-5-5zm-11 19h-3v-11h3v11zm-1.5-12.268c-.966 0-1.75-.779-1.75-1.75s.784-1.75 1.75-1.75 1.75.779 1.75 1.75-.784 1.75-1.75 1.75zm13.5 12.268h-3v-5.604c0-3.368-4-3.113-4 0v5.604h-3v-11h3v1.765c1.396-2.586 7-2.777 7 2.476v6.759z"/></svg>
-                LinkedIn
-              </span>
-            {% elif src_lower == 'jobright' %}
-              <span class="badge bg-purple-50 text-purple-700 border border-purple-200 flex items-center gap-1.5">
-                <span class="w-1.5 h-1.5 rounded-full bg-purple-600"></span>
-                Jobright
-              </span>
-            {% elif src_lower == 'usajobs' %}
-              <span class="badge bg-red-50 text-red-700 border border-red-200 flex items-center gap-1.5">
-                <span class="w-1.5 h-1.5 rounded-full bg-red-600"></span>
-                USAJobs
-              </span>
-            {% else %}
-              <span class="badge bg-gray-50 text-gray-700 border border-gray-200 flex items-center gap-1.5">
-                <span class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
-                {{ job.source|capitalize }}
-              </span>
-            {% endif %}
-          {% endif %}
-        </div>
-        {% set _BLOCKED = ["needs-session","needs-portal-login","needs-review",
-                           "linkedin_login_required","workday_session_expired",
-                           "brassring_login_required","microsoft_login_required"] %}
-        {% if job.apply_last_status and job.apply_last_status in _BLOCKED %}
-        <div class="flex items-start gap-1.5 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3 text-xs text-amber-800">
-          <span class="flex-shrink-0 mt-0.5">🔒</span>
-          <div>
-            <span class="font-semibold">Session required</span>
-            {% if job.apply_last_detail %}
-              <span class="text-amber-700 ml-1">— {{ job.apply_last_detail[:120] }}</span>
-            {% endif %}
-            <div class="text-amber-600 mt-0.5 font-mono">python src/main.py prepare-sessions</div>
+            {% if job.score >= 80 %}{% set sc = 'sb-hi' %}{% elif job.score >= 60 %}{% set sc = 'sb-go' %}{% elif job.score >= 40 %}{% set sc = 'sb-me' %}{% else %}{% set sc = 'sb-lo' %}{% endif %}
+          {% else %}{% set sc = 'sb-no' %}{% endif %}
+          <div id="card-{{ job.job_id }}" class="jcard">
+            <div class="jcard-acc acc-{{ src_c }}"></div>
+            <div class="jcard-body">
+              <div class="jcard-top">
+                <div class="jcard-info">
+                  <div class="jcard-title"><a href="{{ job.url or '#' }}" target="_blank" rel="noopener" title="{{ job.title }}">{{ job.title or 'Untitled' }}</a></div>
+                  <div class="jcard-co">{{ job.company or '—' }}</div>
+                </div>
+                <div class="sbox {{ sc }}">{% if job.score is not none %}{{ job.score }}{% else %}–{% endif %}</div>
+              </div>
+              <div class="jcard-meta">
+                {% if job.location %}<span class="mpill mp-loc">📍 {{ job.location }}</span>{% endif %}
+                {% if job.salary_raw %}<span class="mpill mp-sal">💰 {{ job.salary_raw }}</span>{% endif %}
+                {% if job.remote_type %}<span class="mpill mp-rem">{{ job.remote_type }}</span>{% endif %}
+                {% if job.source %}<span class="mpill mp-{{ src_c }}">{{ job.source|capitalize }}</span>{% endif %}
+              </div>
+              {% if job.score_reason %}<div class="jcard-reason">{{ job.score_reason }}</div>{% endif %}
+              <div class="jcard-actions">
+                <button class="jbtn jb-purple" onclick="doAction('{{ job.job_id }}', 'applied')">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+                  Mark Applied
+                </button>
+                <button class="jbtn jb-ghost" onclick="doAction('{{ job.job_id }}', 'archive')" title="Archive">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+                </button>
+              </div>
+            </div>
           </div>
-        </div>
-        {% elif job.apply_last_status and job.apply_last_status not in ["applied","started",""] %}
-        <div class="flex items-start gap-1.5 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3 text-xs text-red-800">
-          <span class="flex-shrink-0 mt-0.5">⚠️</span>
-          <div>
-            <span class="font-semibold">{{ job.apply_last_status }}</span>
-            {% if job.apply_last_detail %}<span class="text-red-700 ml-1">— {{ job.apply_last_detail[:120] }}</span>{% endif %}
-            {% if job.apply_attempt_count %}<div class="text-red-500 mt-0.5">{{ job.apply_attempt_count }} attempt(s)</div>{% endif %}
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div><!-- /tab-ready -->
+
+
+    <!-- ═══════════════ TAB: NEEDS PREP ═══════════════════ -->
+    <div class="tab-panel" id="tab-prep">
+      <div class="pg-title">Needs Prep</div>
+      <div class="pg-sub">ATS session expired — refresh sessions then re-run the agent, or apply manually.</div>
+
+      {% if not approved_needs_prep %}
+      <div class="empty">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#D1D5DB" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+        <h3>All sessions active</h3>
+        <p>No jobs are waiting on a session refresh.</p>
+      </div>
+      {% else %}
+      <div class="cat-bar yellow">
+        <span class="cat-dot yellow"></span>
+        <span class="cat-title yellow">Session Expired</span>
+        <span class="cat-desc">— run <code style="font-size:11px;background:rgba(0,0,0,.07);padding:1px 5px;border-radius:4px;font-family:monospace;">python src/main.py prepare-sessions</code> first</span>
+        <span class="cat-count yellow">{{ approved_needs_prep|length }}</span>
+      </div>
+      <div class="info-bar yellow">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+        <span>These jobs use Workday, BrassRing, or another enterprise ATS. The agent needs a live session cookie — run <code>python src/main.py prepare-sessions</code> to log in, then re-run apply. Or click <strong>Apply Manually</strong> to do it yourself now.</span>
+      </div>
+      <div class="jgrid">
+        {% for job in approved_needs_prep %}
+          {% set src = (job.source or 'other').lower() %}
+          {% set src_c = src if src in ['indeed','linkedin','jobright','usajobs'] else 'other' %}
+          {% if job.score is not none %}
+            {% if job.score >= 80 %}{% set sc = 'sb-hi' %}{% elif job.score >= 60 %}{% set sc = 'sb-go' %}{% elif job.score >= 40 %}{% set sc = 'sb-me' %}{% else %}{% set sc = 'sb-lo' %}{% endif %}
+          {% else %}{% set sc = 'sb-no' %}{% endif %}
+          <div id="card-{{ job.job_id }}" class="jcard">
+            <div class="jcard-acc acc-{{ src_c }}"></div>
+            <div class="jcard-body">
+              <div class="jcard-top">
+                <div class="jcard-info">
+                  <div class="jcard-title"><a href="{{ job.url or '#' }}" target="_blank" rel="noopener" title="{{ job.title }}">{{ job.title or 'Untitled' }}</a></div>
+                  <div class="jcard-co">{{ job.company or '—' }}</div>
+                </div>
+                <div class="sbox {{ sc }}">{% if job.score is not none %}{{ job.score }}{% else %}–{% endif %}</div>
+              </div>
+              <div class="jcard-meta">
+                {% if job.location %}<span class="mpill mp-loc">📍 {{ job.location }}</span>{% endif %}
+                {% if job.salary_raw %}<span class="mpill mp-sal">💰 {{ job.salary_raw }}</span>{% endif %}
+                {% if job.remote_type %}<span class="mpill mp-rem">{{ job.remote_type }}</span>{% endif %}
+                {% if job.source %}<span class="mpill mp-{{ src_c }}">{{ job.source|capitalize }}</span>{% endif %}
+              </div>
+              {% if job.apply_last_status and job.apply_last_status not in ['','applied','started'] %}
+              <div class="jcard-status jcs-yellow">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="flex-shrink:0"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+                <span style="font-family:monospace;font-size:10px;">{{ job.apply_last_status }}</span>
+                {% if job.apply_attempt_count %}<span style="margin-left:auto;font-size:10px;color:#D97706;">{{ job.apply_attempt_count }}×</span>{% endif %}
+              </div>
+              {% endif %}
+              <div class="jcard-actions">
+                <a class="jbtn jb-yellow" href="{{ job.url or '#' }}" target="_blank" rel="noopener">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                  Apply Manually
+                </a>
+                <button class="jbtn jb-purple" onclick="doAction('{{ job.job_id }}', 'applied')">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 11 12 14 22 4"/></svg>
+                  Mark Applied
+                </button>
+                <button class="jbtn jb-ghost" onclick="doAction('{{ job.job_id }}', 'archive')" title="Archive">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+                </button>
+              </div>
+            </div>
           </div>
-        </div>
-        {% endif %}
-        <div class="mt-auto flex gap-2 pt-2 border-t border-gray-100">
-          <button onclick="doAction('{{ job.job_id }}', 'applied')"
-                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition">
-            Mark Applied
-          </button>
-          <button onclick="doAction('{{ job.job_id }}', 'skipped')"
-                  class="flex-1 text-xs font-semibold py-1.5 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 transition">
-            Skip
-          </button>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div><!-- /tab-prep -->
+
+
+    <!-- ═══════════════ TAB: NEEDS YOU ════════════════════ -->
+    <div class="tab-panel" id="tab-you">
+      <div class="pg-title">Needs You</div>
+      <div class="pg-sub">The agent hit a hard block — these need a human touch. Click Apply Manually to open the job and submit yourself.</div>
+
+      {% if not approved_needs_you %}
+      <div class="empty">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#D1D5DB" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <h3>No manual actions needed</h3>
+        <p>All blocked jobs have been resolved or archived.</p>
+      </div>
+      {% else %}
+      <div class="cat-bar orange">
+        <span class="cat-dot orange"></span>
+        <span class="cat-title orange">Action Required</span>
+        <span class="cat-desc">— agent can't proceed, manual apply needed</span>
+        <span class="cat-count orange">{{ approved_needs_you|length }}</span>
+      </div>
+      <div class="jgrid">
+        {% for job in approved_needs_you %}
+          {% set src = (job.source or 'other').lower() %}
+          {% set src_c = src if src in ['indeed','linkedin','jobright','usajobs'] else 'other' %}
+          {% if job.score is not none %}
+            {% if job.score >= 80 %}{% set sc = 'sb-hi' %}{% elif job.score >= 60 %}{% set sc = 'sb-go' %}{% elif job.score >= 40 %}{% set sc = 'sb-me' %}{% else %}{% set sc = 'sb-lo' %}{% endif %}
+          {% else %}{% set sc = 'sb-no' %}{% endif %}
+          <div id="card-{{ job.job_id }}" class="jcard">
+            <div class="jcard-acc acc-{{ src_c }}"></div>
+            <div class="jcard-body">
+              <div class="jcard-top">
+                <div class="jcard-info">
+                  <div class="jcard-title"><a href="{{ job.url or '#' }}" target="_blank" rel="noopener" title="{{ job.title }}">{{ job.title or 'Untitled' }}</a></div>
+                  <div class="jcard-co">{{ job.company or '—' }}</div>
+                </div>
+                <div class="sbox {{ sc }}">{% if job.score is not none %}{{ job.score }}{% else %}–{% endif %}</div>
+              </div>
+              <div class="jcard-meta">
+                {% if job.location %}<span class="mpill mp-loc">📍 {{ job.location }}</span>{% endif %}
+                {% if job.salary_raw %}<span class="mpill mp-sal">💰 {{ job.salary_raw }}</span>{% endif %}
+                {% if job.remote_type %}<span class="mpill mp-rem">{{ job.remote_type }}</span>{% endif %}
+                {% if job.source %}<span class="mpill mp-{{ src_c }}">{{ job.source|capitalize }}</span>{% endif %}
+              </div>
+              {% if job.apply_last_status and job.apply_last_status not in ['','applied','started'] %}
+              <div class="jcard-status jcs-orange">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="flex-shrink:0"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                <span style="font-family:monospace;font-size:10px;">{{ job.apply_last_status }}</span>
+                {% if job.apply_last_detail %}<span style="color:#EA580C;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">— {{ job.apply_last_detail[:80] }}</span>{% endif %}
+                {% if job.apply_attempt_count %}<span style="margin-left:auto;font-size:10px;flex-shrink:0;">{{ job.apply_attempt_count }}×</span>{% endif %}
+              </div>
+              {% endif %}
+              <div class="jcard-actions">
+                <a class="jbtn jb-orange" href="{{ job.url or '#' }}" target="_blank" rel="noopener">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                  Apply Manually
+                </a>
+                <button class="jbtn jb-purple" onclick="doAction('{{ job.job_id }}', 'applied')">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 11 12 14 22 4"/></svg>
+                  Mark Applied
+                </button>
+                <button class="jbtn jb-ghost" onclick="doAction('{{ job.job_id }}', 'archive')" title="Archive">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div><!-- /tab-you -->
+
+
+    <!-- ═══════════════ TAB: APPLIED ═══════════════════════ -->
+    <div class="tab-panel" id="tab-applied">
+      <div class="pg-title">Applied</div>
+      <div class="pg-sub">Most recent {{ applied|length }} application{{ 's' if applied|length != 1 else '' }} submitted.</div>
+      {% if not applied %}
+      <div class="empty">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#D1D5DB" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+        <h3>No applications yet</h3>
+        <p>Submitted jobs will appear here.</p>
+      </div>
+      {% else %}
+      <div class="twrap">
+        <table class="dtbl">
+          <thead>
+            <tr>
+              <th>Role</th>
+              <th>Company</th>
+              <th>Source</th>
+              <th>Score</th>
+              <th>Date</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for job in applied %}
+            {% set src = (job.source or 'other').lower() %}
+            {% set src_c = src if src in ['indeed','linkedin','jobright','usajobs'] else 'other' %}
+            <tr>
+              <td><a href="{{ job.url or '#' }}" target="_blank" rel="noopener">{{ job.title or 'Untitled' }}</a></td>
+              <td style="color:#6B7280;">{{ job.company or '—' }}</td>
+              <td><span class="mpill mp-{{ src_c }}" style="display:inline-flex;">{{ job.source|capitalize if job.source else '—' }}</span></td>
+              <td>
+                {% if job.score is not none %}
+                  {% if job.score >= 80 %}<span class="sbox sb-hi" style="width:auto;height:auto;padding:2px 8px;border-radius:20px;font-size:12px;">{{ job.score }}</span>
+                  {% elif job.score >= 60 %}<span class="sbox sb-go" style="width:auto;height:auto;padding:2px 8px;border-radius:20px;font-size:12px;">{{ job.score }}</span>
+                  {% elif job.score >= 40 %}<span class="sbox sb-me" style="width:auto;height:auto;padding:2px 8px;border-radius:20px;font-size:12px;">{{ job.score }}</span>
+                  {% else %}<span class="sbox sb-lo" style="width:auto;height:auto;padding:2px 8px;border-radius:20px;font-size:12px;">{{ job.score }}</span>{% endif %}
+                {% else %}—{% endif %}
+              </td>
+              <td style="color:#9CA3AF;white-space:nowrap;">{{ job.updated_at.strftime('%b %-d, %Y') if job.updated_at else '—' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div><!-- /tab-applied -->
+
+
+    <!-- ═══════════════ TAB: SYNC LOG ══════════════════════ -->
+    <div class="tab-panel" id="tab-log">
+      <div class="pg-title">Sync Log</div>
+      <div class="pg-sub">Last {{ sync_log|length }} agent run{{ 's' if sync_log|length != 1 else '' }}.</div>
+      {% if not sync_log %}
+      <div class="empty">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#D1D5DB" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <h3>No sync history</h3>
+        <p>Run the agent to start recording syncs.</p>
+      </div>
+      {% else %}
+      <div class="twrap">
+        <table class="dtbl">
+          <thead>
+            <tr><th>Time</th><th>Jobs Found</th><th>Source</th><th>Notes</th></tr>
+          </thead>
+          <tbody>
+            {% for entry in sync_log %}
+            <tr>
+              <td style="white-space:nowrap;color:#6B7280;">{{ entry.synced_at.strftime('%b %-d, %-I:%M %p') if entry.synced_at else '—' }}</td>
+              <td style="font-weight:700;color:#111827;">{{ entry.job_count or 0 }}</td>
+              <td style="color:#6B7280;">{{ entry.source or '—' }}</td>
+              <td style="color:#9CA3AF;font-size:12px;">{{ entry.notes or '' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div><!-- /tab-log -->
+
+
+    <!-- ═══════════════ TAB: SETTINGS ══════════════════════ -->
+    <div class="tab-panel" id="tab-settings">
+      <div class="pg-title">Settings</div>
+      <div class="pg-sub">Saved credentials for job board logins. These are stored server-side and used for automated apply.</div>
+
+      <div class="creds-grid">
+        <!-- Indeed -->
+        <form class="ccard" onsubmit="saveCredentials(event, 'indeed')">
+          <div class="ccard-head"><span class="cdot cdot-indeed"></span> Indeed</div>
+          <div class="frow"><label>Email</label><input type="email" id="creds-indeed-email" placeholder="your@email.com" value="{{ credentials.get('indeed', {}).get('email', '') }}" /></div>
+          <div class="frow"><label>Password</label><input type="password" id="creds-indeed-password" placeholder="••••••••" value="{{ credentials.get('indeed', {}).get('password', '') }}" /></div>
+          <button type="submit" class="jbtn jb-blue" style="margin-top:8px;">Save Indeed</button>
+        </form>
+
+        <!-- LinkedIn -->
+        <form class="ccard" onsubmit="saveCredentials(event, 'linkedin')">
+          <div class="ccard-head"><span class="cdot cdot-linkedin"></span> LinkedIn</div>
+          <div class="frow"><label>Email</label><input type="email" id="creds-linkedin-email" placeholder="your@email.com" value="{{ credentials.get('linkedin', {}).get('email', '') }}" /></div>
+          <div class="frow"><label>Password</label><input type="password" id="creds-linkedin-password" placeholder="••••••••" value="{{ credentials.get('linkedin', {}).get('password', '') }}" /></div>
+          <button type="submit" class="jbtn jb-blue" style="margin-top:8px;">Save LinkedIn</button>
+        </form>
+
+        <!-- Jobright -->
+        <form class="ccard" onsubmit="saveCredentials(event, 'jobright')">
+          <div class="ccard-head"><span class="cdot cdot-jobright"></span> Jobright</div>
+          <div class="frow"><label>Email</label><input type="email" id="creds-jobright-email" placeholder="your@email.com" value="{{ credentials.get('jobright', {}).get('email', '') }}" /></div>
+          <div class="frow"><label>Password</label><input type="password" id="creds-jobright-password" placeholder="••••••••" value="{{ credentials.get('jobright', {}).get('password', '') }}" /></div>
+          <button type="submit" class="jbtn jb-blue" style="margin-top:8px;">Save Jobright</button>
+        </form>
+
+        <!-- ATS Session Status -->
+        {% set blocked_jobs = approved_needs_prep %}
+        <div class="ats-panel">
+          <div class="ats-head">
+            <div class="ats-title">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+              ATS Session Status
+            </div>
+            {% if blocked_jobs %}
+              <span class="ats-badge ats-blocked">{{ blocked_jobs|length }} blocked</span>
+            {% else %}
+              <span class="ats-badge ats-ok">All ready ✓</span>
+            {% endif %}
+          </div>
+          {% if blocked_jobs %}
+            <p style="font-size:11px;color:#92400E;line-height:1.5;margin-bottom:8px;">Enterprise ATS portals (Workday, BrassRing, etc.) use SSO — credentials won't work without a live session cookie.</p>
+            <div class="ats-list">
+              {% for j in blocked_jobs %}
+              <div class="ats-row">
+                <span class="ats-row-co">{{ j.company or '?' }}</span>
+                <span class="ats-row-st">{{ j.apply_last_status }}</span>
+              </div>
+              {% endfor %}
+            </div>
+            <div style="background:#fff;border:1px solid #FDE68A;border-radius:8px;padding:8px 10px;margin-top:6px;">
+              <div style="font-size:10px;font-weight:600;color:#92400E;margin-bottom:3px;">Run to refresh sessions:</div>
+              <code style="font-size:11px;color:#78350F;font-family:'SF Mono','Fira Code',monospace;user-select:all;">python src/main.py prepare-sessions</code>
+            </div>
+          {% else %}
+            <p style="font-size:11px;color:#065F46;line-height:1.5;">No jobs are blocked by ATS session issues. Ready to run <code style="font-family:monospace;font-size:10px;background:rgba(0,0,0,.06);padding:1px 5px;border-radius:4px;">python src/main.py apply</code>.</p>
+          {% endif %}
         </div>
       </div>
-      {% endfor %}
-    </div>
-  </details>
-  {% endif %}
+    </div><!-- /tab-settings -->
 
-  <!-- Applied Section -->
-  <details class="mt-10">
-    <summary class="flex items-center gap-2 mb-4 select-none">
-      <h2 class="text-lg font-bold text-gray-900">Applied</h2>
-      <span class="text-sm font-normal text-gray-400">(last 10)</span>
-      <svg class="w-4 h-4 text-gray-400 ml-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-    </summary>
-    {% if not applied %}
-    <p class="text-sm text-gray-400 pl-1">No applications submitted yet.</p>
-    {% else %}
-    <div class="overflow-x-auto rounded-xl border border-gray-200">
-      <table class="min-w-full text-sm">
-        <thead class="bg-gray-50 text-xs font-semibold text-gray-500 uppercase tracking-wider">
-          <tr>
-            <th class="px-4 py-3 text-left">Job</th>
-            <th class="px-4 py-3 text-left">Company</th>
-            <th class="px-4 py-3 text-left">Source</th>
-            <th class="px-4 py-3 text-left">Score</th>
-            <th class="px-4 py-3 text-left">Applied</th>
-          </tr>
-        </thead>
-        <tbody class="bg-white divide-y divide-gray-100">
-          {% for job in applied %}
-          <tr class="hover:bg-gray-50">
-            <td class="px-4 py-3">
-              <a href="{{ job.url or '#' }}" target="_blank" rel="noopener"
-                 class="font-medium text-gray-900 hover:text-blue-600">
-                {{ job.title or 'Untitled' }}
-              </a>
-            </td>
-            <td class="px-4 py-3 text-gray-600">{{ job.company or '—' }}</td>
-            <td class="px-4 py-3">
-              {% if job.source %}
-                {% set src_lower = job.source.lower() %}
-                {% if src_lower == 'indeed' %}
-                  <span class="badge bg-blue-50 text-blue-700 border border-blue-200 flex items-center gap-1 w-max">
-                    <svg class="w-3.5 h-3.5 text-blue-600" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
-                    Indeed
-                  </span>
-                {% elif src_lower == 'linkedin' %}
-                  <span class="badge bg-sky-50 text-sky-700 border border-sky-200 flex items-center gap-1 w-max">
-                    <svg class="w-3.5 h-3.5 text-sky-600" viewBox="0 0 24 24" fill="currentColor"><path d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.761 2.239 5 5 5h14c2.762 0 5-2.239 5-5v-14c0-2.761-2.238-5-5-5zm-11 19h-3v-11h3v11zm-1.5-12.268c-.966 0-1.75-.779-1.75-1.75s.784-1.75 1.75-1.75 1.75.779 1.75 1.75-.784 1.75-1.75 1.75zm13.5 12.268h-3v-5.604c0-3.368-4-3.113-4 0v5.604h-3v-11h3v1.765c1.396-2.586 7-2.777 7 2.476v6.759z"/></svg>
-                    LinkedIn
-                  </span>
-                {% elif src_lower == 'jobright' %}
-                  <span class="badge bg-purple-50 text-purple-700 border border-purple-200 flex items-center gap-1.5 w-max">
-                    <span class="w-1.5 h-1.5 rounded-full bg-purple-600"></span>
-                    Jobright
-                  </span>
-                {% elif src_lower == 'usajobs' %}
-                  <span class="badge bg-red-50 text-red-700 border border-red-200 flex items-center gap-1.5 w-max">
-                    <span class="w-1.5 h-1.5 rounded-full bg-red-600"></span>
-                    USAJobs
-                  </span>
-                {% else %}
-                  <span class="badge bg-gray-50 text-gray-700 border border-gray-200 flex items-center gap-1.5 w-max">
-                    <span class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
-                    {{ job.source|capitalize }}
-                  </span>
-                {% endif %}
-              {% endif %}
-            </td>
-            <td class="px-4 py-3">
-              {% if job.score is not none %}
-                {% if job.score >= 80 %}
-                  <span class="badge score-green">{{ job.score }}</span>
-                {% elif job.score >= 60 %}
-                  <span class="badge score-yellow">{{ job.score }}</span>
-                {% elif job.score >= 40 %}
-                  <span class="badge score-orange">{{ job.score }}</span>
-                {% else %}
-                  <span class="badge score-red">{{ job.score }}</span>
-                {% endif %}
-              {% else %}—{% endif %}
-            </td>
-            <td class="px-4 py-3 text-gray-500 text-xs">
-              {{ job.updated_at.strftime('%b %-d, %Y') if job.updated_at else '—' }}
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    {% endif %}
-  </details>
+  </div><!-- /content -->
+</div><!-- /main -->
 
-  <!-- Sync Log Section -->
-  <section class="mt-10 mb-16">
-    <h2 class="text-lg font-bold text-gray-900 mb-4">Sync Log <span class="text-sm font-normal text-gray-400">(last 5)</span></h2>
-    {% if not sync_log %}
-    <p class="text-sm text-gray-400 pl-1">No syncs recorded yet.</p>
-    {% else %}
-    <div class="overflow-x-auto rounded-xl border border-gray-200">
-      <table class="min-w-full text-sm">
-        <thead class="bg-gray-50 text-xs font-semibold text-gray-500 uppercase tracking-wider">
-          <tr>
-            <th class="px-4 py-3 text-left">Time</th>
-            <th class="px-4 py-3 text-left">Jobs</th>
-            <th class="px-4 py-3 text-left">Sources</th>
-            <th class="px-4 py-3 text-left">Notes</th>
-          </tr>
-        </thead>
-        <tbody class="bg-white divide-y divide-gray-100">
-          {% for entry in sync_log %}
-          <tr>
-            <td class="px-4 py-3 text-gray-600 text-xs whitespace-nowrap">
-              {{ entry.synced_at.strftime('%b %-d %Y, %-I:%M %p UTC') if entry.synced_at else '—' }}
-            </td>
-            <td class="px-4 py-3 font-semibold text-gray-800">{{ entry.job_count or 0 }}</td>
-            <td class="px-4 py-3 text-gray-600">{{ entry.source or '—' }}</td>
-            <td class="px-4 py-3 text-xs text-gray-500">{{ entry.notes or '' }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    {% endif %}
-  </section>
-</main>
+<!-- Toast -->
+<div id="toast"><div id="toast-inner"></div></div>
 
-<!-- Toast notification -->
-<div id="toast" class="fixed bottom-6 right-6 hidden z-50">
-  <div id="toast-inner" class="px-5 py-3 rounded-xl shadow-lg text-white text-sm font-medium transition-all"></div>
-</div>
+<style>
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { animation: spin 1s linear infinite; }
+</style>
 
 <script>
-  // ---- Action handler ----
+  // ── Tab navigation ──────────────────────────────────────────
+  function showTab(name) {
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.nb').forEach(b => b.classList.remove('active'));
+    var panel = document.getElementById('tab-' + name);
+    var btn   = document.getElementById('nav-' + name);
+    if (panel) panel.classList.add('active');
+    if (btn)   btn.classList.add('active');
+    history.replaceState(null, '', '#' + name);
+  }
+
+  // Restore tab from URL hash on load
+  (function() {
+    var hash = location.hash.replace('#', '');
+    if (hash && document.getElementById('tab-' + hash)) showTab(hash);
+  })();
+
+  // ── Job action ──────────────────────────────────────────────
   async function doAction(jobId, action) {
-    const card = document.getElementById('card-' + jobId);
-    if (card) {
-      card.classList.add('removing');
-    }
+    var card = document.getElementById('card-' + jobId);
+    if (card) card.classList.add('removing');
 
     try {
-      const resp = await fetch('/api/action', {
+      var resp = await fetch('/api/action', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ job_id: jobId, action: action })
       });
-
-      const data = await resp.json();
-
+      var data = await resp.json();
       if (resp.ok) {
-        showToast(
-          action === 'approved'   ? 'Marked for application!' :
-          action === 'bookmarked' ? 'Bookmarked!'             :
-          action === 'applied'    ? 'Marked as applied!'      :
-                                    'Skipped.',
-          action === 'skipped' ? '#6b7280' : '#16a34a'
-        );
-        if (card) {
-          setTimeout(() => card.remove(), 300);
-        }
+        var msgs = { approved: 'Added to apply queue!', bookmarked: 'Bookmarked!', applied: 'Marked as applied!', archive: 'Archived.', skipped: 'Skipped.' };
+        var colors = { approved: '#059669', bookmarked: '#2563EB', applied: '#7C3AED', archive: '#6B7280', skipped: '#6B7280' };
+        showToast(msgs[action] || 'Done.', colors[action] || '#374151');
+        if (card) setTimeout(function() { card.remove(); updateBadges(); }, 300);
       } else {
         if (card) card.classList.remove('removing');
-        showToast('Error: ' + (data.detail || 'Unknown error'), '#dc2626');
+        showToast('Error: ' + (data.detail || 'Unknown error'), '#DC2626');
       }
     } catch (err) {
       if (card) card.classList.remove('removing');
-      showToast('Network error: ' + err.message, '#dc2626');
+      showToast('Network error: ' + err.message, '#DC2626');
     }
   }
 
-  // ---- Toast helper ----
-  let toastTimer = null;
+  function updateBadges() {
+    ['review','ready','prep','you'].forEach(function(id) {
+      var grid = document.querySelector('#tab-' + (id === 'review' ? 'review' : id === 'ready' ? 'ready' : id === 'prep' ? 'prep' : 'you') + ' .jgrid');
+      var badge = document.getElementById('badge-' + id);
+      if (grid && badge) badge.textContent = grid.querySelectorAll('.jcard:not(.removing)').length;
+    });
+  }
+
+  // ── Toast ────────────────────────────────────────────────────
+  var _toastTimer = null;
   function showToast(msg, color) {
-    const toast = document.getElementById('toast');
-    const inner = document.getElementById('toast-inner');
+    var toast = document.getElementById('toast');
+    var inner = document.getElementById('toast-inner');
     inner.textContent = msg;
-    inner.style.background = color || '#1f2937';
-    toast.classList.remove('hidden');
-    if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toast.classList.add('hidden'), 3000);
+    inner.style.background = color || '#1F2937';
+    toast.classList.add('show');
+    if (_toastTimer) clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(function() { toast.classList.remove('show'); }, 3000);
   }
 
-  // ---- Auto-refresh countdown ----
-  let seconds = 60;
-  const countdownEl = document.getElementById('countdown');
+  // ── Auto-refresh countdown ───────────────────────────────────
+  var _secs = 60;
+  var _cdEl = document.getElementById('countdown');
+  (function tick() {
+    _secs -= 1;
+    if (_cdEl) _cdEl.textContent = _secs;
+    if (_secs <= 0) { window.location.reload(); }
+    else { setTimeout(tick, 1000); }
+  })();
 
-  function tick() {
-    seconds -= 1;
-    if (countdownEl) countdownEl.textContent = seconds;
-    if (seconds <= 0) {
-      window.location.reload();
-    } else {
-      setTimeout(tick, 1000);
-    }
-  }
-  setTimeout(tick, 1000);
-
-  // ---- Save Credentials ----
+  // ── Save credentials ─────────────────────────────────────────
   async function saveCredentials(event, platform) {
     event.preventDefault();
-    const email = document.getElementById(`creds-${platform}-email`).value.trim();
-    const password = document.getElementById(`creds-${platform}-password`).value.trim();
-    const btn = event.target.querySelector('button[type="submit"]');
-
+    var email    = document.getElementById('creds-' + platform + '-email').value.trim();
+    var password = document.getElementById('creds-' + platform + '-password').value.trim();
+    var btn = event.target.querySelector('button[type="submit"]');
     if (!email || !password) return;
-
-    const originalText = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = 'Saving...';
-
+    var orig = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Saving…';
     try {
-      const resp = await fetch('/api/credentials', {
+      var resp = await fetch('/api/credentials', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ platform, email, password })
+        body: JSON.stringify({ platform: platform, email: email, password: password })
       });
-
-      const data = await resp.json();
-      if (resp.ok) {
-        showToast('Credentials saved for ' + platform.toUpperCase() + '!', '#16a34a');
-      } else {
-        showToast('Error: ' + (data.detail || 'Could not save credentials'), '#dc2626');
-      }
-    } catch (err) {
-      showToast('Network error: ' + err.message, '#dc2626');
+      var data = await resp.json();
+      if (resp.ok) showToast('Credentials saved for ' + platform + '!', '#059669');
+      else showToast('Error: ' + (data.detail || 'Could not save'), '#DC2626');
+    } catch(err) {
+      showToast('Network error: ' + err.message, '#DC2626');
     } finally {
-      btn.disabled = false;
-      btn.textContent = originalText;
+      btn.disabled = false; btn.textContent = orig;
     }
   }
 
-  // ---- Add External Job ----
+  // ── Add external job ─────────────────────────────────────────
   async function addExternalJob(event) {
     event.preventDefault();
-    const urlInput = document.getElementById('external-url');
-    const btn = document.getElementById('add-job-btn');
-    const url = urlInput.value.trim();
+    var input = document.getElementById('external-url');
+    var btn   = document.getElementById('add-job-btn');
+    var url   = input.value.trim();
     if (!url) return;
-
-    btn.disabled = true;
-    btn.innerHTML = '<span>Adding...</span>';
-
+    btn.disabled = true; btn.textContent = 'Adding…';
     try {
-      const resp = await fetch('/api/jobs/external', {
+      var resp = await fetch('/api/jobs/external', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url })
       });
-
-      const data = await resp.json();
-
+      var data = await resp.json();
       if (resp.ok) {
-        showToast('External job added! Hydration in progress.', '#1d4ed8');
-        urlInput.value = '';
-        setTimeout(() => window.location.reload(), 1500);
+        showToast('Job added — hydrating in background.', '#2563EB');
+        input.value = '';
+        setTimeout(function() { window.location.reload(); }, 1600);
       } else {
-        showToast('Error: ' + (data.detail || 'Could not add job'), '#dc2626');
+        showToast('Error: ' + (data.detail || 'Could not add job'), '#DC2626');
       }
-    } catch (err) {
-      showToast('Network error: ' + err.message, '#dc2626');
+    } catch(err) {
+      showToast('Network error: ' + err.message, '#DC2626');
     } finally {
-      btn.disabled = false;
-      btn.innerHTML = '<span>+ Add Job</span>';
+      btn.disabled = false; btn.textContent = '+ Add Job';
     }
   }
 </script>

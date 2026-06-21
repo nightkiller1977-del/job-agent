@@ -401,6 +401,40 @@ class Orchestrator:
         for key, count in sorted(blockers.items()):
             console.print(f"  {key}: {count}")
 
+    async def browser_setup(self) -> None:
+        """Install the Jobright Chrome extension into the job-agent profile.
+
+        LinkedIn, Jobright, and Indeed all auto-login from .env credentials
+        at run-time — no manual sign-in needed. The only thing that requires
+        a one-time browser action is installing the Jobright AI autofill
+        extension from the Chrome Web Store. Run this once, install the
+        extension, close the window, and every future run picks it up.
+        """
+        console.print("\n[bold cyan]Job-Agent Browser Setup[/bold cyan]")
+        console.print("[dim]LinkedIn/Jobright/Indeed log in automatically from .env — no manual sign-in needed.[/dim]")
+        console.print("[dim]Opening Chrome to install the Jobright AI extension from the Web Store...[/dim]\n")
+
+        scraper = JobrightScraper(self.config)
+        page = await scraper._start_browser(load_extensions=True)
+        ctx = scraper._context
+
+        # Go straight to the Jobright extension on the Chrome Web Store
+        await page.goto(
+            "https://chromewebstore.google.com/search/jobright%20ai",
+            wait_until="domcontentloaded",
+        )
+
+        console.print("[green]Browser open.[/green] Click [bold]'Add to Chrome'[/bold] on the Jobright AI extension, then close the window.")
+
+        # Wait until the user closes the browser window
+        try:
+            while ctx.pages:
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+
+        console.print("[green]Setup complete.[/green] Extension installed — all future apply runs will use it.\n")
+
     async def prepare_sessions(
         self,
         source: Optional[str] = None,
@@ -561,6 +595,10 @@ class Orchestrator:
                 if result:
                     self.state.set_status(job["job_id"], "applied")
                     self.state.record_apply_attempt(job["job_id"], "applied", "Application submitted successfully.")
+                    # Persist any analytics the scraper collected (atsScore, resumeVersion, etc.)
+                    _analytics = getattr(scraper, "_apply_analytics", None)
+                    if _analytics:
+                        self.state.record_application_analytics(job["job_id"], _analytics)
                     applied_count += 1
                     outcomes.append({"job": job, "status": "applied", "reason": "submitted"})
                     console.print("[green]Applied! Status updated.[/green]")
@@ -579,11 +617,9 @@ class Orchestrator:
                     outcomes.append({"job": job, "status": code, "reason": reason})
             except JobExpiredError as exc:
                 self.state.set_status(job["job_id"], "expired")
-                self.state.record_apply_attempt(job["job_id"], "expired", str(exc))
-                console.print("[red]Job no longer active (expired). Status updated to expired.[/red]")
+                console.print("[red]Job no longer active (expired). Removed from database.[/red]")
                 outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
                 await self._push_status_to_cloud(job["job_id"], "expired")
-                await self._push_apply_attempt_to_cloud(job["job_id"])
             except Exception as exc:
                 console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")
                 self.state.record_apply_attempt(job["job_id"], "error", str(exc)[:400])
