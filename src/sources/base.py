@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
+import subprocess
+import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+
+_log = logging.getLogger(__name__)
 
 
 class JobExpiredError(Exception):
@@ -68,19 +73,11 @@ class BaseScraper(ABC):
 
     @staticmethod
     def _chrome_is_running() -> bool:
-        """True when the user's Chrome instance is already running.
-
-        When Chrome is running and Playwright tries to launch another Chrome
-        instance with a different user_data_dir, Chrome's ProcessSingleton
-        mechanism intercepts the launch and delegates it to the already-running
-        instance (which uses the default profile). That causes every scraper to
-        fail auth because it ends up in the wrong profile.
-        """
+        """True when the user's Chrome instance is running (ProcessSingleton risk)."""
         try:
-            import subprocess as _sp
-            return _sp.run(
+            return subprocess.run(
                 ["pgrep", "-x", "Google Chrome"],
-                capture_output=True, timeout=3
+                capture_output=True, timeout=3,
             ).returncode == 0
         except Exception:
             return False
@@ -97,7 +94,7 @@ class BaseScraper(ABC):
     def _clear_profile_locks(self) -> None:
         """Remove stale Chrome lock files and kill orphaned Chrome processes
         holding the profile before re-launching."""
-        import subprocess, time
+        import time
         # Kill any Chrome processes still holding this profile directory
         try:
             subprocess.run(
@@ -158,20 +155,38 @@ class BaseScraper(ABC):
                 args.append(f"--load-extension={str(ext_path)}")
             # Extensions already installed in the Chrome profile load automatically.
 
-        # When Chrome is already running its ProcessSingleton intercepts any new
-        # Chrome launch and hands it off to the existing instance (which uses the
-        # user's default profile, not our isolated one). Detect this and fall back
-        # to bundled Chromium + a previously exported JSON session file instead.
+        # Decide whether to use bundled Chromium + JSON session (background/unattended)
+        # or persistent Chrome context (interactive).
         #
-        # Guard: only use the fallback for unattended (background) runs — i.e. when
-        # there is no TTY. Interactive runs (prepare-sessions, apply) must stay on
-        # the persistent Chrome profile so that:
-        #   1. freshly-refreshed cookies are written to the profile (not just the JSON),
-        #   2. Chrome Web Store extensions in the profile remain available for apply.
-        import sys
-        in_background = not sys.stdout.isatty()
+        # Background detection: launchd sets stdin=/dev/null (not a TTY).
+        # Use sys.stdin, not sys.stdout — stdout piped to `tee` would incorrectly
+        # classify an interactive run as background.
+        #
+        # Interactive runs (prepare-sessions, apply) always use persistent Chrome so:
+        #   1. freshly-refreshed cookies land in the profile, not just the JSON;
+        #   2. Chrome Web Store extensions remain available for apply.
+        in_background = not sys.stdin.isatty()
 
-        if in_background and self._chrome_is_running() and self._session_export_path.exists():
+        # When a valid JSON export exists, background runs always use bundled Chromium.
+        # Background discover never needs channel="chrome" — it only needs cookies,
+        # which the JSON export provides. This completely avoids the ProcessSingleton
+        # conflict (two Chrome binaries sharing the same global IPC socket) regardless
+        # of whether Chrome happens to be running at the time.
+        use_chromium_fallback = False
+        if in_background and self._session_export_path.exists():
+            # Validate the file before trusting it — a partial write from a prior crash
+            # would produce opaque Playwright errors inside new_context().
+            try:
+                json.loads(self._session_export_path.read_text())
+                use_chromium_fallback = True
+            except (json.JSONDecodeError, OSError) as exc:
+                _log.warning(
+                    "%s: session export is corrupt (%s) — deleting and falling back to Chrome profile.",
+                    self.name, exc,
+                )
+                self._session_export_path.unlink(missing_ok=True)
+
+        if use_chromium_fallback:
             self._browser = await self._playwright.chromium.launch(
                 headless=False,
                 args=args,
@@ -183,18 +198,21 @@ class BaseScraper(ABC):
                 accept_downloads=True,
             )
         else:
+            # Interactive run, or no valid session export yet — use persistent Chrome.
+            if in_background:
+                # No export file means bootstrap hasn't run yet.  Check Chrome as an
+                # extra diagnostic — if it's also running the ProcessSingleton conflict
+                # will happen, which is why a hint about 'prepare-sessions' matters.
+                extra = " (Chrome is running — ProcessSingleton conflict likely)" if self._chrome_is_running() else ""
+                _log.warning(
+                    "%s: no session export found for background run%s. "
+                    "Run 'prepare-sessions' once with Chrome closed to create it.",
+                    self.name, extra,
+                )
             # channel="chrome" uses the real installed Chrome binary so Chrome Web
             # Store extensions, saved logins, and Chrome's cookie encryption all
             # work correctly. The dedicated profile dir keeps sessions separate from
             # the main Chrome profile — no locking conflicts, no risk to personal data.
-            if in_background and self._chrome_is_running():
-                import logging
-                logging.getLogger(__name__).warning(
-                    "%s: Chrome is running but no session export exists — "
-                    "scrape will likely fail (ProcessSingleton). "
-                    "Run 'prepare-sessions' once with Chrome closed to create the export.",
-                    self.name,
-                )
             self._context = await self._playwright.chromium.launch_persistent_context(
                 user_data_dir=str(self._profile_dir),
                 channel="chrome",
@@ -208,7 +226,6 @@ class BaseScraper(ABC):
         # Get or create a page
         pages = self._context.pages
         self._page = pages[0] if pages else await self._context.new_page()
-        # Bring window to front
         await self._page.bring_to_front()
         return self._page
 
@@ -216,29 +233,39 @@ class BaseScraper(ABC):
         """Export current cookies to a JSON file that bundled Chromium can load.
 
         Called after successful login and on close so that background discover runs
-        can use Chromium instead of Chrome (avoiding the ProcessSingleton conflict
-        that occurs when the user's Chrome is already open).
+        can use Chromium + JSON instead of fighting Chrome's ProcessSingleton.
+        Uses an atomic rename so a crash mid-write never leaves a corrupt file.
         """
         if not self._context:
             return
+        tmp = self._session_export_path.with_suffix(".tmp")
         try:
             state = await self._context.storage_state()
-            self._session_export_path.parent.mkdir(parents=True, exist_ok=True)
-            self._session_export_path.write_text(json.dumps(state))
-        except Exception:
-            pass
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(state))
+            tmp.replace(self._session_export_path)  # atomic on POSIX
+        except Exception as exc:
+            _log.warning("%s: failed to export session to %s: %s", self.name, self._session_export_path, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     async def _save_session(self) -> None:
         """Export session cookies to JSON for Chromium fallback (persistent context saves automatically)."""
         await self._export_session_json()
 
     async def _close_browser(self, save_session: bool = True) -> None:
-        # Persistent context: close the context (saves automatically)
-        # Wrap each step so a crashed browser doesn't raise in the finally block.
+        # Export session before closing — must happen while context is still live.
+        # Separated from the close() call so that close() is always reached even if
+        # the export fails (export has its own internal error handling).
+        if save_session:
+            await self._export_session_json()
+
+        had_context = self._context is not None or self._browser is not None
+
         if self._context:
             try:
-                if save_session:
-                    await self._export_session_json()
                 await self._context.close()
             except Exception:
                 pass
@@ -259,7 +286,9 @@ class BaseScraper(ABC):
         # Wait for Chrome to finish flushing its SQLite databases to disk.
         # Without this, rapid close→open on the same profile causes database
         # lock errors and renderer crashes in the next session.
-        await asyncio.sleep(2)
+        # Skip the wait if nothing was ever opened (avoids 2s delay on startup errors).
+        if had_context:
+            await asyncio.sleep(2)
 
     async def _delay(self, extra_min: float = 0, extra_max: float = 0) -> None:
         """Random human-like delay between actions."""
