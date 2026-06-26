@@ -15,7 +15,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from .base import BaseScraper, JobExpiredError
+from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_warning, notify_success, notify_info
 from src.resume_helper import ResumeFieldFixer, resolve_resume_path
 
@@ -1044,8 +1044,8 @@ class JobrightScraper(BaseScraper):
                     logged_in = await self._auto_login(page, email, password)
                     if not logged_in:
                         if not (sys.stdin and sys.stdin.isatty()):
-                            console.print("[red]Jobright: Auto-login failed and running non-interactively. Skipping Jobright scrape.[/red]")
-                            return []
+                            console.print("[red]Jobright: Auto-login failed (non-interactive). Raising AuthFailedError.[/red]")
+                            raise AuthFailedError("jobright", "Auto-login returned False (non-interactive)")
                         console.print(
                             "\n[yellow]Jobright:[/yellow] Auto-login failed.\n"
                             "  → Please log in manually in the browser window.\n"
@@ -1057,8 +1057,8 @@ class JobrightScraper(BaseScraper):
                         await self._save_session()
                 else:
                     if not (sys.stdin and sys.stdin.isatty()):
-                        console.print("[red]Jobright: Not logged in, no credentials in .env, and running non-interactively. Skipping Jobright scrape.[/red]")
-                        return []
+                        console.print("[red]Jobright: Not logged in, no credentials in .env (non-interactive). Raising AuthFailedError.[/red]")
+                        raise AuthFailedError("jobright", "Not logged in and no credentials in .env")
                     console.print(
                         "\n[yellow]Jobright:[/yellow] Not logged in.\n"
                         "  → Please log in to jobright.ai in the browser window that just opened.\n"
@@ -1073,8 +1073,8 @@ class JobrightScraper(BaseScraper):
             console.print(f"[magenta]Jobright:[/magenta] Page loaded: {page.url}")
 
             if "jobright.ai/jobs" not in page.url:
-                console.print("[red]Jobright: Could not navigate to jobs page — skipping.[/red]")
-                return []
+                console.print("[red]Jobright: Could not navigate to jobs page — raising AuthFailedError.[/red]")
+                raise AuthFailedError("jobright", f"Unexpected redirect to {page.url}")
 
             console.print("[magenta]Jobright:[/magenta] Waiting for job cards to render…")
             try:

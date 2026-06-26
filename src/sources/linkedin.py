@@ -16,7 +16,7 @@ from urllib.parse import quote_plus
 
 from rich.console import Console
 
-from .base import BaseScraper, JobExpiredError
+from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.resume_helper import resolve_resume_path
 
 console = Console()
@@ -77,8 +77,8 @@ class LinkedInScraper(BaseScraper):
                     logged_in = await self._auto_login(page, email, password)
                     if not logged_in:
                         if not (sys.stdin and sys.stdin.isatty()):
-                            console.print("[red]LinkedIn: Auto-login failed and running non-interactively. Skipping LinkedIn scrape.[/red]")
-                            return []
+                            console.print("[red]LinkedIn: Auto-login failed (non-interactive). Raising AuthFailedError.[/red]")
+                            raise AuthFailedError("linkedin", "Auto-login returned False (non-interactive)")
                         console.print(
                             "\n[yellow]LinkedIn:[/yellow] Auto-login failed.\n"
                             "  → Please log in manually in the browser window.\n"
@@ -90,8 +90,8 @@ class LinkedInScraper(BaseScraper):
                         await self._save_session()
                 else:
                     if not (sys.stdin and sys.stdin.isatty()):
-                        console.print("[red]LinkedIn: Not logged in, no credentials in .env, and running non-interactively. Skipping LinkedIn scrape.[/red]")
-                        return []
+                        console.print("[red]LinkedIn: Not logged in, no credentials (non-interactive). Raising AuthFailedError.[/red]")
+                        raise AuthFailedError("linkedin", "Not logged in and no credentials in .env")
                     console.print(
                         "\n[yellow]LinkedIn:[/yellow] Not logged in.\n"
                         "  → Please log in to LinkedIn in the browser window.\n"

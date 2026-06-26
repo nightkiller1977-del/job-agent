@@ -14,7 +14,7 @@ from typing import Optional
 
 from rich.console import Console
 
-from .base import BaseScraper, JobExpiredError
+from .base import BaseScraper, AuthFailedError, JobExpiredError
 
 console = Console()
 
@@ -67,16 +67,16 @@ class USAJobsScraper(BaseScraper):
                     logged_in = await self._auto_login(page, email, password)
                     if not logged_in:
                         if not (sys.stdin and sys.stdin.isatty()):
-                            console.print("[red]USAJobs: Auto-login failed (non-interactive). Skipping.[/red]")
-                            return []
+                            console.print("[red]USAJobs: Auto-login failed (non-interactive). Raising AuthFailedError.[/red]")
+                            raise AuthFailedError("usajobs", "Auto-login failed — 2FA required (non-interactive)")
                         console.print("[yellow]USAJobs:[/yellow] Auto-login failed. Complete login in the browser window.")
                         input("  Press Enter once logged in > ")
                         await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=30000)
                         await self._delay(2, 3)
                 else:
                     if not (sys.stdin and sys.stdin.isatty()):
-                        console.print("[red]USAJobs: Not logged in and no credentials in .env. Skipping.[/red]")
-                        return []
+                        console.print("[red]USAJobs: Not logged in and no credentials (non-interactive). Raising AuthFailedError.[/red]")
+                        raise AuthFailedError("usajobs", "Not logged in and no credentials in .env")
                     console.print("[red]USAJobs:[/red] Not logged in. Add USAJOBS_EMAIL/USAJOBS_PASSWORD to .env, or log in manually.")
                     input("  Press Enter once logged in > ")
                     await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=30000)

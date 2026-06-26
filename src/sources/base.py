@@ -27,6 +27,18 @@ class JobExpiredError(Exception):
     pass
 
 
+class AuthFailedError(Exception):
+    """Raised when a scraper detects an expired or invalid session.
+
+    Caught by the orchestrator to trigger ReauthManager instead of
+    silently skipping the source.
+    """
+    def __init__(self, source: str, detail: str = ""):
+        self.source = source
+        self.detail = detail
+        super().__init__(f"{source} auth failed: {detail}" if detail else f"{source} auth failed")
+
+
 # Where session state files are stored
 SESSIONS_DIR = Path(__file__).parent.parent.parent / "state" / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
