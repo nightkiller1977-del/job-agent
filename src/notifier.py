@@ -99,6 +99,20 @@ def record_run_stats(applied: int, failed: int, skipped: int) -> None:
     _save_status(status)
 
 
+def record_reauth_event(source: str, mode: str, outcome: str, detail: str = "") -> None:
+    """Append a reauth attempt to state/agent_status.json under 'reauth_events'."""
+    status = _load_status()
+    status.setdefault("reauth_events", [])
+    status["reauth_events"] = status["reauth_events"][-99:] + [{
+        "source": source,
+        "mode": mode,       # "automated" | "human_notified" | "human"
+        "outcome": outcome, # "success" | "failed" | "waiting" | "session_refreshed" | "timeout"
+        "detail": detail,
+        "ts": datetime.utcnow().isoformat(),
+    }]
+    _save_status(status)
+
+
 def get_status() -> dict:
     """Return the current status dict — used by the dashboard / Desktop Commander."""
     return _load_status()
