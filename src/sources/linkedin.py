@@ -152,7 +152,7 @@ class LinkedInScraper(BaseScraper):
                     return []
 
             for _ in range(5):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await self._safe_evaluate(page, "window.scrollTo(0, document.body.scrollHeight)", default=None)
                 await self._delay(1, 2)
 
             card_selectors = [
@@ -168,7 +168,10 @@ class LinkedInScraper(BaseScraper):
                     if found:
                         cards = found
                         break
-                except Exception:
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                        raise
                     continue
 
             for card in cards[:self.max_jobs]:
@@ -260,7 +263,10 @@ class LinkedInScraper(BaseScraper):
                     text = (await elem.inner_text()).strip()
                     if text:
                         return text
-            except Exception:
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                    raise
                 continue
         return ""
 
@@ -308,7 +314,10 @@ class LinkedInScraper(BaseScraper):
                     await page.click(sel, timeout=5000)
                     submitted = True
                     break
-                except Exception:
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                        raise
                     continue
             if not submitted:
                 try:
@@ -348,7 +357,10 @@ class LinkedInScraper(BaseScraper):
                         if await field.is_visible():
                             await field.fill(value)
                             return field
-                except Exception:
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                        raise
                     continue
             await asyncio.sleep(0.25)
         return None
@@ -396,7 +408,7 @@ class LinkedInScraper(BaseScraper):
                 except Exception:
                     continue
             if not scrolled:
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await self._safe_evaluate(page, "window.scrollTo(0, document.body.scrollHeight)", default=None)
             await self._delay(1, 2)
 
         # Get all job cards
@@ -413,7 +425,10 @@ class LinkedInScraper(BaseScraper):
                 if found:
                     cards = found
                     break
-            except Exception:
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                    raise
                 continue
 
         for card in cards[:self.max_jobs - len(seen_ids)]:
@@ -567,7 +582,10 @@ class LinkedInScraper(BaseScraper):
                         if "easy apply" in badge_text or badge_text == "":
                             has_easy_apply = True
                             break
-                except Exception:
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                        raise
                     continue
 
             # Salary (LinkedIn often doesn't show it on the card)
@@ -642,7 +660,7 @@ class LinkedInScraper(BaseScraper):
                 )
 
             # Check if job is expired/closed
-            page_text = await page.evaluate("document.body.innerText")
+            page_text = await self._safe_evaluate(page, "document.body.innerText", default="")
             if any(w in page_text.lower() for w in ["no longer accepting applications", "job is closed", "no longer available"]):
                 console.print(f"[yellow]LinkedIn:[/yellow] Job no longer accepting applications — skipping.")
                 raise JobExpiredError("LinkedIn: Job is closed or no longer accepting applications.")
@@ -703,7 +721,7 @@ class LinkedInScraper(BaseScraper):
                 'a[href*="/jobs/view/"][href*="/apply/"]',
             ]:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=4000)
+                    btn = await page.wait_for_selector(sel, timeout=8000)
                     if btn:
                         try:
                             text = (await btn.inner_text()).strip().lower()
@@ -719,7 +737,8 @@ class LinkedInScraper(BaseScraper):
             # Second pass: JS-based search (catches LinkedIn DOM variants)
             if not easy_apply_btn:
                 try:
-                    found = await page.evaluate(
+                    found = await self._safe_evaluate(
+                        page,
                         """
                         () => {
                             const cands = Array.from(document.querySelectorAll('button, a[role="button"], a[href]'));
@@ -730,22 +749,29 @@ class LinkedInScraper(BaseScraper):
                                        (el.className && /jobs-apply-button/i.test(el.className) && text !== 'save');
                             });
                         }
-                        """
+                        """,
+                        default=False,
                     )
                     if found:
-                        easy_apply_btn = await page.evaluate_handle(
-                            """
-                            () => {
-                                const cands = Array.from(document.querySelectorAll('button, a[role="button"], a[href]'));
-                                return cands.find(el => {
-                                    const text = (el.innerText || el.textContent || '').trim().toLowerCase();
-                                    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-                                    return text === 'easy apply' || aria.includes('easy apply') ||
-                                           (el.className && /jobs-apply-button/i.test(el.className) && text !== 'save');
-                                });
-                            }
-                            """
-                        )
+                        try:
+                            easy_apply_btn = await page.evaluate_handle(
+                                """
+                                () => {
+                                    const cands = Array.from(document.querySelectorAll('button, a[role="button"], a[href]'));
+                                    return cands.find(el => {
+                                        const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                                        return text === 'easy apply' || aria.includes('easy apply') ||
+                                               (el.className && /jobs-apply-button/i.test(el.className) && text !== 'save');
+                                    });
+                                }
+                                """
+                            )
+                        except Exception as exc:
+                            err = str(exc).lower()
+                            if any(k in err for k in ["closed", "target page", "detached", "crashed"]):
+                                raise
+                            easy_apply_btn = None
                 except Exception:
                     pass
 
@@ -768,9 +794,11 @@ class LinkedInScraper(BaseScraper):
             if not easy_apply_btn:
                 # Diagnose why — helps distinguish expired jobs from auth issues
                 try:
-                    page_text = (await page.evaluate("document.body?.innerText || ''")).lower()
-                    all_btns = await page.evaluate(
-                        "Array.from(document.querySelectorAll('button, a')).map(e => e.innerText?.trim()).filter(Boolean).slice(0, 20)"
+                    page_text = (await self._safe_evaluate(page, "document.body?.innerText || ''", default="")).lower()
+                    all_btns = await self._safe_evaluate(
+                        page,
+                        "Array.from(document.querySelectorAll('button, a')).map(e => e.innerText?.trim()).filter(Boolean).slice(0, 20)",
+                        default=[],
                     )
                     console.print(f"[dim]LinkedIn: visible buttons: {all_btns[:10]}[/dim]")
                     if "no longer accepting" in page_text or "job is closed" in page_text:
@@ -808,14 +836,16 @@ class LinkedInScraper(BaseScraper):
                 await self._delay(1, 2)
                 page_text = ""
                 try:
-                    page_text = await page.evaluate(
+                    page_text = await self._safe_evaluate(
+                        page,
                         """
                         () => {
                             const h = document.querySelector('h1,h2,h3');
                             const pageText = document.body?.innerText?.match(/\\d+\\/\\d+ pages/i)?.[0] || '';
                             return [pageText, h?.innerText || ''].filter(Boolean).join(' — ');
                         }
-                        """
+                        """,
+                        default="",
                     )
                     if page_text:
                         console.print(f"[dim]LinkedIn apply step {step}: {page_text[:140]}[/dim]")
@@ -826,16 +856,15 @@ class LinkedInScraper(BaseScraper):
                 if page_text and page_text == _prev_page_text:
                     _stuck_count += 1
                     if _stuck_count >= 3:
-                        try:
-                            errors = await page.evaluate(
-                                """
-                                () => Array.from(document.querySelectorAll(
-                                    '.artdeco-inline-feedback--error, [class*="error"], [aria-invalid="true"]'
-                                )).map(e => e.innerText?.trim()).filter(Boolean).slice(0, 5)
-                                """
-                            )
-                        except Exception:
-                            errors = []
+                        errors = await self._safe_evaluate(
+                            page,
+                            """
+                            () => Array.from(document.querySelectorAll(
+                                '.artdeco-inline-feedback--error, [class*="error"], [aria-invalid="true"]'
+                            )).map(e => e.innerText?.trim()).filter(Boolean).slice(0, 5)
+                            """,
+                            default=[],
+                        )
                         err_str = "; ".join(errors) if errors else "unknown validation error"
                         console.print(f"[yellow]LinkedIn: Stuck on '{page_text}' — {err_str}[/yellow]")
                         return self._set_apply_outcome(
@@ -855,7 +884,10 @@ class LinkedInScraper(BaseScraper):
                         modal = await page.query_selector(sel)
                         if modal:
                             break
-                    except Exception:
+                    except Exception as exc:
+                        err = str(exc).lower()
+                        if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                            raise
                         continue
 
                 if not modal:
@@ -880,7 +912,10 @@ class LinkedInScraper(BaseScraper):
                         if btn:
                             submit_btn = btn
                             break
-                    except Exception:
+                    except Exception as exc:
+                        err = str(exc).lower()
+                        if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                            raise
                         continue
 
                 for sel in ['button[aria-label*="Review"]', 'button:text-matches("Review", "i")']:
@@ -889,7 +924,10 @@ class LinkedInScraper(BaseScraper):
                         if btn:
                             review_btn = btn
                             break
-                    except Exception:
+                    except Exception as exc:
+                        err = str(exc).lower()
+                        if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                            raise
                         continue
 
                 for sel in [
@@ -902,7 +940,10 @@ class LinkedInScraper(BaseScraper):
                         if btn and not submit_btn:
                             next_btn = btn
                             break
-                    except Exception:
+                    except Exception as exc:
+                        err = str(exc).lower()
+                        if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                            raise
                         continue
 
                 if submit_btn:
@@ -1026,7 +1067,7 @@ class LinkedInScraper(BaseScraper):
             return ""
 
         # --- Pass 1: static DOM scan ---
-        url = await page.evaluate("""
+        url = await self._safe_evaluate(page, """
         () => {
             const ATS_RE = /workday|greenhouse|lever|icims|brassring|taleo|smartrecruiters|successfactors|ashby|teamtailor|apply|career|job/i;
             const direct = Array.from(document.querySelectorAll('a[href]'))
@@ -1035,7 +1076,7 @@ class LinkedInScraper(BaseScraper):
             if (direct) return direct;
             return '';
         }
-        """)
+        """, default="")
         if url and "linkedin.com" not in url:
             return url
 
@@ -1080,7 +1121,10 @@ class LinkedInScraper(BaseScraper):
                 )
                 if apply_btn and not await apply_btn.evaluate("el => !!el"):
                     apply_btn = None
-            except Exception:
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(k in err for k in ["closed", "target page", "detached", "crashed"]):
+                    raise
                 apply_btn = None
 
         if not apply_btn:
@@ -1187,7 +1231,10 @@ class LinkedInScraper(BaseScraper):
                                 external = _strip_linkedin(page.url)
                                 if external:
                                     return external
-                except Exception:
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                        raise
                     continue
 
             # One final check — any new tab that opened late
@@ -1221,7 +1268,8 @@ class LinkedInScraper(BaseScraper):
 
     async def _click_linkedin_button_by_text(self, page, patterns: list[str]) -> bool:
         try:
-            return await page.evaluate(
+            return await self._safe_evaluate(
+                page,
                 """
                 (patterns) => {
                     const regexes = patterns.map(p => new RegExp(p, 'i'));
@@ -1239,6 +1287,7 @@ class LinkedInScraper(BaseScraper):
                 }
                 """,
                 patterns,
+                default=False,
             )
         except Exception:
             return False
@@ -1269,14 +1318,16 @@ class LinkedInScraper(BaseScraper):
             url = page.url.lower()
             if any(part in url for part in LOGIN_URL_MARKERS):
                 return True
-            return await page.evaluate(
+            return await self._safe_evaluate(
+                page,
                 """
                 () => {
                     const text = (document.body?.innerText || '').toLowerCase();
                     return /sign in|join linkedin|security verification|checkpoint|authwall/.test(text) &&
                         !!document.querySelector('input[type="password"], input[name="session_password"]');
                 }
-                """
+                """,
+                default=False,
             )
         except Exception:
             return False
@@ -1376,7 +1427,10 @@ class LinkedInScraper(BaseScraper):
                 if chosen:
                     await sel_elem.select_option(value=chosen)
                     await self._delay(0.3, 0.5)
-            except Exception:
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                    raise
                 continue
 
     async def _fill_radio_fields(self, page) -> None:
@@ -1413,7 +1467,10 @@ class LinkedInScraper(BaseScraper):
                     if not is_checked:
                         await chosen_radio.click()
                         await self._delay(0.3, 0.5)
-            except Exception:
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                    raise
                 continue
 
     async def _fill_text_questions(self, page) -> None:
@@ -1459,7 +1516,10 @@ class LinkedInScraper(BaseScraper):
                 if answer:
                     await inp.fill(answer)
                     await self._delay(0.3, 0.5)
-            except Exception:
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                    raise
                 continue
 
     async def _get_field_label(self, page, element) -> str:
@@ -1471,7 +1531,13 @@ class LinkedInScraper(BaseScraper):
                 if label:
                     return (await label.inner_text()).strip()
             # Try parent/sibling label
-            parent = await element.evaluate_handle("el => el.closest('.form-group, .jobs-easy-apply-form-element, fieldset, div')")
+            try:
+                parent = await element.evaluate_handle("el => el.closest('.form-group, .jobs-easy-apply-form-element, fieldset, div')")
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(k in err for k in ["closed", "target page", "detached", "crashed"]):
+                    raise
+                parent = None
             if parent:
                 label = await parent.query_selector("label, legend, span[class*='label']")
                 if label:

@@ -161,9 +161,9 @@ class IndeedScraper(BaseScraper):
                 break
 
             # Scroll to trigger lazy-loaded cards
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await self._safe_evaluate(page, "window.scrollTo(0, document.body.scrollHeight)", default=None)
             await self._delay(1, 2)
-            await page.evaluate("window.scrollTo(0, 0)")
+            await self._safe_evaluate(page, "window.scrollTo(0, 0)", default=None)
             await self._delay(0.5, 1)
 
             page_jobs = await self._js_extract(page)
@@ -190,7 +190,7 @@ class IndeedScraper(BaseScraper):
 
     async def _js_extract(self, page) -> list[dict]:
         """Extract job cards from the Indeed search results DOM."""
-        raw = await page.evaluate(f"""
+        raw = await self._safe_evaluate(page, f"""
         () => {{
             const BASE = '{INDEED_BASE}';
             const results = [];
@@ -227,7 +227,7 @@ class IndeedScraper(BaseScraper):
             }}
             return results;
         }}
-        """)
+        """, default=[])
 
         now = datetime.utcnow().isoformat()
         jobs = []
@@ -313,9 +313,7 @@ class IndeedScraper(BaseScraper):
             if desc_el:
                 job["description"] = (await desc_el.inner_text()).strip()[:4000]
             else:
-                body = await page.evaluate(
-                    "document.body.innerText"
-                )
+                body = await self._safe_evaluate(page, "document.body.innerText", default="")
                 job["description"] = (body or "")[:3000]
 
         except Exception as exc:
@@ -407,7 +405,7 @@ class IndeedScraper(BaseScraper):
         Find the external company ATS URL on an Indeed job listing.
         Returns empty string for Easy Apply (no external URL) or if not found.
         """
-        return await page.evaluate(f"""
+        return await self._safe_evaluate(page, f"""
         () => {{
             const ATS = {_ATS_HOSTS!r};
             // Direct anchor tags pointing to company ATS
@@ -424,7 +422,7 @@ class IndeedScraper(BaseScraper):
             if (tagged) return tagged.getAttribute('data-apply-url') || tagged.getAttribute('data-ats-url') || '';
             return '';
         }}
-        """)
+        """, default="")
 
     async def prepare_session(self, job: dict | None) -> None:
         """Open Indeed and establish a persistent session.
@@ -519,7 +517,7 @@ class IndeedScraper(BaseScraper):
 
             for sel in ['button[type="submit"]', 'button:text-matches("Continue", "i")']:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=3000)
+                    btn = await page.wait_for_selector(sel, timeout=8000)
                     if btn:
                         await btn.click()
                         await self._delay(2, 3)
@@ -544,15 +542,20 @@ class IndeedScraper(BaseScraper):
 
             for sel in ['button[type="submit"]', 'button:text-matches("Sign In", "i")']:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=3000)
+                    btn = await page.wait_for_selector(sel, timeout=8000)
                     if btn:
                         await btn.click()
                         break
                 except Exception:
                     continue
 
-            for _ in range(15):
-                await asyncio.sleep(2)
+            # Wait for navigation triggered by the sign-in button click
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+
+            for _ in range(8):
                 cur = page.url
                 if "indeed.com/jobs" in cur or "indeed.com/myjobs" in cur:
                     console.print("[green]Indeed: Auto-login successful![/green]")
@@ -560,6 +563,7 @@ class IndeedScraper(BaseScraper):
                 if "/account/login" not in cur and "secure.indeed.com" not in cur:
                     console.print("[green]Indeed: Auto-login successful (redirect detected)![/green]")
                     return True
+                await asyncio.sleep(2)
 
             return False
 
