@@ -1,22 +1,136 @@
 # job-agent
 
-A production job application agent that scrapes job listings, scores them against your criteria using Claude AI, presents a terminal review queue, and automates applications via Playwright using real Chrome.
+A fully automated job application pipeline that scrapes listings across multiple job boards, scores them against your role and compensation criteria using Claude AI, presents a terminal review queue, and applies — including resume tailoring, ATS form autofill, and final submission — via Playwright-controlled Chrome. When a site session expires, the agent heals itself automatically, writes a regression test, and sends you an iMessage summary of what it fixed.
 
 For engineering internals and apply-workflow architecture, see [`DEVELOPER_ONBOARDING.md`](DEVELOPER_ONBOARDING.md).
 
-## How It Works (Overview)
+---
 
-1. **Discover** — scrapes LinkedIn, Jobright, USAJobs; Claude scores each job against your role/comp criteria
-2. **Review** — terminal queue where you approve, skip, or bookmark each scored job
-3. **Apply** — fully automated: generates a Claude-tailored resume, autofills the ATS form, submits
+## Capabilities at a Glance
 
-All site logins (LinkedIn, Jobright, Indeed) are handled automatically using credentials in `.env`. No manual sign-in is needed for scheduled runs.
+| Capability | Details |
+|---|---|
+| **Multi-source discovery** | LinkedIn, Jobright, Indeed, USAJobs |
+| **AI scoring** | Claude evaluates each job against your role, seniority, and comp criteria |
+| **Terminal review queue** | Approve / skip / bookmark with keyboard controls |
+| **Resume tailoring** | Claude rewrites resume bullets + summary for each specific role |
+| **ATS autofill** | Playwright fills Workday, BrassRing, Greenhouse, Lever, and fallback portals |
+| **LinkedIn Easy Apply** | Full modal and full-page `/apply/` flows, reading `profile.json` |
+| **Session management** | Persistent Chrome profiles per source; one-time prepare-sessions for Workday SSO |
+| **Self-healing auth** | Expired sessions auto-recovered; human-assist path for 2FA-gated sources |
+| **iMessage alerts** | Auth failures, self-heal outcomes, and correction summaries sent to your phone |
+| **macOS notifications** | Native banners for every error, warning, and reauth event |
+| **Regression test generation** | Each successful self-heal appends a pytest test documenting the exact failure |
+| **Cloud dashboard** | Render.com API for approving/rejecting jobs from any browser |
+| **Scheduled runs** | Cron-safe; Chrome opens and closes automatically, no user presence needed |
+
+---
+
+## Architecture
+
+```
+job-agent/
+├── src/
+│   ├── main.py              # CLI entry point — all commands defined here
+│   ├── orchestrator.py      # Flow coordinator: discover → score → review → apply
+│   │                        #   catches AuthFailedError, invokes ReauthManager, retries
+│   ├── scorer.py            # Claude Haiku job scoring (role match, ATS score, tailoring)
+│   ├── reauth.py            # ReauthManager — self-healing auth (automated + human paths)
+│   │                        #   on success: writes regression test + sends iMessage
+│   ├── notifier.py          # agent_status.json writer + macOS notification dispatcher
+│   │                        #   record_reauth_event() appends to a capped event log
+│   ├── state_manager.py     # SQLite persistence: jobs, status, analytics
+│   ├── review_queue.py      # Rich terminal review UI
+│   ├── resume_helper.py     # Resume path resolution + Claude PDF generation
+│   └── sources/
+│       ├── base.py          # BaseScraper: Chrome profile isolation, session export,
+│       │                    #   _safe_evaluate(), _safe_goto(), AuthFailedError
+│       ├── jobright.py      # Discovery, Orion AI tailoring, Claude ATS, ATS autofill
+│       ├── linkedin.py      # Discovery, saved jobs, Easy Apply, external ATS routing
+│       ├── indeed.py        # Discovery + application
+│       └── usajobs.py       # USAJobs.gov discovery + application
+├── tests/
+│   ├── test_reauth_unit.py        # 53 unit tests — auth, safe_evaluate, reauth routing
+│   ├── test_reauth_feature.py     # 16 integration tests — orchestrator end-to-end flows
+│   ├── test_reauth_regressions.py # Auto-generated — appended on each self-heal
+│   ├── test_state_manager.py
+│   ├── test_apply_functional.py
+│   └── test_credentials.py
+├── dashboard/               # Render.com cloud API + job approval UI
+├── state/
+│   ├── jobs.db              # SQLite (auto-created, gitignored)
+│   ├── profile.json         # Work history, skills, contact info for form autofill (gitignored)
+│   ├── sessions/            # Per-source Chrome profiles + session JSON exports (gitignored)
+│   ├── tailored_resumes/    # Claude-generated and Orion-generated PDFs (gitignored)
+│   └── agent_status.json    # Live alerts + reauth event log
+├── config.json              # Scoring config, resume path, search settings
+├── .env                     # Credentials and API keys (never committed)
+├── .env.example             # Template with all required and optional keys
+├── CLAUDE.md                # Critical constraints for Claude Code (Chrome profile isolation)
+├── DEVELOPER_ONBOARDING.md  # Engineering internals and apply-workflow architecture
+└── requirements.txt
+```
+
+### Data Flow
+
+```
+main.py
+  └─ Orchestrator.discover()
+        ├─ ScraperCls(config).scrape()   ← raises AuthFailedError on session expiry
+        │     └─ ReauthManager.handle()  ← automated or human-assist reauth
+        │           ├─ _reauth_automated()  → _auto_login() → export session JSON
+        │           └─ _reauth_human()     → iMessage → poll mtime → detect refresh
+        │                 └─ on success: _write_regression_test() + _notify_correction()
+        ├─ JobScorer.score()             ← Claude Haiku evaluation
+        └─ ReviewQueue.run()             ← terminal approve/skip/bookmark
+
+  └─ Orchestrator.apply_approved()
+        ├─ scraper.apply(job)            ← raises AuthFailedError if session gone
+        │     └─ ReauthManager.handle(context="apply")  ← shorter timeout
+        └─ retry scraper.apply(job)
+```
+
+### Self-Healing Auth
+
+```
+AuthFailedError raised by scraper
+          │
+          ▼
+  ReauthManager.handle(source, detail, context)
+          │
+    ┌─────┴──────┐
+    │            │
+automated    human-assisted
+(jobright,   (usajobs)
+ indeed,
+ linkedin)
+    │            │
+_auto_login()  iMessage → poll session file mtime
+    │            │
+    └────────────┘
+          │
+     on success
+          ├─ record_reauth_event(source, mode, "success")
+          ├─ _write_regression_test()   → tests/test_reauth_regressions.py
+          ├─ _notify_correction()       → iMessage to NOTIFY_PHONE
+          └─ return True               → orchestrator retries the scraper
+```
+
+### Browser Architecture
+
+Each source scraper uses an **isolated Chromium profile** under `state/sessions/<source>_profile/`. This avoids Chrome's ProcessSingleton lock that would occur if any scraper pointed at the main Chrome profile. Session cookies are exported to `state/sessions/<source>_chromium.json` after every successful login so headless background runs can load them without re-authenticating.
+
+`_safe_evaluate()` and `_safe_goto()` on `BaseScraper` protect every `page.evaluate()` and `page.goto()` call:
+
+- Non-fatal Playwright errors (selector timeouts, parse failures) return a configurable default and log a warning.
+- Browser-death signals (`closed`, `detached`, `crashed`, `browser has been`) are re-raised immediately so the scraper loop exits cleanly rather than silently swallowing the failure.
 
 ---
 
 ## Quick Start
 
 ### 1. Install dependencies
+
 ```bash
 cd ~/Dev/Projects/job-agent
 python -m venv .venv
@@ -26,47 +140,51 @@ playwright install chrome
 ```
 
 ### 2. Configure credentials
+
 ```bash
 cp .env.example .env
 # Edit .env — add your API key and site credentials
 ```
 
 Key `.env` values:
+
 ```
-ANTHROPIC_API_KEY=...         # Required for scoring and ATS analysis
+ANTHROPIC_API_KEY=...          # Required for scoring and resume tailoring
 LINKEDIN_EMAIL=...
 LINKEDIN_PASSWORD=...
 JOBRIGHT_EMAIL=...
 JOBRIGHT_PASSWORD=...
 INDEED_EMAIL=...
 INDEED_PASSWORD=...
-COMPANY_EMAIL=...             # Used for company ATS portal auto-login (Workday, BrassRing, etc.)
+COMPANY_EMAIL=...              # Workday / BrassRing portal auto-login
 COMPANY_PASSWORD=...
-DASHBOARD_URL=...             # Render.com cloud dashboard URL
+NOTIFY_PHONE=+1XXXXXXXXXX      # iMessage alerts and self-heal notifications
+REAUTH_TIMEOUT_MINUTES=30      # How long to wait for a human-assisted session refresh
+REAUTH_TIMEOUT_APPLY_MINUTES=10
+DASHBOARD_URL=...              # Render.com cloud dashboard URL
 SYNC_SECRET=...
 ```
 
 Set your resume path in `config.json`:
+
 ```json
 { "local_resume_path": "/Users/yourname/resume.pdf" }
 ```
 
-Fill in your real work history, education, and skills in `state/profile.json` — this feeds LinkedIn Easy Apply form autofill and Claude resume tailoring. See the file for the expected structure.
+Fill in `state/profile.json` with your real work history, skills, and contact information — this feeds LinkedIn Easy Apply autofill and Claude resume tailoring.
 
-### 3. One-time setup (install Chrome extension)
-
-Logins are automatic from `.env`. The only manual step is installing the Jobright AI autofill extension into the job-agent Chrome profile — run this once:
+### 3. One-time setup
 
 ```bash
 python src/main.py setup
 ```
 
-Chrome opens to the Web Store. Click **Add to Chrome** on the Jobright AI extension, then close the window.
+Chrome opens to the Web Store. Click **Add to Chrome** on the Jobright AI extension, then close the window. All source logins are automatic from `.env` — no other manual steps required.
 
 ### 4. Run
 
 ```bash
-# Scrape all sources, score, show review queue
+# Scrape all sources, score, and open review queue
 python src/main.py discover
 
 # Single source
@@ -74,6 +192,7 @@ python src/main.py discover --source linkedin
 python src/main.py discover --source linkedin-saved --no-review
 python src/main.py discover --source usajobs
 python src/main.py discover --source jobright
+python src/main.py discover --source indeed
 
 # Hydrate externally pasted dashboard jobs
 python src/main.py hydrate
@@ -89,41 +208,44 @@ python src/main.py apply --limit 1 --no-auto-submit
 python src/main.py apply --company "Microsoft" --no-auto-submit
 python src/main.py apply --job-id <job_id> --auto-submit
 
+# Resolve blocked Workday sessions
+python src/main.py prepare-sessions
+python src/main.py prepare-sessions --source jobright --company "CVS"
+
 # Show stats
 python src/main.py status
+
+# Pre-flight check + mock apply-path tests
+python src/main.py ops-check
 ```
 
 ---
 
 ## What's Automated vs Manual
 
-| Task | Automated? |
+| Task | Status |
 |---|---|
 | LinkedIn login | ✅ Auto from `.env` |
 | Jobright login | ✅ Auto from `.env` |
 | Indeed login | ✅ Auto from `.env` |
-| Company ATS portals (Workday, BrassRing) | ✅ Auto attempt via `COMPANY_EMAIL`/`COMPANY_PASSWORD` in `.env` |
-| ATS score + resume tailoring | ✅ Claude Haiku API |
+| USAJobs login | ✅ Auto from `.env` via login.gov |
+| Company ATS portals (Workday, BrassRing) | ✅ Auto attempt via `COMPANY_EMAIL/PASSWORD` |
+| ATS scoring + resume tailoring | ✅ Claude Haiku API |
 | Tailored resume PDF generation | ✅ Playwright + HTML template |
-| Form autofill (Jobright extension) | ✅ Extension in Chrome profile |
+| LinkedIn Easy Apply autofill | ✅ Reading `state/profile.json` |
+| Jobright extension autofill | ✅ Extension in Chrome profile |
 | Final application submit | ✅ With `--auto-submit` |
-| USAJobs login | ✅ Auto from `.env` via login.gov — pauses for 2FA the first time only |
-| Workday portals that reject `COMPANY_EMAIL` | ⚠️ One-time per company via `prepare-sessions` |
-| Jobright extension install | ⚠️ One-time via `setup` |
+| Session self-healing (LinkedIn, Jobright, Indeed) | ✅ Fully automated |
+| Session self-healing (USAJobs 2FA) | ✅ iMessage prompt + mtime polling |
+| Regression test on each self-heal | ✅ Auto-written to `tests/test_reauth_regressions.py` |
+| iMessage on each self-heal | ✅ Sent to `NOTIFY_PHONE` |
+| Workday portals that reject `COMPANY_EMAIL` | ⚠️ One-time `prepare-sessions` per company |
+| Jobright extension install | ⚠️ One-time `setup` |
+| USAJobs 2FA (first run only) | ⚠️ Human in browser, then auto thereafter |
 
 ---
 
 ## Apply Workflow
-
-### Claude ATS Scoring (runs on every external ATS job)
-
-Before filling any form, Claude Haiku analyzes the job description against your resume and returns:
-- **ATS score** (0–100) — keyword match percentage
-- **Missing keywords** — what's in the JD but not your resume
-- **Tailored summary + bullets** — rewritten for this specific role
-- **Cover letter** — 3-paragraph, role-specific
-
-If the ATS score is below 85 and `--auto-submit` is set, a yellow warning is printed but the application still proceeds.
 
 ### Resume Priority Order
 
@@ -133,40 +255,41 @@ If the ATS score is below 85 and `--auto-submit` is set, a yellow warning is pri
 4. `LOCAL_RESUME_PATH` / `RESUME_PATH` env vars
 5. Common locations: `state/resumes/`, `~/Documents/Job App/`, `~/Downloads/`, `~/Desktop/`
 
+### Claude ATS Scoring
+
+Before filling any form, Claude Haiku analyzes the job description and returns:
+
+- **ATS score** (0–100) — keyword match against your resume
+- **Missing keywords** — in the JD but not your resume
+- **Tailored summary + bullets** — rewritten for this specific role
+- **Cover letter** — 3-paragraph, role-specific
+
+If the ATS score is below 85 and `--auto-submit` is set, a warning is printed but the application proceeds.
+
 ### Jobright Jobs
 
-1. Opens the Jobright job detail page
-2. Extracts the company ATS URL
-3. Runs Jobright Orion AI resume tailoring; falls back to Claude PDF if Orion fails (~60% failure rate)
-4. Opens the ATS URL
-5. Runs Claude ATS scoring on the job description
-6. Triggers Jobright Autofill extension
-7. Runs pre-submit validation checklist (resume uploaded, required fields filled)
-8. Submits unless `--auto-submit` is not set
+1. Opens job detail page and extracts company ATS URL
+2. Runs Jobright Orion AI resume tailoring; falls back to Claude PDF if Orion fails
+3. Opens ATS URL and runs Claude ATS scoring
+4. Triggers Jobright Autofill extension for form filling
+5. Runs pre-submit validation checklist (resume uploaded, required fields filled)
+6. Submits unless `--auto-submit` is not set
 
 ### LinkedIn Jobs
 
-1. Attempts Jobright resume tailoring first (same as above)
+1. Runs Jobright resume tailoring first (same as above)
 2. Opens LinkedIn job page
 3. Supports both legacy modal Easy Apply and newer full-page `/jobs/view/<id>/apply/` flows
-4. Autofills phone/contact/profile fields from `state/profile.json`
+4. Autofills phone, contact, and profile fields from `state/profile.json`
 5. Uploads tailored or fallback resume
-6. If no LinkedIn-hosted apply flow found, extracts the external ATS URL and routes to the Jobright ATS path
-
-### Session Management
-
-Most logins are automatic. Workday portals are the exception — each company's Workday instance requires a one-time manual login:
-
-```bash
-python src/main.py prepare-sessions              # opens all session-blocked jobs
-python src/main.py prepare-sessions --source jobright --company "CVS"
-```
+6. If no LinkedIn apply flow found, extracts external ATS URL and routes to ATS path
 
 ---
 
 ## Scoring Criteria
 
 ### Target Roles
+
 - Director of Software Engineering / Director of IT
 - VP of IT / VP of Software Engineering / AVP of Software Engineering
 - CTO / CIO / Engineering Manager
@@ -175,11 +298,13 @@ python src/main.py prepare-sessions --source jobright --company "CVS"
 - DoD/cleared positions at matching seniority
 
 ### Rejected Roles
+
 - Software Engineer / Developer (IC)
 - Staff / Principal Engineer (IC)
 - Data Engineer / DevOps Engineer (unless Manager/Director of)
 
 ### Compensation Thresholds
+
 | Work type | Min |
 |---|---|
 | Remote | $180k |
@@ -196,6 +321,7 @@ Missing salary: always flag for review.
 ---
 
 ## Review Queue Controls
+
 ```
 [A] Apply     — mark job for application
 [S] Skip      — skip and never show again
@@ -205,13 +331,57 @@ Missing salary: always flag for review.
 
 ---
 
+## Testing
+
+```bash
+source .venv/bin/activate
+pytest tests/test_reauth_unit.py tests/test_reauth_feature.py -v
+```
+
+| Suite | Tests | Coverage |
+|---|---|---|
+| `test_reauth_unit.py` | 53 | `AuthFailedError`, `_safe_evaluate`, `_safe_goto`, `record_reauth_event`, `ReauthManager` routing, automated reauth, human reauth, `_write_regression_test`, `_notify_correction` |
+| `test_reauth_feature.py` | 16 | Full orchestrator flows: discover + apply with reauth success/failure/retry-failure paths; `_safe_evaluate` integration through concrete scrapers |
+| `test_reauth_regressions.py` | auto-grows | Appended by `ReauthManager` every time a real session self-heals in production |
+| `test_state_manager.py` | — | SQLite persistence layer |
+| `test_apply_functional.py` | — | Apply-workflow end-to-end |
+| `test_credentials.py` | — | Credential loading and validation |
+
+---
+
+## Notifications
+
+Every significant event writes to `state/agent_status.json` and fires a native macOS notification banner. The `reauth_events` list in that file is capped at 100 entries and records every reauth attempt outcome for post-run inspection.
+
+| Event | Channel |
+|---|---|
+| Auth failure detected | macOS notification |
+| Automated reauth started | macOS notification |
+| Session refreshed (automated) | macOS notification + iMessage |
+| Session refreshed (human-assisted) | macOS notification + iMessage |
+| Reauth timed out | macOS notification |
+| Missing credentials | macOS notification |
+
+iMessage format on self-heal:
+
+```
+✅ Job Agent self-healed: JOBRIGHT
+What failed: redirect to /login
+How fixed: automated reauth
+When: 2026-06-26 14:22:01 UTC
+Status: Session refreshed — source will be retried
+```
+
+---
+
 ## Safety
 
 - `--auto-submit` is required for actual submission — runs without it stop before the final click
-- All discovered jobs stored in SQLite (`state/jobs.db`) — never applies to the same job twice
-- Browser runs in headed (visible) mode — Chrome windows open and close automatically; no interaction needed
-- `python src/main.py preflight` reports session blockers before you start a full run
+- All discovered jobs are stored in SQLite — the agent never applies to the same job twice
+- Browser runs in headed (visible) mode — Chrome windows open and close automatically
+- `python src/main.py preflight` reports session blockers before a full run
 - `python src/main.py ops-check` runs preflight + mock Playwright apply-path tests
+- Never commit `.env`, `state/jobs.db`, `state/profile.json`, `state/sessions/`, or `state/tailored_resumes/`
 
 ---
 
@@ -219,47 +389,8 @@ Missing salary: always flag for review.
 
 ```bash
 # Example: run every weekday at 8am
-# Add to crontab (crontab -e)
+# crontab -e
 0 8 * * 1-5 cd /Users/alarkins/Dev/Projects/job-agent && source .venv/bin/activate && python src/main.py apply --auto-submit >> /tmp/job-agent.log 2>&1
 ```
 
-Chrome windows open and close automatically. No user presence needed.
-
----
-
-## Project Structure
-
-```
-job-agent/
-├── src/
-│   ├── main.py              # CLI entry point + command definitions
-│   ├── orchestrator.py      # Flow coordinator (discover, apply, setup, prepare-sessions)
-│   ├── scorer.py            # Claude-powered job scoring
-│   ├── state_manager.py     # SQLite state + analytics persistence
-│   ├── review_queue.py      # Rich terminal review UI
-│   └── sources/
-│       ├── base.py          # BaseScraper: Chrome profile, session management, delays
-│       ├── jobright.py      # Jobright discovery, Orion tailoring, Claude ATS, external ATS autofill
-│       ├── linkedin.py      # LinkedIn discovery, saved jobs, Easy Apply, full-page apply
-│       └── usajobs.py       # USAJobs.gov discovery + application
-├── state/
-│   ├── jobs.db              # SQLite DB (auto-created, gitignored)
-│   ├── profile.json         # Your real work history/skills for form autofill (gitignored)
-│   ├── sessions/            # Persistent Chrome profiles per source (gitignored)
-│   ├── tailored_resumes/    # Claude + Jobright generated PDFs (gitignored)
-│   └── extensions/          # Local Chrome extension fallbacks (gitignored)
-├── dashboard/               # Render.com cloud API + approval UI
-├── config.json              # Scoring config, resume path, search settings
-├── .env                     # Credentials + API keys (never committed)
-├── DEVELOPER_ONBOARDING.md  # Engineering internals and architecture
-└── requirements.txt
-```
-
----
-
-## Notes
-
-- `state/profile.json` must contain real data (name, phone, work history, skills) — placeholder values cause LinkedIn Easy Apply validation failures
-- The job-agent Chrome profile (`state/sessions/jobright_profile`) is separate from your personal Chrome profile — no risk of corruption or conflict
-- Sessions in the Chrome profile persist between runs; if a session expires, the scraper auto-re-logs in using `.env` credentials
-- Do not commit `.env`, `state/jobs.db`, `state/profile.json`, or anything under `state/sessions/` or `state/tailored_resumes/`
+Chrome opens and closes automatically — no user presence required. If a session expires mid-run, `ReauthManager` recovers it and retries the source without interrupting the rest of the queue.
