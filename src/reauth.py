@@ -1,23 +1,30 @@
 """
 ReauthManager — recover from expired source sessions automatically.
 
-Automated path (jobright, indeed):
+Automated path (jobright, indeed, linkedin):
     Spins up a fresh Playwright context, calls the source's existing
     _auto_login(), saves the refreshed session, returns True/False.
 
-Human-assisted path (linkedin, usajobs):
+Human-assisted path (usajobs):
     Sends an iMessage to NOTIFY_PHONE with the exact terminal command
     to run, then polls the session file mtime until the user completes
     the interactive login (or the timeout expires).
+
+On every successful correction:
+    1. A regression test is appended to tests/test_reauth_regressions.py
+       documenting the exact failure pattern so it can be caught in CI.
+    2. An iMessage is sent to NOTIFY_PHONE summarising what was fixed.
 """
 from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import time
 import logging
 
+from datetime import datetime, timezone
 from pathlib import Path
 from .sources.base import SESSIONS_DIR
 from .notifier import notify_error, notify_info, notify_warning, record_reauth_event, _macos_notify
@@ -45,6 +52,9 @@ class ReauthManager:
         self.notify_phone = os.environ.get("NOTIFY_PHONE", "")
         self.timeout_discover = int(os.environ.get("REAUTH_TIMEOUT_MINUTES", "30"))
         self.timeout_apply    = int(os.environ.get("REAUTH_TIMEOUT_APPLY_MINUTES", "10"))
+        self.regression_test_path: Path = (
+            Path(__file__).parent.parent / "tests" / "test_reauth_regressions.py"
+        )
 
     async def handle(self, source: str, detail: str = "", context: str = "discover") -> bool:
         """Attempt session recovery for *source*.
@@ -94,6 +104,8 @@ class ReauthManager:
                 await scraper._export_session_json()
                 record_reauth_event(source, "automated", "success")
                 notify_info(f"{source} reauth", "Session refreshed automatically — retrying")
+                self._write_regression_test(source, "automated", "_auto_login returned True after session expiry")
+                self._notify_correction(source, "automated", "_auto_login returned True after session expiry")
                 return True
             else:
                 record_reauth_event(source, "automated", "failed", "_auto_login returned False")
@@ -142,6 +154,8 @@ class ReauthManager:
             if session_file.exists() and session_file.stat().st_mtime > baseline_mtime:
                 record_reauth_event(source, "human", "session_refreshed")
                 notify_info(f"{source} session refreshed", "Session file updated — retrying source")
+                self._write_regression_test(source, "human", detail)
+                self._notify_correction(source, "human", detail)
                 return True
 
         record_reauth_event(source, "human", "timeout", f"No refresh after {timeout_minutes} min")
@@ -150,6 +164,71 @@ class ReauthManager:
             f"Session was not refreshed within {timeout_minutes} minutes. Skipping source this run.",
         )
         return False
+
+    # ------------------------------------------------------------------
+    # Intelligent self-healing: regression test + iMessage notification
+    # ------------------------------------------------------------------
+
+    def _write_regression_test(self, source: str, mode: str, detail: str) -> None:
+        """Append an auto-generated regression test to tests/test_reauth_regressions.py."""
+        ts = datetime.now(timezone.utc)
+        ts_slug = ts.strftime("%Y%m%d_%H%M%S")
+        ts_human = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        strategy = "_reauth_automated" if mode == "automated" else "_reauth_human"
+        set_name = "AUTOMATED_SOURCES" if mode == "automated" else "HUMAN_SOURCES"
+
+        safe_detail = re.sub(r"[^\w\s.,:;'()/-]", "", detail)[:120]
+
+        test_body = f'''
+@pytest.mark.asyncio
+async def test_regression_{source}_{ts_slug}():
+    """Auto-generated regression: {source} — {safe_detail} — corrected {ts_human}"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "{source}" in {set_name}
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("{source}", "{safe_detail}")
+    assert exc.source == "{source}"
+    assert "{safe_detail}" in str(exc)
+
+    # Verify ReauthManager routes to the correct strategy
+    mgr = ReauthManager(config={{}})
+    with patch.object(mgr, "{strategy}", new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle("{source}", "{safe_detail}")
+        mock.assert_called_once()
+    assert result is True
+'''
+
+        regression_path = self.regression_test_path
+
+        if not regression_path.exists():
+            header = (
+                '"""Auto-generated regression tests — written by ReauthManager on each successful self-heal."""\n'
+                "import pytest\n"
+            )
+            regression_path.write_text(header)
+
+        with regression_path.open("a") as fh:
+            fh.write(test_body)
+
+        _log.info("ReauthManager: regression test written for %s (%s)", source, ts_slug)
+
+    def _notify_correction(self, source: str, mode: str, detail: str) -> None:
+        """Send an iMessage summarising the successful self-heal."""
+        ts_human = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        msg = (
+            f"✅ Job Agent self-healed: {source.upper()}\n"
+            f"What failed: {detail}\n"
+            f"How fixed: {mode} reauth\n"
+            f"When: {ts_human}\n"
+            f"Status: Session refreshed — source will be retried"
+        )
+        _send_imessage(self.notify_phone, msg)
 
 
 # ------------------------------------------------------------------
