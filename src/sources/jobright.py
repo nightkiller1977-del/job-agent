@@ -261,8 +261,7 @@ class JobrightScraper(BaseScraper):
             # a brief redirect/validation pass that invalidates the page handle if we
             # call page.evaluate too soon.
             if _is_teamtailor:
-                await asyncio.sleep(4)
-                # Wait for the actual form fields to appear
+                # Wait for the actual form fields to appear (replaces fixed sleep)
                 for _form_sel in [
                     'input[name="job_application[name]"]',
                     'input[name*="name"]',
@@ -471,7 +470,7 @@ class JobrightScraper(BaseScraper):
 
         await improve_btn.click()
         await self._delay(2, 3)
-        await page.evaluate("""
+        await self._safe_evaluate(page, """
         () => {
             const labels = Array.from(document.querySelectorAll('label, span, p'));
             const fullEdit = labels.find(l => l.textContent.trim().match(/^full edit/i));
@@ -479,7 +478,7 @@ class JobrightScraper(BaseScraper):
             document.querySelectorAll('input[type="checkbox"]:not(:checked)')
                 .forEach(cb => cb.click());
         }
-        """)
+        """, default=None)
         await self._delay(1, 2)
 
         gen_btn = None
@@ -503,8 +502,10 @@ class JobrightScraper(BaseScraper):
         console.print("[magenta]Jobright Tailor:[/magenta] Generating tailored resume…")
         for _ in range(15):
             await asyncio.sleep(2)
-            buttons = await page.evaluate(
-                "Array.from(document.querySelectorAll('button')).map(b=>b.textContent.trim())"
+            buttons = await self._safe_evaluate(
+                page,
+                "Array.from(document.querySelectorAll('button')).map(b=>b.textContent.trim())",
+                default=[],
             )
             if any("Download" in text for text in buttons):
                 break
@@ -753,7 +754,7 @@ class JobrightScraper(BaseScraper):
         await self._delay(0.5, 1.0)
 
         # ── Step 2a: select Full Edit radio ──────────────────────────────────
-        full_edit_result = await page.evaluate("""
+        full_edit_result = await self._safe_evaluate(page, """
         () => {
             // Method 1: find the <input type="radio"> whose associated label starts with "Full Edit"
             for (const radio of document.querySelectorAll('input[type="radio"]')) {
@@ -777,12 +778,12 @@ class JobrightScraper(BaseScraper):
             }
             return 'full-edit-not-found';
         }
-        """)
+        """, default="evaluate-failed")
         console.print(f"[magenta]Jobright Tailor:[/magenta] Full Edit: {full_edit_result}")
         await self._delay(0.3, 0.6)
 
         # ── Step 2b: select ALL skill keywords ───────────────────────────────
-        kw_result = await page.evaluate("""
+        kw_result = await self._safe_evaluate(page, """
         () => {
             // Prefer the "Select all" button (becomes "Unselect all" when already all-selected)
             const controls = Array.from(
@@ -805,7 +806,7 @@ class JobrightScraper(BaseScraper):
             }
             return 'all-keywords-already-checked';
         }
-        """)
+        """, default="evaluate-failed")
         console.print(f"[magenta]Jobright Tailor:[/magenta] Keywords: {kw_result}")
         await self._delay(0.5, 1.0)
 
@@ -833,9 +834,11 @@ class JobrightScraper(BaseScraper):
         # ── Step 3: wait for Review step (Download Resume or APPLY NOW) ───────
         for _ in range(15):
             await asyncio.sleep(2)
-            btns = await page.evaluate(
+            btns = await self._safe_evaluate(
+                page,
                 "Array.from(document.querySelectorAll('button, a'))"
-                ".map(b => (b.textContent || b.innerText || '').trim())"
+                ".map(b => (b.textContent || b.innerText || '').trim())",
+                default=[],
             )
             if any(re.search(r'download\s*resume|apply\s*now', t, re.IGNORECASE) for t in btns):
                 console.print("[magenta]Jobright Tailor:[/magenta] Orion Step 3 — review loaded.")
@@ -982,7 +985,8 @@ class JobrightScraper(BaseScraper):
         return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
 
     async def _click_first_button_text(self, page, patterns: list[str]) -> bool:
-        return await page.evaluate(
+        return await self._safe_evaluate(
+            page,
             """
             (patterns) => {
                 const regexes = patterns.map(p => new RegExp(p, 'i'));
@@ -1018,6 +1022,7 @@ class JobrightScraper(BaseScraper):
             }
             """,
             patterns,
+            default=False,
         )
 
     def _tailored_resume_filename(self, job: dict) -> str:
@@ -1127,7 +1132,10 @@ class JobrightScraper(BaseScraper):
                         clicked = True
                         console.print(f"[magenta]Jobright:[/magenta] Clicked sign-in trigger.")
                         break
-                except Exception:
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                        raise
                     continue
 
             if not clicked:
@@ -1151,7 +1159,10 @@ class JobrightScraper(BaseScraper):
                         email_input = elem
                         console.print(f"[magenta]Jobright:[/magenta] Found email field.")
                         break
-                except Exception:
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                        raise
                     continue
 
             if not email_input:
@@ -1181,12 +1192,15 @@ class JobrightScraper(BaseScraper):
                 'button:text("Log In")',
             ]:
                 try:
-                    btn = await page.wait_for_selector(submit_sel, timeout=3000)
+                    btn = await page.wait_for_selector(submit_sel, timeout=8000)
                     if btn:
                         await btn.click()
                         submitted = True
                         break
-                except Exception:
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                        raise
                     continue
 
             if not submitted:
@@ -1223,9 +1237,9 @@ class JobrightScraper(BaseScraper):
                 break
 
             # Scroll to load lazy content
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await self._safe_evaluate(page, "window.scrollTo(0, document.body.scrollHeight)", default=None)
             await self._delay(1, 1.5)
-            await page.evaluate("window.scrollTo(0, 0)")
+            await self._safe_evaluate(page, "window.scrollTo(0, 0)", default=None)
             await self._delay(0.5, 1)
 
             page_jobs = await self._js_extract(page)
@@ -1273,7 +1287,7 @@ class JobrightScraper(BaseScraper):
 
     async def _js_extract(self, page) -> list[dict]:
         """Use page.evaluate() to extract all job cards using the real Jobright DOM structure."""
-        raw = await page.evaluate("""
+        raw = await self._safe_evaluate(page, """
         () => {
             const JOBRIGHT_BASE = 'https://jobright.ai';
             const cards = document.querySelectorAll('[class*="index_job-card__"]');
@@ -1308,7 +1322,7 @@ class JobrightScraper(BaseScraper):
             }
             return jobs;
         }
-        """)
+        """, default=[])
 
         results = []
         now = datetime.utcnow().isoformat()
@@ -1502,8 +1516,10 @@ class JobrightScraper(BaseScraper):
 
             # ── Step 6: Open ATS via Jobright Apply button (triggers extension autofill)
             # Close the Orion resume modal first
-            await page.evaluate(
-                "document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,bubbles:true}))"
+            await self._safe_evaluate(
+                page,
+                "document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,bubbles:true}))",
+                default=None,
             )
             await self._delay(1, 2)
 
@@ -1833,7 +1849,8 @@ class JobrightScraper(BaseScraper):
 
     async def _click_visible_control_by_text(self, page, patterns: list[str]) -> bool:
         """Click the first visible button/link/control whose text matches."""
-        return await page.evaluate(
+        return await self._safe_evaluate(
+            page,
             """
             (patterns) => {
                 const regexes = patterns.map(p => new RegExp(p, 'i'));
@@ -1871,6 +1888,7 @@ class JobrightScraper(BaseScraper):
             }
             """,
             patterns,
+            default=False,
         )
 
     async def _visible_controls_snapshot(self, page, limit: int = 40) -> list[dict]:
@@ -1998,7 +2016,8 @@ class JobrightScraper(BaseScraper):
 
     async def _click_first_matching_link_or_button(self, page, patterns: list[str]) -> bool:
         """Like _click_visible_control_by_text but returns href navigation for anchors when possible."""
-        return await page.evaluate(
+        return await self._safe_evaluate(
+            page,
             """
             (patterns) => {
                 const regexes = patterns.map(p => new RegExp(p, 'i'));
@@ -2040,6 +2059,7 @@ class JobrightScraper(BaseScraper):
             }
             """,
             patterns,
+            default=False,
         )
 
     async def _looks_like_application_form(self, page) -> bool:
@@ -2133,7 +2153,7 @@ class JobrightScraper(BaseScraper):
         ]
         for sel in popup_selectors:
             try:
-                btn = await page.wait_for_selector(sel, timeout=3000)
+                btn = await page.wait_for_selector(sel, timeout=8000)
                 if btn and await btn.is_visible():
                     await btn.click()
                     console.print("[dim]Jobright: dismissed popup[/dim]")
@@ -2161,7 +2181,7 @@ class JobrightScraper(BaseScraper):
         Extract the company ATS application URL directly from the Jobright DOM.
         Tries Next.js page data first, then scans anchor tags for known ATS hostnames.
         """
-        url = await page.evaluate("""
+        url = await self._safe_evaluate(page, """
         () => {
             // 1. Try Next.js __NEXT_DATA__ (most reliable)
             try {
@@ -2196,7 +2216,7 @@ class JobrightScraper(BaseScraper):
 
             return '';
         }
-        """)
+        """, default="")
         if url:
             return url
         return await self._reveal_external_url_with_autofill(page)
@@ -2302,7 +2322,7 @@ class JobrightScraper(BaseScraper):
                 'input[autocomplete="username"]',
             ]:
                 try:
-                    elem = await page.wait_for_selector(sel, timeout=4000)
+                    elem = await page.wait_for_selector(sel, timeout=8000)
                     if elem:
                         await elem.click()
                         await self._delay(0.3, 0.6)
@@ -2324,7 +2344,7 @@ class JobrightScraper(BaseScraper):
                 'button[type="submit"]',
             ]:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=3000)
+                    btn = await page.wait_for_selector(sel, timeout=8000)
                     if btn and await btn.is_visible():
                         await btn.click()
                         await self._delay(2, 3)
@@ -2352,7 +2372,7 @@ class JobrightScraper(BaseScraper):
                 'button[type="submit"]',
             ]:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=3000)
+                    btn = await page.wait_for_selector(sel, timeout=8000)
                     if btn and await btn.is_visible():
                         await btn.click()
                         await self._delay(5, 8)  # wait for redirect
@@ -2380,7 +2400,7 @@ class JobrightScraper(BaseScraper):
         try:
             for sel in ['input[type="email"]', 'input[name*="email" i]', 'input[placeholder*="email" i]']:
                 try:
-                    elem = await page.wait_for_selector(sel, timeout=3000)
+                    elem = await page.wait_for_selector(sel, timeout=8000)
                     if elem:
                         await elem.triple_click()
                         await elem.type(email, delay=80)
@@ -2390,7 +2410,7 @@ class JobrightScraper(BaseScraper):
                     continue
             for sel in ['button:text-matches("^Next$","i")', 'button:text-matches("^Continue$","i")', 'button[type="submit"]']:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=2000)
+                    btn = await page.wait_for_selector(sel, timeout=8000)
                     if btn and await btn.is_visible():
                         await btn.click()
                         await self._delay(2, 3)
@@ -2407,7 +2427,7 @@ class JobrightScraper(BaseScraper):
                 return
             for sel in ['button:text-matches("^Sign In$","i")', 'button:text-matches("^Log In$","i")', 'button[type="submit"]']:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=2000)
+                    btn = await page.wait_for_selector(sel, timeout=8000)
                     if btn and await btn.is_visible():
                         await btn.click()
                         await self._delay(5, 8)
@@ -2660,7 +2680,7 @@ class JobrightScraper(BaseScraper):
 
         for sel in apply_selectors:
             try:
-                btn = await page.wait_for_selector(sel, timeout=4000)
+                btn = await page.wait_for_selector(sel, timeout=8000)
                 if btn:
                     await btn.click()
                     console.print(f"[magenta]Jobright:[/magenta] Clicked Apply button → waiting for form…")
@@ -3072,7 +3092,7 @@ class JobrightScraper(BaseScraper):
 
         for sel in selectors:
             try:
-                elem = await page.wait_for_selector(sel, timeout=3000)
+                elem = await page.wait_for_selector(sel, timeout=8000)
                 if elem:
                     await elem.click()
                     console.print(f"[green]Jobright:[/green] Extension autofill triggered")
@@ -3111,16 +3131,16 @@ class JobrightScraper(BaseScraper):
         # The Jobright extension often fills forms silently without a button click.
         # When opened via the Jobright Apply button, it fires automatically.
         # Wait up to 20 seconds for form fields to get populated.
-        console.print("[dim]Jobright: no autofill button found — waiting 20s for extension auto-fill…[/dim]")
+        console.print("[dim]Jobright: no autofill button found — waiting for extension auto-fill (networkidle)…[/dim]")
         try:
-            await asyncio.sleep(20)
+            await page.wait_for_load_state("networkidle", timeout=20000)
             # Check if any input fields got filled
-            filled = await page.evaluate("""
+            filled = await self._safe_evaluate(page, """
                 () => {
                     const inputs = [...document.querySelectorAll('input:not([type="hidden"]):not([type="file"]), textarea')];
                     return inputs.some(i => (i.value || '').trim().length > 0);
                 }
-            """)
+            """, default=False)
             if filled:
                 console.print("[green]Jobright:[/green] Extension auto-filled form fields")
                 return True
@@ -3442,7 +3462,7 @@ class JobrightScraper(BaseScraper):
         submit_btn = None
         for sel in submit_selectors:
             try:
-                btn = await page.wait_for_selector(sel, timeout=4000)
+                btn = await page.wait_for_selector(sel, timeout=8000)
                 if btn and await btn.is_visible():
                     submit_btn = btn
                     break
@@ -3541,9 +3561,9 @@ class JobrightScraper(BaseScraper):
                 await page.evaluate("btn => btn.click()", submit_btn)
             except Exception:
                 # Fallback: dispatch a MouseEvent directly
-                await page.evaluate("""btn => {
+                await self._safe_evaluate(page, """btn => {
                     btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-                }""", submit_btn)
+                }""", submit_btn, default=None)
             await self._delay(3, 5)
             # ── Record analytics for orchestrator to persist via extra_json ──
             self._apply_analytics = {
