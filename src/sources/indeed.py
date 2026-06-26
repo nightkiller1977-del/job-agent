@@ -23,7 +23,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from .base import BaseScraper, JobExpiredError
+from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error
 
 console = Console()
@@ -68,8 +68,8 @@ class IndeedScraper(BaseScraper):
                     console.print("[blue]Indeed:[/blue] Not logged in — attempting auto-login…")
                     if not await self._auto_login(page, email, password):
                         if not (sys.stdin and sys.stdin.isatty()):
-                            console.print("[red]Indeed: Auto-login failed (non-interactive). Skipping.[/red]")
-                            return []
+                            console.print("[red]Indeed: Auto-login failed (non-interactive). Raising AuthFailedError.[/red]")
+                            raise AuthFailedError("indeed", "Auto-login returned False (non-interactive)")
                         console.print(
                             "\n[yellow]Indeed:[/yellow] Auto-login failed.\n"
                             "  → Log in manually in the browser window, then press Enter."
@@ -79,8 +79,8 @@ class IndeedScraper(BaseScraper):
                         await self._delay(2, 3)
                 else:
                     if not (sys.stdin and sys.stdin.isatty()):
-                        console.print("[red]Indeed: Not logged in, no credentials, non-interactive. Skipping.[/red]")
-                        return []
+                        console.print("[red]Indeed: Not logged in, no credentials, non-interactive. Raising AuthFailedError.[/red]")
+                        raise AuthFailedError("indeed", "Not logged in and no credentials in .env")
                     console.print(
                         "\n[yellow]Indeed:[/yellow] Not logged in.\n"
                         "  → Log in to indeed.com in the browser, then press Enter."
@@ -92,8 +92,8 @@ class IndeedScraper(BaseScraper):
             console.print(f"[blue]Indeed:[/blue] Page loaded: {page.url}")
 
             if "indeed.com" not in page.url:
-                console.print("[red]Indeed: Could not navigate to jobs page — skipping.[/red]")
-                return []
+                console.print("[red]Indeed: Could not navigate to jobs page — raising AuthFailedError.[/red]")
+                raise AuthFailedError("indeed", f"Unexpected redirect to {page.url}")
 
             # Run configured keyword search if present
             search   = self.config.get("search_settings", {})
