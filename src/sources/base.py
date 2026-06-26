@@ -326,6 +326,39 @@ class BaseScraper(ABC):
         except Exception:
             return False
 
+    async def _safe_evaluate(self, page, script, *args, default=None):
+        """Wrap page.evaluate() so browser-death errors propagate and others are logged.
+
+        If the browser/page/context has closed, re-raises so the orchestrator
+        can catch it. Any other evaluate error logs a warning and returns default.
+        """
+        try:
+            if args:
+                return await page.evaluate(script, *args)
+            return await page.evaluate(script)
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(k in err for k in ["closed", "target page", "detached", "crashed", "browser has been"]):
+                raise
+            import logging
+            logging.getLogger(__name__).warning("%s: evaluate failed (non-fatal): %s", self.name, exc)
+            return default
+
+    async def _safe_goto(self, page, url: str, timeout: int = 30000, wait_until: str = "domcontentloaded") -> bool:
+        """Navigate to url, return False on failure instead of raising.
+        Re-raises if the browser/context itself has closed.
+        """
+        try:
+            await page.goto(url, wait_until=wait_until, timeout=timeout)
+            return True
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(k in err for k in ["closed", "target page", "detached", "crashed", "browser has been"]):
+                raise
+            import logging
+            logging.getLogger(__name__).warning("%s: goto %s failed: %s", self.name, url, exc)
+            return False
+
     def _check_logged_in_redirect(self, page: Page, expected_domain: str) -> bool:
         """Returns True if the page URL contains the expected domain."""
         return expected_domain in page.url
