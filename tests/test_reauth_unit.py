@@ -510,3 +510,63 @@ class TestReauthHuman:
         outcomes = [e["outcome"] for e in events if e["source"] == "usajobs"]
         assert "waiting" in outcomes
         assert "timeout" in outcomes
+
+
+# ── _write_regression_test & _notify_correction ────────────────────────────────
+
+class TestSelfHealingNotifications:
+    def test_write_regression_test_creates_file_with_valid_python(self, tmp_path):
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        test_file = tmp_path / "test_reauth_regressions.py"
+        mgr.regression_test_path = test_file
+
+        mgr._write_regression_test("jobright", "automated", "redirect to /login")
+
+        assert test_file.exists()
+        content = test_file.read_text()
+        assert "def test_regression_jobright_" in content
+        assert "redirect to /login" in content
+        assert "AUTOMATED_SOURCES" in content
+
+    def test_write_regression_test_appends_on_subsequent_calls(self, tmp_path):
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        test_file = tmp_path / "test_reauth_regressions.py"
+        test_file.write_text('"""existing header"""\nimport pytest\n')
+        mgr.regression_test_path = test_file
+
+        mgr._write_regression_test("indeed", "automated", "cookie missing")
+
+        content = test_file.read_text()
+        assert "existing header" in content
+        assert "def test_regression_indeed_" in content
+
+    def test_notify_correction_sends_imessage_with_correct_fields(self):
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        mgr.notify_phone = "+15551234567"
+
+        with patch("src.reauth._send_imessage") as mock_send:
+            mgr._notify_correction("linkedin", "automated", "li_at cookie expired")
+
+        mock_send.assert_called_once()
+        phone, msg = mock_send.call_args[0]
+        assert phone == "+15551234567"
+        assert "LINKEDIN" in msg
+        assert "automated" in msg
+        assert "li_at cookie expired" in msg
+        assert "self-healed" in msg
+
+    def test_notify_correction_human_mode_message(self):
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        mgr.notify_phone = "+15559876543"
+
+        with patch("src.reauth._send_imessage") as mock_send:
+            mgr._notify_correction("usajobs", "human", "2FA completed")
+
+        _, msg = mock_send.call_args[0]
+        assert "human" in msg
+        assert "USAJOBS" in msg
+        assert "Session refreshed" in msg
