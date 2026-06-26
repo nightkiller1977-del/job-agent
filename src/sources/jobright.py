@@ -1040,8 +1040,9 @@ class JobrightScraper(BaseScraper):
             await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
 
-            # Check for login redirect
-            if "/login" in page.url or "/signin" in page.url or "auth" in page.url or "jobright.ai" not in page.url:
+            # Check for login redirect — includes home-page redirect when session
+            # is expired (jobright.ai/jobs/recommend → jobright.ai/ with no /jobs path)
+            if "/login" in page.url or "/signin" in page.url or "auth" in page.url or "jobright.ai" not in page.url or "jobright.ai/jobs" not in page.url:
                 email = os.environ.get("JOBRIGHT_EMAIL", "")
                 password = os.environ.get("JOBRIGHT_PASSWORD", "")
                 if email and password:
