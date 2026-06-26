@@ -20,8 +20,9 @@ from .sources.linkedin import LinkedInScraper
 from .sources.usajobs import USAJobsScraper
 from .sources.indeed import IndeedScraper
 
-from .sources.base import JobExpiredError
+from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_info, notify_warning, record_run_stats
+from .reauth import ReauthManager
 
 console = Console()
 
@@ -100,6 +101,21 @@ class Orchestrator:
             try:
                 jobs = await scraper.scrape()
                 console.print(f"  Scraped {len(jobs)} raw jobs from {src_name}")
+            except AuthFailedError as auth_exc:
+                console.print(f"[yellow]{src_name}: session expired — attempting reauth…[/yellow]")
+                reauth_mgr = ReauthManager(self.config)
+                refreshed = await reauth_mgr.handle(src_name, auth_exc.detail, context="discover")
+                if refreshed:
+                    try:
+                        scraper2 = SOURCE_MAP[src_name](self.config)
+                        jobs = await scraper2.scrape()
+                        console.print(f"  Scraped {len(jobs)} raw jobs from {src_name} (after reauth)")
+                    except Exception as retry_exc:
+                        console.print(f"[red]{src_name} scrape failed after reauth:[/red] {retry_exc}")
+                        jobs = []
+                else:
+                    console.print(f"[red]{src_name} reauth failed — skipping this run.[/red]")
+                    jobs = []
             except Exception as exc:
                 console.print(f"[red]{src_name} scrape failed:[/red] {exc}")
                 jobs = []
@@ -615,6 +631,40 @@ class Orchestrator:
                     await self._push_apply_attempt_to_cloud(job["job_id"])
                     skipped_count += 1
                     outcomes.append({"job": job, "status": code, "reason": reason})
+            except AuthFailedError as auth_exc:
+                console.print(f"[yellow]{src} apply: session expired — attempting reauth…[/yellow]")
+                reauth_mgr = ReauthManager(self.config)
+                refreshed = await reauth_mgr.handle(src, auth_exc.detail, context="apply")
+                if refreshed:
+                    try:
+                        scraper2 = SOURCE_MAP[src](self.config)
+                        result = await scraper2.apply(job, auto_submit=auto_submit)
+                        if result:
+                            self.state.set_status(job["job_id"], "applied")
+                            self.state.record_apply_attempt(job["job_id"], "applied", "Submitted after reauth.")
+                            applied_count += 1
+                            outcomes.append({"job": job, "status": "applied", "reason": "submitted after reauth"})
+                            console.print("[green]Applied after reauth! Status updated.[/green]")
+                            await self._push_status_to_cloud(job["job_id"], "applied")
+                            await self._push_apply_attempt_to_cloud(job["job_id"])
+                        else:
+                            reason = getattr(scraper2, "last_apply_detail", "") or "not submitted"
+                            code   = getattr(scraper2, "last_apply_status",  "") or "blocked"
+                            self.state.record_apply_attempt(job["job_id"], code, reason)
+                            await self._push_apply_attempt_to_cloud(job["job_id"])
+                            skipped_count += 1
+                            outcomes.append({"job": job, "status": code, "reason": reason})
+                    except Exception as retry_exc:
+                        console.print(f"[red]{src} apply failed after reauth:[/red] {retry_exc}")
+                        self.state.record_apply_attempt(job["job_id"], "reauth_retry_error", str(retry_exc)[:400])
+                        await self._push_apply_attempt_to_cloud(job["job_id"])
+                        failed_count += 1
+                        outcomes.append({"job": job, "status": "reauth_retry_error", "reason": str(retry_exc)})
+                else:
+                    self.state.record_apply_attempt(job["job_id"], "reauth_failed", auth_exc.detail[:400])
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    skipped_count += 1
+                    outcomes.append({"job": job, "status": "reauth_failed", "reason": auth_exc.detail})
             except JobExpiredError as exc:
                 self.state.set_status(job["job_id"], "expired")
                 console.print("[red]Job no longer active (expired). Removed from database.[/red]")
