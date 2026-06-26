@@ -14,7 +14,7 @@ from typing import Optional
 
 from rich.console import Console
 
-from .base import BaseScraper, JobExpiredError
+from .base import BaseScraper, AuthFailedError, JobExpiredError
 
 console = Console()
 
@@ -67,16 +67,16 @@ class USAJobsScraper(BaseScraper):
                     logged_in = await self._auto_login(page, email, password)
                     if not logged_in:
                         if not (sys.stdin and sys.stdin.isatty()):
-                            console.print("[red]USAJobs: Auto-login failed (non-interactive). Skipping.[/red]")
-                            return []
+                            console.print("[red]USAJobs: Auto-login failed (non-interactive). Raising AuthFailedError.[/red]")
+                            raise AuthFailedError("usajobs", "Auto-login failed — 2FA required (non-interactive)")
                         console.print("[yellow]USAJobs:[/yellow] Auto-login failed. Complete login in the browser window.")
                         input("  Press Enter once logged in > ")
                         await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=30000)
                         await self._delay(2, 3)
                 else:
                     if not (sys.stdin and sys.stdin.isatty()):
-                        console.print("[red]USAJobs: Not logged in and no credentials in .env. Skipping.[/red]")
-                        return []
+                        console.print("[red]USAJobs: Not logged in and no credentials (non-interactive). Raising AuthFailedError.[/red]")
+                        raise AuthFailedError("usajobs", "Not logged in and no credentials in .env")
                     console.print("[red]USAJobs:[/red] Not logged in. Add USAJOBS_EMAIL/USAJOBS_PASSWORD to .env, or log in manually.")
                     input("  Press Enter once logged in > ")
                     await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=30000)
@@ -135,12 +135,15 @@ class USAJobsScraper(BaseScraper):
             # Click the Sign In link on the USAJobs homepage
             for sel in ['a:text-matches("Sign In", "i")', 'a[href*="login"]', 'button:text-matches("Sign In", "i")']:
                 try:
-                    btn = await page.wait_for_selector(sel, timeout=4000)
+                    btn = await page.wait_for_selector(sel, timeout=8000)
                     if btn and await btn.is_visible():
                         await btn.click()
                         await self._delay(2, 3)
                         break
-                except Exception:
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                        raise
                     continue
 
             # If not yet on login.gov, navigate there directly
@@ -214,7 +217,7 @@ class USAJobsScraper(BaseScraper):
 
         # Scroll to load results
         for _ in range(3):
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await self._safe_evaluate(page, "window.scrollTo(0, document.body.scrollHeight)", default=None)
             await self._delay(1, 2)
 
         # Find job cards
@@ -232,7 +235,10 @@ class USAJobsScraper(BaseScraper):
                 if found:
                     cards = found
                     break
-            except Exception:
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                    raise
                 continue
 
         for card in cards[:self.max_jobs]:
@@ -395,7 +401,7 @@ class USAJobsScraper(BaseScraper):
                 )
 
             # Check if job is expired/closed
-            page_text = await page.evaluate("document.body.innerText")
+            page_text = await self._safe_evaluate(page, "document.body.innerText", default="")
             if "announcement has closed" in page_text.lower() or "no longer available" in page_text.lower():
                 console.print(f"[yellow]USAJobs:[/yellow] Announcement has closed — skipping.")
                 raise JobExpiredError("USAJobs: Announcement has closed.")
@@ -433,7 +439,7 @@ class USAJobsScraper(BaseScraper):
             pages = page.context.pages
             if len(pages) > 1:
                 apply_page = pages[-1]
-                await apply_page.wait_for_load_state("domcontentloaded")
+                await apply_page.wait_for_load_state("domcontentloaded", timeout=30000)
             else:
                 apply_page = page
 
@@ -501,7 +507,10 @@ class USAJobsScraper(BaseScraper):
                                     submitted = True
                                     console.print("[green]USAJobs: Application submitted![/green]")
                                     break
-                            except Exception:
+                            except Exception as exc:
+                                err = str(exc).lower()
+                                if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                                    raise
                                 continue
                         if not submitted:
                             if auto_submit:
@@ -668,8 +677,10 @@ class USAJobsScraper(BaseScraper):
                         await radio.click()
                         await self._delay(0.3, 0.5)
                     return
-        except Exception:
-            pass
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                raise
 
     async def _show_review_summary(self, page) -> None:
         """Print the review page content for user inspection."""
@@ -695,14 +706,17 @@ class USAJobsScraper(BaseScraper):
         ]
         for sel in next_selectors:
             try:
-                btn = await page.wait_for_selector(sel, timeout=3000)
+                btn = await page.wait_for_selector(sel, timeout=8000)
                 if btn:
                     is_disabled = await btn.get_attribute("disabled")
                     if not is_disabled:
                         await btn.click()
                         await self._delay(2, 3)
                         return True
-            except Exception:
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(k in err for k in ["closed", "target", "detached", "crashed"]):
+                    raise
                 continue
         return False
 
