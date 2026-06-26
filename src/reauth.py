@@ -24,16 +24,18 @@ from .notifier import notify_error, notify_info, notify_warning, record_reauth_e
 
 _log = logging.getLogger(__name__)
 
-AUTOMATED_SOURCES = {"jobright", "indeed"}
-HUMAN_SOURCES     = {"linkedin", "usajobs"}
+AUTOMATED_SOURCES = {"jobright", "indeed", "linkedin"}
+HUMAN_SOURCES     = {"usajobs"}
 
 # Map source name → scraper class (populated lazily to avoid circular imports)
 def _get_source_map():
     from .sources.jobright import JobrightScraper
     from .sources.indeed import IndeedScraper
+    from .sources.linkedin import LinkedInScraper
     return {
         "jobright": JobrightScraper,
         "indeed":   IndeedScraper,
+        "linkedin": LinkedInScraper,
     }
 
 
