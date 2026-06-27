@@ -238,6 +238,11 @@ class BaseScraper(ABC):
         # Get or create a page
         pages = self._context.pages
         self._page = pages[0] if pages else await self._context.new_page()
+        try:
+            from playwright_stealth import stealth_async
+            await stealth_async(self._page)
+        except Exception as exc:
+            _log.warning("%s: failed to apply playwright-stealth: %s", self.name, exc)
         await self._page.bring_to_front()
         return self._page
 

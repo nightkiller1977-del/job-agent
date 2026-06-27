@@ -181,9 +181,11 @@ class USAJobsScraper(BaseScraper):
             except Exception:
                 pass
 
-            # Step 3: 2FA — try backup code automatically, then fall back to manual
+            # Step 3: 2FA — try backup code or email code automatically, then fall back to manual
             if "login.gov" in page.url:
                 if await self._try_backup_code(page):
+                    await self._delay(2, 3)
+                elif await self._try_email_2fa(page):
                     await self._delay(2, 3)
                 elif not (sys.stdin and sys.stdin.isatty()):
                     pass  # non-interactive — will fall through to AuthFailedError check below
@@ -299,6 +301,70 @@ class USAJobsScraper(BaseScraper):
             return True
 
         console.print("[yellow]USAJobs:[/yellow] Backup code was not accepted — trying manual 2FA.")
+        return False
+
+    async def _try_email_2fa(self, page) -> bool:
+        """Attempt to retrieve and submit an email 2FA code automatically."""
+        import os
+        import asyncio
+
+        email_addr = os.environ.get("USAJOBS_EMAIL", "")
+        # Use an explicit IMAP password, or fall back to the main USAJOBS_PASSWORD
+        imap_password = os.environ.get("IMAP_PASSWORD", "") or os.environ.get("USAJOBS_PASSWORD", "")
+
+        if not email_addr or not imap_password:
+            return False
+
+        # Find the 2FA OTP code input field
+        code_input = None
+        for sel in [
+            'input[name="code"]',
+            '#code',
+            'input[autocomplete="one-time-code"]',
+            'input[name*="code" i][type="text"]',
+            'input[id*="code" i][type="text"]',
+        ]:
+            try:
+                el = await page.wait_for_selector(sel, timeout=3000)
+                if el and await el.is_visible():
+                    code_input = el
+                    break
+            except Exception:
+                continue
+
+        if not code_input:
+            return False
+
+        console.print("[cyan]USAJobs:[/cyan] Detected 2FA input field. Attempting automated email code retrieval...")
+
+        from src.email_helper import retrieve_email_2fa_code
+        loop = asyncio.get_running_loop()
+        code = await loop.run_in_executor(
+            None,
+            retrieve_email_2fa_code,
+            email_addr,
+            imap_password,
+            "no-reply@login.gov",
+            "security code"
+        )
+
+        if not code:
+            console.print("[yellow]USAJobs:[/yellow] Could not retrieve 2FA code from email automatically.")
+            return False
+
+        await code_input.fill(code)
+        await self._delay(0.5, 1)
+
+        submit = await page.query_selector('button[type="submit"], input[type="submit"]')
+        if submit:
+            await submit.click()
+            await self._delay(3, 4)
+
+        if "login.gov" not in page.url:
+            console.print("[green]USAJobs: ✓ Email 2FA code accepted.[/green]")
+            return True
+
+        console.print("[yellow]USAJobs:[/yellow] Email 2FA code was not accepted.")
         return False
 
     async def _search(self, page, keyword: str, grade: str, seen_ids: set) -> list[dict]:
