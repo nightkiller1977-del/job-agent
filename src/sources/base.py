@@ -151,7 +151,7 @@ class BaseScraper(ABC):
         self._playwright = await async_playwright().start()
 
         args = [
-            "--start-maximized",
+            "--window-size=1280,800",
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
