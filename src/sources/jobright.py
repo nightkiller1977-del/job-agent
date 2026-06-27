@@ -2285,7 +2285,7 @@ class JobrightScraper(BaseScraper):
         Falls back to COMPANY_EMAIL_ALT / COMPANY_PASSWORD_ALT if the primary fails.
 
         Two credential sets are configured:
-          COMPANY_EMAIL       — redacted@example.com (most portals: Motorola, Booz Allen,
+          COMPANY_EMAIL       — your portal email (most portals: Motorola, Booz Allen,
                                 Greenhouse, SAIC, PNC, Capital One, ManTech, etc.)
           COMPANY_EMAIL_ALT   — redacted@example.com (government/contractor: GDIT, etc.)
 
