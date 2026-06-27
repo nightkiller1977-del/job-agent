@@ -9,6 +9,7 @@ import re
 from typing import Optional
 
 import anthropic
+from src.telemetry import model_span
 
 # ---------------------------------------------------------------------------
 # User profile and criteria embedded directly (also read from config)
@@ -142,11 +143,14 @@ class JobScorer:
             return 5, ic_check, "IC_ROLE,SKIP", "skip"
 
         try:
-            message = self.client.messages.create(
-                model=self.model,
-                max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            with model_span("anthropic", self.model, agent="job-agent/scorer") as span:
+                message = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=512,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                span["input_tokens"] = message.usage.input_tokens
+                span["output_tokens"] = message.usage.output_tokens
             raw = message.content[0].text.strip()
             # Strip markdown code fences if present
             raw = re.sub(r"^```(?:json)?\s*", "", raw)

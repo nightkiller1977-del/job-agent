@@ -20,11 +20,14 @@ from .sources.linkedin import LinkedInScraper
 from .sources.usajobs import USAJobsScraper
 from .sources.indeed import IndeedScraper
 
+import logging
+
 from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
 
 console = Console()
+_log = logging.getLogger(__name__)
 
 
 SOURCE_MAP = {
@@ -96,13 +99,16 @@ class Orchestrator:
 
         for src_name in sources_to_run:
             console.rule(f"[bold]Scraping {src_name}[/bold]")
+            _log.info("scrape.start source=%s", src_name)
             scraper_cls = SOURCE_MAP[src_name]
             scraper = scraper_cls(self.config)
             try:
                 jobs = await scraper.scrape()
                 console.print(f"  Scraped {len(jobs)} raw jobs from {src_name}")
+                _log.info("scrape.complete source=%s jobs=%d", src_name, len(jobs))
             except AuthFailedError as auth_exc:
                 console.print(f"[yellow]{src_name}: session expired — attempting reauth…[/yellow]")
+                _log.warning("scrape.auth_failed source=%s detail=%s", src_name, auth_exc.detail)
                 reauth_mgr = ReauthManager(self.config)
                 refreshed = await reauth_mgr.handle(src_name, auth_exc.detail, context="discover")
                 if refreshed:
@@ -110,14 +116,18 @@ class Orchestrator:
                         scraper2 = SOURCE_MAP[src_name](self.config)
                         jobs = await scraper2.scrape()
                         console.print(f"  Scraped {len(jobs)} raw jobs from {src_name} (after reauth)")
+                        _log.info("scrape.complete source=%s jobs=%d reauth=true", src_name, len(jobs))
                     except Exception as retry_exc:
                         console.print(f"[red]{src_name} scrape failed after reauth:[/red] {retry_exc}")
+                        _log.error("scrape.failed source=%s error=%s", src_name, retry_exc)
                         jobs = []
                 else:
                     console.print(f"[red]{src_name} reauth failed — skipping this run.[/red]")
+                    _log.error("scrape.reauth_failed source=%s", src_name)
                     jobs = []
             except Exception as exc:
                 console.print(f"[red]{src_name} scrape failed:[/red] {exc}")
+                _log.error("scrape.failed source=%s error=%s", src_name, exc)
                 jobs = []
 
             # Filter already-seen jobs
@@ -129,6 +139,7 @@ class Orchestrator:
 
             # Score jobs
             console.print(f"  Scoring {len(new_jobs)} jobs with Claude…")
+            _log.info("scoring.start source=%s count=%d", src_name, len(new_jobs))
             scored = await self._score_jobs_with_progress(new_jobs)
 
             # Save to DB

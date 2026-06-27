@@ -179,6 +179,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch and scrape unhydrated external job URLs",
     )
 
+    # commander
+    commander_parser = subparsers.add_parser(
+        "commander",
+        help="AI Commander — query, diagnose, and self-heal the agent",
+    )
+    commander_sub = commander_parser.add_subparsers(dest="subcommand", required=True)
+
+    ask_p = commander_sub.add_parser("ask", help="Ask the model a natural language question about the agent")
+    ask_p.add_argument("question", nargs="+", help="The question to ask")
+
+    diag_p = commander_sub.add_parser("diagnose", help="Diagnose source health")
+    diag_p.add_argument("--source", choices=["linkedin", "jobright", "indeed", "usajobs"], default=None)
+
+    fix_p = commander_sub.add_parser("fix", help="Attempt automated fix for a source")
+    fix_p.add_argument("--source", required=True, choices=["linkedin", "jobright", "indeed", "usajobs"])
+
+    commander_sub.add_parser("report", help="Full agent health report")
+
+    watch_p = commander_sub.add_parser("watch", help="Watch for failures and auto-heal")
+    watch_p.add_argument("--interval", type=int, default=30)
+    watch_p.add_argument("--no-auto-fix", action="store_true")
+
     return parser
 
 
@@ -233,16 +255,55 @@ async def main_async(args: argparse.Namespace) -> int:
     elif args.command == "hydrate":
         await orchestrator.hydrate_external_jobs()
 
+    elif args.command == "commander":
+        import json
+        from src.commander import AgentCommander
+        from src.watcher import StatusWatcher
+
+        config = json.loads((project_root / "config.json").read_text())
+        commander = AgentCommander(config)
+
+        if args.subcommand == "ask":
+            question = " ".join(args.question)
+            console.print(commander.query(question))
+
+        elif args.subcommand == "diagnose":
+            report = commander.diagnose(args.source)
+            console.print(report["summary"])
+            for src, d in report["sources"].items():
+                color = {"healthy": "green", "warning": "yellow", "critical": "red"}.get(d["severity"], "white")
+                console.print(f"  [{color}]{src}[/{color}]: {d['root_cause']} | fixable={d['fixable']}")
+
+        elif args.subcommand == "fix":
+            result = await commander.attempt_fix(args.source)
+            if result["success"]:
+                console.print(f"[green]Fixed {args.source}[/green]: {result.get('detail', '')}")
+            else:
+                console.print(f"[red]Could not fix {args.source}[/red]: {result.get('reason', '')}")
+
+        elif args.subcommand == "report":
+            report = commander.get_report()
+            console.print(commander.format_report(report))
+
+        elif args.subcommand == "watch":
+            watcher = StatusWatcher(config, poll_interval=args.interval, auto_fix=not args.no_auto_fix)
+            console.print(f"[green]Watching for failures every {args.interval}s (auto_fix={not args.no_auto_fix})...[/green]")
+            await watcher.watch()
+
     return 0
 
 
 def main() -> None:
     load_env()
+    from src.telemetry import setup as setup_telemetry
+    setup_telemetry(agent="job-agent")
     parser = build_parser()
     args = parser.parse_args()
 
     # All commands except 'status' need the API key
     if args.command in ("discover", "hydrate") and not check_api_key():
+        sys.exit(1)
+    if args.command == "commander" and args.subcommand in ("ask", "report", "watch") and not check_api_key():
         sys.exit(1)
 
     try:
