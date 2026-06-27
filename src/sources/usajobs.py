@@ -181,13 +181,18 @@ class USAJobsScraper(BaseScraper):
             except Exception:
                 pass
 
-            # Step 3: If still on login.gov, likely hit 2FA — wait for manual completion
+            # Step 3: 2FA — try backup code automatically, then fall back to manual
             if "login.gov" in page.url:
-                console.print("[cyan]USAJobs:[/cyan] 2FA required — complete it in the browser window (waiting up to 90s)…")
-                for _ in range(45):
-                    await asyncio.sleep(2)
-                    if "login.gov" not in page.url:
-                        break
+                if await self._try_backup_code(page):
+                    await self._delay(2, 3)
+                elif not (sys.stdin and sys.stdin.isatty()):
+                    pass  # non-interactive — will fall through to AuthFailedError check below
+                else:
+                    console.print("[cyan]USAJobs:[/cyan] 2FA required — complete it in the browser window (waiting up to 90s)…")
+                    for _ in range(45):
+                        await asyncio.sleep(2)
+                        if "login.gov" not in page.url:
+                            break
 
             # Verify logged in
             await page.goto(USAJOBS_BASE, wait_until="domcontentloaded", timeout=15000)
@@ -202,6 +207,99 @@ class USAJobsScraper(BaseScraper):
         except Exception as exc:
             console.print(f"[yellow]USAJobs:[/yellow] Auto-login error: {exc}")
             return False
+
+    async def _try_backup_code(self, page) -> bool:
+        """Use a stored login.gov backup code for 2FA. Consumes one code per call."""
+        import json
+        from pathlib import Path
+
+        codes_file = Path("state/usajobs_codes.json")
+        try:
+            data = json.loads(codes_file.read_text())
+            codes: list[str] = data.get("backup_codes", [])
+        except Exception:
+            return False
+
+        if not codes:
+            console.print("[yellow]USAJobs:[/yellow] No backup codes remaining — 2FA requires manual completion.")
+            return False
+
+        # login.gov may land on an auth-method selector or directly on the 2FA page.
+        # Try to reach the backup-code input via the "Use backup codes" link first.
+        for sel in [
+            'a[href*="backup_code"]',
+            'a:text-matches("backup code", "i")',
+            'a:text-matches("personal key", "i")',
+            'a:text-matches("another method", "i")',
+            'a:text-matches("different method", "i")',
+        ]:
+            try:
+                link = await page.wait_for_selector(sel, timeout=3000)
+                if link and await link.is_visible():
+                    await link.click()
+                    await self._delay(1.5, 2.5)
+                    break
+            except Exception:
+                continue
+
+        # From the method-picker, try to select "Backup codes" if shown
+        for sel in [
+            'label:text-matches("backup code", "i")',
+            'input[value*="backup_code"]',
+            'a[href*="backup_code"]',
+        ]:
+            try:
+                el = await page.wait_for_selector(sel, timeout=3000)
+                if el and await el.is_visible():
+                    await el.click()
+                    await self._delay(1, 2)
+                    # After selecting, there may be a "continue" button
+                    cont = await page.query_selector('button[type="submit"], input[type="submit"]')
+                    if cont:
+                        await cont.click()
+                        await self._delay(1.5, 2.5)
+                    break
+            except Exception:
+                continue
+
+        # Find the backup code text input (login.gov field name is "personal_key")
+        code_input = None
+        for sel in [
+            'input[name="personal_key"]',
+            '#backup_code_verification_form_personal_key',
+            'input[autocomplete="one-time-code"]',
+            'input[name*="backup" i]',
+            'input[name*="code" i][type="text"]',
+        ]:
+            try:
+                el = await page.wait_for_selector(sel, timeout=5000)
+                if el and await el.is_visible():
+                    code_input = el
+                    break
+            except Exception:
+                continue
+
+        if not code_input:
+            console.print("[yellow]USAJobs:[/yellow] Backup code input not found — manual 2FA needed.")
+            return False
+
+        code = codes[0]
+        await code_input.fill(code)
+        await self._delay(0.5, 1)
+
+        submit = await page.query_selector('button[type="submit"], input[type="submit"]')
+        if submit:
+            await submit.click()
+            await self._delay(3, 4)
+
+        if "login.gov" not in page.url:
+            console.print(f"[green]USAJobs:[/green] Backup code accepted ({len(codes) - 1} remaining).")
+            data["backup_codes"] = codes[1:]
+            codes_file.write_text(json.dumps(data, indent=2))
+            return True
+
+        console.print("[yellow]USAJobs:[/yellow] Backup code was not accepted — trying manual 2FA.")
+        return False
 
     async def _search(self, page, keyword: str, grade: str, seen_ids: set) -> list[dict]:
         """Execute a USAJobs search and return job dicts."""
