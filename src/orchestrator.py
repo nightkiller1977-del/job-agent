@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -292,15 +293,13 @@ class Orchestrator:
         ) as progress:
             task_id = progress.add_task("Scoring…", total=len(jobs))
             for job in jobs:
-                # Run scoring in executor to avoid blocking event loop
-                loop = asyncio.get_event_loop()
-                scored_job = await loop.run_in_executor(None, self._score_one, job)
+                scored_job = await self._score_one(job)
                 scored.append(scored_job)
                 progress.advance(task_id)
         return scored
 
-    def _score_one(self, job: dict) -> dict:
-        score, reason, flags, action = self.scorer.score(job)
+    async def _score_one(self, job: dict) -> dict:
+        score, reason, flags, action = await self.scorer.score(job)
         job["score"] = score
         job["score_reason"] = reason
         job["flags"] = flags
@@ -717,6 +716,52 @@ class Orchestrator:
                 f"Run: python src/main.py prepare-sessions",
             )
 
+    def prune_stale_jobs(self, max_age_days: int = 30, dry_run: bool = False) -> dict:
+        """Archive jobs that have been sitting in discovered/approved status
+        for longer than max_age_days without ever being applied to.
+
+        Most job listings close within 30 days, so age is a reliable proxy for
+        unavailability without requiring an expensive browser visit per job.
+
+        Returns a summary dict: { "pruned": [...], "total": N }
+        """
+        stale = self.state.get_stale_jobs(max_age_days=max_age_days)
+        if not stale:
+            console.print(
+                f"[green]No stale jobs found (none older than {max_age_days} days in discovered/approved).[/green]"
+            )
+            return {"pruned": [], "total": 0}
+
+        console.print(
+            f"\n[bold]Stale job cleanup:[/bold] {len(stale)} job(s) older than {max_age_days} days"
+        )
+        if dry_run:
+            console.print("[yellow]Dry-run — no changes will be made.[/yellow]")
+
+        pruned = []
+        for job in stale:
+            age_days = 0
+            try:
+                disc = datetime.fromisoformat(job["discovered_at"].rstrip("Z"))
+                age_days = (datetime.utcnow() - disc).days
+            except Exception:
+                pass
+            console.print(
+                f"  {'[dim]would archive[/dim]' if dry_run else '[red]archiving[/red]'}: "
+                f"{job.get('title')} @ {job.get('company')} "
+                f"({job.get('source')}, {age_days}d old, status={job.get('status')})"
+            )
+            if not dry_run:
+                self.state.archive_job(job["job_id"], reason=f"stale>{max_age_days}d")
+            pruned.append(job)
+
+        if not dry_run:
+            console.print(f"[green]Archived {len(pruned)} stale job(s).[/green]")
+        else:
+            console.print(f"[yellow]Would archive {len(pruned)} job(s). Run without --dry-run to apply.[/yellow]")
+
+        return {"pruned": pruned, "total": len(pruned)}
+
     async def _pull_approved_from_cloud(self) -> None:
         """Fetch jobs marked 'approved' on the cloud dashboard and upsert them
         into the local SQLite DB so the apply command can act on them."""
@@ -1000,9 +1045,9 @@ class Orchestrator:
                     if not job.get("description"):
                         job["description"] = "No description available."
 
-                    # Run Claude scorer
-                    console.print(f"Scoring with Claude...")
-                    score, reason, flags, action = self.scorer.score(job)
+                    # Score via Ollama → Claude cascade
+                    console.print(f"Scoring job...")
+                    score, reason, flags, action = await self.scorer.score(job)
                     job["score"] = score
                     job["score_reason"] = reason
                     job["flags"] = (flags or "").replace("needs_hydration", "").strip(",")
