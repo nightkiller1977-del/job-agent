@@ -96,6 +96,8 @@ class USAJobsScraper(BaseScraper):
                 await self._delay(2, 4)
 
             console.print(f"[cyan]USAJobs:[/cyan] Total: {len(all_jobs)} jobs found.")
+        except AuthFailedError:
+            raise
         except Exception as exc:
             console.print(f"[red]USAJobs scrape error:[/red] {exc}")
         finally:

@@ -1106,6 +1106,8 @@ class JobrightScraper(BaseScraper):
                 console.print(f"[yellow]Jobright:[/yellow] External jobs scrape skipped: {exc}")
 
             console.print(f"[magenta]Jobright:[/magenta] Found {len(jobs)} jobs.")
+        except AuthFailedError:
+            raise
         except Exception as exc:
             console.print(f"[red]Jobright scrape error:[/red] {exc}")
         finally:

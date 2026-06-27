@@ -106,6 +106,8 @@ class IndeedScraper(BaseScraper):
             jobs = await self._extract_all_pages(page)
             console.print(f"[blue]Indeed:[/blue] Found {len(jobs)} jobs.")
 
+        except AuthFailedError:
+            raise
         except Exception as exc:
             console.print(f"[red]Indeed scrape error:[/red] {exc}")
         finally:
