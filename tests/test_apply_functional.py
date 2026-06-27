@@ -36,6 +36,7 @@ def force_headless(request):
 
 
 # ── Option 1: Mock LinkedIn Easy Apply E2E Test ─────────────────────────────
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_mock_linkedin_easy_apply():
     # Setup mock profile variables
@@ -133,6 +134,7 @@ async def test_mock_linkedin_easy_apply():
 
 
 # ── Option 1: Mock Indeed Scraper with ATS Handoff Test ─────────────────────
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_mock_indeed_ats_handoff():
     config = {
@@ -204,6 +206,7 @@ async def test_mock_indeed_ats_handoff():
         assert success is True
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_mock_linkedin_non_easy_apply_fast_path_delegates_to_external_ats():
     config = {
@@ -278,6 +281,7 @@ async def test_mock_linkedin_non_easy_apply_fast_path_delegates_to_external_ats(
     assert scraper.easy_apply_selectors_checked is False
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_mock_linkedin_extracts_external_url_from_interstitial_query_param():
     config = {
@@ -379,6 +383,7 @@ async def test_live_indeed_dry_run():
 
 
 # ── Option 1: ATS Score Gate Negative Test ──────────────────────────────────
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_mock_ats_score_gate_negative():
     config = {
@@ -462,6 +467,7 @@ async def test_mock_ats_score_gate_negative():
 
 
 # ── Option 1: ATS Score Gate Positive Test ──────────────────────────────────
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_mock_ats_score_gate_positive():
     config = {
@@ -544,6 +550,7 @@ async def test_mock_ats_score_gate_positive():
 
 
 # ── Option 1: Pre-Submission Empty Form Validation Negative Test ──────────────
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_mock_pre_submission_validation_empty_form():
     config = {
