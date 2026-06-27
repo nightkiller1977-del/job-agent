@@ -14,6 +14,9 @@ Usage:
   python src/main.py preflight                 # Check approved queue readiness
   python src/main.py prepare-sessions          # Open blocked portals to refresh login/session cookies
   python src/main.py status                    # Show stats
+  python src/main.py prune                     # Archive jobs older than 30 days (discovered/approved with no apply)
+  python src/main.py prune --max-age-days 14   # Use a shorter staleness window
+  python src/main.py prune --dry-run           # Preview what would be pruned without changing anything
 """
 from __future__ import annotations
 
@@ -179,6 +182,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch and scrape unhydrated external job URLs",
     )
 
+    # prune
+    prune_parser = subparsers.add_parser(
+        "prune",
+        help="Archive jobs that have been sitting discovered/approved for too long (likely no longer available)",
+    )
+    prune_parser.add_argument(
+        "--max-age-days",
+        type=int,
+        default=30,
+        help="Treat jobs older than this many days as stale (default: 30)",
+    )
+    prune_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be pruned without making any changes",
+    )
+
     # commander
     commander_parser = subparsers.add_parser(
         "commander",
@@ -254,6 +274,12 @@ async def main_async(args: argparse.Namespace) -> int:
 
     elif args.command == "hydrate":
         await orchestrator.hydrate_external_jobs()
+
+    elif args.command == "prune":
+        orchestrator.prune_stale_jobs(
+            max_age_days=args.max_age_days,
+            dry_run=args.dry_run,
+        )
 
     elif args.command == "commander":
         import json
