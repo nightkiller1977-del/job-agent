@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -102,32 +103,39 @@ class Orchestrator:
             _log.info("scrape.start source=%s", src_name)
             scraper_cls = SOURCE_MAP[src_name]
             scraper = scraper_cls(self.config)
+            t_scrape = time.perf_counter()
             try:
                 jobs = await scraper.scrape()
+                duration_s = round(time.perf_counter() - t_scrape)
                 console.print(f"  Scraped {len(jobs)} raw jobs from {src_name}")
-                _log.info("scrape.complete source=%s jobs=%d", src_name, len(jobs))
+                _log.info("scrape.complete source=%s jobs=%d duration_s=%d status=success", src_name, len(jobs), duration_s)
             except AuthFailedError as auth_exc:
+                duration_s = round(time.perf_counter() - t_scrape)
                 console.print(f"[yellow]{src_name}: session expired — attempting reauth…[/yellow]")
-                _log.warning("scrape.auth_failed source=%s detail=%s", src_name, auth_exc.detail)
+                _log.warning("scrape.auth_failed source=%s detail=%s duration_s=%d status=auth_failed", src_name, auth_exc.detail, duration_s)
                 reauth_mgr = ReauthManager(self.config)
                 refreshed = await reauth_mgr.handle(src_name, auth_exc.detail, context="discover")
                 if refreshed:
+                    t_scrape2 = time.perf_counter()
                     try:
                         scraper2 = SOURCE_MAP[src_name](self.config)
                         jobs = await scraper2.scrape()
+                        duration_s2 = round(time.perf_counter() - t_scrape2)
                         console.print(f"  Scraped {len(jobs)} raw jobs from {src_name} (after reauth)")
-                        _log.info("scrape.complete source=%s jobs=%d reauth=true", src_name, len(jobs))
+                        _log.info("scrape.complete source=%s jobs=%d duration_s=%d status=success reauth=true", src_name, len(jobs), duration_s2)
                     except Exception as retry_exc:
+                        duration_s2 = round(time.perf_counter() - t_scrape2)
                         console.print(f"[red]{src_name} scrape failed after reauth:[/red] {retry_exc}")
-                        _log.error("scrape.failed source=%s error=%s", src_name, retry_exc)
+                        _log.error("scrape.failed source=%s error=%s duration_s=%d status=failed", src_name, retry_exc, duration_s2)
                         jobs = []
                 else:
                     console.print(f"[red]{src_name} reauth failed — skipping this run.[/red]")
-                    _log.error("scrape.reauth_failed source=%s", src_name)
+                    _log.error("scrape.reauth_failed source=%s duration_s=%d status=reauth_failed", src_name, duration_s)
                     jobs = []
             except Exception as exc:
+                duration_s = round(time.perf_counter() - t_scrape)
                 console.print(f"[red]{src_name} scrape failed:[/red] {exc}")
-                _log.error("scrape.failed source=%s error=%s", src_name, exc)
+                _log.error("scrape.failed source=%s error=%s duration_s=%d status=failed", src_name, exc, duration_s)
                 jobs = []
 
             # Filter already-seen jobs
