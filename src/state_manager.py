@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +34,23 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_source ON jobs(source);
 CREATE INDEX IF NOT EXISTS idx_discovered_at ON jobs(discovered_at);
+
+CREATE TABLE IF NOT EXISTS archived_jobs (
+    job_id         TEXT PRIMARY KEY,
+    source         TEXT,
+    title          TEXT,
+    company        TEXT,
+    location       TEXT,
+    url            TEXT,
+    score          INTEGER,
+    status         TEXT,
+    discovered_at  TEXT,
+    archived_at    TEXT NOT NULL,
+    archive_reason TEXT,
+    extra_json     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_archived_at ON archived_jobs(archived_at);
 """
 
 
@@ -53,7 +70,7 @@ class StateManager:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(DB_SCHEMA)
-            # Remove any existing expired jobs
+            # Hard-delete any legacy expired rows (pre-archive schema)
             conn.execute("DELETE FROM jobs WHERE status = 'expired'")
 
     # ------------------------------------------------------------------
@@ -108,7 +125,7 @@ class StateManager:
 
     def set_status(self, job_id: str, status: str) -> None:
         if status == "expired":
-            self.delete_job(job_id)
+            self.archive_job(job_id, reason="expired")
             return
 
         now = datetime.utcnow().isoformat()
@@ -135,6 +152,71 @@ class StateManager:
         """Delete a job record completely from the database."""
         with self._connect() as conn:
             conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+
+    def archive_job(self, job_id: str, reason: str = "expired") -> Optional[dict]:
+        """Move a job to archived_jobs and remove it from the active jobs table.
+
+        Preserves history so expired/pruned jobs can be audited later without
+        cluttering the active queue.
+        Returns the job dict before archiving, or None if the job was not found.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if not row:
+                return None
+            job = dict(row)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO archived_jobs
+                    (job_id, source, title, company, location, url, score,
+                     status, discovered_at, archived_at, archive_reason, extra_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job["job_id"],
+                    job.get("source"),
+                    job.get("title"),
+                    job.get("company"),
+                    job.get("location"),
+                    job.get("url"),
+                    job.get("score"),
+                    job.get("status"),
+                    job.get("discovered_at"),
+                    now,
+                    reason,
+                    job.get("extra_json"),
+                ),
+            )
+            conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            return job
+
+    def get_stale_jobs(
+        self,
+        max_age_days: int = 30,
+        statuses: Optional[list] = None,
+    ) -> list[dict]:
+        """Return active jobs older than max_age_days in the given statuses.
+
+        Defaults to 'discovered' and 'approved' — the two states where a job
+        can sit indefinitely without triggering the JobExpiredError path.
+        """
+        if statuses is None:
+            statuses = ["discovered", "approved"]
+        cutoff = (datetime.utcnow() - timedelta(days=max_age_days)).isoformat()
+        placeholders = ",".join("?" * len(statuses))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE status IN ({placeholders}) AND discovered_at < ?
+                ORDER BY discovered_at ASC
+                """,
+                (*statuses, cutoff),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def update_score(self, job_id: str, score: int, reason: str, flags: str = "") -> None:
         with self._connect() as conn:

@@ -351,16 +351,28 @@ class AgentCommander:
         _AUTOMATED = {"jobright", "indeed", "linkedin"}
         strategy = "automated" if source in _AUTOMATED else "human"
 
+        _log.info(
+            "heal.start source=%s strategy=%s root_cause=%s",
+            source, strategy, root_cause,
+        )
         try:
             success = await ReauthManager(self.config).handle(
                 source, root_cause, context="discover"
             )
             if success:
+                _log.info(
+                    "heal.success source=%s strategy=%s root_cause=%s",
+                    source, strategy, root_cause,
+                )
                 notify_info(
                     title=f"Auto-fix succeeded: {source}",
                     detail=f"strategy={strategy} root_cause={root_cause}",
                 )
             else:
+                _log.warning(
+                    "heal.failed source=%s strategy=%s root_cause=%s reason=reauth_returned_false",
+                    source, strategy, root_cause,
+                )
                 notify_error(
                     title=f"Auto-fix failed: {source}",
                     detail=f"strategy={strategy} root_cause={root_cause}",
@@ -372,6 +384,10 @@ class AgentCommander:
                 "detail": root_cause,
             }
         except Exception as exc:
+            _log.error(
+                "heal.exception source=%s strategy=%s error=%s",
+                source, strategy, exc,
+            )
             notify_error(
                 title=f"Auto-fix exception: {source}",
                 detail=str(exc),
