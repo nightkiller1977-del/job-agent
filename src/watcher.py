@@ -81,9 +81,9 @@ class StatusWatcher:
             source = self._extract_source(combined)
 
             log.info(
-                "New error alert detected — title=%r source=%s ts=%s",
-                title,
+                "watcher.alert_detected source=%s title=%r ts=%s",
                 source,
+                title,
                 alert.get("ts"),
             )
 
@@ -119,10 +119,14 @@ class StatusWatcher:
             fixable: bool = bool(source_info.get("fixable", False))
 
             if fixable and self.auto_fix:
-                log.info("Source %s is fixable — attempting auto-fix", source)
+                log.info("watcher.fix_start source=%s", source)
                 try:
                     fix_result = await self._commander.attempt_fix(source)
-                    log.info("attempt_fix(%s) result: %s", source, fix_result)
+                    success = fix_result.get("success", False)
+                    log.info(
+                        "watcher.fix_result source=%s success=%s strategy=%s",
+                        source, success, fix_result.get("strategy", "unknown"),
+                    )
                     actions.append(
                         {
                             "type": "alert",
@@ -133,7 +137,7 @@ class StatusWatcher:
                         }
                     )
                 except Exception as exc:
-                    log.warning("attempt_fix(%s) raised: %s", source, exc)
+                    log.warning("watcher.fix_error source=%s error=%s", source, exc)
                     actions.append(
                         {
                             "type": "alert",
@@ -145,12 +149,7 @@ class StatusWatcher:
                     )
             else:
                 reason = "not_fixable" if not fixable else "auto_fix_disabled"
-                log.info(
-                    "Source %s — skipping fix (%s); diagnosis=%s",
-                    source,
-                    reason,
-                    diagnosis,
-                )
+                log.info("watcher.fix_skipped source=%s reason=%s", source, reason)
                 actions.append(
                     {
                         "type": "alert",
@@ -174,7 +173,7 @@ class StatusWatcher:
             self._seen_reauth_keys.add(key)
 
             log.warning(
-                "Reauth event — source=%s mode=%s outcome=%s detail=%r ts=%s",
+                "watcher.reauth_event source=%s mode=%s outcome=%s detail=%r ts=%s",
                 event.get("source"),
                 event.get("mode"),
                 outcome,
