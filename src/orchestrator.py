@@ -147,9 +147,17 @@ class Orchestrator:
                 continue
 
             # Score jobs
-            console.print(f"  Scoring {len(new_jobs)} jobs with Claude…")
+            console.print(f"  Scoring {len(new_jobs)} jobs with Ollama → Claude cascade…")
             _log.info("scoring.start source=%s count=%d", src_name, len(new_jobs))
+            t_score = time.perf_counter()
             scored = await self._score_jobs_with_progress(new_jobs)
+            score_duration = round(time.perf_counter() - t_score, 1)
+            n_approved = sum(1 for j in scored if j.get("status") == "approved")
+            n_skipped = sum(1 for j in scored if j.get("status") == "skipped")
+            _log.info(
+                "scoring.complete source=%s scored=%d approved=%d skipped=%d duration_s=%.1f",
+                src_name, len(scored), n_approved, n_skipped, score_duration,
+            )
 
             # Save to DB
             saved = 0
@@ -696,6 +704,10 @@ class Orchestrator:
                 outcomes.append({"job": job, "status": "error", "reason": str(exc)})
 
         record_run_stats(applied_count, failed_count, skipped_count)
+        _log.info(
+            "apply.complete applied=%d failed=%d skipped=%d session_blocked=%d",
+            applied_count, failed_count, skipped_count, len(blocked),
+        )
         console.print(
             f"\n[bold]Apply run complete:[/bold] "
             f"{applied_count} applied, {failed_count} failed, "
