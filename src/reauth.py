@@ -65,12 +65,13 @@ class ReauthManager:
 
         Returns True if the session was refreshed and the caller should retry.
         """
+        _log.info("reauth.start source=%s context=%s", source, context)
         if source in AUTOMATED_SOURCES:
             return await self._reauth_automated(source)
         elif source in HUMAN_SOURCES:
             timeout = self.timeout_discover if context == "discover" else self.timeout_apply
             return await self._reauth_human(source, detail, timeout)
-        _log.warning("ReauthManager: unknown source '%s' — cannot reauth", source)
+        _log.warning("reauth.unknown_source source=%s", source)
         return False
 
     # ------------------------------------------------------------------
@@ -103,12 +104,14 @@ class ReauthManager:
             if success:
                 await scraper._export_session_json()
                 record_reauth_event(source, "automated", "success")
+                _log.info("reauth.success source=%s mode=automated", source)
                 notify_info(f"{source} reauth", "Session refreshed automatically — retrying")
                 self._write_regression_test(source, "automated", "_auto_login returned True after session expiry")
                 self._notify_correction(source, "automated", "_auto_login returned True after session expiry")
                 return True
             else:
                 record_reauth_event(source, "automated", "failed", "_auto_login returned False")
+                _log.warning("reauth.failed source=%s mode=automated reason=login_returned_false", source)
                 notify_warning(
                     f"{source} automated reauth failed",
                     "Login returned False — may need human assist or CAPTCHA",
@@ -116,6 +119,7 @@ class ReauthManager:
                 return False
         except Exception as exc:
             record_reauth_event(source, "automated", "failed", str(exc)[:300])
+            _log.error("reauth.error source=%s mode=automated error=%s", source, exc)
             notify_error(f"{source} automated reauth error", str(exc)[:200])
             return False
         finally:
@@ -142,6 +146,10 @@ class ReauthManager:
             f"Agent will auto-retry within {timeout_minutes} min."
         )
         _send_imessage(self.notify_phone, msg)
+        _log.info(
+            "reauth.human_notified source=%s timeout_min=%d phone_set=%s",
+            source, timeout_minutes, bool(self.notify_phone),
+        )
         record_reauth_event(source, "human_notified", "waiting", detail)
         notify_warning(
             f"{source} session expired — action needed",
@@ -153,12 +161,14 @@ class ReauthManager:
             await asyncio.sleep(30)
             if session_file.exists() and session_file.stat().st_mtime > baseline_mtime:
                 record_reauth_event(source, "human", "session_refreshed")
+                _log.info("reauth.success source=%s mode=human", source)
                 notify_info(f"{source} session refreshed", "Session file updated — retrying source")
                 self._write_regression_test(source, "human", detail)
                 self._notify_correction(source, "human", detail)
                 return True
 
         record_reauth_event(source, "human", "timeout", f"No refresh after {timeout_minutes} min")
+        _log.warning("reauth.timeout source=%s mode=human timeout_min=%d", source, timeout_minutes)
         notify_error(
             f"{source} reauth timed out",
             f"Session was not refreshed within {timeout_minutes} minutes. Skipping source this run.",

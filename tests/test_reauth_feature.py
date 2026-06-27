@@ -53,7 +53,7 @@ def orchestrator(tmp_path):
         from src.state_manager import StateManager
         orc.state = StateManager(config["state_db_path"])
         orc.scorer = MagicMock()
-        orc.scorer.score = MagicMock(return_value=(90, "Good fit", "remote", "apply"))
+        orc.scorer.score = AsyncMock(return_value=(90, "Good fit", "remote", "apply"))
     return orc
 
 
