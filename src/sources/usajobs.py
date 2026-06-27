@@ -181,9 +181,11 @@ class USAJobsScraper(BaseScraper):
             except Exception:
                 pass
 
-            # Step 3: 2FA — try backup code or email code automatically, then fall back to manual
+            # Step 3: 2FA — try TOTP, backup code or email code automatically, then fall back to manual
             if "login.gov" in page.url:
-                if await self._try_backup_code(page):
+                if await self._try_totp_2fa(page):
+                    await self._delay(2, 3)
+                elif await self._try_backup_code(page):
                     await self._delay(2, 3)
                 elif await self._try_email_2fa(page):
                     await self._delay(2, 3)
@@ -208,6 +210,95 @@ class USAJobsScraper(BaseScraper):
 
         except Exception as exc:
             console.print(f"[yellow]USAJobs:[/yellow] Auto-login error: {exc}")
+            return False
+
+    async def _try_totp_2fa(self, page) -> bool:
+        """Attempt to use a TOTP shared secret from .env to generate and submit a 2FA code."""
+        import os
+        import pyotp
+
+        secret = os.environ.get("USAJOBS_2FA_SECRET", "").replace(" ", "")
+        if not secret:
+            return False
+
+        # If on the method-selection screen, try to navigate to the Authenticator app input
+        for sel in [
+            'a[href*="auth_app"]',
+            'a:text-matches("authenticator app", "i")',
+            'a:text-matches("another method", "i")',
+            'a:text-matches("different method", "i")',
+        ]:
+            try:
+                link = await page.wait_for_selector(sel, timeout=2000)
+                if link and await link.is_visible():
+                    await link.click()
+                    await self._delay(1, 2)
+                    break
+            except Exception:
+                continue
+
+        # If we see a list of radio buttons/labels for auth methods, choose the authenticator app option
+        for sel in [
+            'label:text-matches("authenticator app", "i")',
+            'input[value*="auth_app"]',
+            'input[value*="totp"]',
+        ]:
+            try:
+                el = await page.wait_for_selector(sel, timeout=2000)
+                if el and await el.is_visible():
+                    await el.click()
+                    await self._delay(1, 1.5)
+                    # Click continue/submit
+                    cont = await page.query_selector('button[type="submit"], input[type="submit"]')
+                    if cont:
+                        await cont.click()
+                        await self._delay(1.5, 2.5)
+                    break
+            except Exception:
+                continue
+
+        # Now locate the OTP code input field
+        code_input = None
+        for sel in [
+            'input[name="code"]',
+            '#code',
+            'input[autocomplete="one-time-code"]',
+            'input[name*="code" i][type="text"]',
+            'input[id*="code" i][type="text"]',
+        ]:
+            try:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    code_input = el
+                    break
+            except Exception:
+                continue
+
+        if not code_input:
+            return False
+
+        try:
+            totp = pyotp.TOTP(secret)
+            code = totp.now()
+            console.print("[cyan]USAJobs:[/cyan] Generating TOTP code via secret...")
+            await code_input.fill(code)
+            await self._delay(0.5, 1)
+
+            submit = await page.query_selector('button[type="submit"], input[type="submit"]')
+            if submit:
+                await submit.click()
+                await self._delay(2.5, 4)
+
+            # Check if code was accepted (no errors on the page)
+            error_el = await page.query_selector('.usa-alert--error')
+            if error_el and await error_el.is_visible():
+                console.print("[yellow]USAJobs:[/yellow] TOTP 2FA code was rejected.")
+                return False
+
+            console.print("[green]USAJobs: ✓ TOTP 2FA code submitted successfully.[/green]")
+            return True
+        except Exception as exc:
+            console.print(f"[yellow]USAJobs:[/yellow] TOTP 2FA error: {exc}")
             return False
 
     async def _try_backup_code(self, page) -> bool:
