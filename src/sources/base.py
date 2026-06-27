@@ -67,6 +67,19 @@ class BaseScraper(ABC):
         self._playwright = None
         self.last_apply_status = ""
         self.last_apply_detail = ""
+        self._mc = None  # lazy ModelClient — shared across all model calls in this scraper instance
+
+    @property
+    def _model_client(self):
+        """Lazy ModelClient: Ollama → Claude → OpenAI cascade for all in-scraper model calls."""
+        if self._mc is None:
+            import os as _os
+            from src.model_client import ModelClient
+            self._mc = ModelClient(
+                anthropic_api_key=_os.environ.get("ANTHROPIC_API_KEY", ""),
+                anthropic_model="claude-haiku-4-5-20251001",
+            )
+        return self._mc
 
     def _set_apply_outcome(self, status: str, detail: str) -> bool:
         """Record why an apply attempt did or did not submit."""

@@ -3207,7 +3207,7 @@ class JobrightScraper(BaseScraper):
         return ""
 
     async def _claude_ats_and_tailor(self, job: dict, jd_text: str) -> dict:
-        """Use Claude API (haiku) to score ATS match and generate tailored resume content.
+        """Score ATS match and generate tailored resume content via Ollama → Claude cascade.
 
         Returns dict with: ats_score, missing_keywords, matching_keywords,
         tailored_summary, tailored_bullets, cover_letter, recommendation.
@@ -3216,9 +3216,7 @@ class JobrightScraper(BaseScraper):
         if not jd_text or len(jd_text) < 100:
             return {}
         try:
-            import anthropic as _anthropic
-            _api_key = os.environ.get("ANTHROPIC_API_KEY")
-            _client = _anthropic.Anthropic(api_key=_api_key) if _api_key else _anthropic.Anthropic()
+            import json as _json
             resume_text = self._extract_resume_text()
             _prompt = (
                 "You are an expert resume writer and ATS specialist. "
@@ -3240,16 +3238,21 @@ class JobrightScraper(BaseScraper):
                 '  "cover_letter": "3-paragraph cover letter for this specific role and company"\n'
                 "}"
             )
-            _msg = _client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1800,
+            _text = await self._model_client.complete(
                 messages=[{"role": "user", "content": _prompt}],
+                task_type="reasoning",
+                max_tokens=1800,
             )
-            import json as _json
-            _text = _msg.content[0].text.strip()
-            if _text.startswith("```"):
-                _text = re.sub(r"^```[a-z]*\n?", "", _text)
-                _text = re.sub(r"\n?```$", "", _text)
+            if not _text or _text.startswith("No model available"):
+                return {}
+            # Strip markdown fences and deepseek-r1 <think> blocks before parsing
+            _text = re.sub(r"<think>.*?</think>\s*", "", _text, flags=re.DOTALL)
+            _text = re.sub(r"^```[a-z]*\n?", "", _text.strip())
+            _text = re.sub(r"\n?```$", "", _text)
+            # Extract first JSON object if there's surrounding prose
+            _m = re.search(r"\{.*\}", _text, re.DOTALL)
+            if _m:
+                _text = _m.group()
             result = _json.loads(_text)
             return {
                 "ats_score": int(result.get("ats_score", 0)),
@@ -3261,7 +3264,7 @@ class JobrightScraper(BaseScraper):
                 "cover_letter": result.get("cover_letter", ""),
             }
         except Exception as _e:
-            console.print(f"[dim]Claude ATS/tailor failed: {_e}[/dim]")
+            console.print(f"[dim]ATS/tailor failed: {_e}[/dim]")
             return {}
 
     async def _generate_tailored_resume_pdf(self, job: dict, tailored: dict) -> str:
