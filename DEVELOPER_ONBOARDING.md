@@ -49,7 +49,7 @@ Credentials live in `.env` — all set and working as of June 2026:
 | `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | `jobright.py` | `_auto_login()` — fills form programmatically |
 | `INDEED_EMAIL` / `INDEED_PASSWORD` | `indeed.py` | `_auto_login()` — fills form programmatically (`shoalinwu@gmail.com`) |
 | `USAJOBS_EMAIL` / `USAJOBS_PASSWORD` | `usajobs.py` | `_auto_login()` via login.gov; pauses for 2FA if triggered |
-| `COMPANY_EMAIL` / `COMPANY_PASSWORD` | `jobright.py` `_company_portal_login()` | Primary ATS portal auto-login — `alarkins.jsearch@yahoo.com` (Motorola, Booz Allen, Greenhouse, SAIC, PNC, Capital One, ManTech) |
+| `COMPANY_EMAIL` / `COMPANY_PASSWORD` | `jobright.py` `_company_portal_login()` | Primary ATS portal auto-login — set to your portal email (Motorola, Booz Allen, Greenhouse, SAIC, PNC, Capital One, ManTech) |
 | `COMPANY_EMAIL_ALT` / `COMPANY_PASSWORD_ALT` | `jobright.py` `_company_portal_login()` | Fallback ATS portal login — `anthonyclarkins@icloud.com` (GDIT, government portals); tried automatically if primary login fails |
 | `ANTHROPIC_API_KEY` | `scorer.py`, `jobright.py` | Claude scoring + ATS analysis |
 | `DASHBOARD_URL` / `SYNC_SECRET` | `orchestrator.py` | Cloud dashboard sync |
@@ -248,7 +248,7 @@ The apply run is safe to schedule — all logins are automatic, Chrome windows o
 
 ```bash
 # crontab -e
-0 8 * * 1-5 cd /Users/alarkins/Dev/Projects/job-agent && source .venv/bin/activate && python src/main.py apply --auto-submit >> /tmp/job-agent.log 2>&1
+0 8 * * 1-5 cd /path/to/job-agent && source .venv/bin/activate && python src/main.py apply --auto-submit >> /tmp/job-agent.log 2>&1
 ```
 
 ---

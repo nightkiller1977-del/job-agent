@@ -16,7 +16,7 @@ def _profile_dir(self) -> Path:
 Each scraper gets an isolated profile under `state/sessions/<name>_profile/`.
 
 **Do NOT:**
-- Return `Path("/Users/alarkins/Library/Application Support/Google/Chrome")`
+- Return `Path("/Users/<you>/Library/Application Support/Google/Chrome")`
 - Add `--profile-directory=Default` to Chrome args
 - Add any guard in `_clear_profile_locks()` that skips lock removal for the main profile
 

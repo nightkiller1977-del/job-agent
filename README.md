@@ -390,7 +390,7 @@ Status: Session refreshed — source will be retried
 ```bash
 # Example: run every weekday at 8am
 # crontab -e
-0 8 * * 1-5 cd /Users/alarkins/Dev/Projects/job-agent && source .venv/bin/activate && python src/main.py apply --auto-submit >> /tmp/job-agent.log 2>&1
+0 8 * * 1-5 cd /path/to/job-agent && source .venv/bin/activate && python src/main.py apply --auto-submit >> /tmp/job-agent.log 2>&1
 ```
 
 Chrome opens and closes automatically — no user presence required. If a session expires mid-run, `ReauthManager` recovers it and retries the source without interrupting the rest of the queue.
