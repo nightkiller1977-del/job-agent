@@ -1,15 +1,16 @@
 """
-Job scorer — uses Claude API to score each job against user criteria.
+Job scorer — uses Ollama (local) first, Claude as fallback, to score jobs.
 Returns a score 0-100, a reason string, and a flags string.
+
+Model routing: Ollama → Claude (Sonnet) → OpenAI, via ModelClient.
+All tiers emit model_span() logs so Grafana shows which provider handled each call.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Optional
-
-import anthropic
-from src.telemetry import model_span
 
 # ---------------------------------------------------------------------------
 # User profile and criteria embedded directly (also read from config)
@@ -113,16 +114,31 @@ Return ONLY the JSON object, no other text.
 """
 
 
+_CLAUDE_SONNET = "claude-sonnet-4-5"
+
+
 class JobScorer:
     def __init__(self, api_key: Optional[str] = None):
-        self.client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-        self.model = "claude-sonnet-4-5"
+        from src.model_client import ModelClient
+        _key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        # Use Sonnet (not Haiku) when Claude is the fallback — scoring quality matters.
+        self._model_client = ModelClient(
+            anthropic_api_key=_key,
+            anthropic_model=_CLAUDE_SONNET,
+        )
 
-    def score(self, job: dict) -> tuple[int, str, str, str]:
-        """
-        Score a single job.
+    async def score(self, job: dict) -> tuple[int, str, str, str]:
+        """Score a single job via Ollama → Claude → OpenAI cascade.
+
         Returns (score, reason, flags, recommended_action).
+        ModelClient emits model_span() logs for whichever provider fires,
+        so the Grafana "Model Calls by Provider" panels reflect actual usage.
         """
+        # Fast pre-filter: obvious IC roles get score 0 without any model call
+        ic_check = self._quick_ic_check(job)
+        if ic_check:
+            return 5, ic_check, "IC_ROLE,SKIP", "skip"
+
         prompt = SCORE_PROMPT_TEMPLATE.format(
             user_profile=USER_PROFILE,
             target_roles=TARGET_ROLES,
@@ -137,32 +153,50 @@ class JobScorer:
             description=(job.get("description", "") or "")[:3000],
         )
 
-        # Fast pre-filter: obvious IC roles get score 0 without API call
-        ic_check = self._quick_ic_check(job)
-        if ic_check:
-            return 5, ic_check, "IC_ROLE,SKIP", "skip"
-
         try:
-            with model_span("anthropic", self.model, agent="job-agent/scorer") as span:
-                message = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=512,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                span["input_tokens"] = message.usage.input_tokens
-                span["output_tokens"] = message.usage.output_tokens
-            raw = message.content[0].text.strip()
-            # Strip markdown code fences if present
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            data = json.loads(raw)
-            score = max(0, min(100, int(data.get("score", 50))))
-            reason = data.get("reason", "")
-            flags = data.get("flags", "")
-            action = data.get("recommended_action", "review")
-            return score, reason, flags, action
+            text = await self._model_client.complete(
+                messages=[{"role": "user", "content": prompt}],
+                task_type="reasoning",
+                max_tokens=512,
+            )
+            if not text or text.startswith("No model available"):
+                return 50, "No model available for scoring", "FLAG_FOR_REVIEW", "review"
+            return self._parse_response(text)
         except Exception as exc:
             return 50, f"Scoring error: {exc}", "FLAG_FOR_REVIEW", "review"
+
+    async def batch_score(self, jobs: list[dict]) -> list[dict]:
+        """Score a list of jobs in place, returning the annotated list."""
+        for job in jobs:
+            score, reason, flags, action = await self.score(job)
+            job["score"] = score
+            job["score_reason"] = reason
+            job["flags"] = flags
+            job["recommended_action"] = action
+        return jobs
+
+    def _parse_response(self, raw: str) -> tuple[int, str, str, str]:
+        """Parse a JSON scoring response into (score, reason, flags, action)."""
+        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        raw = re.sub(r"\s*```$", "", raw)
+        # deepseek-r1 wraps answers in <think>...</think> — strip it
+        raw = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Try extracting the first JSON object
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if m:
+                data = json.loads(m.group())
+            else:
+                return 50, "Could not parse model response", "FLAG_FOR_REVIEW", "review"
+        score = max(0, min(100, int(data.get("score", 50))))
+        return (
+            score,
+            data.get("reason", ""),
+            data.get("flags", ""),
+            data.get("recommended_action", "review"),
+        )
 
     def _quick_ic_check(self, job: dict) -> Optional[str]:
         """Returns a rejection reason if the job title clearly matches an IC role, else None."""
@@ -192,15 +226,3 @@ class JobScorer:
             if pattern in title_lower:
                 return f"IC role rejected: '{job.get('title')}'"
         return None
-
-    def batch_score(self, jobs: list[dict]) -> list[dict]:
-        """Score a list of jobs in place, adding score/score_reason/flags/recommended_action fields."""
-        results = []
-        for job in jobs:
-            score, reason, flags, action = self.score(job)
-            job["score"] = score
-            job["score_reason"] = reason
-            job["flags"] = flags
-            job["recommended_action"] = action
-            results.append(job)
-        return results
