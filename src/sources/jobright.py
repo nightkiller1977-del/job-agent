@@ -1212,7 +1212,7 @@ class JobrightScraper(BaseScraper):
 
             # Step 5: Wait for redirect to jobs page (up to 30s)
             console.print("[magenta]Jobright:[/magenta] Waiting for login to complete…")
-            for _ in range(15):
+            for attempt in range(15):
                 await asyncio.sleep(2)
                 cur = page.url
                 if "jobright.ai/jobs" in cur or "jobright.ai/dashboard" in cur or "jobright.ai/home" in cur:
@@ -1221,9 +1221,11 @@ class JobrightScraper(BaseScraper):
                     await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=20000)
                     await self._delay(2, 3)
                     return True
-                console.print(f"[dim]  Waiting… {cur}[/dim]")
+                # Only log on first check and halfway through to avoid spamming output
+                if attempt == 0 or attempt == 7:
+                    console.print(f"[dim]  Still waiting ({attempt * 2}s)… URL: {cur}[/dim]")
 
-            console.print(f"[red]Jobright: Login redirect timed out. URL: {page.url}[/red]")
+            console.print(f"[red]Jobright: Login redirect timed out after 30s. URL: {page.url}[/red]")
             return False
 
         except Exception as exc:
