@@ -4,10 +4,13 @@ State manager — SQLite backend for tracking all discovered/applied/skipped job
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 
 DB_SCHEMA = """
@@ -124,6 +127,7 @@ class StateManager:
             return True
 
     def set_status(self, job_id: str, status: str) -> None:
+        _log.info("job.status job_id=%s status=%s", job_id, status)
         if status == "expired":
             self.archive_job(job_id, reason="expired")
             return
