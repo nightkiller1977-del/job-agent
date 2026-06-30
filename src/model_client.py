@@ -39,6 +39,11 @@ except Exception:
     def _model_span(*args, **kwargs):
         yield {}
 
+try:
+    from .notifier import notify_error as _notify_error
+except Exception:
+    _notify_error = None  # type: ignore[assignment]
+
 
 _log = logging.getLogger(__name__)
 
@@ -127,17 +132,34 @@ class ModelClient:
 
         # Tier 3: OpenAI / Codex
         openai_key = os.environ.get("OPENAI_API_KEY", "")
+        last_error: str = ""
         if openai_key:
             try:
                 with _model_span("openai", OPENAI_MODEL):
                     return await self._call_openai(messages, system, max_tokens)
             except Exception as exc:
+                last_error = str(exc)
                 _log.error("ModelClient: OpenAI also failed: %s", exc)
 
-        return (
+        # All three tiers exhausted — emit a visible alert before returning the
+        # degraded fallback string so the failure surfaces in agent_status.json
+        # and in Loki via the structured log entry.
+        _degraded_msg = (
             "No model available: Ollama is not running, ANTHROPIC_API_KEY and "
             "OPENAI_API_KEY are not set."
         )
+        _log.error(
+            "ModelClient: cascade total failure — all inference tiers failed. last_error=%s",
+            last_error,
+            extra={"tags": {"level": "error", "alert": "true"}},
+        )
+        if _notify_error is not None:
+            _notify_error(
+                "Model cascade total failure",
+                f"All inference tiers failed (Ollama + Claude + OpenAI). "
+                f"Scoring degraded. Last error: {last_error}",
+            )
+        return _degraded_msg
 
     async def get_ollama_models(self) -> list[str]:
         """Return names of all locally pulled Ollama models."""

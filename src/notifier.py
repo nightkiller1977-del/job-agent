@@ -31,8 +31,44 @@ def _save_status(data: dict) -> None:
     STATUS_FILE.write_text(json.dumps(data, indent=2))
 
 
+import time
+
+_last_notification_times: dict[str, float] = {}
+
+def _send_telegram(message: str) -> None:
+    try:
+        settings_path = Path.home() / "Library" / "Application Support" / "ai-command-center" / "settings-v3.json"
+        if not settings_path.exists():
+            return
+        settings = json.loads(settings_path.read_text())
+        tg = settings.get("telegram", {})
+        if not tg.get("enabled"):
+            return
+        token = tg.get("botToken")
+        chat_id = tg.get("chatId")
+        if not token or not chat_id:
+            return
+            
+        import urllib.request
+        import urllib.parse
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            pass
+    except Exception:
+        pass
+
 def _macos_notify(title: str, message: str, subtitle: str = "Job Agent") -> None:
-    """Fire a native macOS notification via osascript."""
+    """Fire a native macOS notification via osascript with rate limiting."""
+    now = time.time()
+    cache_key = f"{title}:{message}"
+    last_time = _last_notification_times.get(cache_key, 0)
+    # Rate limit identical macOS notifications to once every 15 minutes (900 seconds)
+    if now - last_time < 900:
+        return
+    _last_notification_times[cache_key] = now
+
     try:
         script = (
             f'display notification "{message}" '
@@ -68,25 +104,44 @@ def _add_alert(level: str, title: str, detail: str) -> None:
 def notify_error(title: str, detail: str = "") -> None:
     """Signal a hard failure — missing credentials, crash, etc."""
     _add_alert("error", title, detail)
+    
+    # Send to Telegram (rate limited by caching key)
+    now = time.time()
+    cache_key = f"tg:error:{title}:{detail}"
+    last_time = _last_notification_times.get(cache_key, 0)
+    if now - last_time >= 900:
+        _last_notification_times[cache_key] = now
+        _send_telegram(f"🚨 [Job Agent ERROR] {title}\nDetail: {detail}")
+
     _macos_notify(f"🔴 {title}", detail or title, subtitle="Job Agent ERROR")
 
 
 def notify_warning(title: str, detail: str = "") -> None:
     """Signal something degraded but not fatal — login retry, skipped job."""
     _add_alert("warning", title, detail)
+
+    # Send to Telegram (rate limited by caching key)
+    now = time.time()
+    cache_key = f"tg:warn:{title}:{detail}"
+    last_time = _last_notification_times.get(cache_key, 0)
+    if now - last_time >= 900:
+        _last_notification_times[cache_key] = now
+        _send_telegram(f"⚠️ [Job Agent WARNING] {title}\nDetail: {detail}")
+
     _macos_notify(f"🟡 {title}", detail or title, subtitle="Job Agent WARNING")
 
 
 def notify_success(title: str, detail: str = "") -> None:
     """Signal a successful application submission."""
     _add_alert("success", title, detail)
+    _send_telegram(f"✅ [Job Agent SUCCESS] {title}\nDetail: {detail}")
     _macos_notify(f"✅ {title}", detail or title, subtitle="Job Agent")
 
 
 def notify_info(title: str, detail: str = "") -> None:
     """Informational — run started, jobs discovered, etc."""
     _add_alert("info", title, detail)
-    # Don't fire a macOS popup for info — just write to status file
+    # Don't fire a macOS popup or Telegram for info — just write to status file
 
 
 def record_run_stats(applied: int, failed: int, skipped: int) -> None:

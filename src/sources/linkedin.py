@@ -1021,6 +1021,11 @@ class LinkedInScraper(BaseScraper):
         return submitted
 
     async def _tailor_resume_with_jobright(self, job: dict) -> str:
+        # NOTE: linkedin.py makes no direct AI model calls. All model use is
+        # delegated — either to JobrightScraper._claude_ats_and_tailor() (already
+        # wrapped with model_span in jobright.py) or to JobrightScraper's Orion
+        # browser automation. model_span wrapping is therefore not needed here.
+
         # Skip entirely if Orion already failed in this session — no point
         # opening a second browser and searching Jobright when we know there
         # is no downloadable resume at the end.

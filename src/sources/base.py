@@ -254,6 +254,11 @@ class BaseScraper(ABC):
         try:
             from playwright_stealth import stealth_async
             await stealth_async(self._page)
+        except ImportError:
+            _log.warning(
+                "playwright-stealth not installed — bot-detection mitigation is OFF. "
+                "Run: pip install playwright-stealth"
+            )
         except Exception as exc:
             _log.warning("%s: failed to apply playwright-stealth: %s", self.name, exc)
         await self._page.bring_to_front()

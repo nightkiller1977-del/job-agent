@@ -106,6 +106,16 @@ class ReauthManager:
                 record_reauth_event(source, "automated", "success")
                 _log.info("reauth.success source=%s mode=automated", source)
                 notify_info(f"{source} reauth", "Session refreshed automatically — retrying")
+                # After a successful Jobright reauth, re-enable Orion resume tailoring
+                # so the next job in the queue gets a fresh Orion attempt rather than
+                # being skipped for the remainder of the session.
+                if source == "jobright":
+                    try:
+                        from .sources.jobright import JobrightScraper
+                        JobrightScraper.reset_orion_availability()
+                        _log.info("reauth.orion_reset source=jobright")
+                    except Exception as _reset_exc:
+                        _log.warning("reauth.orion_reset_failed: %s", _reset_exc)
                 self._write_regression_test(source, "automated", "_auto_login returned True after session expiry")
                 self._notify_correction(source, "automated", "_auto_login returned True after session expiry")
                 return True
