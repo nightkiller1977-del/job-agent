@@ -60,6 +60,54 @@ def check_api_key() -> bool:
     return True
 
 
+# Credential pairs required by each source that uses a browser login.
+_SOURCE_CREDS: dict[str, list[str]] = {
+    "linkedin":  ["LINKEDIN_EMAIL",  "LINKEDIN_PASSWORD"],
+    "jobright":  ["JOBRIGHT_EMAIL",  "JOBRIGHT_PASSWORD"],
+    "indeed":    ["INDEED_EMAIL",    "INDEED_PASSWORD"],
+    "usajobs":   ["USAJOBS_USERNAME", "USAJOBS_PASSWORD"],
+}
+
+
+def preflight_env_check(sources: list[str] | None) -> bool:
+    """Validate that every credential required by *sources* is present in env.
+
+    Returns True when all credentials are present, False (after printing errors)
+    when any are missing.  Call this before launching any browser.
+
+    Args:
+        sources: list of source names that will actually run (e.g. ["linkedin"]).
+                 Pass None to check all four browser-login sources.
+    """
+    if sources is None:
+        sources = list(_SOURCE_CREDS.keys())
+
+    missing_count = 0
+    for src in sources:
+        required = _SOURCE_CREDS.get(src)
+        if not required:
+            # source has no mandatory creds (e.g. "mcp", "linkedin-saved")
+            continue
+        for var in required:
+            val = os.environ.get(var, "")
+            if not val:
+                print(
+                    f"[PREFLIGHT FAIL] Missing credentials for {src}: "
+                    f"{var} is not set. Set it in .env before running.",
+                    file=sys.stderr,
+                )
+                missing_count += 1
+
+    if missing_count:
+        print(
+            f"\n[PREFLIGHT FAIL] {missing_count} credential(s) missing. "
+            "Fix them in .env and re-run.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="job-agent",
@@ -331,6 +379,27 @@ def main() -> None:
         sys.exit(1)
     if args.command == "commander" and args.subcommand in ("ask", "report", "watch") and not check_api_key():
         sys.exit(1)
+
+    # Pre-flight: ensure browser-login credentials are present before any
+    # browser is launched.  For 'discover', only check the source(s) that
+    # will actually run; for 'apply', check the single --source (or all).
+    if args.command == "discover":
+        # mcp and linkedin-saved don't use browser login creds
+        src = getattr(args, "source", None)
+        if src in ("mcp", "linkedin-saved"):
+            sources_to_check: list[str] | None = []   # nothing to validate
+        elif src is not None:
+            sources_to_check = [src]
+        else:
+            sources_to_check = None  # all four
+        if sources_to_check != [] and not preflight_env_check(sources_to_check):
+            sys.exit(1)
+
+    if args.command == "apply":
+        src = getattr(args, "source", None)
+        sources_to_check = [src] if src else None
+        if not preflight_env_check(sources_to_check):
+            sys.exit(1)
 
     try:
         exit_code = asyncio.run(main_async(args))
