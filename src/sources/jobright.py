@@ -18,6 +18,7 @@ from rich.console import Console
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_warning, notify_success, notify_info
 from src.resume_helper import ResumeFieldFixer, resolve_resume_path
+from src.telemetry import model_span
 
 console = Console()
 
@@ -34,6 +35,16 @@ class JobrightScraper(BaseScraper):
     # Class-level flag: once Orion tailoring fails in a session, skip it for
     # all subsequent jobs instead of waiting 2-4 minutes per job on timeouts.
     _orion_tailoring_available: bool = True
+
+    @classmethod
+    def reset_orion_availability(cls) -> None:
+        """Re-enable Orion resume tailoring after a successful session reauth.
+
+        Called by ReauthManager after a successful Jobright reauth so that the
+        next job in the queue gets a fresh Orion attempt instead of being skipped
+        for the rest of the session.
+        """
+        cls._orion_tailoring_available = True
 
     def _set_apply_outcome(self, status: str, detail: str) -> bool:
         self.last_apply_status = status
@@ -3238,11 +3249,14 @@ class JobrightScraper(BaseScraper):
                 '  "cover_letter": "3-paragraph cover letter for this specific role and company"\n'
                 "}"
             )
-            _text = await self._model_client.complete(
-                messages=[{"role": "user", "content": _prompt}],
-                task_type="reasoning",
-                max_tokens=1800,
-            )
+            with model_span("model_client", "cascade", agent="job-agent", task="ats_analysis") as span:
+                _text = await self._model_client.complete(
+                    messages=[{"role": "user", "content": _prompt}],
+                    task_type="reasoning",
+                    max_tokens=1800,
+                )
+                span["job_title"] = job.get("title", "")
+                span["company"] = job.get("company", "")
             if not _text or _text.startswith("No model available"):
                 return {}
             # Strip markdown fences and deepseek-r1 <think> blocks before parsing

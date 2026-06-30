@@ -25,7 +25,7 @@ from .sources.indeed import IndeedScraper
 import logging
 
 from .sources.base import AuthFailedError, JobExpiredError
-from .notifier import notify_info, notify_warning, record_run_stats
+from .notifier import notify_error, notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
 
 console = Console()
@@ -805,6 +805,8 @@ class Orchestrator:
                 console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")
         except Exception as e:
             console.print(f"[dim]Cloud pull failed (non-fatal): {e}[/dim]")
+            _log.warning("cloud_sync.pull_failed error=%s", e)
+            notify_error("Cloud sync failed: _pull_approved_from_cloud", str(e)[:200])
 
     async def _push_status_to_cloud(self, job_id: str, status: str) -> None:
         """POST a status update back to the cloud dashboard (non-fatal)."""
@@ -824,6 +826,8 @@ class Orchestrator:
                     console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
         except Exception as e:
             console.print(f"[dim]Cloud status push failed (non-fatal): {e}[/dim]")
+            _log.warning("cloud_sync.push_status_failed error=%s", e)
+            notify_error("Cloud sync failed: _push_status_to_cloud", str(e)[:200])
 
     async def _push_apply_attempt_to_cloud(self, job_id: str) -> None:
         """Sync the latest local apply attempt fields to the dashboard.
