@@ -336,10 +336,10 @@ class JobrightScraper(BaseScraper):
                             compiler = LaTeXCompiler(Path(__file__).parent.parent.parent)
                             safe_title = re.sub(r'[^\w\-]', '_', (job.get('title') or 'role'))[:40]
                             safe_co = re.sub(r'[^\w\-]', '_', (job.get('company') or 'co'))[:25]
-                            
+
                             pdf_cv_path = str(TAILORED_RESUMES_DIR / f"{safe_title}_{safe_co}_resume.pdf")
                             pdf_cl_path = str(TAILORED_RESUMES_DIR / f"{safe_title}_{safe_co}_cover_letter.pdf")
-                            
+
                             # Load profile
                             profile: dict = {}
                             import json as _json
@@ -347,19 +347,19 @@ class JobrightScraper(BaseScraper):
                             if os.path.isfile(_ppath):
                                 with open(_ppath) as _f:
                                     profile = _json.load(_f)
-                            
+
                             # Compile CV/Resume (LaTeX with Playwright HTML fallback)
                             success_cv = await compiler.compile_cv(profile, _tailored, pdf_cv_path, page=page)
                             if success_cv:
                                 resolved_resume = pdf_cv_path
                                 self._last_tailored_resume_path = pdf_cv_path
                                 self._last_application_method = "Claude Tailored"
-                                
+
                                 # Check ATS Readability
                                 all_keywords = list(profile.get("skills", [])) + _tailored.get("missing_keywords", [])
                                 check_ats_readability(pdf_cv_path, all_keywords)
                                 console.print("[green]ATS readability check passed successfully ✓[/green]")
-                            
+
                             # Compile Cover Letter
                             if _tailored.get("cover_letter"):
                                 success_cl = await compiler.compile_cover_letter(profile, _tailored, job, pdf_cl_path, page=page)
@@ -3077,10 +3077,10 @@ class JobrightScraper(BaseScraper):
         """Upload resume and cover letter to visible file inputs depending on their labels/accept types."""
         res_path = Path(resume_path).expanduser() if resume_path else None
         cl_path = Path(cover_letter_path).expanduser() if cover_letter_path else None
-        
+
         uploaded_resume = False
         uploaded_cover = False
-        
+
         try:
             file_inputs = await page.query_selector_all('input[type="file"]')
             for file_input in file_inputs:
@@ -3106,15 +3106,15 @@ class JobrightScraper(BaseScraper):
                 except Exception:
                     label = ""
                 hints = " ".join([accept, name, label.lower()])
-                
+
                 # Check file extension constraints
                 if accept and not any(ext in accept for ext in [".pdf", ".doc", ".docx", "pdf", "word"]):
                     continue
-                
+
                 # Distinguish between cover letter input and resume input
                 is_cover_letter = any(word in hints for word in ["cover", "letter", "cl", "motivation", "motivational"])
                 is_resume = any(word in hints for word in ["resume", "cv", "vitae", "work history"]) or not hints.strip()
-                
+
                 if is_cover_letter and cl_path and cl_path.exists():
                     await file_input.set_input_files(str(cl_path))
                     console.print(f"[green]Jobright ATS:[/green] Uploaded cover letter: {cl_path.name}")
@@ -3131,7 +3131,7 @@ class JobrightScraper(BaseScraper):
                     console.print(f"[green]Jobright ATS:[/green] Uploaded resume (fallback): {res_path.name}")
                     uploaded_resume = True
                     await self._delay(1, 2)
-                    
+
         except Exception as exc:
             console.print(f"[yellow]Jobright ATS:[/yellow] Document upload check failed: {exc}")
         return uploaded_resume
@@ -3284,7 +3284,7 @@ class JobrightScraper(BaseScraper):
         try:
             import json as _json
             resume_text = self._extract_resume_text()
-            
+
             # --- 1. DRAFTER STEP ---
             _draft_prompt = (
                 "You are an expert resume writer and ATS specialist. "
@@ -3314,17 +3314,17 @@ class JobrightScraper(BaseScraper):
                 )
                 span["job_title"] = job.get("title", "")
                 span["company"] = job.get("company", "")
-                
+
             if not _draft_text or _draft_text.startswith("No model available"):
                 return {}
-                
+
             _draft_text = re.sub(r"<think>.*?</think>\s*", "", _draft_text, flags=re.DOTALL)
             _draft_text = re.sub(r"^```[a-z]*\n?", "", _draft_text.strip())
             _draft_text = re.sub(r"\n?```$", "", _draft_text)
             _m = re.search(r"\{.*\}", _draft_text, re.DOTALL)
             if _m:
                 _draft_text = _m.group()
-            
+
             # --- 2. REVIEWER / GROUNDING STEP ---
             _review_prompt = (
                 "You are an ATS compliance auditor and grounding checker.\n"
@@ -3344,17 +3344,17 @@ class JobrightScraper(BaseScraper):
                     task_type="reasoning",
                     max_tokens=1800,
                 )
-            
+
             if not _final_text or _final_text.startswith("No model available"):
                 _final_text = _draft_text
-                
+
             _final_text = re.sub(r"<think>.*?</think>\s*", "", _final_text, flags=re.DOTALL)
             _final_text = re.sub(r"^```[a-z]*\n?", "", _final_text.strip())
             _final_text = re.sub(r"\n?```$", "", _final_text)
             _m = re.search(r"\{.*\}", _final_text, re.DOTALL)
             if _m:
                 _final_text = _m.group()
-                
+
             result = _json.loads(_final_text)
             return {
                 "ats_score": int(result.get("ats_score", 0)),
