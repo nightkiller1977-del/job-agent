@@ -1,0 +1,55 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1.0in]{geometry}
+\usepackage{charter} % clean, readable serif font
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\definecolor{primary}{RGB}{30, 41, 59}
+\definecolor{linkcolor}{RGB}{37, 99, 235}
+
+\hypersetup{
+    colorlinks=true,
+    urlcolor=linkcolor
+}
+
+\pagestyle{empty}
+
+\begin{document}
+
+\begin{flushright}
+    \textbf{{{FULL_NAME}}} \\
+    {{CONTACT_INFO}} \\
+    \vspace{1em}
+    \today
+\end{flushright}
+
+\vspace{2em}
+
+\begin{flushleft}
+    \textbf{To the Hiring Team} \\
+    {{COMPANY_NAME}} \\
+    {{COMPANY_ADDRESS}} \\
+\end{flushleft}
+
+\vspace{1.5em}
+
+\noindent \textbf{Subject: Application for {{JOB_TITLE}} (Job ID: {{JOB_ID}})}
+
+\vspace{1.5em}
+
+\noindent Dear Hiring Team,
+
+\vspace{1em}
+
+{{COVER_LETTER_BODY}}
+
+\vspace{2em}
+
+\begin{flushleft}
+    Sincerely, \\
+    \vspace{2em}
+    {{FULL_NAME}}
+\end{flushleft}
+
+\end{document}
