@@ -14,7 +14,6 @@ Reference: electron/services/modelRegistry.js, modelRouterService.js, modelServi
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import platform
@@ -251,27 +250,21 @@ class SystemPerformanceGate:
     @classmethod
     def get_memory_status(cls) -> dict:
         import os as _os
-        total_gb = _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES") / (1024 ** 3) \
-            if platform.system() != "Darwin" else _os.cpu_count()  # fallback
-        try:
-            import resource as _res  # Unix only
-        except ImportError:
-            pass
-        # Use psutil if available for accurate free memory; otherwise estimate
+        import re
+
+        # Use psutil if available for accurate memory figures; otherwise use sysconf
         try:
             import psutil
             vm = psutil.virtual_memory()
             total_gb = vm.total / (1024 ** 3)
             free_gb = vm.available / (1024 ** 3)
         except ImportError:
-            import os as _os2
-            total_gb = _os2.sysconf("SC_PAGE_SIZE") * _os2.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
+            total_gb = _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
             free_gb = total_gb * 0.4  # conservative fallback
 
         swap_gb = 0.0
         if platform.system() == "Darwin":
             out = cls._run(["sysctl", "-n", "vm.swapusage"])
-            import re
             m = re.search(r"used\s*=\s*([\d.]+)([KMGT])", out, re.IGNORECASE)
             if m:
                 val, unit = float(m.group(1)), m.group(2).upper()

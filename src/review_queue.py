@@ -4,8 +4,6 @@ Uses Rich for a clean, readable terminal UI.
 """
 from __future__ import annotations
 
-import sys
-from typing import Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -131,8 +129,6 @@ def render_job_card(job: dict, index: int, total: int) -> Panel:
             snippet += "…"
         table.add_row("Snippet", Text(snippet, style="italic dim"))
 
-    from rich.columns import Columns
-    from rich.align import Align
 
     content_lines = [title_text, "", table]
 

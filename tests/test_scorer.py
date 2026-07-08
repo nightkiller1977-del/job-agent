@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -20,8 +20,6 @@ from src.scorer import (
     JobScorer,
     _build_profile_from_config,
     _smart_excerpt,
-    _IC_PATTERNS,
-    _SENIORITY_PATTERNS,
 )
 
 
