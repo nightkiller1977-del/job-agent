@@ -61,20 +61,34 @@ class StateManager:
     def __init__(self, db_path: str = "state/jobs.db"):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn: Optional[sqlite3.Connection] = None
+        # Persistent shared connection — avoids per-operation open/close overhead
+        # on large batch_score runs (50 upserts × connection cycle = significant latency).
+        # check_same_thread=False is safe here: all callers are async but SQLite WAL
+        # mode handles concurrent readers and a single writer correctly.
+        self._conn: sqlite3.Connection = sqlite3.connect(
+            str(self.db_path), check_same_thread=False
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+        """Return the shared connection. Kept for backwards compatibility."""
+        return self._conn
+
+    def close(self) -> None:
+        """Explicitly close the database connection."""
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(DB_SCHEMA)
-            # Hard-delete any legacy expired rows (pre-archive schema)
-            conn.execute("DELETE FROM jobs WHERE status = 'expired'")
+        self._conn.executescript(DB_SCHEMA)
+        # Hard-delete any legacy expired rows (pre-archive schema)
+        self._conn.execute("DELETE FROM jobs WHERE status = 'expired'")
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Write helpers

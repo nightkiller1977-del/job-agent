@@ -198,10 +198,12 @@ class AgentCommander:
     # Query
     # ------------------------------------------------------------------
 
-    def query(self, question: str) -> str:
+    async def query(self, question: str) -> str:
         """
         Answer a natural language question about the agent.
         Routes through Ollama first (via ModelClient); Claude is the fallback.
+
+        async to avoid nested asyncio.run() crash when called from main_async().
         """
         context = self._build_context()
         system = (
@@ -217,9 +219,7 @@ class AgentCommander:
                 "content": f"Agent state:\n{context}\n\nQuestion: {question}",
             }
         ]
-        return asyncio.run(
-            self._model_client.complete(messages, system=system, task_type="reasoning")
-        )
+        return await self._model_client.complete(messages, system=system, task_type="reasoning")
 
     # ------------------------------------------------------------------
     # Diagnose
