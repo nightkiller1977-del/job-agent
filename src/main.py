@@ -339,7 +339,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
         if args.subcommand == "ask":
             question = " ".join(args.question)
-            console.print(commander.query(question))
+            console.print(await commander.query(question))
 
         elif args.subcommand == "diagnose":
             report = commander.diagnose(args.source)
