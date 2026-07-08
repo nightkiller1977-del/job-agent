@@ -269,6 +269,23 @@ def build_parser() -> argparse.ArgumentParser:
     watch_p.add_argument("--interval", type=int, default=30)
     watch_p.add_argument("--no-auto-fix", action="store_true")
 
+    # expand
+    expand_parser = subparsers.add_parser(
+        "expand",
+        help="Enrich profile skills by analyzing public profiles (e.g. GitHub)",
+    )
+    expand_parser.add_argument(
+        "--github",
+        required=True,
+        help="GitHub username to analyze",
+    )
+
+    # upskill
+    subparsers.add_parser(
+        "upskill",
+        help="Analyze skill gaps against approved/applied jobs and generate learning roadmap",
+    )
+
     return parser
 
 
@@ -329,6 +346,16 @@ async def main_async(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
         )
 
+    elif args.command == "expand":
+        from src.profile_enricher import ProfileEnricher
+        enricher = ProfileEnricher()
+        await enricher.enrich_from_github(args.github)
+
+    elif args.command == "upskill":
+        from src.gap_analyzer import GapAnalyzer
+        analyzer = GapAnalyzer()
+        await analyzer.run_analysis()
+
     elif args.command == "commander":
         import json
         from src.commander import AgentCommander
@@ -375,7 +402,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # All commands except 'status' need the API key
-    if args.command in ("discover", "hydrate") and not check_api_key():
+    if args.command in ("discover", "hydrate", "expand", "upskill") and not check_api_key():
         sys.exit(1)
     if args.command == "commander" and args.subcommand in ("ask", "report", "watch") and not check_api_key():
         sys.exit(1)

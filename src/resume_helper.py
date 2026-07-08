@@ -271,3 +271,54 @@ class ResumeFieldFixer:
         except Exception:
             pass
         return False
+
+
+class ATSReadabilityError(Exception):
+    """Raised when a generated resume PDF fails ATS keyword or parseability checks."""
+    pass
+
+
+def check_ats_readability(pdf_path: str, target_keywords: list[str]) -> None:
+    """Extracts text layer from the PDF using pypdf and verifies that target keywords are present.
+    If the text layer is unreadable or keywords are missing, raises ATSReadabilityError.
+    """
+    from pypdf import PdfReader
+    
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        
+    try:
+        reader = PdfReader(pdf_path)
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + " "
+    except Exception as e:
+        raise ATSReadabilityError(f"Failed to parse PDF text layer: {e}")
+
+    # Check if text is completely empty or mostly whitespaces (unreadable PDF)
+    if not text.strip():
+        raise ATSReadabilityError(
+            "ATS check failed: Generated PDF has no extractable text layer. "
+            "It might have compiled as a flat image or fonts are unreadable."
+        )
+
+    # Normalize extracted text for case-insensitive checking
+    normalized_text = text.lower()
+    
+    # Verify keywords
+    missing_keywords = []
+    for keyword in target_keywords:
+        if not keyword or not keyword.strip():
+            continue
+        kw_clean = keyword.lower().strip()
+        # Fallback to simple substring match if word boundary search is too restrictive
+        if kw_clean not in normalized_text:
+            missing_keywords.append(keyword)
+
+    if missing_keywords:
+        raise ATSReadabilityError(
+            f"ATS check failed: Generated PDF is missing critical target keywords: {', '.join(missing_keywords)}"
+        )
+
