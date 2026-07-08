@@ -6,24 +6,20 @@ Three layers of protection:
      source as healthy / stale / expired / missing.
   2. Heartbeat: silently visit each source in the background to extend cookie
      lifetime without a full login — run nightly via scheduler.
-  3. Deep-link notification: when automated reauth fails, send a Telegram
-     message containing a jobagent:// URL that opens Terminal and runs
-     prepare-sessions in one tap from your phone.
+  3. Deep-link notification: delegates to notifier.py which reads Telegram
+     credentials from AI Commander's settings-v3.json automatically.
+     (~Library/Application Support/ai-command-center/settings-v3.json)
+     No duplicate credential configuration needed — configure Telegram once
+     in AI Commander and job-agent picks it up automatically.
 
 macOS URL handler (register once):
-  defaults write com.apple.LaunchServices LSHandlers -array-add \
-    '{LSHandlerURLScheme=jobagent;LSHandlerRoleAll=com.apple.terminal;}'
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-    -kill -r -domain local -domain user
-
-Or install the provided LaunchAgent in scripts/install-jobagent-url-handler.sh
+  bash scripts/install-jobagent-url-handler.sh
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,10 +48,6 @@ _HEARTBEAT_SOURCES = {"linkedin", "indeed", "jobright"}
 
 # Sources that need a visible browser for the user to complete login
 _HUMAN_SOURCES = {"linkedin", "usajobs"}
-
-# Telegram bot config (optional — falls back to iMessage/console if unset)
-_TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-_TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 # ---------------------------------------------------------------------------
@@ -271,48 +263,25 @@ async def _heartbeat_source(source: str, config: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def _send_deep_link_notification(source: str, message: str) -> None:
-    """Send a Telegram message (or console fallback) with a one-tap repair link.
+    """Send a Telegram message with a one-tap repair deep-link.
 
-    The jobagent:// URL is handled by the macOS LaunchAgent installed via
-    scripts/install-jobagent-url-handler.sh — tapping it on any device
-    that has iCloud/Handoff opens Terminal and runs prepare-sessions.
+    Delegates entirely to notifier._send_telegram() which reads credentials
+    from AI Commander's settings-v3.json — no duplicate config needed.
+    Configure Telegram once in AI Commander; job-agent picks it up here.
+
+    Deep-link format: jobagent://prepare-sessions?source=<source>
+    Handled by scripts/install-jobagent-url-handler.sh (register once).
     """
     deep_link = f"jobagent://prepare-sessions?source={source}"
     full_msg = f"{message}\n\n{deep_link}"
 
-    if _TELEGRAM_TOKEN and _TELEGRAM_CHAT_ID:
-        _send_telegram(full_msg, source)
-    else:
-        # Fallback: iMessage (uses existing notifier path)
-        try:
-            from .notifier import _macos_notify
-            _macos_notify(f"{source} session needs refresh", message)
-        except Exception:
-            pass
-        console.print(f"[yellow]Session alert:[/yellow] {full_msg}")
-
-
-def _send_telegram(message: str, source: str) -> None:
-    """Fire-and-forget Telegram message. Errors are logged, never raised."""
     try:
-        import urllib.request
-        import urllib.parse
-        payload = json.dumps({
-            "chat_id": _TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        }).encode()
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{_TELEGRAM_TOKEN}/sendMessage",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            _log.info("telegram.sent source=%s status=%d", source, resp.status)
+        from .notifier import _send_telegram, _macos_notify
+        _send_telegram(full_msg)
+        _macos_notify(f"{source} session needs refresh", message)
     except Exception as exc:
-        _log.warning("telegram.failed source=%s error=%s", source, exc)
+        _log.warning("session_watchdog.notify_failed source=%s error=%s", source, exc)
+        console.print(f"[yellow]Session alert ({source}):[/yellow] {message}\n{deep_link}")
 
 
 # ---------------------------------------------------------------------------
