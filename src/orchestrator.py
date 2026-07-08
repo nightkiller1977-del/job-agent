@@ -49,7 +49,7 @@ class Orchestrator:
         self.config = self._load_config(config_path)
         self.state = StateManager(self.config.get("state_db_path", "state/jobs.db"))
         api_key = os.environ.get("ANTHROPIC_API_KEY")
-        self.scorer = JobScorer(api_key=api_key)
+        self.scorer = JobScorer(config=self.config, api_key=api_key)
 
     def _load_config(self, path: str) -> dict:
         p = Path(path).expanduser()
@@ -959,7 +959,7 @@ class Orchestrator:
 
         console.print(f"[cyan]Found {len(unhydrated)} unhydrated job(s). Starting local scraper...[/cyan]")
 
-        from .sources.linkedin import LinkedInScraper, _infer_remote_type
+        from .sources.linkedin import LinkedInScraper, _infer_remote_type  # noqa: F401
         from .sources.jobright import JobrightScraper
         from .sources.indeed import IndeedScraper
 

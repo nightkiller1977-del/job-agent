@@ -48,7 +48,7 @@ def _send_telegram(message: str) -> None:
         chat_id = tg.get("chatId")
         if not token or not chat_id:
             return
-            
+
         import urllib.request
         import urllib.parse
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -104,7 +104,7 @@ def _add_alert(level: str, title: str, detail: str) -> None:
 def notify_error(title: str, detail: str = "") -> None:
     """Signal a hard failure — missing credentials, crash, etc."""
     _add_alert("error", title, detail)
-    
+
     # Send to Telegram (rate limited by caching key)
     now = time.time()
     cache_key = f"tg:error:{title}:{detail}"

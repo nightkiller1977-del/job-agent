@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "fix/**", "feature/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        # Scope to unit tests that have no infrastructure dependencies.
+        # test_credentials and test_email_2fa need fastapi/imap — excluded.
+        # Functional/browser tests need playwright install + live creds — excluded.
+        run: |
+          pytest tests/test_scorer.py \
+                 tests/test_state_manager.py \
+                 tests/test_reauth_regressions.py \
+                 tests/test_reauth_feature.py \
+                 -q --tb=short --asyncio-mode=auto
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install ruff
+      # E402: module-level imports after sys.path.insert (pre-existing pattern in main.py)
+      # E741: ambiguous variable name (pre-existing in email_helper.py)
+      # F841/F541: pre-existing unused variable / f-string in orchestrator.py
+      - run: ruff check src/ --select=E,W,F --ignore=E501,W291,E402,E741,F841,F541
