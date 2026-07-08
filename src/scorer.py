@@ -120,7 +120,7 @@ _IC_PATTERNS = re.compile(
 )
 
 _SENIORITY_PATTERNS = re.compile(
-    r"\b(manager|director|vp|vice\s+president|head\s+of|lead)\b",
+    r"\b(manager|director|vp|vice\s+president|head\s+of|lead|gs-1[3-5])\b",
     re.IGNORECASE,
 )
 
