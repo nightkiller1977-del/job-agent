@@ -19,12 +19,10 @@ import asyncio
 import os
 import sys
 from datetime import datetime
-from pathlib import Path
 
 from rich.console import Console
 
 from .base import BaseScraper, AuthFailedError, JobExpiredError
-from src.notifier import notify_error
 
 console = Console()
 
