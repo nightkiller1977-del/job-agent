@@ -16,7 +16,7 @@ from pathlib import Path
 from rich.console import Console
 
 from .base import BaseScraper, AuthFailedError, JobExpiredError
-from src.notifier import notify_error, notify_warning, notify_success, notify_info
+from src.notifier import notify_error, notify_success
 from src.resume_helper import ResumeFieldFixer, resolve_resume_path
 from src.telemetry import model_span
 
