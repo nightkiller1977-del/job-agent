@@ -16,6 +16,8 @@ import os
 import re
 from typing import Optional
 
+from src.model_client import ModelClient
+
 # ---------------------------------------------------------------------------
 # Default profile (used only when config is absent — never hardcoded in prod)
 # ---------------------------------------------------------------------------
@@ -187,7 +189,6 @@ def _smart_excerpt(text: str, max_chars: int = 2500) -> str:
 
 class JobScorer:
     def __init__(self, config: dict | None = None, api_key: Optional[str] = None):
-        from src.model_client import ModelClient
         # Read profile from config so config.json changes propagate immediately
         cfg = config or {}
         self._user_profile, self._target_roles, self._reject_roles, self._comp_rules = (
