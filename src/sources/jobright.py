@@ -17,7 +17,8 @@ from rich.console import Console
 
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_success
-from src.resume_helper import ResumeFieldFixer, resolve_resume_path
+from src.resume_helper import ResumeFieldFixer, resolve_resume_path, check_ats_readability, ATSReadabilityError
+from src.latex_compiler import LaTeXCompiler
 from src.telemetry import model_span
 
 console = Console()
@@ -329,25 +330,57 @@ class JobrightScraper(BaseScraper):
                         console.print(f"[{_score_color}]Claude ATS Score: {self._last_ats_score}/100[/{_score_color}]")
                         if self._last_ats_missing_keywords:
                             console.print(f"[dim]Missing keywords: {', '.join(self._last_ats_missing_keywords[:8])}[/dim]")
-                        # If Orion didn't produce a tailored resume, generate one via Claude
+                        # Use LaTeXCompiler to compile resume and cover letter
                         _base_resume = resolve_resume_path(self.config)
                         if not resolved_resume or resolved_resume == _base_resume:
-                            _claude_pdf = await self._generate_tailored_resume_pdf(job, _tailored)
-                            if _claude_pdf:
-                                resolved_resume = _claude_pdf
-                                self._last_tailored_resume_path = _claude_pdf
+                            compiler = LaTeXCompiler(Path(__file__).parent.parent.parent)
+                            safe_title = re.sub(r'[^\w\-]', '_', (job.get('title') or 'role'))[:40]
+                            safe_co = re.sub(r'[^\w\-]', '_', (job.get('company') or 'co'))[:25]
+                            
+                            pdf_cv_path = str(TAILORED_RESUMES_DIR / f"{safe_title}_{safe_co}_resume.pdf")
+                            pdf_cl_path = str(TAILORED_RESUMES_DIR / f"{safe_title}_{safe_co}_cover_letter.pdf")
+                            
+                            # Load profile
+                            profile: dict = {}
+                            import json as _json
+                            _ppath = os.path.join("state", "profile.json")
+                            if os.path.isfile(_ppath):
+                                with open(_ppath) as _f:
+                                    profile = _json.load(_f)
+                            
+                            # Compile CV/Resume (LaTeX with Playwright HTML fallback)
+                            success_cv = await compiler.compile_cv(profile, _tailored, pdf_cv_path, page=page)
+                            if success_cv:
+                                resolved_resume = pdf_cv_path
+                                self._last_tailored_resume_path = pdf_cv_path
                                 self._last_application_method = "Claude Tailored"
+                                
+                                # Check ATS Readability
+                                all_keywords = list(profile.get("skills", [])) + _tailored.get("missing_keywords", [])
+                                check_ats_readability(pdf_cv_path, all_keywords)
+                                console.print("[green]ATS readability check passed successfully ✓[/green]")
+                            
+                            # Compile Cover Letter
+                            if _tailored.get("cover_letter"):
+                                success_cl = await compiler.compile_cover_letter(profile, _tailored, job, pdf_cl_path, page=page)
+                                if success_cl:
+                                    self._last_tailored_cover_letter_path = pdf_cl_path
+                                    console.print(f"[green]Cover letter generated at:[/green] {pdf_cl_path}")
+
                         # ATS gate: warn only — never block auto-submit
                         if self._last_ats_score > 0 and self._last_ats_score < 85 and auto_submit:
                             console.print(
                                 f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
                                 "proceeding anyway (warn-only gate).[/yellow]"
                             )
+            except ATSReadabilityError:
+                # Let ATSReadabilityError propagate to the orchestrator to trigger self-healing
+                raise
             except Exception as _ce:
                 console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
 
             if resolved_resume:
-                await self._upload_resume_if_prompted(page, resolved_resume)
+                await self._upload_documents_if_prompted(page, resolved_resume, getattr(self, "_last_tailored_cover_letter_path", ""))
             else:
                 console.print("[yellow]Jobright ATS:[/yellow] No local resume file found for upload fallback.")
 
@@ -3040,12 +3073,14 @@ class JobrightScraper(BaseScraper):
 
         console.print("[magenta]Jobright:[/magenta] Workday wizard navigation complete")
 
-    async def _upload_resume_if_prompted(self, page, resume_path: str) -> bool:
-        """Upload a configured resume to visible ATS file inputs when possible."""
-        path = Path(resume_path).expanduser()
-        if not path.exists():
-            return False
-        uploaded = False
+    async def _upload_documents_if_prompted(self, page, resume_path: str, cover_letter_path: str = "") -> bool:
+        """Upload resume and cover letter to visible file inputs depending on their labels/accept types."""
+        res_path = Path(resume_path).expanduser() if resume_path else None
+        cl_path = Path(cover_letter_path).expanduser() if cover_letter_path else None
+        
+        uploaded_resume = False
+        uploaded_cover = False
+        
         try:
             file_inputs = await page.query_selector_all('input[type="file"]')
             for file_input in file_inputs:
@@ -3071,16 +3106,36 @@ class JobrightScraper(BaseScraper):
                 except Exception:
                     label = ""
                 hints = " ".join([accept, name, label.lower()])
+                
+                # Check file extension constraints
                 if accept and not any(ext in accept for ext in [".pdf", ".doc", ".docx", "pdf", "word"]):
                     continue
-                if any(word in hints for word in ["resume", "cv", "upload", "file", "attachment"]) or not hints.strip():
-                    await file_input.set_input_files(str(path))
-                    console.print(f"[green]Jobright ATS:[/green] Uploaded resume: {path.name}")
-                    uploaded = True
+                
+                # Distinguish between cover letter input and resume input
+                is_cover_letter = any(word in hints for word in ["cover", "letter", "cl", "motivation", "motivational"])
+                is_resume = any(word in hints for word in ["resume", "cv", "vitae", "work history"]) or not hints.strip()
+                
+                if is_cover_letter and cl_path and cl_path.exists():
+                    await file_input.set_input_files(str(cl_path))
+                    console.print(f"[green]Jobright ATS:[/green] Uploaded cover letter: {cl_path.name}")
+                    uploaded_cover = True
                     await self._delay(1, 2)
+                elif is_resume and res_path and res_path.exists():
+                    await file_input.set_input_files(str(res_path))
+                    console.print(f"[green]Jobright ATS:[/green] Uploaded resume: {res_path.name}")
+                    uploaded_resume = True
+                    await self._delay(1, 2)
+                elif res_path and res_path.exists() and not uploaded_resume:
+                    # Fallback default upload to the first input if not resolved
+                    await file_input.set_input_files(str(res_path))
+                    console.print(f"[green]Jobright ATS:[/green] Uploaded resume (fallback): {res_path.name}")
+                    uploaded_resume = True
+                    await self._delay(1, 2)
+                    
         except Exception as exc:
-            console.print(f"[yellow]Jobright ATS:[/yellow] Resume upload check failed: {exc}")
-        return uploaded
+            console.print(f"[yellow]Jobright ATS:[/yellow] Document upload check failed: {exc}")
+        return uploaded_resume
+
 
     async def _trigger_autofill(self, page) -> bool:
         """
@@ -3218,7 +3273,7 @@ class JobrightScraper(BaseScraper):
         return ""
 
     async def _claude_ats_and_tailor(self, job: dict, jd_text: str) -> dict:
-        """Score ATS match and generate tailored resume content via Ollama → Claude cascade.
+        """Score ATS match and generate tailored resume content via Drafter-Reviewer cascade.
 
         Returns dict with: ats_score, missing_keywords, matching_keywords,
         tailored_summary, tailored_bullets, cover_letter, recommendation.
@@ -3229,7 +3284,9 @@ class JobrightScraper(BaseScraper):
         try:
             import json as _json
             resume_text = self._extract_resume_text()
-            _prompt = (
+            
+            # --- 1. DRAFTER STEP ---
+            _draft_prompt = (
                 "You are an expert resume writer and ATS specialist. "
                 "Analyze this job description against the candidate resume, then produce tailored content.\n\n"
                 f"JOB: {job.get('title', '')} @ {job.get('company', '')}\n\n"
@@ -3249,25 +3306,56 @@ class JobrightScraper(BaseScraper):
                 '  "cover_letter": "3-paragraph cover letter for this specific role and company"\n'
                 "}"
             )
-            with model_span("model_client", "cascade", agent="job-agent", task="ats_analysis") as span:
-                _text = await self._model_client.complete(
-                    messages=[{"role": "user", "content": _prompt}],
+            with model_span("model_client", "cascade", agent="job-agent", task="ats_drafting") as span:
+                _draft_text = await self._model_client.complete(
+                    messages=[{"role": "user", "content": _draft_prompt}],
                     task_type="reasoning",
                     max_tokens=1800,
                 )
                 span["job_title"] = job.get("title", "")
                 span["company"] = job.get("company", "")
-            if not _text or _text.startswith("No model available"):
+                
+            if not _draft_text or _draft_text.startswith("No model available"):
                 return {}
-            # Strip markdown fences and deepseek-r1 <think> blocks before parsing
-            _text = re.sub(r"<think>.*?</think>\s*", "", _text, flags=re.DOTALL)
-            _text = re.sub(r"^```[a-z]*\n?", "", _text.strip())
-            _text = re.sub(r"\n?```$", "", _text)
-            # Extract first JSON object if there's surrounding prose
-            _m = re.search(r"\{.*\}", _text, re.DOTALL)
+                
+            _draft_text = re.sub(r"<think>.*?</think>\s*", "", _draft_text, flags=re.DOTALL)
+            _draft_text = re.sub(r"^```[a-z]*\n?", "", _draft_text.strip())
+            _draft_text = re.sub(r"\n?```$", "", _draft_text)
+            _m = re.search(r"\{.*\}", _draft_text, re.DOTALL)
             if _m:
-                _text = _m.group()
-            result = _json.loads(_text)
+                _draft_text = _m.group()
+            
+            # --- 2. REVIEWER / GROUNDING STEP ---
+            _review_prompt = (
+                "You are an ATS compliance auditor and grounding checker.\n"
+                "Review the following draft tailored resume content and cover letter against the candidate's original resume/profile to ensure that:\n"
+                "1. Every skill, project, or role mentioned in the tailored bullets or cover letter actually corresponds to details in the candidate's original profile.\n"
+                "2. No technologies, degrees, or certifications were fabricated (e.g. if the candidate's profile doesn't mention Kubernetes, the tailored bullets or cover letter must not claim the candidate did Kubernetes).\n"
+                "3. The response is clean, grammatically correct, and matches the job description requirements.\n\n"
+                "If there are any fabricated claims or inaccuracies, output a revised version of the JSON object fixing them to be fully grounded. If it is already grounded and accurate, output the original JSON object as-is.\n\n"
+                f"CANDIDATE ORIGINAL RESUME / PROFILE:\n{resume_text[:3000]}\n\n"
+                f"JOB DESCRIPTION:\n{jd_text[:2000]}\n\n"
+                f"DRAFT TAILORED CONTENT:\n{_draft_text}\n\n"
+                "Respond ONLY with valid JSON in the exact same format as the draft (no markdown format, no other text)."
+            )
+            with model_span("model_client", "cascade", agent="job-agent", task="ats_review") as span:
+                _final_text = await self._model_client.complete(
+                    messages=[{"role": "user", "content": _review_prompt}],
+                    task_type="reasoning",
+                    max_tokens=1800,
+                )
+            
+            if not _final_text or _final_text.startswith("No model available"):
+                _final_text = _draft_text
+                
+            _final_text = re.sub(r"<think>.*?</think>\s*", "", _final_text, flags=re.DOTALL)
+            _final_text = re.sub(r"^```[a-z]*\n?", "", _final_text.strip())
+            _final_text = re.sub(r"\n?```$", "", _final_text)
+            _m = re.search(r"\{.*\}", _final_text, re.DOTALL)
+            if _m:
+                _final_text = _m.group()
+                
+            result = _json.loads(_final_text)
             return {
                 "ats_score": int(result.get("ats_score", 0)),
                 "missing_keywords": result.get("missing_keywords", []),

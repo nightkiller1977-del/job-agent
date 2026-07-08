@@ -27,6 +27,7 @@ import logging
 from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
+from .resume_helper import ATSReadabilityError
 
 console = Console()
 _log = logging.getLogger(__name__)
@@ -696,6 +697,15 @@ class Orchestrator:
                 console.print("[red]Job no longer active (expired). Removed from database.[/red]")
                 outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
                 await self._push_status_to_cloud(job["job_id"], "expired")
+            except ATSReadabilityError as exc:
+                console.print(f"[red]ATS Readability Failure for {job.get('title')} (ATS_FAILURE):[/red] {exc}")
+                self.state.record_apply_attempt(job["job_id"], "ats_failure", str(exc)[:400])
+                await self._push_apply_attempt_to_cloud(job["job_id"])
+                notify_error("ATS Readability Failure (ATS_FAILURE)", f"Job ID {job.get('job_id')} failed ATS check: {exc}")
+                failed_count += 1
+                outcomes.append({"job": job, "status": "ats_failure", "reason": str(exc)})
+                console.print("[bold yellow]Pausing application loop due to ATS failure. Self-healing/repair required.[/bold yellow]")
+                raise
             except Exception as exc:
                 console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")
                 self.state.record_apply_attempt(job["job_id"], "error", str(exc)[:400])
