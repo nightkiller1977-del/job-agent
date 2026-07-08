@@ -35,17 +35,62 @@ import time
 
 _last_notification_times: dict[str, float] = {}
 
+def _load_telegram_config() -> tuple[str, str]:
+    """Load Telegram bot token and chat ID.
+
+    Resolution order (first non-empty wins):
+      1. Process env vars  — set by the shell or job-agent's own .env
+      2. AI Commander userData .env  — ~/Library/Application Support/ai-command-center/.env
+         This is the same file telegramApprovalProvider.js reads via main.js loadEnvFile().
+      3. AI Commander settings-v3.json telegram section  — legacy fallback
+
+    Returns (token, chat_id) or ("", "") if not configured.
+    """
+    import os as _os
+
+    # 1. Process env (already loaded)
+    token = _os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = _os.environ.get("TELEGRAM_CHAT_ID", "")
+    if token and chat_id:
+        return token, chat_id
+
+    # 2. AI Commander userData .env
+    userdata_env = (
+        Path.home() / "Library" / "Application Support" / "ai-command-center" / ".env"
+    )
+    if userdata_env.exists():
+        for line in userdata_env.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip()
+            if key == "TELEGRAM_BOT_TOKEN" and not token:
+                token = val
+            elif key == "TELEGRAM_CHAT_ID" and not chat_id:
+                chat_id = val
+        if token and chat_id:
+            return token, chat_id
+
+    # 3. settings-v3.json legacy fallback (in case UI ever writes there)
+    settings_path = (
+        Path.home() / "Library" / "Application Support" / "ai-command-center" / "settings-v3.json"
+    )
+    if settings_path.exists():
+        try:
+            tg = json.loads(settings_path.read_text()).get("telegram", {})
+            token = token or tg.get("botToken", "")
+            chat_id = chat_id or tg.get("chatId", "")
+        except Exception:
+            pass
+
+    return token, chat_id
+
+
 def _send_telegram(message: str) -> None:
+    """Send a Telegram message. Silently does nothing if not configured."""
     try:
-        settings_path = Path.home() / "Library" / "Application Support" / "ai-command-center" / "settings-v3.json"
-        if not settings_path.exists():
-            return
-        settings = json.loads(settings_path.read_text())
-        tg = settings.get("telegram", {})
-        if not tg.get("enabled"):
-            return
-        token = tg.get("botToken")
-        chat_id = tg.get("chatId")
+        token, chat_id = _load_telegram_config()
         if not token or not chat_id:
             return
 
@@ -54,7 +99,7 @@ def _send_telegram(message: str) -> None:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         data = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")
         req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=5):
             pass
     except Exception:
         pass
