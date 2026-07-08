@@ -1,9 +1,10 @@
 import json
-import os
+import re
 import sqlite3
 from pathlib import Path
 from rich.console import Console
 from rich.markdown import Markdown
+from src.model_client import ModelClient
 
 console = Console()
 
@@ -26,12 +27,12 @@ class GapAnalyzer:
         """Fetch all approved or applied jobs from SQLite."""
         if not self.db_path.exists():
             return []
-        
+
         try:
             conn = sqlite3.connect(str(self.db_path))
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            
+
             # Fetch jobs that were approved or applied
             cursor.execute(
                 "SELECT title, company, description, score, flags FROM jobs WHERE status IN ('approved', 'applied') OR score >= 70"
@@ -54,7 +55,7 @@ class GapAnalyzer:
 
         # Prepare existing skills
         existing_skills = self.profile.get("skills", [])
-        
+
         # Prepare job requirements text summary
         job_summaries = []
         for i, j in enumerate(jobs[:15]): # limit to top 15 to fit within context length safely
@@ -64,7 +65,6 @@ class GapAnalyzer:
             )
         jobs_text = "\n\n".join(job_summaries)
 
-        from src.model_client import ModelClient
         model_client = ModelClient()
 
         prompt = (
@@ -87,16 +87,15 @@ class GapAnalyzer:
                 task_type="reasoning",
                 max_tokens=1500
             )
-            
+
             # Clean think blocks if present
-            import re
             report_md = re.sub(r"<think>.*?</think>\s*", "", report_md, flags=re.DOTALL)
-            
+
             # Save report locally
             report_path = Path("state/upskilling_report.md")
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(report_md, encoding="utf-8")
-            
+
             console.print("\n" + "="*40)
             console.print(Markdown(report_md))
             console.print("="*40 + "\n")

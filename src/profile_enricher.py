@@ -5,6 +5,7 @@ from pathlib import Path
 import httpx
 from rich.console import Console
 from rich.table import Table
+from src.model_client import ModelClient
 
 console = Console()
 
@@ -36,7 +37,7 @@ class ProfileEnricher:
     async def enrich_from_github(self, github_username: str) -> None:
         """Fetches public repo info from GitHub for github_username and extracts new skills."""
         console.print(f"[cyan]Fetching GitHub profile and repos for '{github_username}'...[/cyan]")
-        
+
         headers = {"Accept": "application/vnd.github.v3+json"}
         token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN") or os.environ.get("GITHUB_TOKEN")
         if token:
@@ -49,7 +50,7 @@ class ProfileEnricher:
                 user_res.raise_for_status()
                 user_data = user_res.json()
                 bio = user_data.get("bio") or ""
-                
+
                 # 2. Fetch Repos
                 repos_res = await client.get(f"https://api.github.com/users/{github_username}/repos?per_page=50&sort=updated", headers=headers)
                 repos_res.raise_for_status()
@@ -72,13 +73,12 @@ class ProfileEnricher:
             repo_summaries.append(f"- Repo: {name}\n  Description: {desc}\n  Primary Language: {lang}\n  Topics: {topics}")
 
         repos_text = "\n".join(repo_summaries)
-        
+
         # 3. Call AI Model Client to extract skills
         console.print("[cyan]Analyzing repository contents via Claude...[/cyan]")
-        
-        from src.model_client import ModelClient
+
         model_client = ModelClient()
-        
+
         prompt = (
             "You are a technical profile auditor.\n"
             "Analyze the candidate's GitHub user bio and repository summaries to extract a list of professional skills, frameworks, tools, and programming languages they possess.\n\n"
@@ -93,7 +93,7 @@ class ProfileEnricher:
                 task_type="reasoning",
                 max_tokens=500
             )
-            
+
             # Clean response
             raw_response = re.sub(r"<think>.*?</think>\s*", "", raw_response, flags=re.DOTALL)
             raw_response = re.sub(r"^```[a-z]*\n?", "", raw_response.strip())
@@ -101,7 +101,7 @@ class ProfileEnricher:
             m = re.search(r"\[.*\]", raw_response, re.DOTALL)
             if m:
                 raw_response = m.group()
-                
+
             extracted_skills = json.loads(raw_response)
         except Exception as e:
             console.print(f"[red]Failed to extract skills using AI model:[/red] {e}")
@@ -113,7 +113,7 @@ class ProfileEnricher:
 
         # Clean and filter extracted skills
         extracted_skills = [str(s).strip() for s in extracted_skills if s and str(s).strip()]
-        
+
         # Merge into existing skills
         existing_skills = {s.lower(): s for s in self.profile.get("skills", [])}
         new_skills_added = []
@@ -129,7 +129,7 @@ class ProfileEnricher:
             for skill in new_skills_added:
                 table.add_row(skill)
             console.print(table)
-            
+
             # Save updated profile
             self.save_profile()
         else:

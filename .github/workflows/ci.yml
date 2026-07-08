@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["main", "fix/**", "feature/**"]
+    branches: ["main", "fix/**", "feat/**", "feature/**"]
   pull_request:
     branches: ["main"]
 
@@ -31,11 +31,14 @@ jobs:
         # Scope to unit tests that have no infrastructure dependencies.
         # test_credentials and test_email_2fa need fastapi/imap — excluded.
         # Functional/browser tests need playwright install + live creds — excluded.
+        # test_drafter_reviewer needs full JobrightScraper instantiation — excluded.
         run: |
           pytest tests/test_scorer.py \
                  tests/test_state_manager.py \
                  tests/test_reauth_regressions.py \
                  tests/test_reauth_feature.py \
+                 tests/test_ats_checker.py \
+                 tests/test_latex_compiler.py \
                  -q --tb=short --asyncio-mode=auto
 
   lint:

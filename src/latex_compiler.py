@@ -1,6 +1,5 @@
 from __future__ import annotations
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -57,7 +56,7 @@ class LaTeXCompiler:
         try:
             tex_file = Path(temp_dir) / "document.tex"
             tex_file.write_text(tex_content, encoding="utf-8")
-            
+
             # Run the LaTeX compiler twice for resolving page numbers/references if needed
             for _ in range(2):
                 result = subprocess.run(
@@ -70,7 +69,7 @@ class LaTeXCompiler:
                 if result.returncode != 0:
                     console.print(f"[red]LaTeX compilation error ({compiler_cmd}):[/red]\n{result.stdout}")
                     return False
-            
+
             generated_pdf = Path(temp_dir) / "document.pdf"
             if generated_pdf.exists():
                 os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
@@ -113,12 +112,12 @@ class LaTeXCompiler:
             return False
 
         template_content = self.cv_template_path.read_text(encoding="utf-8")
-        
+
         info = profile.get("personal_info", {})
         first_name = info.get("first_name", "")
         last_name = info.get("last_name", "")
         full_name = f"{first_name} {last_name}".strip() or "Candidate"
-        
+
         email = info.get("email", "")
         phone = info.get("phone", "")
         linkedin = profile.get("social_links", {}).get("linkedin", "")
@@ -139,10 +138,10 @@ class LaTeXCompiler:
             title = escape_latex(wh.get("job_title", role.get("role", "")))
             start = escape_latex(wh.get("start_date", ""))
             end = escape_latex(wh.get("end_date", "Present"))
-            
+
             bullets = role.get("bullets", [])
             bullets_tex = "\n".join(f"    \\item {escape_latex(b)}" for b in bullets)
-            
+
             work_history_tex += (
                 f"\\noindent \\textbf{{{title}}} \\hfill {{{start} -- {end}}} \\\\\n"
                 f"\\noindent \\textit{{{company}}} \\\\\n"
@@ -189,12 +188,12 @@ class LaTeXCompiler:
             return False
 
         template_content = self.cover_template_path.read_text(encoding="utf-8")
-        
+
         info = profile.get("personal_info", {})
         first_name = info.get("first_name", "")
         last_name = info.get("last_name", "")
         full_name = f"{first_name} {last_name}".strip() or "Candidate"
-        
+
         email = info.get("email", "")
         phone = info.get("phone", "")
         city = info.get("city", "")
@@ -232,16 +231,16 @@ class LaTeXCompiler:
             city = info.get("city", "")
             state_abbr = info.get("state", "")
             location = ", ".join(p for p in [city, state_abbr] if p)
-            
+
             skills = list(profile.get("skills", []))
             for kw in tailored.get("missing_keywords", []):
                 if kw and kw not in skills:
                     skills.append(kw)
-            
+
             education = profile.get("education", [])
             work_history = profile.get("work_history", [])
             tailored_bullets = tailored.get("tailored_bullets", [])
-            
+
             experience_html = ""
             for i, role in enumerate(tailored_bullets):
                 wh = work_history[i] if i < len(work_history) else {}

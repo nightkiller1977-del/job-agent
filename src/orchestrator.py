@@ -698,14 +698,20 @@ class Orchestrator:
                 outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
                 await self._push_status_to_cloud(job["job_id"], "expired")
             except ATSReadabilityError as exc:
+                _is_unreadable = "no extractable text layer" in str(exc).lower() or "failed to parse" in str(exc).lower()
                 console.print(f"[red]ATS Readability Failure for {job.get('title')} (ATS_FAILURE):[/red] {exc}")
                 self.state.record_apply_attempt(job["job_id"], "ats_failure", str(exc)[:400])
                 await self._push_apply_attempt_to_cloud(job["job_id"])
                 notify_error("ATS Readability Failure (ATS_FAILURE)", f"Job ID {job.get('job_id')} failed ATS check: {exc}")
                 failed_count += 1
                 outcomes.append({"job": job, "status": "ats_failure", "reason": str(exc)})
-                console.print("[bold yellow]Pausing application loop due to ATS failure. Self-healing/repair required.[/bold yellow]")
-                raise
+                if _is_unreadable:
+                    # Unreadable PDF (image-only or corrupt) — pause the whole loop; self-healing required.
+                    console.print("[bold yellow]Pausing application loop: PDF is unreadable. Self-healing/repair required.[/bold yellow]")
+                    break
+                # Keyword mismatch — skip this job only; continue applying to others.
+                console.print("[yellow]Skipping this job due to keyword ATS failure; continuing with remaining jobs.[/yellow]")
+                continue
             except Exception as exc:
                 console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")
                 self.state.record_apply_attempt(job["job_id"], "error", str(exc)[:400])

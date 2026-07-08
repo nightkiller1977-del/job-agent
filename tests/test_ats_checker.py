@@ -8,8 +8,8 @@ def test_ats_checker_success():
     mock_page = MagicMock()
     mock_page.extract_text.return_value = "I am a Senior Software Engineer skilled in Python, Kubernetes, and Docker."
     mock_reader.pages = [mock_page]
-    
-    with patch("pypdf.PdfReader", return_value=mock_reader), patch("os.path.exists", return_value=True):
+
+    with patch("src.resume_helper.PdfReader", return_value=mock_reader), patch("os.path.exists", return_value=True):
         # Keywords exist in text. Should run without throwing.
         check_ats_readability("dummy_resume.pdf", ["Python", "Docker", "Kubernetes"])
 
@@ -19,8 +19,8 @@ def test_ats_checker_missing_keywords():
     mock_page = MagicMock()
     mock_page.extract_text.return_value = "Senior developer with Python and Docker experience."
     mock_reader.pages = [mock_page]
-    
-    with patch("pypdf.PdfReader", return_value=mock_reader), patch("os.path.exists", return_value=True):
+
+    with patch("src.resume_helper.PdfReader", return_value=mock_reader), patch("os.path.exists", return_value=True):
         # "React" is missing. Should raise exception.
         with pytest.raises(ATSReadabilityError) as exc:
             check_ats_readability("dummy_resume.pdf", ["Python", "React"])
@@ -32,8 +32,8 @@ def test_ats_checker_unreadable_pdf():
     mock_page = MagicMock()
     mock_page.extract_text.return_value = "   " # whitespace only
     mock_reader.pages = [mock_page]
-    
-    with patch("pypdf.PdfReader", return_value=mock_reader), patch("os.path.exists", return_value=True):
+
+    with patch("src.resume_helper.PdfReader", return_value=mock_reader), patch("os.path.exists", return_value=True):
         with pytest.raises(ATSReadabilityError) as exc:
             check_ats_readability("dummy_resume.pdf", ["Python"])
         assert "has no extractable text layer" in str(exc.value)
