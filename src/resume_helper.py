@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 from rich.console import Console
 from playwright.async_api import Page
+from pypdf import PdfReader
 
 console = Console()
 
@@ -271,3 +272,55 @@ class ResumeFieldFixer:
         except Exception:
             pass
         return False
+
+
+class ATSReadabilityError(Exception):
+    """Raised when a generated resume PDF fails ATS keyword or parseability checks."""
+    pass
+
+
+def check_ats_readability(pdf_path: str, target_keywords: list[str]) -> None:
+    """Extracts text layer from the PDF using pypdf and verifies that target keywords are present.
+    If the text layer is unreadable raises ATSReadabilityError.
+    If keywords are missing raises ATSReadabilityError (keyword variant — skip-only, not loop-halt).
+    """
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+
+    try:
+        reader = PdfReader(pdf_path)
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + " "
+    except Exception as e:
+        raise ATSReadabilityError(f"Failed to parse PDF text layer: {e}")
+
+    if not text.strip():
+        raise ATSReadabilityError(
+            "ATS check failed: Generated PDF has no extractable text layer. "
+            "It might have compiled as a flat image or fonts are unreadable."
+        )
+
+    normalized_text = text.lower()
+
+    missing_keywords = []
+    for keyword in target_keywords:
+        if not keyword or not keyword.strip():
+            continue
+        kw_clean = keyword.lower().strip()
+        # Use word boundaries for short keywords (≤4 chars) to avoid false positives
+        # e.g. "Go" matching "Google", "AWS" matching "drawsome"
+        if len(kw_clean) <= 4:
+            if not re.search(r"\b" + re.escape(kw_clean) + r"\b", normalized_text):
+                missing_keywords.append(keyword)
+        else:
+            if kw_clean not in normalized_text:
+                missing_keywords.append(keyword)
+
+    if missing_keywords:
+        raise ATSReadabilityError(
+            f"ATS check failed: Generated PDF is missing critical target keywords: {', '.join(missing_keywords)}"
+        )
+

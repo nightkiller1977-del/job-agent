@@ -1,0 +1,50 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+% Define color palette
+\definecolor{primary}{RGB}{30, 41, 59} % Dark slate
+\definecolor{secondary}{RGB}{71, 85, 105} % Muted slate
+\definecolor{linkcolor}{RGB}{37, 99, 235} % Slate blue
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=linkcolor,
+    urlcolor=linkcolor
+}
+
+% Section styling
+\titleformat{\section}{\large\bfseries\color{primary}}{}{0em}{}[\titlerule]
+\titlespacing*{\section}{0pt}{12pt}{6pt}
+
+\setlist[itemize]{leftmargin=*,noitemsep,topsep=2pt}
+
+\pagestyle{empty}
+
+\begin{document}
+
+\begin{center}
+    {\Huge\bfseries\color{primary} {{FULL_NAME}}} \\
+    \vspace{4pt}
+    \small\color{secondary} {{CONTACT_INFO}}
+\end{center}
+
+\vspace{8pt}
+
+\section*{Professional Summary}
+{{SUMMARY}}
+
+\section*{Professional Experience}
+{{WORK_HISTORY}}
+
+\section*{Education}
+{{EDUCATION}}
+
+\section*{Skills \& Certifications}
+{{SKILLS}}
+
+\end{document}
