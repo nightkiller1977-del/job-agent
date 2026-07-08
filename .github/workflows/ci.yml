@@ -28,15 +28,14 @@ jobs:
       - name: Run tests
         env:
           PYTHONPATH: ${{ github.workspace }}
-        # Scope to unit tests only — functional/browser tests need `playwright install`
-        # and live credentials which are not available in CI.
+        # Scope to unit tests that have no infrastructure dependencies.
+        # test_credentials and test_email_2fa need fastapi/imap — excluded.
+        # Functional/browser tests need playwright install + live creds — excluded.
         run: |
           pytest tests/test_scorer.py \
                  tests/test_state_manager.py \
                  tests/test_reauth_regressions.py \
-                 tests/test_credentials.py \
                  tests/test_reauth_feature.py \
-                 tests/test_email_2fa.py \
                  -q --tb=short --asyncio-mode=auto
 
   lint:
