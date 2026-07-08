@@ -959,7 +959,7 @@ class Orchestrator:
 
         console.print(f"[cyan]Found {len(unhydrated)} unhydrated job(s). Starting local scraper...[/cyan]")
 
-        from .sources.linkedin import LinkedInScraper, _infer_remote_type
+        from .sources.linkedin import LinkedInScraper, _infer_remote_type  # noqa: F401
         from .sources.jobright import JobrightScraper
         from .sources.indeed import IndeedScraper
 

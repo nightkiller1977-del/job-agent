@@ -120,13 +120,13 @@ class ResumeFieldFixer:
                 return
 
             console.print(f"[magenta]ResumeFieldFixer:[/magenta] Evaluating {len(elements)} visible form element(s) on current step...")
-            
+
             for el in elements:
                 # Bypasses: skip hidden, disabled, or buttons/submits
                 is_disabled = await el.evaluate("node => node.disabled")
                 if is_disabled:
                     continue
-                
+
                 el_type = await el.evaluate("node => node.type")
                 if el_type in ("submit", "button", "hidden", "file", "checkbox", "radio"):
                     # Checkboxes and radios need customized matching — handled separately below
@@ -186,7 +186,7 @@ class ResumeFieldFixer:
                 id: node.id
             }
         }""")
-        
+
         for k in ("aria_label", "placeholder", "data_auto", "name", "id"):
             if attrs.get(k) and attrs[k].strip():
                 # Clean up snake_case/kebab-case/camelCase for easy matching
@@ -216,7 +216,7 @@ class ResumeFieldFixer:
                 return await self._select_by_text(el, disclosures.get("veteran", ""))
             if any(w in label for w in ("disability", "disabled")):
                 return await self._select_by_text(el, disclosures.get("disability", ""))
-            
+
             # General Country/State selects
             if "country" in label:
                 return await self._select_by_text(el, p_info.get("country", "United States"))
@@ -258,7 +258,7 @@ class ResumeFieldFixer:
                 opt_txt = await opt.inner_text()
                 o_txt = opt_txt.strip().lower()
                 val_txt = text.strip().lower()
-                
+
                 # Check for exact match or word-boundary matches
                 if o_txt == val_txt or re.search(rf"\b{re.escape(val_txt)}\b", o_txt):
                     # Edge-case safety: ensure "male" does not match "female"
