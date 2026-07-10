@@ -28,6 +28,7 @@ from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
 from .resume_helper import ATSReadabilityError
+from .session_watchdog import preflight_session_check
 
 console = Console()
 _log = logging.getLogger(__name__)
@@ -590,14 +591,19 @@ class Orchestrator:
 
         if blocked:
             console.print("\n[yellow]Session-blocked (skipping in this run):[/yellow]")
+            blocked_sources = set()
             for bj, readiness, reason in blocked:
                 console.print(
                     f"  • {readiness}: {bj.get('title','?')[:50]} @ {bj.get('company','?')}"
                 )
                 console.print(f"    [dim]{reason}[/dim]")
+                blocked_sources.add(bj.get("source", ""))
                 # Persist so dashboard and future runs can surface the reason
                 self.state.record_apply_attempt(bj["job_id"], readiness, reason)
                 await self._push_apply_attempt_to_cloud(bj["job_id"])
+            # Emit deep-link notifications for each blocked source
+            if not is_interactive and blocked_sources:
+                preflight_session_check(list(blocked_sources))
             if not is_interactive:
                 console.print(
                     "\n[cyan]To fix:[/cyan] Run  python src/main.py prepare-sessions\n"
