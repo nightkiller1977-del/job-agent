@@ -126,11 +126,28 @@ class ReauthManager:
                     f"{source} automated reauth failed",
                     "Login returned False — may need human assist or CAPTCHA",
                 )
+                # Escalate: send a one-tap deep-link so user can fix from phone
+                try:
+                    from .session_watchdog import _send_deep_link_notification
+                    _send_deep_link_notification(
+                        source,
+                        f"[Job Agent] {source.capitalize()} automated login failed (CAPTCHA/2FA). Tap to open Terminal and fix:",
+                    )
+                except Exception:
+                    pass
                 return False
         except Exception as exc:
             record_reauth_event(source, "automated", "failed", str(exc)[:300])
             _log.error("reauth.error source=%s mode=automated error=%s", source, exc)
             notify_error(f"{source} automated reauth error", str(exc)[:200])
+            try:
+                from .session_watchdog import _send_deep_link_notification
+                _send_deep_link_notification(
+                    source,
+                    f"[Job Agent] {source.capitalize()} reauth error: {str(exc)[:120]}. Tap to fix:",
+                )
+            except Exception:
+                pass
             return False
         finally:
             try:
@@ -149,13 +166,24 @@ class ReauthManager:
         msg = (
             f"Job agent: {source.upper()} session expired.\n"
             f"{detail}\n\n"
-            f"To fix — open Terminal and run:\n"
+            f"Tap the link below to open Terminal automatically:\n"
+            f"jobagent://prepare-sessions?source={source}\n\n"
+            f"Or run manually:\n"
             f"  cd ~/Dev/Projects/job-agent\n"
             f"  python src/main.py prepare-sessions --source {source}\n\n"
             f"Log in / complete 2FA in the browser, then close it.\n"
             f"Agent will auto-retry within {timeout_minutes} min."
         )
         _send_imessage(self.notify_phone, msg)
+        # Also send via Telegram for the clickable deep-link
+        try:
+            from .session_watchdog import _send_deep_link_notification
+            _send_deep_link_notification(
+                source,
+                f"[Job Agent] {source.capitalize()} session expired. Tap to open Terminal and refresh:",
+            )
+        except Exception:
+            pass
         _log.info(
             "reauth.human_notified source=%s timeout_min=%d phone_set=%s",
             source, timeout_minutes, bool(self.notify_phone),

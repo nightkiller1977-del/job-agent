@@ -286,6 +286,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Analyze skill gaps against approved/applied jobs and generate learning roadmap",
     )
 
+    # session-status
+    subparsers.add_parser(
+        "session-status",
+        help="Show session health for all sources (healthy/stale/expired/missing)",
+    )
+
+    # heartbeat
+    heartbeat_p = subparsers.add_parser(
+        "heartbeat",
+        help="Silently visit each source to extend cookie lifetime (run nightly via cron)",
+    )
+    heartbeat_p.add_argument(
+        "--source",
+        help="Limit heartbeat to one source (linkedin, indeed, jobright)",
+    )
+
     return parser
 
 
@@ -345,6 +361,26 @@ async def main_async(args: argparse.Namespace) -> int:
             max_age_days=args.max_age_days,
             dry_run=args.dry_run,
         )
+
+    elif args.command == "session-status":
+        from src.session_watchdog import check_session_health, print_health_table
+        results = check_session_health()
+        print_health_table(results)
+        blocked = [r for r in results if r.status in {"expired", "missing"}]
+        if blocked:
+            console.print(f"\n[red]{len(blocked)} source(s) need attention.[/red]")
+            console.print("[cyan]Run:[/cyan] python src/main.py prepare-sessions")
+            console.print("[cyan]Or:[/cyan]  bash scripts/install-jobagent-url-handler.sh  (one-tap repair from phone)")
+        return 1 if blocked else 0
+
+    elif args.command == "heartbeat":
+        from src.session_watchdog import run_heartbeat
+        sources = [args.source] if getattr(args, "source", None) else None
+        results = await run_heartbeat(sources=sources, config=orchestrator.config)
+        for src, ok in results.items():
+            status = "[green]✓[/green]" if ok else "[red]✗[/red]"
+            console.print(f"  {status} {src}")
+        return 0
 
     elif args.command == "expand":
         from src.profile_enricher import ProfileEnricher
