@@ -803,6 +803,8 @@ class USAJobsScraper(BaseScraper):
                     except (EOFError, KeyboardInterrupt):
                         break
 
+        except JobExpiredError:
+            raise
         except Exception as exc:
             console.print(f"[red]USAJobs apply error:[/red] {exc}")
             self._set_apply_outcome("usajobs_error", str(exc))

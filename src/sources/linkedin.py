@@ -1001,6 +1001,8 @@ class LinkedInScraper(BaseScraper):
                     f"LinkedIn apply flow reached {max_steps} steps without exposing a final Submit control.",
                 )
 
+        except JobExpiredError:
+            raise
         except Exception as exc:
             console.print(f"[red]LinkedIn apply error:[/red] {exc}")
             self._set_apply_outcome("linkedin_error", str(exc))
