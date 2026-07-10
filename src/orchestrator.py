@@ -42,6 +42,12 @@ SOURCE_MAP = {
     "external": JobrightScraper,   # legacy fallback for manually-pasted non-source URLs
 }
 
+# Sources fanned out by default discovery (no --source given). Deliberately
+# excludes "external", which resolves to JobrightScraper and is only meant for
+# explicitly hydrating manually-pasted non-source URLs — including it here would
+# scrape Jobright twice per run.
+DEFAULT_DISCOVERY_SOURCES = ["jobright", "linkedin", "usajobs", "indeed"]
+
 # Path to the file written by the Claude-in-Chrome MCP scraper
 MCP_SCRAPED_FILE = Path(__file__).parent.parent / "state" / "mcp_scraped.json"
 
@@ -91,7 +97,7 @@ class Orchestrator:
             await self._discover_linkedin_saved(no_review=no_review)
             return
 
-        sources_to_run = [source] if source else list(SOURCE_MAP.keys())
+        sources_to_run = [source] if source else list(DEFAULT_DISCOVERY_SOURCES)
 
         # Validate source
         for s in sources_to_run:
