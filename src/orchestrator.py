@@ -292,8 +292,8 @@ class Orchestrator:
         )
 
     async def _score_jobs_with_progress(self, jobs: list[dict]) -> list[dict]:
-        """Score jobs with a progress bar."""
-        scored = []
+        """Score jobs concurrently (via JobScorer.batch_score) with a progress bar."""
+        concurrency = self.config.get("search_settings", {}).get("score_concurrency", 5)
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -302,20 +302,25 @@ class Orchestrator:
             console=console,
         ) as progress:
             task_id = progress.add_task("Scoring…", total=len(jobs))
-            for job in jobs:
-                scored_job = await self._score_one(job)
-                scored.append(scored_job)
-                progress.advance(task_id)
+            scored = await self.scorer.batch_score(
+                jobs,
+                concurrency=concurrency,
+                on_result=lambda: progress.advance(task_id),
+            )
+            # Guard: ensure the bar shows complete even if a job settled without
+            # firing the callback.
+            progress.update(task_id, completed=len(jobs))
+
+        # Classify status after scoring so the per-job log lines don't interleave
+        # with the live progress bar.
+        for job in scored:
+            self._classify_status(job)
         return scored
 
-    async def _score_one(self, job: dict) -> dict:
-        score, reason, flags, action = await self.scorer.score(job)
-        job["score"] = score
-        job["score_reason"] = reason
-        job["flags"] = flags
-        job["recommended_action"] = action
-
-        # Auto-classify job status based on recommended action for full automation
+    def _classify_status(self, job: dict) -> dict:
+        """Map a scored job's recommended_action onto its lifecycle status."""
+        action = job.get("recommended_action")
+        score = job.get("score")
         if action == "apply":
             job["status"] = "approved"
             console.print(f"  [green]→ Auto-approved: {job.get('title')} @ {job.get('company')} (Score: {score})[/green]")
@@ -324,7 +329,6 @@ class Orchestrator:
             console.print(f"  [dim]→ Auto-skipped: {job.get('title')} @ {job.get('company')} (Score: {score})[/dim]")
         else:
             job["status"] = "discovered"
-
         return job
 
     # ------------------------------------------------------------------
