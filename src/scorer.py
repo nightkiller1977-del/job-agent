@@ -127,8 +127,11 @@ _IC_PATTERNS = re.compile(
 # Engineer" are individual-contributor roles and must still hit the IC check.
 # Genuine management "lead" titles (e.g. "Team Lead") carry no IC keyword, so
 # they aren't quick-rejected and fall through to full model scoring anyway.
+# "avp" covers the abbreviated form of a configured target role ("AVP of
+# Software Engineering"); the spelled-out "assistant vice president" already
+# matches via "vice president".
 _SENIORITY_PATTERNS = re.compile(
-    r"\b(manager|director|vp|vice\s+president|head\s+of|gs-1[3-5])\b",
+    r"\b(manager|director|avp|vp|vice\s+president|head\s+of|gs-1[3-5])\b",
     re.IGNORECASE,
 )
 
