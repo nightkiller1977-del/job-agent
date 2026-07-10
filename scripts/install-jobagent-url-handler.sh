@@ -84,6 +84,19 @@ for param in \$(echo "\$QUERY" | tr '&' '\\n'); do
   [[ "\$key" == "source" ]] && SOURCE="\$val"
 done
 
+# Validate action and source to prevent command injection
+if [[ "\$ACTION" != "prepare-sessions" && "\$ACTION" != "session-status" && "\$ACTION" != "heartbeat" ]]; then
+  echo "Error: Forbidden action '\$ACTION'" >&2
+  exit 1
+fi
+
+if [[ -n "\$SOURCE" ]]; then
+  if [[ ! "\$SOURCE" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Error: Invalid source parameter '\$SOURCE'" >&2
+    exit 1
+  fi
+fi
+
 # Build the actual CLI command
 PROJECT="$PROJECT_DIR"
 if [[ -n "\$SOURCE" ]]; then
