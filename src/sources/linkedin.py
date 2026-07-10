@@ -1367,25 +1367,7 @@ class LinkedInScraper(BaseScraper):
         await self._fill_radio_fields(page)
         await self._fill_text_questions(page)
 
-    async def _upload_resume_if_prompted(self, page, resume_path: str) -> None:
-        path = Path(resume_path).expanduser()
-        if not path.exists():
-            return
-        try:
-            file_inputs = await page.query_selector_all('input[type="file"]')
-            for file_input in file_inputs:
-                accept = (await file_input.get_attribute("accept") or "").lower()
-                name = (await file_input.get_attribute("name") or "").lower()
-                label = (await self._get_field_label(page, file_input) or "").lower()
-                hints = " ".join([accept, name, label])
-                if accept and not any(ext in accept for ext in [".pdf", "pdf", "application/pdf"]):
-                    continue
-                if any(word in hints for word in ["resume", "cv", "upload", "file"]) or not hints.strip():
-                    await file_input.set_input_files(str(path))
-                    console.print(f"[green]LinkedIn:[/green] Uploaded resume: {path.name}")
-                    await self._delay(1, 2)
-        except Exception as exc:
-            console.print(f"[yellow]LinkedIn:[/yellow] Resume upload check failed: {exc}")
+
 
     async def _fill_select_fields(self, page) -> None:
         """Fill dropdown selects based on common LinkedIn question patterns."""
@@ -1531,29 +1513,7 @@ class LinkedInScraper(BaseScraper):
                     raise
                 continue
 
-    async def _get_field_label(self, page, element) -> str:
-        """Try to find the label text for an input element."""
-        try:
-            field_id = await element.get_attribute("id")
-            if field_id:
-                label = await page.query_selector(f'label[for="{field_id}"]')
-                if label:
-                    return (await label.inner_text()).strip()
-            # Try parent/sibling label
-            try:
-                parent = await element.evaluate_handle("el => el.closest('.form-group, .jobs-easy-apply-form-element, fieldset, div')")
-            except Exception as exc:
-                err = str(exc).lower()
-                if any(k in err for k in ["closed", "target page", "detached", "crashed"]):
-                    raise
-                parent = None
-            if parent:
-                label = await parent.query_selector("label, legend, span[class*='label']")
-                if label:
-                    return (await label.inner_text()).strip()
-        except Exception:
-            pass
-        return ""
+
 
     def _profile_value(self, section: str, key: str) -> str:
         try:
