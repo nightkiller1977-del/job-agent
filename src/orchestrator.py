@@ -27,6 +27,8 @@ import logging
 from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
+from .resume_helper import ATSReadabilityError
+from .session_watchdog import preflight_session_check
 
 console = Console()
 _log = logging.getLogger(__name__)
@@ -49,7 +51,7 @@ class Orchestrator:
         self.config = self._load_config(config_path)
         self.state = StateManager(self.config.get("state_db_path", "state/jobs.db"))
         api_key = os.environ.get("ANTHROPIC_API_KEY")
-        self.scorer = JobScorer(api_key=api_key)
+        self.scorer = JobScorer(config=self.config, api_key=api_key)
 
     def _load_config(self, path: str) -> dict:
         p = Path(path).expanduser()
@@ -589,14 +591,19 @@ class Orchestrator:
 
         if blocked:
             console.print("\n[yellow]Session-blocked (skipping in this run):[/yellow]")
+            blocked_sources = set()
             for bj, readiness, reason in blocked:
                 console.print(
                     f"  • {readiness}: {bj.get('title','?')[:50]} @ {bj.get('company','?')}"
                 )
                 console.print(f"    [dim]{reason}[/dim]")
+                blocked_sources.add(bj.get("source", ""))
                 # Persist so dashboard and future runs can surface the reason
                 self.state.record_apply_attempt(bj["job_id"], readiness, reason)
                 await self._push_apply_attempt_to_cloud(bj["job_id"])
+            # Emit deep-link notifications for each blocked source
+            if not is_interactive and blocked_sources:
+                preflight_session_check(list(blocked_sources))
             if not is_interactive:
                 console.print(
                     "\n[cyan]To fix:[/cyan] Run  python src/main.py prepare-sessions\n"
@@ -696,6 +703,21 @@ class Orchestrator:
                 console.print("[red]Job no longer active (expired). Removed from database.[/red]")
                 outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
                 await self._push_status_to_cloud(job["job_id"], "expired")
+            except ATSReadabilityError as exc:
+                _is_unreadable = "no extractable text layer" in str(exc).lower() or "failed to parse" in str(exc).lower()
+                console.print(f"[red]ATS Readability Failure for {job.get('title')} (ATS_FAILURE):[/red] {exc}")
+                self.state.record_apply_attempt(job["job_id"], "ats_failure", str(exc)[:400])
+                await self._push_apply_attempt_to_cloud(job["job_id"])
+                notify_error("ATS Readability Failure (ATS_FAILURE)", f"Job ID {job.get('job_id')} failed ATS check: {exc}")
+                failed_count += 1
+                outcomes.append({"job": job, "status": "ats_failure", "reason": str(exc)})
+                if _is_unreadable:
+                    # Unreadable PDF (image-only or corrupt) — pause the whole loop; self-healing required.
+                    console.print("[bold yellow]Pausing application loop: PDF is unreadable. Self-healing/repair required.[/bold yellow]")
+                    break
+                # Keyword mismatch — skip this job only; continue applying to others.
+                console.print("[yellow]Skipping this job due to keyword ATS failure; continuing with remaining jobs.[/yellow]")
+                continue
             except Exception as exc:
                 console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")
                 self.state.record_apply_attempt(job["job_id"], "error", str(exc)[:400])
@@ -959,7 +981,7 @@ class Orchestrator:
 
         console.print(f"[cyan]Found {len(unhydrated)} unhydrated job(s). Starting local scraper...[/cyan]")
 
-        from .sources.linkedin import LinkedInScraper, _infer_remote_type
+        from .sources.linkedin import LinkedInScraper, _infer_remote_type  # noqa: F401
         from .sources.jobright import JobrightScraper
         from .sources.indeed import IndeedScraper
 
