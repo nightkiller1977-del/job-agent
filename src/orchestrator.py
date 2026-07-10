@@ -293,7 +293,16 @@ class Orchestrator:
 
     async def _score_jobs_with_progress(self, jobs: list[dict]) -> list[dict]:
         """Score jobs concurrently (via JobScorer.batch_score) with a progress bar."""
-        concurrency = self.config.get("search_settings", {}).get("score_concurrency", 5)
+        # Coerce to a positive int: a config value of 0/false/None/garbage would
+        # otherwise become asyncio.Semaphore(0) inside batch_score and hang the
+        # whole discover run. Fall back to the default of 5.
+        raw_concurrency = self.config.get("search_settings", {}).get("score_concurrency", 5)
+        try:
+            concurrency = int(raw_concurrency)
+        except (TypeError, ValueError):
+            concurrency = 5
+        if concurrency < 1:
+            concurrency = 5
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
