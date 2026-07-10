@@ -65,7 +65,7 @@ _SOURCE_CREDS: dict[str, list[str]] = {
     "linkedin":  ["LINKEDIN_EMAIL",  "LINKEDIN_PASSWORD"],
     "jobright":  ["JOBRIGHT_EMAIL",  "JOBRIGHT_PASSWORD"],
     "indeed":    ["INDEED_EMAIL",    "INDEED_PASSWORD"],
-    "usajobs":   ["USAJOBS_USERNAME", "USAJOBS_PASSWORD"],
+    "usajobs":   ["USAJOBS_EMAIL", "USAJOBS_PASSWORD"],
 }
 
 
