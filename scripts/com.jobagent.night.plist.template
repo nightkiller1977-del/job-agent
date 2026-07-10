@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nightly job-agent run (discover + apply --auto-submit) at 11:00 PM.
+
+  Install:
+    1. Copy this file to ~/Library/LaunchAgents/com.jobagent.night.plist
+    2. Replace __DASHBOARD_URL__ and __SYNC_SECRET__ with the real values from .env
+       (do NOT commit the filled-in copy — it contains a secret).
+    3. launchctl load ~/Library/LaunchAgents/com.jobagent.night.plist
+    4. Verify: launchctl list | grep com.jobagent.night
+
+  Site credentials are read from .env by src/main.py; only the dashboard
+  sync values are injected here as environment variables.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jobagent.night</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/alarkins/Dev/Projects/job-agent/scripts/night_run.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/alarkins/Dev/Projects/job-agent</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>23</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/alarkins/Dev/Projects/job-agent/state/agent.night.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/alarkins/Dev/Projects/job-agent/state/agent.night.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>DASHBOARD_URL</key>
+    <string>__DASHBOARD_URL__</string>
+    <key>SYNC_SECRET</key>
+    <string>__SYNC_SECRET__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
