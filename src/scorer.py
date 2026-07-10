@@ -235,22 +235,31 @@ class JobScorer:
         except Exception as exc:
             return 50, f"Scoring error: {exc}", "FLAG_FOR_REVIEW", "review"
 
-    async def batch_score(self, jobs: list[dict], concurrency: int = 5) -> list[dict]:
+    async def batch_score(
+        self, jobs: list[dict], concurrency: int = 5, on_result=None
+    ) -> list[dict]:
         """Score jobs in parallel using a semaphore to cap concurrency.
 
         Default concurrency=5 balances Ollama load vs. throughput.
         Reduces 50-job batch time from ~100s to ~20s.
+
+        on_result: optional zero-arg callback invoked once per job as each score
+        settles (success or failure) — used to drive a progress bar.
         """
         sem = asyncio.Semaphore(concurrency)
 
         async def _score_one(job: dict) -> dict:
             async with sem:
-                score, reason, flags, action = await self.score(job)
-                job["score"] = score
-                job["score_reason"] = reason
-                job["flags"] = flags
-                job["recommended_action"] = action
-                return job
+                try:
+                    score, reason, flags, action = await self.score(job)
+                    job["score"] = score
+                    job["score_reason"] = reason
+                    job["flags"] = flags
+                    job["recommended_action"] = action
+                    return job
+                finally:
+                    if on_result is not None:
+                        on_result()
 
         results = await asyncio.gather(*[_score_one(j) for j in jobs], return_exceptions=True)
         out = []
