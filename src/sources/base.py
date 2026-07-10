@@ -24,6 +24,33 @@ console = Console()
 
 _log = logging.getLogger(__name__)
 
+# Collects {accept, name, label} for every file input in one round-trip.
+# Label resolution: explicit <label for=id>, then up to 4 ancestors' text,
+# then aria-label / data-automation-id. Returned in document order so results
+# align with page.query_selector_all('input[type="file"]').
+_FILE_INPUT_METADATA_JS = """
+() => Array.from(document.querySelectorAll('input[type="file"]')).map(node => {
+    let label = '';
+    const id = node.id;
+    const explicit = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+    if (explicit && explicit.innerText) {
+        label = explicit.innerText;
+    } else {
+        let p = node.parentElement;
+        for (let i = 0; p && i < 4; i++, p = p.parentElement) {
+            const txt = (p.innerText || '').trim();
+            if (txt) { label = txt; break; }
+        }
+    }
+    if (!label) label = node.getAttribute('aria-label') || node.getAttribute('data-automation-id') || '';
+    return {
+        accept: (node.accept || '').toLowerCase(),
+        name: (node.name || '').toLowerCase(),
+        label: (label || '').toLowerCase(),
+    };
+})
+"""
+
 
 class JobExpiredError(Exception):
     """Exception raised when a job posting is no longer active or listed."""
@@ -412,25 +439,85 @@ class BaseScraper(ABC):
         import hashlib
         return hashlib.md5(url.encode()).hexdigest()[:16]
 
-    async def _upload_resume_if_prompted(self, page, resume_path: str) -> None:
-        path = Path(resume_path).expanduser()
-        if not path.exists():
-            return
+    async def _upload_documents_if_prompted(
+        self, page, resume_path: str, cover_letter_path: str = ""
+    ) -> bool:
+        """Upload a resume (and optionally a cover letter) to visible file inputs.
+
+        Each file input is classified as a cover-letter or resume target using its
+        ``accept`` type, ``name``, and resolved label. Metadata for every input is
+        gathered in a single in-page ``evaluate`` (one Playwright round-trip for the
+        whole form instead of several per input), then matched back to the element
+        handles by document order.
+
+        Returns True if a resume was uploaded.
+        """
+        res_path = Path(resume_path).expanduser() if resume_path else None
+        cl_path = Path(cover_letter_path).expanduser() if cover_letter_path else None
+        if not (res_path and res_path.exists()) and not (cl_path and cl_path.exists()):
+            return False
+
+        uploaded_resume = False
         try:
             file_inputs = await page.query_selector_all('input[type="file"]')
-            for file_input in file_inputs:
-                accept = (await file_input.get_attribute("accept") or "").lower()
-                name = (await file_input.get_attribute("name") or "").lower()
-                label = (await self._get_field_label(page, file_input) or "").lower()
-                hints = " ".join([accept, name, label])
-                if accept and not any(ext in accept for ext in [".pdf", "pdf", "application/pdf"]):
+            if not file_inputs:
+                return False
+            # One round-trip: {accept, name, label} for every file input, in
+            # document order (matches the query_selector_all ordering above).
+            metas = await page.evaluate(_FILE_INPUT_METADATA_JS)
+            for idx, file_input in enumerate(file_inputs):
+                meta = metas[idx] if idx < len(metas) else {}
+                accept = meta.get("accept", "")
+                hints = " ".join([accept, meta.get("name", ""), meta.get("label", "")])
+
+                # Skip inputs that explicitly reject document formats.
+                if accept and not any(
+                    ext in accept for ext in [".pdf", ".doc", ".docx", "pdf", "word"]
+                ):
                     continue
-                if any(word in hints for word in ["resume", "cv", "upload", "file"]) or not hints.strip():
-                    await file_input.set_input_files(str(path))
-                    console.print(f"[green]{self.name.capitalize()}:[/green] Uploaded resume: {path.name}")
+
+                is_cover_letter = any(
+                    w in hints for w in ["cover", "letter", "cl", "motivation", "motivational"]
+                )
+                is_resume = (
+                    any(w in hints for w in ["resume", "cv", "vitae", "work history", "upload", "file"])
+                    or not hints.strip()
+                )
+
+                if is_cover_letter and cl_path and cl_path.exists():
+                    await file_input.set_input_files(str(cl_path))
+                    console.print(
+                        f"[green]{self.name.capitalize()}:[/green] Uploaded cover letter: {cl_path.name}"
+                    )
+                    await self._delay(1, 2)
+                elif is_resume and res_path and res_path.exists():
+                    await file_input.set_input_files(str(res_path))
+                    console.print(
+                        f"[green]{self.name.capitalize()}:[/green] Uploaded resume: {res_path.name}"
+                    )
+                    uploaded_resume = True
+                    await self._delay(1, 2)
+                elif res_path and res_path.exists() and not uploaded_resume:
+                    # Fallback: no clear match — send the resume to the first input.
+                    await file_input.set_input_files(str(res_path))
+                    console.print(
+                        f"[green]{self.name.capitalize()}:[/green] Uploaded resume (fallback): {res_path.name}"
+                    )
+                    uploaded_resume = True
                     await self._delay(1, 2)
         except Exception as exc:
-            console.print(f"[yellow]{self.name.capitalize()}:[/yellow] Resume upload check failed: {exc}")
+            console.print(
+                f"[yellow]{self.name.capitalize()}:[/yellow] Document upload check failed: {exc}"
+            )
+        return uploaded_resume
+
+    async def _upload_resume_if_prompted(self, page, resume_path: str) -> None:
+        """Back-compat wrapper — upload only a resume.
+
+        Retained for callers that don't handle cover letters; delegates to
+        :meth:`_upload_documents_if_prompted`.
+        """
+        await self._upload_documents_if_prompted(page, resume_path)
 
     async def _get_field_label(self, page, element) -> str:
         """Try to find the label text for an input element."""

@@ -3077,69 +3077,8 @@ class JobrightScraper(BaseScraper):
 
         console.print("[magenta]Jobright:[/magenta] Workday wizard navigation complete")
 
-    async def _upload_documents_if_prompted(self, page, resume_path: str, cover_letter_path: str = "") -> bool:
-        """Upload resume and cover letter to visible file inputs depending on their labels/accept types."""
-        res_path = Path(resume_path).expanduser() if resume_path else None
-        cl_path = Path(cover_letter_path).expanduser() if cover_letter_path else None
-
-        uploaded_resume = False
-        uploaded_cover = False
-
-        try:
-            file_inputs = await page.query_selector_all('input[type="file"]')
-            for file_input in file_inputs:
-                accept = (await file_input.get_attribute("accept") or "").lower()
-                name = (await file_input.get_attribute("name") or "").lower()
-                label = ""
-                try:
-                    label = await file_input.evaluate(
-                        """
-                        node => {
-                            const id = node.id;
-                            const explicit = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
-                            if (explicit?.innerText) return explicit.innerText;
-                            let p = node.parentElement;
-                            for (let i = 0; p && i < 4; i++, p = p.parentElement) {
-                                const txt = (p.innerText || '').trim();
-                                if (txt) return txt;
-                            }
-                            return node.getAttribute('aria-label') || node.getAttribute('data-automation-id') || '';
-                        }
-                        """
-                    )
-                except Exception:
-                    label = ""
-                hints = " ".join([accept, name, label.lower()])
-
-                # Check file extension constraints
-                if accept and not any(ext in accept for ext in [".pdf", ".doc", ".docx", "pdf", "word"]):
-                    continue
-
-                # Distinguish between cover letter input and resume input
-                is_cover_letter = any(word in hints for word in ["cover", "letter", "cl", "motivation", "motivational"])
-                is_resume = any(word in hints for word in ["resume", "cv", "vitae", "work history"]) or not hints.strip()
-
-                if is_cover_letter and cl_path and cl_path.exists():
-                    await file_input.set_input_files(str(cl_path))
-                    console.print(f"[green]Jobright ATS:[/green] Uploaded cover letter: {cl_path.name}")
-                    uploaded_cover = True
-                    await self._delay(1, 2)
-                elif is_resume and res_path and res_path.exists():
-                    await file_input.set_input_files(str(res_path))
-                    console.print(f"[green]Jobright ATS:[/green] Uploaded resume: {res_path.name}")
-                    uploaded_resume = True
-                    await self._delay(1, 2)
-                elif res_path and res_path.exists() and not uploaded_resume:
-                    # Fallback default upload to the first input if not resolved
-                    await file_input.set_input_files(str(res_path))
-                    console.print(f"[green]Jobright ATS:[/green] Uploaded resume (fallback): {res_path.name}")
-                    uploaded_resume = True
-                    await self._delay(1, 2)
-
-        except Exception as exc:
-            console.print(f"[yellow]Jobright ATS:[/yellow] Document upload check failed: {exc}")
-        return uploaded_resume
-
+    # _upload_documents_if_prompted / _upload_resume_if_prompted are inherited
+    # from BaseScraper (batched, cover-letter-aware). See src/sources/base.py.
 
     async def _trigger_autofill(self, page) -> bool:
         """
