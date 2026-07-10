@@ -497,10 +497,16 @@ def main() -> None:
         src = getattr(args, "source", None)
         if src:
             sources_to_check = [src]
+        elif os.environ.get("DASHBOARD_URL"):
+            # apply_approved() pulls cloud-approved jobs into the local queue
+            # AFTER this preflight, so the local queue can't tell us which
+            # sources those jobs use yet. Validate all sources to preserve the
+            # fail-fast guarantee for the cloud-approval workflow.
+            sources_to_check = None
         else:
-            # Validate creds only for sources actually represented in the
-            # approved queue — a missing USAJOBS_PASSWORD shouldn't block an
-            # apply run whose queue is all LinkedIn jobs. An empty queue means
+            # Local-only: validate creds just for sources actually represented
+            # in the approved queue — a missing USAJOBS_PASSWORD shouldn't block
+            # an apply run whose queue is all LinkedIn jobs. An empty queue means
             # nothing to apply, so nothing to validate.
             sources_to_check = _sources_in_apply_queue(getattr(args, "company", None))
         if sources_to_check != [] and not preflight_env_check(sources_to_check):
