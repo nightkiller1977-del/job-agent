@@ -1799,6 +1799,8 @@ class JobrightScraper(BaseScraper):
                     f"Application submitted successfully"
                 )
 
+        except JobExpiredError:
+            raise
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
