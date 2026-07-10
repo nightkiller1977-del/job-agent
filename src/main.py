@@ -269,6 +269,39 @@ def build_parser() -> argparse.ArgumentParser:
     watch_p.add_argument("--interval", type=int, default=30)
     watch_p.add_argument("--no-auto-fix", action="store_true")
 
+    # expand
+    expand_parser = subparsers.add_parser(
+        "expand",
+        help="Enrich profile skills by analyzing public profiles (e.g. GitHub)",
+    )
+    expand_parser.add_argument(
+        "--github",
+        required=True,
+        help="GitHub username to analyze",
+    )
+
+    # upskill
+    subparsers.add_parser(
+        "upskill",
+        help="Analyze skill gaps against approved/applied jobs and generate learning roadmap",
+    )
+
+    # session-status
+    subparsers.add_parser(
+        "session-status",
+        help="Show session health for all sources (healthy/stale/expired/missing)",
+    )
+
+    # heartbeat
+    heartbeat_p = subparsers.add_parser(
+        "heartbeat",
+        help="Silently visit each source to extend cookie lifetime (run nightly via cron)",
+    )
+    heartbeat_p.add_argument(
+        "--source",
+        help="Limit heartbeat to one source (linkedin, indeed, jobright)",
+    )
+
     return parser
 
 
@@ -329,6 +362,36 @@ async def main_async(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
         )
 
+    elif args.command == "session-status":
+        from src.session_watchdog import check_session_health, print_health_table
+        results = check_session_health()
+        print_health_table(results)
+        blocked = [r for r in results if r.status in {"expired", "missing"}]
+        if blocked:
+            console.print(f"\n[red]{len(blocked)} source(s) need attention.[/red]")
+            console.print("[cyan]Run:[/cyan] python src/main.py prepare-sessions")
+            console.print("[cyan]Or:[/cyan]  bash scripts/install-jobagent-url-handler.sh  (one-tap repair from phone)")
+        return 1 if blocked else 0
+
+    elif args.command == "heartbeat":
+        from src.session_watchdog import run_heartbeat
+        sources = [args.source] if getattr(args, "source", None) else None
+        results = await run_heartbeat(sources=sources, config=orchestrator.config)
+        for src, ok in results.items():
+            status = "[green]✓[/green]" if ok else "[red]✗[/red]"
+            console.print(f"  {status} {src}")
+        return 0
+
+    elif args.command == "expand":
+        from src.profile_enricher import ProfileEnricher
+        enricher = ProfileEnricher()
+        await enricher.enrich_from_github(args.github)
+
+    elif args.command == "upskill":
+        from src.gap_analyzer import GapAnalyzer
+        analyzer = GapAnalyzer()
+        await analyzer.run_analysis()
+
     elif args.command == "commander":
         import json
         from src.commander import AgentCommander
@@ -339,7 +402,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
         if args.subcommand == "ask":
             question = " ".join(args.question)
-            console.print(commander.query(question))
+            console.print(await commander.query(question))
 
         elif args.subcommand == "diagnose":
             report = commander.diagnose(args.source)
@@ -375,7 +438,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # All commands except 'status' need the API key
-    if args.command in ("discover", "hydrate") and not check_api_key():
+    if args.command in ("discover", "hydrate", "expand", "upskill") and not check_api_key():
         sys.exit(1)
     if args.command == "commander" and args.subcommand in ("ask", "report", "watch") and not check_api_key():
         sys.exit(1)
