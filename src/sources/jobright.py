@@ -374,7 +374,9 @@ class JobrightScraper(BaseScraper):
                                 "proceeding anyway (warn-only gate).[/yellow]"
                             )
             except ATSReadabilityError:
-                # Let ATSReadabilityError propagate to the orchestrator to trigger self-healing
+                # Let ATSReadabilityError propagate to the orchestrator, which decides
+                # per-job: pause the loop on a genuinely unreadable PDF, or skip just
+                # this job on a keyword mismatch and continue with the rest.
                 raise
             except Exception as _ce:
                 console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
