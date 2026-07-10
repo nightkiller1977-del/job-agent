@@ -98,21 +98,29 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
 
         # Also peek inside for LinkedIn expiry timestamps if available
         cookie_expiry_hours = _parse_linkedin_expiry(found) if src == "linkedin" else None
-        effective_age = min(age_hours, cookie_expiry_hours or age_hours)
 
-        if effective_age >= _EXPIRED_HOURS:
+        is_expired = (age_hours >= _EXPIRED_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 0)
+        is_stale = (age_hours >= _STALE_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 4)
+
+        if is_expired:
             status = "expired"
-            detail = f"Session is {effective_age:.0f}h old — cookies very likely invalid."
-        elif effective_age >= _STALE_HOURS:
+            if cookie_expiry_hours is not None and cookie_expiry_hours <= 0:
+                detail = f"LinkedIn cookies expired {abs(cookie_expiry_hours):.1f}h ago."
+            else:
+                detail = f"Session is {age_hours:.0f}h old — cookies very likely invalid."
+        elif is_stale:
             status = "stale"
-            detail = f"Session is {effective_age:.0f}h old — heartbeat recommended."
+            if cookie_expiry_hours is not None and cookie_expiry_hours <= 4:
+                detail = f"LinkedIn cookies expire in {cookie_expiry_hours:.1f}h — heartbeat recommended."
+            else:
+                detail = f"Session is {age_hours:.0f}h old — heartbeat recommended."
         else:
             status = "healthy"
-            detail = f"Session is {effective_age:.1f}h old — looks good."
+            detail = f"Session is {age_hours:.1f}h old — looks good."
 
         results.append(SessionHealth(
             source=src, status=status,
-            age_hours=effective_age,
+            age_hours=age_hours,
             session_path=found,
             detail=detail,
         ))
@@ -276,7 +284,16 @@ def _send_deep_link_notification(source: str, message: str) -> None:
     full_msg = f"{message}\n\n{deep_link}"
 
     try:
-        from .notifier import _send_telegram, _macos_notify
+        from .notifier import _send_telegram, _macos_notify, _last_notification_times
+        import time
+        now = time.time()
+        cache_key = f"tg:deep_link:{source}"
+        last_time = _last_notification_times.get(cache_key, 0)
+        # Rate limit identical deep link Telegram alerts to once every 12 hours (43200 seconds)
+        if now - last_time < 43200:
+            return
+        _last_notification_times[cache_key] = now
+
         _send_telegram(full_msg)
         _macos_notify(f"{source} session needs refresh", message)
     except Exception as exc:
