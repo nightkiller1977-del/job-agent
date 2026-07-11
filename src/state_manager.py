@@ -290,6 +290,39 @@ class StateManager:
             extra["apply_last_status"]  = status
             extra["apply_last_detail"]  = (detail or "")[:500]
             extra["apply_attempt_count"] = extra.get("apply_attempt_count", 0) + 1
+            # P1 instrumentation: a durable success flag on EVERY attempt (success or
+            # failure) so success-rate is computable. Previously only rich analytics
+            # were recorded, and only on success — leaving `submitted` null everywhere.
+            extra["submitted"] = str(status).strip().lower() == "applied"
+            # P2: stamp the control-flow class so the circuit breaker and dashboards
+            # can reason about this outcome without re-deriving it.
+            from .blocker_classifier import classify
+            extra["blocker_class"] = classify(status).value
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
+    def flag_circuit_break(self, job_id: str, blocker_class: str, reason: str) -> None:
+        """P2: record that the circuit breaker skipped this job, WITHOUT touching
+        apply_last_status / apply_attempt_count (so the real blocker and count are
+        preserved for classification). Lets dashboards surface circuit-broken jobs.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            extra: dict = {}
+            if row and row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    pass
+            extra["circuit_broken"] = True
+            extra["circuit_class"] = blocker_class
+            extra["circuit_reason"] = (reason or "")[:300]
+            extra["circuit_broken_at"] = now
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
                 (json.dumps(extra), job_id),
@@ -373,6 +406,99 @@ class StateManager:
             ).fetchall()
             stats["today"] = {r["status"]: r["cnt"] for r in today_rows}
             return stats
+
+    # ------------------------------------------------------------------
+    # P1 instrumentation: apply funnel & success-rate
+    # ------------------------------------------------------------------
+
+    # Failure-status → cluster, so the report groups the noise the way the
+    # plan's measured baseline does. This is a *display* grouping only; the
+    # authoritative blocker classifier lands in P2 (src/blocker_classifier.py).
+    _FAILURE_CLUSTERS = {
+        "form_completion": {
+            "external_ats_error", "form_not_reached", "submit_not_found",
+            "linkedin_external_apply_not_found", "microsoft_apply_not_reached",
+        },
+        "auth_session": {
+            "workday_session_expired", "brassring_login_required",
+            "reauth_failed", "reauth_retry_error",
+        },
+        "field_completion": {
+            "linkedin_stuck_on_required_field", "ats_failure",
+        },
+        "config_error": {"bad_ats_url", "unknown_source", "error"},
+    }
+
+    @classmethod
+    def _cluster_for(cls, status: str) -> str:
+        s = (status or "").strip()
+        for cluster, members in cls._FAILURE_CLUSTERS.items():
+            if s in members:
+                return cluster
+        return "other"
+
+    def get_apply_funnel(self) -> dict:
+        """Compute the apply funnel and success rate from persisted extra_json.
+
+        Reads what P1 records on every attempt (`apply_last_status`, `submitted`,
+        `apply_attempt_count`). Pure read; safe to call anytime. Returns a dict:
+        totals, funnel counts, attempt_success_rate, failure histogram + clusters,
+        per-source breakdown, and wasted-retry count.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT source, status, extra_json FROM jobs"
+            ).fetchall()
+
+        total = len(rows)
+        status_counts: dict = {}
+        attempts = 0
+        submitted = 0
+        wasted_retries = 0
+        failure_hist: dict = {}
+        cluster_hist: dict = {}
+        per_source: dict = {}
+
+        for r in rows:
+            status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+            try:
+                extra = json.loads(r["extra_json"]) if r["extra_json"] else {}
+            except Exception:
+                extra = {}
+            last = extra.get("apply_last_status")
+            if not last:
+                continue  # no apply attempt recorded for this job
+
+            attempts += 1
+            was_submitted = bool(extra.get("submitted")) or str(last).lower() == "applied"
+            src = r["source"] or "unknown"
+            ps = per_source.setdefault(src, {"attempts": 0, "submitted": 0})
+            ps["attempts"] += 1
+
+            if was_submitted:
+                submitted += 1
+                ps["submitted"] += 1
+            else:
+                failure_hist[last] = failure_hist.get(last, 0) + 1
+                cluster = self._cluster_for(last)
+                cluster_hist[cluster] = cluster_hist.get(cluster, 0) + 1
+                # Attempts beyond the first on a job that never succeeded = wasted effort.
+                wasted_retries += max(0, int(extra.get("apply_attempt_count", 1)) - 1)
+
+        for ps in per_source.values():
+            ps["rate"] = (ps["submitted"] / ps["attempts"]) if ps["attempts"] else 0.0
+
+        return {
+            "total_jobs": total,
+            "status_counts": status_counts,
+            "attempts": attempts,
+            "submitted": submitted,
+            "attempt_success_rate": (submitted / attempts) if attempts else 0.0,
+            "failure_histogram": dict(sorted(failure_hist.items(), key=lambda x: -x[1])),
+            "failure_clusters": dict(sorted(cluster_hist.items(), key=lambda x: -x[1])),
+            "per_source": per_source,
+            "wasted_retries": wasted_retries,
+        }
 
     def already_seen(self, job_id: str) -> bool:
         with self._connect() as conn:

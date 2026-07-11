@@ -8,3 +8,5 @@ playwright-stealth>=1.0.0,<3.0.0
 pyotp>=2.9.0,<3.0.0
 openai>=1.0.0,<2.0.0
 openlit>=1.0.0,<2.0.0
+patchright>=1.60.0,<2.0.0
+

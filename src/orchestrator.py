@@ -28,6 +28,7 @@ from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
 from .resume_helper import ATSReadabilityError
+from .blocker_classifier import should_attempt, classify, needs_preflight_reauth
 from .session_watchdog import preflight_session_check
 
 console = Console()
@@ -625,10 +626,49 @@ class Orchestrator:
         failed_count   = 0
         skipped_count  = 0
         outcomes: list[dict] = []
+        reauthed_this_run: set[str] = set()  # P3: reauth each source at most once per run
 
         for job in ready:
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
+
+            # P2 circuit breaker: stop burning attempts on jobs that have exhausted
+            # their retry budget for their blocker class (baseline: 245 wasted retries,
+            # some jobs attempted 17×). Reads the prior outcome; does not run apply.
+            try:
+                _extra = json.loads(job.get("extra_json") or "{}")
+            except Exception:
+                _extra = {}
+            _last = _extra.get("apply_last_status")
+            _attempts = int(_extra.get("apply_attempt_count", 0) or 0)
+            _ok, _skip_reason = should_attempt(_last, _attempts)
+            if not _ok:
+                _cls = classify(_last).value
+                console.print(f"[dim]⛔ Circuit breaker: skipping — {_skip_reason}[/dim]")
+                self.state.flag_circuit_break(job["job_id"], _cls, _skip_reason)
+                skipped_count += 1
+                outcomes.append({"job": job, "status": "circuit_open", "reason": _skip_reason})
+                continue
+
             src = job.get("source", "")
+
+            # P3 session/auth preflight: if this job last failed on an auth blocker,
+            # refresh the source session BEFORE attempting (once per source per run),
+            # so we don't burn another attempt hitting the same expired session.
+            if src in SOURCE_MAP and needs_preflight_reauth(_last, src, reauthed_this_run):
+                console.print(f"[cyan]P3 preflight:[/cyan] prior auth blocker ({_last}) — refreshing {src} session…")
+                reauthed_this_run.add(src)
+                try:
+                    _refreshed = await ReauthManager(self.config).handle(src, _last or "", context="apply")
+                except Exception as _re:
+                    _refreshed = False
+                    console.print(f"[yellow]P3 preflight reauth error for {src}:[/yellow] {_re}")
+                if not _refreshed:
+                    console.print(f"[yellow]P3 preflight: {src} session not refreshed — skipping this job.[/yellow]")
+                    self.state.record_apply_attempt(job["job_id"], "reauth_failed", "P3 preflight reauth failed")
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    skipped_count += 1
+                    outcomes.append({"job": job, "status": "reauth_failed", "reason": "preflight reauth failed"})
+                    continue
 
             if src not in SOURCE_MAP:
                 console.print(f"[red]Unknown source '{src}' — skipping.[/red]")
@@ -899,6 +939,61 @@ class Orchestrator:
             console.print(f"\n[cyan]Bookmarked jobs ({len(bookmarked)}):[/cyan]")
             for j in bookmarked[:10]:
                 console.print(f"  • {j['title']} @ {j['company']} — {j['url']}")
+
+    def show_apply_stats(self) -> dict:
+        """P1: print the apply funnel + success rate from persisted data.
+
+        Works on existing data — no new run required. Returns the funnel dict
+        so callers (tests, cloud push) can consume it too.
+        """
+        from rich.table import Table
+
+        f = self.state.get_apply_funnel()
+        rate_pct = f["attempt_success_rate"] * 100
+
+        console.rule("[bold]Apply Success Report[/bold]")
+        console.print(
+            f"Discovered: [bold]{f['total_jobs']}[/bold]   "
+            f"Attempts: [bold]{f['attempts']}[/bold]   "
+            f"Submitted: [bold]{f['submitted']}[/bold]   "
+            f"Success rate: [bold]{rate_pct:.1f}%[/bold]   "
+            f"Wasted retries: [bold]{f['wasted_retries']}[/bold]"
+        )
+
+        sc = f["status_counts"]
+        if sc:
+            console.print(
+                "[dim]Funnel: "
+                + " → ".join(
+                    f"{k}={v}"
+                    for k, v in sorted(sc.items(), key=lambda x: -x[1])
+                )
+                + "[/dim]"
+            )
+
+        if f["failure_clusters"]:
+            ct = Table(title="Failure clusters", show_edge=False)
+            ct.add_column("cluster"); ct.add_column("count", justify="right")
+            for k, v in f["failure_clusters"].items():
+                ct.add_row(k, str(v))
+            console.print(ct)
+
+        if f["failure_histogram"]:
+            ft = Table(title="Failure detail", show_edge=False)
+            ft.add_column("status"); ft.add_column("count", justify="right")
+            for k, v in f["failure_histogram"].items():
+                ft.add_row(k, str(v))
+            console.print(ft)
+
+        if f["per_source"]:
+            st = Table(title="Per source", show_edge=False)
+            st.add_column("source"); st.add_column("attempts", justify="right")
+            st.add_column("submitted", justify="right"); st.add_column("rate", justify="right")
+            for src, d in sorted(f["per_source"].items(), key=lambda x: -x[1]["attempts"]):
+                st.add_row(src, str(d["attempts"]), str(d["submitted"]), f"{d['rate']*100:.0f}%")
+            console.print(st)
+
+        return f
 
     async def load_credentials_from_dashboard(self) -> None:
         """Fetch credentials from the cloud dashboard and populate os.environ.
