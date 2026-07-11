@@ -247,6 +247,27 @@ class JobrightScraper(BaseScraper):
         This is used by LinkedIn jobs that do not expose Easy Apply. It reuses
         the persistent Jobright profile so the autofill extension is available.
         """
+        # Go-live (flag-gated): route through the new adapter registry instead of the
+        # legacy body when USE_ADAPTER_REGISTRY is truthy. Default OFF, so the proven
+        # path runs unless explicitly opted in for live verification. All external
+        # call sites (LinkedIn :1266, Indeed :397, and the "external" source via
+        # JobrightScraper.apply :1521) funnel here, so this one branch flips them all —
+        # and none pre-launch a browser before this point, so there's no jobright
+        # profile-lock collision with ExternalApplySession.
+        if os.environ.get("USE_ADAPTER_REGISTRY", "").strip().lower() in ("1", "true", "yes", "on"):
+            from .adapters.session import ExternalApplySession
+            console.print("[cyan]apply_external_ats_job:[/cyan] routing via adapter registry (USE_ADAPTER_REGISTRY=1)")
+            _job = dict(job)
+            _job["url"] = external_url
+            if resume_path:
+                _job["resume_path"] = resume_path
+            _res = await ExternalApplySession(self.config).apply(_job, auto_submit=auto_submit)
+            self.last_apply_status = _res.status
+            self.last_apply_detail = _res.detail
+            if _res.analytics:
+                self._apply_analytics = _res.analytics
+            return _res.submitted
+
         self.auto_submit = auto_submit
         self.last_apply_status = "started"
         self.last_apply_detail = ""
