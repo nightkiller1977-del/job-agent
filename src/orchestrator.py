@@ -900,6 +900,61 @@ class Orchestrator:
             for j in bookmarked[:10]:
                 console.print(f"  • {j['title']} @ {j['company']} — {j['url']}")
 
+    def show_apply_stats(self) -> dict:
+        """P1: print the apply funnel + success rate from persisted data.
+
+        Works on existing data — no new run required. Returns the funnel dict
+        so callers (tests, cloud push) can consume it too.
+        """
+        from rich.table import Table
+
+        f = self.state.get_apply_funnel()
+        rate_pct = f["attempt_success_rate"] * 100
+
+        console.rule("[bold]Apply Success Report[/bold]")
+        console.print(
+            f"Discovered: [bold]{f['total_jobs']}[/bold]   "
+            f"Attempts: [bold]{f['attempts']}[/bold]   "
+            f"Submitted: [bold]{f['submitted']}[/bold]   "
+            f"Success rate: [bold]{rate_pct:.1f}%[/bold]   "
+            f"Wasted retries: [bold]{f['wasted_retries']}[/bold]"
+        )
+
+        sc = f["status_counts"]
+        if sc:
+            console.print(
+                "[dim]Funnel: "
+                + " → ".join(
+                    f"{k}={v}"
+                    for k, v in sorted(sc.items(), key=lambda x: -x[1])
+                )
+                + "[/dim]"
+            )
+
+        if f["failure_clusters"]:
+            ct = Table(title="Failure clusters", show_edge=False)
+            ct.add_column("cluster"); ct.add_column("count", justify="right")
+            for k, v in f["failure_clusters"].items():
+                ct.add_row(k, str(v))
+            console.print(ct)
+
+        if f["failure_histogram"]:
+            ft = Table(title="Failure detail", show_edge=False)
+            ft.add_column("status"); ft.add_column("count", justify="right")
+            for k, v in f["failure_histogram"].items():
+                ft.add_row(k, str(v))
+            console.print(ft)
+
+        if f["per_source"]:
+            st = Table(title="Per source", show_edge=False)
+            st.add_column("source"); st.add_column("attempts", justify="right")
+            st.add_column("submitted", justify="right"); st.add_column("rate", justify="right")
+            for src, d in sorted(f["per_source"].items(), key=lambda x: -x[1]["attempts"]):
+                st.add_row(src, str(d["attempts"]), str(d["submitted"]), f"{d['rate']*100:.0f}%")
+            console.print(st)
+
+        return f
+
     async def load_credentials_from_dashboard(self) -> None:
         """Fetch credentials from the cloud dashboard and populate os.environ.
         Falls back to local env variables if not found or on error.
