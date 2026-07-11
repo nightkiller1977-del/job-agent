@@ -123,15 +123,15 @@ _IC_PATTERNS = re.compile(
 )
 
 # Management/executive seniority terms that clear the quick IC rejection.
-# NOTE: "lead" is deliberately NOT here — "Lead Software Engineer" / "Lead DevOps
-# Engineer" are individual-contributor roles and must still hit the IC check.
-# Genuine management "lead" titles (e.g. "Team Lead") carry no IC keyword, so
-# they aren't quick-rejected and fall through to full model scoring anyway.
+# "lead" clears "Lead Software Engineer" / "Lead DevOps Engineer" (per #28): these
+# are treated as lead roles worth full model scoring rather than auto-rejected as
+# pure ICs. \blead\b won't match "leader"/"leadership". "Team Lead" clears too
+# (it already fell through with no IC keyword, so behavior is unchanged there).
 # "avp" covers the abbreviated form of a configured target role ("AVP of
 # Software Engineering"); the spelled-out "assistant vice president" already
 # matches via "vice president".
 _SENIORITY_PATTERNS = re.compile(
-    r"\b(manager|director|avp|vp|vice\s+president|head\s+of|gs-1[3-5])\b",
+    r"\b(lead|manager|director|avp|vp|vice\s+president|head\s+of|gs-1[3-5])\b",
     re.IGNORECASE,
 )
 
