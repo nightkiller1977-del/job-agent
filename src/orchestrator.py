@@ -55,6 +55,15 @@ MCP_SCRAPED_FILE = Path(__file__).parent.parent / "state" / "mcp_scraped.json"
 
 class Orchestrator:
     def __init__(self, config_path: str = "config.json"):
+        # BAND-AID / TODO(secrets): defensively load the project .env so credentials
+        # are present even when a launcher didn't go through main.load_env(). override=False
+        # so it never stomps intentionally-set shell/launchd vars; main.py stays the
+        # authoritative override=True load. Replace with single-source store — see roadmap.
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(Path(__file__).parent.parent / ".env", override=False)
+        except Exception:
+            pass
         self.config = self._load_config(config_path)
         self.state = StateManager(self.config.get("state_db_path", "state/jobs.db"))
         api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -573,6 +582,7 @@ class Orchestrator:
         is_interactive = bool(_sys.stdin and _sys.stdin.isatty())
 
         await self.load_credentials_from_dashboard()
+        self._log_credential_presence()
         # Pull cloud-approved jobs into local SQLite first
         await self._pull_approved_from_cloud()
 
@@ -1029,6 +1039,25 @@ class Orchestrator:
 
         return f
 
+    def _log_credential_presence(self) -> None:
+        """BAND-AID / TODO(secrets): log which source credentials are present in
+        os.environ (names + SET/MISSING, never values) at the start of a run. Turns
+        'is JOBRIGHT_EMAIL actually loaded in the scheduled process?' from a guess into
+        a fact in the log. Remove once the single-source secrets store lands (roadmap).
+        """
+        pairs = {
+            "jobright": ("JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD"),
+            "linkedin": ("LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"),
+            "indeed":   ("INDEED_EMAIL", "INDEED_PASSWORD"),
+            "usajobs":  ("USAJOBS_EMAIL", "USAJOBS_PASSWORD"),
+            "anthropic": ("ANTHROPIC_API_KEY", None),
+        }
+        parts = []
+        for name, (ek, pk) in pairs.items():
+            ok = bool(os.environ.get(ek)) and (pk is None or bool(os.environ.get(pk)))
+            parts.append(f"{name}={'SET' if ok else 'MISSING'}")
+        console.print(f"[dim]🔑 Credential presence: {'  '.join(parts)}[/dim]")
+
     async def load_credentials_from_dashboard(self) -> None:
         """Fetch credentials from the cloud dashboard and populate os.environ.
         Falls back to local env variables if not found or on error.
@@ -1049,31 +1078,38 @@ class Orchestrator:
                 if r.status_code == 200:
                     creds = r.json()
                     loaded = []
+                    kept_local = []
+                    # BAND-AID / TODO(secrets): .env is the authoritative source. The cloud
+                    # dashboard may only FILL MISSING creds — never overwrite a value already
+                    # present locally. A stale/empty cloud value previously clobbered good
+                    # .env creds and broke reauth (jobright/usajobs). Replace this whole
+                    # multi-source scheme with the single-source secrets store
+                    # (SOPS + age + Azure Key Vault) — see roadmap.
+                    _platform_keys = {
+                        "indeed":        ("INDEED_EMAIL",   "INDEED_PASSWORD",   "Indeed"),
+                        "linkedin":      ("LINKEDIN_EMAIL", "LINKEDIN_PASSWORD", "LinkedIn"),
+                        "jobright":      ("JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD", "Jobright"),
+                        "company_portal":("COMPANY_EMAIL",  "COMPANY_PASSWORD",  "Company ATS"),
+                    }
                     for item in creds:
-                        platform = item.get("platform")
                         email = item.get("email")
                         password = item.get("password")
-                        if not email or not password:
+                        keys = _platform_keys.get(item.get("platform"))
+                        if not email or not password or not keys:
                             continue
-                        if platform == "indeed":
-                            os.environ["INDEED_EMAIL"] = email
-                            os.environ["INDEED_PASSWORD"] = password
-                            loaded.append("Indeed")
-                        elif platform == "linkedin":
-                            os.environ["LINKEDIN_EMAIL"] = email
-                            os.environ["LINKEDIN_PASSWORD"] = password
-                            loaded.append("LinkedIn")
-                        elif platform == "jobright":
-                            os.environ["JOBRIGHT_EMAIL"] = email
-                            os.environ["JOBRIGHT_PASSWORD"] = password
-                            loaded.append("Jobright")
-                        elif platform == "company_portal":
-                            os.environ["COMPANY_EMAIL"] = email
-                            os.environ["COMPANY_PASSWORD"] = password
-                            loaded.append("Company ATS")
+                        email_key, pw_key, label = keys
+                        # .env wins: only fill when BOTH local values are empty/absent
+                        if os.environ.get(email_key) or os.environ.get(pw_key):
+                            kept_local.append(label)
+                            continue
+                        os.environ[email_key] = email
+                        os.environ[pw_key] = password
+                        loaded.append(label)
                     if loaded:
-                        console.print(f"[green]☁ Platform credentials loaded from cloud: {', '.join(loaded)}[/green]")
-                    else:
+                        console.print(f"[green]☁ Cloud filled missing credentials: {', '.join(loaded)}[/green]")
+                    if kept_local:
+                        console.print(f"[dim]☁ Kept local .env credentials (cloud not applied): {', '.join(kept_local)}[/dim]")
+                    if not loaded and not kept_local:
                         console.print("[yellow]☁ No platform credentials configured on cloud.[/yellow]")
                 else:
                     console.print(f"[yellow]☁ Cloud credentials pull returned {r.status_code} — using local env fallbacks.[/yellow]")
