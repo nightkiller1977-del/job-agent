@@ -72,6 +72,21 @@ def max_attempts(status: str | None) -> int:
     return _MAX_ATTEMPTS[classify(status)]
 
 
+def needs_preflight_reauth(
+    last_status: str | None, source: str, already_reauthed: set[str]
+) -> bool:
+    """P3: should we proactively refresh this source's session BEFORE attempting?
+
+    True when the job's last outcome was an auth blocker and we haven't already
+    re-authed this source in the current run. Turns the reactive "attempt → fail
+    on auth → maybe reauth next run" pattern into "reauth first → attempt".
+    """
+    return (
+        classify(last_status) is BlockerClass.AUTH_REQUIRED
+        and source not in already_reauthed
+    )
+
+
 def should_attempt(last_status: str | None, attempt_count: int) -> tuple[bool, str]:
     """Decide whether to attempt a job given its last outcome and attempt count.
 
