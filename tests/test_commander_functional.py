@@ -388,7 +388,7 @@ class TestTrustQueryReflectsRealState:
 
         commander._model_client.complete = mock_complete
 
-        result = commander.query(question)
+        result = asyncio.run(commander.query(question))
 
         assert len(captured) == 1
         combined = " ".join(m.get("content", "") for m in captured[0]["messages"])
@@ -411,7 +411,7 @@ async def _run_commander_ask(question: str, mock_query_return: str, config: dict
     from src.commander import AgentCommander
     with patch.object(AgentCommander, "query", return_value=mock_query_return):
         cmd = AgentCommander(config)
-        result = cmd.query(question)
+        result = await cmd.query(question)
     assert result == mock_query_return
     return 0
 

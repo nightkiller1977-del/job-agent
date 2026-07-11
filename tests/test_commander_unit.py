@@ -147,7 +147,7 @@ class TestQuery:
         """query() returns the text from ModelClient.complete (Ollama or Claude)."""
         commander, _ = _make_commander(tmp_path, monkeypatch)
         with patch.object(commander._model_client, "complete", new=AsyncMock(return_value="All looks good.")):
-            result = commander.query("How are things?")
+            result = asyncio.run(commander.query("How are things?"))
         assert result == "All looks good."
 
     def test_returns_no_model_message_when_both_unavailable(self, tmp_path, monkeypatch):
@@ -156,7 +156,7 @@ class TestQuery:
         with patch.object(commander._model_client, "complete", new=AsyncMock(
             return_value="No model available: Ollama is not running and ANTHROPIC_API_KEY is not set."
         )):
-            result = commander.query("status?")
+            result = asyncio.run(commander.query("status?"))
         assert "no model" in result.lower() or "not set" in result.lower() or result
 
     def test_system_prompt_contains_job_application_agent(self, tmp_path, monkeypatch):
@@ -169,7 +169,7 @@ class TestQuery:
             return "ok"
 
         with patch.object(commander._model_client, "complete", side_effect=capture_complete):
-            commander.query("test")
+            asyncio.run(commander.query("test"))
         assert "job application agent" in captured.get("system", "").lower()
 
     def test_user_message_contains_context_and_question(self, tmp_path, monkeypatch):
@@ -182,7 +182,7 @@ class TestQuery:
             return "ok"
 
         with patch.object(commander._model_client, "complete", side_effect=capture_complete):
-            commander.query("What went wrong?")
+            asyncio.run(commander.query("What went wrong?"))
         user_content = captured.get("messages", [{}])[0].get("content", "")
         assert "What went wrong?" in user_content
         assert "CREDENTIAL CHECK" in user_content or "Agent state" in user_content
