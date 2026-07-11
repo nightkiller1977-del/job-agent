@@ -294,6 +294,35 @@ class StateManager:
             # failure) so success-rate is computable. Previously only rich analytics
             # were recorded, and only on success — leaving `submitted` null everywhere.
             extra["submitted"] = str(status).strip().lower() == "applied"
+            # P2: stamp the control-flow class so the circuit breaker and dashboards
+            # can reason about this outcome without re-deriving it.
+            from .blocker_classifier import classify
+            extra["blocker_class"] = classify(status).value
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
+    def flag_circuit_break(self, job_id: str, blocker_class: str, reason: str) -> None:
+        """P2: record that the circuit breaker skipped this job, WITHOUT touching
+        apply_last_status / apply_attempt_count (so the real blocker and count are
+        preserved for classification). Lets dashboards surface circuit-broken jobs.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            extra: dict = {}
+            if row and row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    pass
+            extra["circuit_broken"] = True
+            extra["circuit_class"] = blocker_class
+            extra["circuit_reason"] = (reason or "")[:300]
+            extra["circuit_broken_at"] = now
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
                 (json.dumps(extra), job_id),
