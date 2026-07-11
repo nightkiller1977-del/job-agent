@@ -211,6 +211,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show current job application stats",
     )
 
+    # stats — apply funnel & success rate (P1 instrumentation)
+    subparsers.add_parser(
+        "stats",
+        help="Show apply funnel and success rate (attempts, submitted, failure clusters, per-source)",
+    )
+
     # ops-check
     ops_parser = subparsers.add_parser(
         "ops-check",
@@ -339,6 +345,9 @@ async def main_async(args: argparse.Namespace) -> int:
 
     elif args.command == "status":
         orchestrator.show_status()
+
+    elif args.command == "stats":
+        orchestrator.show_apply_stats()
 
     elif args.command == "ops-check":
         console.rule("[bold green]Operational flow check[/bold green]")
