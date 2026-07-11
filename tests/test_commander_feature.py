@@ -141,7 +141,7 @@ class TestQueryIntegration:
         commander = AgentCommander(_make_config(tmp_path))
         _mock_model_client(commander, "You have applied to 2 jobs today.")
 
-        result = commander.query("How many jobs have been applied to?")
+        result = asyncio.run(commander.query("How many jobs have been applied to?"))
 
         assert "2" in result
         assert isinstance(result, str) and len(result) > 0
@@ -164,7 +164,7 @@ class TestQueryIntegration:
             return "Context captured."
 
         commander._model_client.complete = capture_complete
-        commander.query("What is the job count?")
+        asyncio.run(commander.query("What is the job count?"))
 
         assert captured, "ModelClient.complete was never called"
         prompt = captured[0]["messages"][0]["content"]
@@ -191,7 +191,7 @@ class TestQueryIntegration:
             return "Captured."
 
         commander._model_client.complete = capture_complete
-        commander.query("Any errors?")
+        asyncio.run(commander.query("Any errors?"))
 
         prompt = captured[0]["messages"][0]["content"]
         assert alert_title in prompt
