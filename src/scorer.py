@@ -108,19 +108,30 @@ Return ONLY the JSON object, no other text.
 
 _CLAUDE_SONNET = "claude-sonnet-4-5"
 
-# IC patterns — matched with word boundaries to avoid "SRE" / "Senior SRE" mismatches
+# IC patterns — matched with word boundaries to avoid "SRE" / "Senior SRE"
+# mismatches. "engineer(?:ing)?" / "develop(?:er|ment)" also catch the gerund
+# field forms so "…, Software Engineering" / "…, Software Development" are treated
+# the same as "Software Engineer" (e.g. "Technical Lead, Software Engineering").
 _IC_PATTERNS = re.compile(
     r"\b("
-    r"software\s+engineer|software\s+developer|staff\s+engineer|principal\s+engineer"
-    r"|data\s+engineer|devops\s+engineer|site\s+reliability\s+engineer|sre"
-    r"|machine\s+learning\s+engineer|ml\s+engineer|ai\s+engineer"
-    r"|frontend\s+engineer|backend\s+engineer|full[- ]?stack\s+engineer"
+    r"software\s+engineer(?:ing)?|software\s+develop(?:er|ment)|staff\s+engineer(?:ing)?|principal\s+engineer(?:ing)?"
+    r"|data\s+engineer(?:ing)?|devops\s+engineer(?:ing)?|site\s+reliability\s+engineer(?:ing)?|sre"
+    r"|machine\s+learning\s+engineer(?:ing)?|ml\s+engineer(?:ing)?|ai\s+engineer(?:ing)?"
+    r"|frontend\s+engineer(?:ing)?|backend\s+engineer(?:ing)?|full[- ]?stack\s+engineer(?:ing)?"
     r")\b",
     re.IGNORECASE,
 )
 
+# Management/executive seniority terms that clear the quick IC rejection.
+# NOTE: "lead" is deliberately NOT here — "Lead Software Engineer" / "Lead DevOps
+# Engineer" are individual-contributor roles and must still hit the IC check.
+# Genuine management "lead" titles (e.g. "Team Lead") carry no IC keyword, so
+# they aren't quick-rejected and fall through to full model scoring anyway.
+# "avp" covers the abbreviated form of a configured target role ("AVP of
+# Software Engineering"); the spelled-out "assistant vice president" already
+# matches via "vice president".
 _SENIORITY_PATTERNS = re.compile(
-    r"\b(manager|director|vp|vice\s+president|head\s+of|lead|gs-1[3-5])\b",
+    r"\b(manager|director|avp|vp|vice\s+president|head\s+of|gs-1[3-5])\b",
     re.IGNORECASE,
 )
 
@@ -292,9 +303,13 @@ class JobScorer:
     def _quick_ic_check(self, job: dict) -> Optional[str]:
         """Return rejection reason if the title is clearly an IC role, else None.
 
-        Uses word-boundary regex to correctly handle:
-        - "SRE" at end of string (not caught by old "sre " trailing-space check)
-        - "Senior SRE" — has IC pattern but also seniority word, so NOT rejected
+        A title is rejected only when it matches an IC pattern AND contains no
+        management seniority term (manager/director/VP/head of/GS-13..15).
+
+        Word-boundary regex handles:
+        - "SRE" at end of string (not caught by the old "sre " trailing-space check)
+        - "Senior SRE" — "senior" is NOT a management term, so this IS rejected as IC
+        - "Engineering Manager" — has a seniority term, so NOT rejected
         """
         title = job.get("title") or ""
         title_lower = title.lower()
