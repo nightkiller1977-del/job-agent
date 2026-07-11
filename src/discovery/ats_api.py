@@ -2,10 +2,56 @@ import hashlib
 import json
 import logging
 import re
+import urllib.parse
 from typing import Dict, Any, List, Optional
 import httpx
 
 logger = logging.getLogger("job-agent.discovery.ats_api")
+
+def canonicalize_url(url: str) -> str:
+    """Removes tracking query parameters, source tags, referrals, and trailing slashes from URLs."""
+    if not url:
+        return ""
+    
+    try:
+        parsed = urllib.parse.urlparse(url)
+        # Parse query parameters into a list of tuples
+        query_params = urllib.parse.parse_qsl(parsed.query)
+        
+        # Define tracking/source parameters to remove
+        params_to_strip = {
+            "source", "utm_source", "utm_medium", "utm_campaign", "utm_content",
+            "ref", "lever-source", "gh_src", "gh_jid", "ashby_source", 
+            "subscription_id", "s", "referred_by"
+        }
+        
+        # Keep only non-tracking parameters
+        cleaned_params = [
+            (k, v) for k, v in query_params 
+            if k.lower() not in params_to_strip
+        ]
+        
+        # Reconstruct the query string
+        new_query = urllib.parse.urlencode(cleaned_params)
+        
+        # Reassemble the URL with cleaned query and stripped fragment
+        cleaned_url = urllib.parse.urlunparse((
+            parsed.scheme,
+            parsed.netloc.lower(),
+            parsed.path,
+            parsed.params,
+            new_query,
+            ""  # Strip fragment
+        ))
+        
+        # Strip trailing slash
+        if cleaned_url.endswith("/"):
+            cleaned_url = cleaned_url[:-1]
+            
+        return cleaned_url
+    except Exception as e:
+        logger.warning(f"Failed to canonicalize URL {url}: {e}")
+        return url
 
 def _infer_remote_type(title: str, location: str, description: str) -> str:
     """Helper to infer remote status based on title, location, and description text."""
@@ -63,10 +109,18 @@ async def fetch_greenhouse_jobs(board_token: str, company_name: Optional[str] = 
     jobs = data.get("jobs", [])
     normalized = []
     company = company_name or board_token.replace("-", " ").replace("_", " ").title()
+    seen_urls = set()
     
     for job in jobs:
-        job_url = job.get("absolute_url") or f"https://boards.greenhouse.io/{board_token}/jobs/{job.get('id')}"
-        # Standardize job ID via 16-char MD5 hash of its unique URL
+        raw_url = job.get("absolute_url") or f"https://boards.greenhouse.io/{board_token}/jobs/{job.get('id')}"
+        job_url = canonicalize_url(raw_url)
+        
+        # Local deduplication
+        if job_url in seen_urls:
+            continue
+        seen_urls.add(job_url)
+        
+        # Standardize job ID via 16-char MD5 hash of its unique canonical URL
         job_id = hashlib.md5(job_url.encode()).hexdigest()[:16]
         
         title = job.get("title", "")
@@ -110,9 +164,16 @@ async def fetch_lever_jobs(company_id: str, company_name: Optional[str] = None) 
         
     normalized = []
     company = company_name or company_id.replace("-", " ").replace("_", " ").title()
+    seen_urls = set()
     
     for item in data:
-        job_url = item.get("hostedUrl") or f"https://jobs.lever.co/{company_id}/{item.get('id')}"
+        raw_url = item.get("hostedUrl") or f"https://jobs.lever.co/{company_id}/{item.get('id')}"
+        job_url = canonicalize_url(raw_url)
+        
+        if job_url in seen_urls:
+            continue
+        seen_urls.add(job_url)
+        
         job_id = hashlib.md5(job_url.encode()).hexdigest()[:16]
         
         title = item.get("title", "")
@@ -176,9 +237,16 @@ async def fetch_ashby_jobs(board_name: str, company_name: Optional[str] = None) 
     jobs = data.get("jobs", [])
     normalized = []
     company = company_name or board_name.replace("-", " ").replace("_", " ").title()
+    seen_urls = set()
     
     for job in jobs:
-        job_url = job.get("jobUrl") or job.get("applyUrl") or f"https://jobs.ashbyhq.com/{board_name}/{job.get('id')}"
+        raw_url = job.get("jobUrl") or job.get("applyUrl") or f"https://jobs.ashbyhq.com/{board_name}/{job.get('id')}"
+        job_url = canonicalize_url(raw_url)
+        
+        if job_url in seen_urls:
+            continue
+        seen_urls.add(job_url)
+        
         job_id = hashlib.md5(job_url.encode()).hexdigest()[:16]
         
         title = job.get("title", "")
