@@ -56,7 +56,19 @@ class ExternalApplySession(BaseScraper):
 
     def __init__(self, config, registry: AtsAdapterRegistry | None = None):
         super().__init__(config)
-        self.registry = registry or AtsAdapterRegistry(fallback=GenericAtsAdapter())
+        self.registry = registry or self._create_default_registry()
+
+    def _create_default_registry(self) -> AtsAdapterRegistry:
+        from .greenhouse import GreenhouseAdapter
+        from .lever import LeverAdapter
+        from .ashby import AshbyAdapter
+        
+        reg = AtsAdapterRegistry(fallback=GenericAtsAdapter())
+        reg.register(GreenhouseAdapter())
+        reg.register(LeverAdapter())
+        reg.register(AshbyAdapter())
+        return reg
+
 
     async def scrape(self, *args, **kwargs):  # BaseScraper abstractmethod; not used here
         raise NotImplementedError("ExternalApplySession does not scrape; it applies.")
@@ -88,4 +100,16 @@ class ExternalApplySession(BaseScraper):
         )
         adapter = await self.registry.pick(ctx)
         console.print(f"[cyan]ExternalApplySession:[/cyan] adapter={adapter.name} url={page.url[:80]}")
-        return await adapter.apply(ctx)
+        res = await adapter.apply(ctx)
+        
+        # Trigger P5 self-healing Browser Use recovery fallback on form-completion failure
+        if not res.submitted and res.status in ("submit_not_found", "form_not_reached", "blocked"):
+            from .recovery_browseruse import BrowserUseRecovery
+            recovery = BrowserUseRecovery()
+            console.print("[yellow]Triggering Browser Use self-healing recovery...[/yellow]")
+            recovery_res = await recovery.apply(ctx)
+            if recovery_res.submitted:
+                return recovery_res
+                
+        return res
+
