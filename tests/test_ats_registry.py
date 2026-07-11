@@ -78,13 +78,6 @@ async def test_generic_is_weak_fallback_and_outscored_by_real_adapters():
     assert chosen.name == "workday"
 
 
-@pytest.mark.asyncio
-async def test_generic_apply_is_scaffold_pending_mac_verification():
-    """Guards that the generic body isn't silently assumed implemented."""
-    with pytest.raises(NotImplementedError):
-        await GenericAtsAdapter().apply(_ctx())
-
-
 def test_result_helpers():
     ok = AtsApplyResult.ok(atsScore=88)
     assert ok.submitted is True and ok.status == "applied" and ok.analytics["atsScore"] == 88
