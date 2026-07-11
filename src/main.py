@@ -108,6 +108,41 @@ def preflight_env_check(sources: list[str] | None) -> bool:
     return True
 
 
+def _db_path_from_config() -> str:
+    """Resolve the jobs DB path the same way the Orchestrator does."""
+    import json
+    for p in (Path("config.json"), Path(__file__).parent.parent / "config.json"):
+        if p.exists():
+            try:
+                with open(p) as f:
+                    return json.load(f).get("state_db_path", "state/jobs.db")
+            except Exception:
+                break
+    return "state/jobs.db"
+
+
+def _sources_in_apply_queue(company: str | None) -> list[str]:
+    """Distinct credential-requiring sources in the approved-but-unapplied queue.
+
+    Used by the 'apply' preflight so only sources with jobs actually queued get
+    their credentials validated. Returns [] when the queue is empty or when no
+    queued source needs credentials (e.g. legacy 'external' jobs).
+    """
+    try:
+        from src.state_manager import StateManager
+        state = StateManager(_db_path_from_config())
+        jobs = state.get_approved_unapplied()
+    except Exception:
+        # If we can't read the queue, fall back to validating nothing here;
+        # the apply flow will surface any real problem.
+        return []
+    if company:
+        needle = company.lower()
+        jobs = [j for j in jobs if needle in (j.get("company") or "").lower()]
+    queued = {(j.get("source") or "").lower() for j in jobs if j.get("source")}
+    return sorted(s for s in queued if s in _SOURCE_CREDS)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="job-agent",
@@ -475,8 +510,21 @@ def main() -> None:
 
     if args.command == "apply":
         src = getattr(args, "source", None)
-        sources_to_check = [src] if src else None
-        if not preflight_env_check(sources_to_check):
+        if src:
+            sources_to_check = [src]
+        elif os.environ.get("DASHBOARD_URL"):
+            # apply_approved() pulls cloud-approved jobs into the local queue
+            # AFTER this preflight, so the local queue can't tell us which
+            # sources those jobs use yet. Validate all sources to preserve the
+            # fail-fast guarantee for the cloud-approval workflow.
+            sources_to_check = None
+        else:
+            # Local-only: validate creds just for sources actually represented
+            # in the approved queue — a missing USAJOBS_PASSWORD shouldn't block
+            # an apply run whose queue is all LinkedIn jobs. An empty queue means
+            # nothing to apply, so nothing to validate.
+            sources_to_check = _sources_in_apply_queue(getattr(args, "company", None))
+        if sources_to_check != [] and not preflight_env_check(sources_to_check):
             sys.exit(1)
 
     try:
