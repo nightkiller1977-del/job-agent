@@ -18,7 +18,18 @@ from pathlib import Path
 from typing import Optional
 from rich.console import Console
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+# P4 (external_ats_error, the biggest failure bucket): prefer patchright — a drop-in
+# Playwright replacement that patches the headless/WebDriver/Runtime.enable signals
+# Cloudflare's bot model keys on. Falls back to stock playwright if patchright isn't
+# installed, so this is safe either way. NOTE (setup): patchright needs its browser
+# via `patchright install chromium` (or `chrome`). Effective on a residential IP
+# (the Mac); a datacenter IP is flagged regardless — see the deployment plan.
+try:
+    from patchright.async_api import async_playwright, Browser, BrowserContext, Page  # type: ignore
+    _BROWSER_ENGINE = "patchright"
+except ImportError:
+    from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+    _BROWSER_ENGINE = "playwright"
 
 console = Console()
 
@@ -164,6 +175,7 @@ class BaseScraper(ABC):
         # Remove stale lock files so Playwright can acquire the profile
         self._clear_profile_locks()
 
+        console.print(f"[dim]Browser engine: {_BROWSER_ENGINE}[/dim]")
         self._playwright = await async_playwright().start()
 
         args = [
