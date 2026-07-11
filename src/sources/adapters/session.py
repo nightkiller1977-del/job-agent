@@ -1,9 +1,9 @@
 """7a: ExternalApplySession — owns browser lifecycle for external ATS applies.
 
-SCAFFOLD (not yet wired into the live apply path). Encodes the three verified
-corrections from the plan; the deep parity extraction + browser verification is a
-Mac-run step. Until wired, LinkedIn/Indeed/`external` continue to use
-JobrightScraper.apply_external_ats_job.
+Real implementation (live-verify on the Mac — no browser in the CI sandbox). Not
+yet wired into the live apply path: LinkedIn/Indeed/`external` still call
+JobrightScraper.apply_external_ats_job until P4 flips the call sites over, so this
+can be exercised in isolation first.
 
 Layering (see ATS_ADAPTER_PLAN.md → Three-Layer Decomposition):
     Site Scraper → ExternalApplySession → AtsAdapterRegistry.pick(ctx).apply(ctx)
@@ -63,11 +63,8 @@ class ExternalApplySession(BaseScraper):
 
     async def apply(self, job: dict, auto_submit: bool = False) -> AtsApplyResult:
         """Parity target for the three migrated call sites (linkedin:1265,
-        indeed:397, SOURCE_MAP['external']).
-
-        SCAFFOLD — the body below is the intended flow; it must be completed and
-        verified against a real browser on the Mac before replacing the live
-        JobrightScraper path.
+        indeed:397, SOURCE_MAP['external']). Live-verify on the Mac before
+        flipping those call sites off JobrightScraper.
         """
         external_url = job.get("url") or job.get("external_url") or ""
         hints = _detect_pre_launch_vendor(external_url)

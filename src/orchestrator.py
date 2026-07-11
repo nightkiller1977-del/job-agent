@@ -28,7 +28,7 @@ from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
 from .resume_helper import ATSReadabilityError
-from .blocker_classifier import should_attempt, classify
+from .blocker_classifier import should_attempt, classify, needs_preflight_reauth
 from .session_watchdog import preflight_session_check
 
 console = Console()
@@ -626,6 +626,7 @@ class Orchestrator:
         failed_count   = 0
         skipped_count  = 0
         outcomes: list[dict] = []
+        reauthed_this_run: set[str] = set()  # P3: reauth each source at most once per run
 
         for job in ready:
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
@@ -649,6 +650,25 @@ class Orchestrator:
                 continue
 
             src = job.get("source", "")
+
+            # P3 session/auth preflight: if this job last failed on an auth blocker,
+            # refresh the source session BEFORE attempting (once per source per run),
+            # so we don't burn another attempt hitting the same expired session.
+            if src in SOURCE_MAP and needs_preflight_reauth(_last, src, reauthed_this_run):
+                console.print(f"[cyan]P3 preflight:[/cyan] prior auth blocker ({_last}) — refreshing {src} session…")
+                reauthed_this_run.add(src)
+                try:
+                    _refreshed = await ReauthManager(self.config).handle(src, _last or "", context="apply")
+                except Exception as _re:
+                    _refreshed = False
+                    console.print(f"[yellow]P3 preflight reauth error for {src}:[/yellow] {_re}")
+                if not _refreshed:
+                    console.print(f"[yellow]P3 preflight: {src} session not refreshed — skipping this job.[/yellow]")
+                    self.state.record_apply_attempt(job["job_id"], "reauth_failed", "P3 preflight reauth failed")
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    skipped_count += 1
+                    outcomes.append({"job": job, "status": "reauth_failed", "reason": "preflight reauth failed"})
+                    continue
 
             if src not in SOURCE_MAP:
                 console.print(f"[red]Unknown source '{src}' — skipping.[/red]")

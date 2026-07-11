@@ -3573,6 +3573,27 @@ class JobrightScraper(BaseScraper):
             # Portal-specific <a> Apply buttons are handled by _click_ats_apply_button first.
         ]
 
+        # P4: prepend curated per-vendor submit selectors (Greenhouse #submit_app,
+        # Lever #post-submit-btn / [data-qa='btn-submit'], Ashby, Workday submit/next
+        # data-automation-ids). These are SPECIFIC ids/data-attrs — not broad text
+        # matches — so they raise submit detection (baseline: 5 submit_not_found) without
+        # the false-submit risk the empty-form guard below still backstops.
+        try:
+            from ..adapters_patterns.ats_selectors import SELECTORS as _VENDOR_SEL
+            _vendor_submits = [
+                s
+                for vendor in _VENDOR_SEL.values()
+                for s in vendor.get("submit_button", [])
+            ]
+            # vendor-specific first, then the existing list; dedupe preserving order
+            _seen: set[str] = set()
+            submit_selectors = [
+                s for s in (_vendor_submits + submit_selectors)
+                if not (s in _seen or _seen.add(s))
+            ]
+        except Exception:
+            pass
+
         submit_btn = None
         for sel in submit_selectors:
             try:
