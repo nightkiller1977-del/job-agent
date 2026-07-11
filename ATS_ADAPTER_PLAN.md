@@ -6,6 +6,26 @@
 
 ---
 
+## Progress (updated 2026-07-11)
+
+| Item | Owner | Status | Branch / PR |
+|---|---|---|---|
+| **P1** Instrumentation & success-rate report | Claude | ✅ **Done** | `feat/sr-core` (`50318b1`) |
+| **P2** Blocker classifier + circuit breaker | Claude | ✅ **Done** | `feat/sr-core` (`c6a8f9b`) |
+| **P6** Discovery via public ATS APIs (Greenhouse/Lever/Ashby) | Antigravity | ✅ **Done** | PR #29 |
+| patchright spike (dependency + verification script) | Antigravity | ✅ **Done** | PR #29 |
+| **7a** Adapter contract (interface/registry/session/generic) | Claude | ⏳ **Next** | unblocks Antigravity's P5 + P6-apply |
+| **P3** Session/auth preflight + re-auth | Claude | ⬜ Queued | |
+| **P4** Form-completion robustness | Claude | ⬜ Queued | **refocus → jobright path (0% / 23 attempts)** |
+| **P5** Browser Use recovery adapter | Antigravity | 🔒 Gated on 7a | |
+| **P6** Vendor apply adapters (greenhouse/lever/ashby) | Antigravity | 🔒 Gated on 7a | |
+
+**Live findings from P1 (measured, not estimated):** baseline confirmed at **10.9%** (5/46). New: **245 wasted retries**, and the **`jobright` apply source is 0% (0/23)** — the single largest failure concentration, vs LinkedIn 25% (4/16). P2's circuit breaker would skip 42/46 previously-attempted jobs, ending the retry bleed.
+
+> **⚠ Branch-flow deviation:** Antigravity's PR #29 targets **`main`**, not the `feat/success-rate` integration branch. Files are all net-new (`src/discovery/*`, `tests/test_ats_api.py`) so there's no code conflict, but it bypasses the integration branch. **Decide:** re-target #29 to `feat/success-rate`, or merge to `main` and rebase `feat/success-rate` on top. (Shared files to reconcile at merge: this plan doc + auto-generated `tests/test_reauth_regressions.py`.)
+
+---
+
 ## Measured Baseline (from `state/jobs.db`, 528 discovered jobs)
 
 | Metric | Value |
@@ -238,10 +258,23 @@ Site Scraper (LinkedIn/Indeed/Jobright)
 ### Antigravity owns — greenfield, isolated modules (builds against Claude's contracts)
 | Priority | Files (all new — no overlap) | Dependency |
 |---|---|---|
-| **P6** ATS discovery via public APIs | new `src/discovery/ats_api.py` (Greenhouse/Lever/Ashby JSON clients + normalizer) | **none — can start day 1** |
-| patchright spike | isolated branch; measure `external_ats_error` before/after | none — can start day 1 |
-| **P5** Browser Use recovery | new `src/sources/adapters/recovery_browseruse.py` | **gated on 7a contract** |
-| **P6** Vendor apply adapters | new `src/sources/adapters/{greenhouse,lever,ashby}.py` | **gated on 7a contract** |
+| **P6** ATS discovery via public APIs | new `src/discovery/ats_api.py` (Greenhouse/Lever/Ashby JSON clients + normalizer) | ✅ done (PR #29) |
+| patchright spike | `src/discovery/patchright_spike.py` | ✅ done (PR #29) |
+| **P5** Browser Use recovery | new `src/sources/adapters/recovery_browseruse.py` | 🔒 gated on 7a contract |
+| **P6** Vendor apply adapters | new `src/sources/adapters/{greenhouse,lever,ashby}.py` | 🔒 gated on 7a contract |
+
+### NEW Antigravity handoffs — unblocked now (isolated, no core-file edits)
+Antigravity is idle after PR #29 but its next big items (P5, P6-apply) are gated on Claude's 7a contract. These are net-new modules it can build **immediately** in parallel, all feeding P4/P5 form-completion (the 66% cluster + the jobright 0% path):
+
+| Task | New file(s) | Why it raises success rate |
+|---|---|---|
+| **Screening-question answer bank** | `src/answers/question_bank.py` | Maps common ATS screening questions → profile-derived answers (work auth, sponsorship, salary, EEO). Directly attacks `linkedin_stuck_on_required_field` + unfilled required fields. Reads profile read-only; no core edits. |
+| **Selector/pattern library** | `src/adapters_patterns/ats_selectors.py` (data-only) | Harvest submit/apply/field selectors + question patterns from neonwatty / AkbarDevop (200+ real apps), as a pure Python data module the P4 fixes and P6 adapters consume. |
+| **patchright benchmark vs real domains** | extend `patchright_spike.py` | Run the spike against the actual domains behind the 15 `external_ats_error` failures (Claude will supply the domain list from P1 data) → quantifies expected P4 lift before wiring. |
+| **Discovery → apply-URL hardening** | extend `src/discovery/ats_api.py` | Emit canonical apply URLs + dedupe, so the pipeline stops hitting `bad_ats_url`/reach failures. Add fixture-based tests against recorded API responses. |
+| **Evidence store (P5b) module** | new `src/adapters/evidence.py` (pure builder; Claude wires the `state_manager` write) | Structured per-attempt evidence (vendor, resume hash, field summary, blocker). Antigravity builds the record builder; Claude owns the DB write. |
+
+**Handoff contract for these:** all are new files that only *import* existing read-only helpers (profile, config). None may edit `orchestrator.py` / `state_manager.py` / `jobright.py` / `reauth.py` / `base.py`. Where a task needs a core write (evidence persistence), Antigravity delivers a pure function and Claude wires the single call site.
 
 ### Coordination rules
 - **Antigravity must not edit** `orchestrator.py`, `state_manager.py`, `jobright.py`, `reauth.py`, `base.py`, or any file in Claude's table. If it needs a change there, it requests a stub/interface from Claude — Claude is the single writer of the core.
