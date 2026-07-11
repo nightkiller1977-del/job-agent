@@ -1,5 +1,10 @@
-"""P3: proactive session/auth preflight decision."""
-from src.blocker_classifier import needs_preflight_reauth
+"""P3: proactive session/auth preflight decision + reauth-viability guard."""
+from src.blocker_classifier import (
+    needs_preflight_reauth,
+    preflight_reauth_viable,
+    classify,
+    BlockerClass,
+)
 
 
 def test_auth_blocker_triggers_preflight():
@@ -22,3 +27,31 @@ def test_only_once_per_source_per_run():
     assert needs_preflight_reauth("workday_session_expired", "jobright", done) is False
     # a different source still triggers
     assert needs_preflight_reauth("brassring_login_required", "linkedin", done) is True
+
+
+# --- P3 reauth-viability guard (avoid doomed reauths mid-apply) ---
+
+def test_human_source_not_viable():
+    viable, why = preflight_reauth_viable("usajobs")
+    assert viable is False and why == "needs_session_prep"
+
+
+def test_automated_source_missing_creds_not_viable(monkeypatch):
+    monkeypatch.delenv("JOBRIGHT_EMAIL", raising=False)
+    monkeypatch.delenv("JOBRIGHT_PASSWORD", raising=False)
+    viable, why = preflight_reauth_viable("jobright")
+    assert viable is False and why == "credentials_missing"
+
+
+def test_automated_source_with_creds_is_viable(monkeypatch):
+    monkeypatch.setenv("JOBRIGHT_EMAIL", "user@example.com")
+    monkeypatch.setenv("JOBRIGHT_PASSWORD", "secret")
+    viable, why = preflight_reauth_viable("jobright")
+    assert viable is True and why == ""
+
+
+def test_new_statuses_are_classified():
+    # needs_session_prep routes like an auth blocker; credentials_missing must be
+    # permanent so the circuit breaker never blind-retries a config gap.
+    assert classify("needs_session_prep") is BlockerClass.AUTH_REQUIRED
+    assert classify("credentials_missing") is BlockerClass.PERMANENT
