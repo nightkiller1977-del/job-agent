@@ -247,6 +247,27 @@ class JobrightScraper(BaseScraper):
         This is used by LinkedIn jobs that do not expose Easy Apply. It reuses
         the persistent Jobright profile so the autofill extension is available.
         """
+        # Go-live (flag-gated): route through the new adapter registry instead of the
+        # legacy body when USE_ADAPTER_REGISTRY is truthy. Default OFF, so the proven
+        # path runs unless explicitly opted in for live verification. All external
+        # call sites (LinkedIn :1266, Indeed :397, and the "external" source via
+        # JobrightScraper.apply :1521) funnel here, so this one branch flips them all —
+        # and none pre-launch a browser before this point, so there's no jobright
+        # profile-lock collision with ExternalApplySession.
+        if os.environ.get("USE_ADAPTER_REGISTRY", "").strip().lower() in ("1", "true", "yes", "on"):
+            from .adapters.session import ExternalApplySession
+            console.print("[cyan]apply_external_ats_job:[/cyan] routing via adapter registry (USE_ADAPTER_REGISTRY=1)")
+            _job = dict(job)
+            _job["url"] = external_url
+            if resume_path:
+                _job["resume_path"] = resume_path
+            _res = await ExternalApplySession(self.config).apply(_job, auto_submit=auto_submit)
+            self.last_apply_status = _res.status
+            self.last_apply_detail = _res.detail
+            if _res.analytics:
+                self._apply_analytics = _res.analytics
+            return _res.submitted
+
         self.auto_submit = auto_submit
         self.last_apply_status = "started"
         self.last_apply_detail = ""
@@ -2734,10 +2755,19 @@ class JobrightScraper(BaseScraper):
         for sel in apply_selectors:
             try:
                 btn = await page.wait_for_selector(sel, timeout=8000)
-                if btn:
-                    await btn.click()
-                    console.print(f"[magenta]Jobright:[/magenta] Clicked Apply button → waiting for form…")
-                    await self._delay(5, 8)
+                if not btn:
+                    continue
+                _url_before = page.url
+                await btn.click()
+                console.print(f"[magenta]Jobright:[/magenta] Clicked Apply candidate → checking for form…")
+                await self._delay(4, 6)
+                # P4 (form_not_reached, 7 failures): confirm the click actually reached
+                # the application form (or navigated into the flow) before declaring
+                # success. Previously the first click returned True unconditionally, so a
+                # wrong/nav-link match dead-ended as form_not_reached and the remaining
+                # selectors were never tried. Now we keep trying until a form appears.
+                if await self._looks_like_application_form(page) or page.url != _url_before:
+                    console.print("[magenta]Jobright:[/magenta] Application form reached.")
                     return True
             except Exception:
                 continue

@@ -10,19 +10,20 @@
 
 | Item | Owner | Status | Branch / PR |
 |---|---|---|---|
-| **P1** Instrumentation & success-rate report | Claude | ✅ **Done** | `feat/sr-core` (`50318b1`) |
-| **P2** Blocker classifier + circuit breaker | Claude | ✅ **Done** | `feat/sr-core` (`c6a8f9b`) |
-| **P6** Discovery via public ATS APIs (Greenhouse/Lever/Ashby) | Antigravity | ✅ **Done** | PR #29 |
-| patchright spike (dependency + verification script) | Antigravity | ✅ **Done** | PR #29 |
-| **7a** Adapter contract (interface/registry/session/generic) | Claude | ⏳ **Next** | unblocks Antigravity's P5 + P6-apply |
-| **P3** Session/auth preflight + re-auth | Claude | ⬜ Queued | |
-| **P4** Form-completion robustness | Claude | ⬜ Queued | **refocus → jobright path (0% / 23 attempts)** |
-| **P5** Browser Use recovery adapter | Antigravity | 🔒 Gated on 7a | |
-| **P6** Vendor apply adapters (greenhouse/lever/ashby) | Antigravity | 🔒 Gated on 7a | |
+| **P1** Instrumentation & success-rate report | Claude | ✅ **Done** (merged) | PR #30 → `feat/success-rate` |
+| **P2** Blocker classifier + circuit breaker | Claude | ✅ **Done** (merged) | PR #30 |
+| **P6** Discovery via public ATS APIs (Greenhouse/Lever/Ashby) | Antigravity | ✅ **Done** (merged) | PR #29 |
+| patchright spike + 5 handoff modules (answer bank, selectors, evidence, discovery hardening) | Antigravity | ✅ **Done** (merged) | PR #29 |
+| **7a** Adapter contract + **real** GenericAtsAdapter/ExternalApplySession | Claude | ✅ **Done** (merged) | PR #30 |
+| **P3** Session/auth preflight + re-auth | Claude | ✅ **Done** (merged) | PR #30 |
+| **P4** Form robustness: submit selectors, `_click_ats_apply_button` (form_not_reached), patchright, openlit fix | Claude | ✅ **Done** (unit-tested) | **PR #31** |
+| Go-live: flag-gated registry apply path (`USE_ADAPTER_REGISTRY`) | Claude | ✅ **Done** (default OFF) | PR #31 |
+| **P5** Browser Use recovery adapter | Antigravity | 🚧 In progress | Antigravity branch |
+| **P6** Vendor apply adapters (greenhouse/lever/ashby) | Antigravity | 🚧 In progress | Antigravity branch |
 
-**Live findings from P1 (measured, not estimated):** baseline confirmed at **10.9%** (5/46). New: **245 wasted retries**, and the **`jobright` apply source is 0% (0/23)** — the single largest failure concentration, vs LinkedIn 25% (4/16). P2's circuit breaker would skip 42/46 previously-attempted jobs, ending the retry bleed.
+**Live findings from P1 (measured, not estimated):** baseline confirmed at **10.9%** (5/46). New: **245 wasted retries**, and the **`jobright` apply source is 0% (0/23)** — the single largest failure concentration, vs LinkedIn 25% (4/16). P2's circuit breaker would skip **42/46** previously-attempted jobs, ending the retry bleed.
 
-> **⚠ Branch-flow deviation:** Antigravity's PR #29 targets **`main`**, not the `feat/success-rate` integration branch. Files are all net-new (`src/discovery/*`, `tests/test_ats_api.py`) so there's no code conflict, but it bypasses the integration branch. **Decide:** re-target #29 to `feat/success-rate`, or merge to `main` and rebase `feat/success-rate` on top. (Shared files to reconcile at merge: this plan doc + auto-generated `tests/test_reauth_regressions.py`.)
+> **⚠ Verification pending (Mac only):** all browser-dependent behavior (patchright, the registry apply path, jobright form fixes, reauth) is **unit-tested but not browser-verified** — the CI sandbox has no playwright/pypdf/openlit. Verify on the Mac: `patchright install chromium`, then `python src/main.py stats`, then `USE_ADAPTER_REGISTRY=1 python src/main.py apply …`, and compare `stats` before/after. The go-live flag defaults OFF so the proven path runs until you flip it.
 
 ---
 
