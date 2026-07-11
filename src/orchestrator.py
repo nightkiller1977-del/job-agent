@@ -28,6 +28,7 @@ from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
 from .resume_helper import ATSReadabilityError
+from .blocker_classifier import should_attempt, classify
 from .session_watchdog import preflight_session_check
 
 console = Console()
@@ -628,6 +629,25 @@ class Orchestrator:
 
         for job in ready:
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
+
+            # P2 circuit breaker: stop burning attempts on jobs that have exhausted
+            # their retry budget for their blocker class (baseline: 245 wasted retries,
+            # some jobs attempted 17×). Reads the prior outcome; does not run apply.
+            try:
+                _extra = json.loads(job.get("extra_json") or "{}")
+            except Exception:
+                _extra = {}
+            _last = _extra.get("apply_last_status")
+            _attempts = int(_extra.get("apply_attempt_count", 0) or 0)
+            _ok, _skip_reason = should_attempt(_last, _attempts)
+            if not _ok:
+                _cls = classify(_last).value
+                console.print(f"[dim]⛔ Circuit breaker: skipping — {_skip_reason}[/dim]")
+                self.state.flag_circuit_break(job["job_id"], _cls, _skip_reason)
+                skipped_count += 1
+                outcomes.append({"job": job, "status": "circuit_open", "reason": _skip_reason})
+                continue
+
             src = job.get("source", "")
 
             if src not in SOURCE_MAP:
