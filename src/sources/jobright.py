@@ -2755,10 +2755,19 @@ class JobrightScraper(BaseScraper):
         for sel in apply_selectors:
             try:
                 btn = await page.wait_for_selector(sel, timeout=8000)
-                if btn:
-                    await btn.click()
-                    console.print(f"[magenta]Jobright:[/magenta] Clicked Apply button → waiting for form…")
-                    await self._delay(5, 8)
+                if not btn:
+                    continue
+                _url_before = page.url
+                await btn.click()
+                console.print(f"[magenta]Jobright:[/magenta] Clicked Apply candidate → checking for form…")
+                await self._delay(4, 6)
+                # P4 (form_not_reached, 7 failures): confirm the click actually reached
+                # the application form (or navigated into the flow) before declaring
+                # success. Previously the first click returned True unconditionally, so a
+                # wrong/nav-link match dead-ended as form_not_reached and the remaining
+                # selectors were never tried. Now we keep trying until a form appears.
+                if await self._looks_like_application_form(page) or page.url != _url_before:
+                    console.print("[magenta]Jobright:[/magenta] Application form reached.")
                     return True
             except Exception:
                 continue
