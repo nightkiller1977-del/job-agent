@@ -1,5 +1,5 @@
 from .generic import GenericAtsAdapter, detect_vendor
-from .context import AtsApplyContext, AtsApplyResult
+from .context import AtsApplyContext
 
 class LeverAdapter(GenericAtsAdapter):
     """Specialized adapter for Lever job boards."""
