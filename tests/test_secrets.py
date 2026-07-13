@@ -92,3 +92,13 @@ def test_quoted_and_export_lines_parsed(store, monkeypatch):
     secrets.clear_cache()
 
     assert secrets.resolve_secret("SYNC_SECRET") == "quoted-value"
+
+
+def test_default_fill_includes_imap_password(store, monkeypatch):
+    monkeypatch.delenv("IMAP_PASSWORD", raising=False)
+    store(IMAP_PASSWORD="imap-app-password")
+
+    filled = secrets.fill_missing()
+
+    assert "IMAP_PASSWORD" in filled
+    assert os.environ["IMAP_PASSWORD"] == "imap-app-password"
