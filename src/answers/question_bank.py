@@ -14,11 +14,11 @@ class AnswerBank:
 
     def get_answer_for_question(self, question_text: str, field_type: str = "text") -> Optional[Any]:
         """Fuzzy-matches question text and returns the corresponding profile answer.
-        
+
         Supports text, boolean, numeric, and select dropdown answer mappings.
         """
         q = question_text.lower().strip()
-        
+
         # 1. Work Authorization & Visa Sponsorship
         if self._matches_any(q, [r"authorized to work", r"legally authorized", r"legal right to work", r"eligible to work", r"work in the (us|united states)"]):
             val = self.disclosures.get("authorized_to_work")
@@ -87,7 +87,7 @@ class AnswerBank:
     def _format_disclosure(self, val: str, allowed_keywords: List[str], field_type: str) -> str:
         """Fuzzy match demographic options to fit target form options."""
         val_clean = str(val).lower().strip()
-        
+
         # Exact/Fuzzy matching against target keyword list
         for kw in allowed_keywords:
             if kw in val_clean:
@@ -95,12 +95,12 @@ class AnswerBank:
                 if kw == "decline" or kw == "prefer not to say":
                     return "Decline to Self-Identify"
                 return kw.title()
-        
+
         return "Decline to Self-Identify"
 
     def _infer_years_of_experience(self, skill: str, field_type: str) -> Any:
         """Infers years of experience for a skill from the profile data.
-        
+
         Checks profile skills object or compiles overall industry years.
         """
         # Look in skills list first if represented as dicts (e.g. {"name": "Python", "years": 5})
@@ -121,5 +121,5 @@ class AnswerBank:
                 return 8 if field_type == "number" else "8"
             except Exception:
                 pass
-                
+
         return 5 if field_type == "number" else "5"
