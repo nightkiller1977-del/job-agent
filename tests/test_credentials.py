@@ -217,12 +217,17 @@ class TestAgentCredentialsSync(unittest.IsolatedAsyncioTestCase):
             ]
             mock_client.get = AsyncMock(return_value=mock_response)
 
+            orchestrator = Orchestrator()
+
+            # Pop AFTER construction: Orchestrator.__init__ reloads the project .env
+            # (and fills from the central store), so clearing before construction would
+            # be undone. We want these genuinely absent so the (legacy) cloud fetch —
+            # the lowest-precedence source — is what fills them in this test.
             for key in ("INDEED_EMAIL", "INDEED_PASSWORD",
                         "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
                         "JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD"):
                 os.environ.pop(key, None)
 
-            orchestrator = Orchestrator()
             await orchestrator.load_credentials_from_dashboard()
 
             self.assertEqual(os.environ.get("INDEED_EMAIL"),    "cloud@indeed.com")
