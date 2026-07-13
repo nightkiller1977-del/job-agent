@@ -433,7 +433,8 @@ class TestReauthHuman:
             os.utime(session_file, (old_time + 100, old_time + 100))
 
         with patch("asyncio.sleep", side_effect=sleep_and_update), \
-             patch("time.monotonic", side_effect=[0, 30]):
+             patch("time.monotonic", side_effect=[0, 30]), \
+             patch("src.reauth._is_interactive", return_value=True):
             result = await mgr._reauth_human("usajobs", "2FA required", timeout_minutes=1)
 
         assert result is True
@@ -462,7 +463,8 @@ class TestReauthHuman:
                 pass
 
         with patch("asyncio.sleep", new_callable=AsyncMock), \
-             patch("time.monotonic", side_effect=[0, 0, 999999]):
+             patch("time.monotonic", side_effect=[0, 0, 999999]), \
+             patch("src.reauth._is_interactive", return_value=True):
             result = await mgr._reauth_human("usajobs", "2FA required", timeout_minutes=1)
 
         assert result is False
@@ -483,7 +485,8 @@ class TestReauthHuman:
         monkeypatch.setattr("src.reauth._send_imessage", capture_imessage)
 
         with patch("asyncio.sleep", new_callable=AsyncMock), \
-             patch("time.monotonic", side_effect=[0, 999999]):
+             patch("time.monotonic", side_effect=[0, 999999]), \
+             patch("src.reauth._is_interactive", return_value=True):
             await mgr._reauth_human("usajobs", "2FA required", timeout_minutes=1)
 
         assert len(sent_messages) == 1
@@ -502,7 +505,8 @@ class TestReauthHuman:
         mgr = ReauthManager(config={})
 
         with patch("asyncio.sleep", new_callable=AsyncMock), \
-             patch("time.monotonic", side_effect=[0, 999999]):
+             patch("time.monotonic", side_effect=[0, 999999]), \
+             patch("src.reauth._is_interactive", return_value=True):
             await mgr._reauth_human("usajobs", "2FA", timeout_minutes=1)
 
         data = json.loads((tmp_path / "status.json").read_text())
@@ -510,6 +514,37 @@ class TestReauthHuman:
         outcomes = [e["outcome"] for e in events if e["source"] == "usajobs"]
         assert "waiting" in outcomes
         assert "timeout" in outcomes
+
+    @pytest.mark.asyncio
+    async def test_noninteractive_returns_false_immediately_without_polling(self, tmp_path, monkeypatch):
+        """Background runs must NOT block waiting for a human. _reauth_human should
+        notify and return False at once — never entering the poll loop — so the
+        orchestrator can move on to other sources instead of stalling for minutes."""
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.setattr("src.reauth.SESSIONS_DIR", tmp_path)
+
+        sent = []
+        monkeypatch.setattr("src.reauth._send_imessage", lambda phone, msg: sent.append((phone, msg)))
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        mgr.notify_phone = "+13055551234"
+
+        (tmp_path / "usajobs_chromium.json").write_text("{}")
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep, \
+             patch("src.reauth._is_interactive", return_value=False):
+            result = await mgr._reauth_human("usajobs", "2FA required", timeout_minutes=30)
+
+        assert result is False
+        mock_sleep.assert_not_called()          # never polled — returned immediately
+        assert len(sent) == 1                   # still notified the user
+        assert "prepare-sessions" in sent[0][1]
+
+        data = json.loads((tmp_path / "status.json").read_text())
+        outcomes = [e["outcome"] for e in data.get("reauth_events", []) if e["source"] == "usajobs"]
+        assert "skipped_noninteractive" in outcomes
+        assert "timeout" not in outcomes
 
 
 # ── _write_regression_test & _notify_correction ────────────────────────────────
