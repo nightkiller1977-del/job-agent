@@ -46,31 +46,17 @@ def _load_telegram_config() -> tuple[str, str]:
 
     Returns (token, chat_id) or ("", "") if not configured.
     """
-    import os as _os
-
-    # 1. Process env (already loaded)
-    token = _os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = _os.environ.get("TELEGRAM_CHAT_ID", "")
+    # 1 + 2. Process env, then the central AI Commander store (CLI → sops → .env),
+    # via the shared resolver so there is only one reader of that file — see
+    # src/secrets.py and SECRETS.md.
+    try:
+        from .secrets import resolve_secret
+        token = resolve_secret("TELEGRAM_BOT_TOKEN") or ""
+        chat_id = resolve_secret("TELEGRAM_CHAT_ID") or ""
+    except Exception:
+        token = chat_id = ""
     if token and chat_id:
         return token, chat_id
-
-    # 2. AI Commander userData .env
-    userdata_env = (
-        Path.home() / "Library" / "Application Support" / "ai-command-center" / ".env"
-    )
-    if userdata_env.exists():
-        for line in userdata_env.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            key, val = key.strip(), val.strip()
-            if key == "TELEGRAM_BOT_TOKEN" and not token:
-                token = val
-            elif key == "TELEGRAM_CHAT_ID" and not chat_id:
-                chat_id = val
-        if token and chat_id:
-            return token, chat_id
 
     # 3. settings-v3.json legacy fallback (in case UI ever writes there)
     settings_path = (
