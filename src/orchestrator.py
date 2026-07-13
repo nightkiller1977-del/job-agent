@@ -1039,22 +1039,26 @@ class Orchestrator:
 
         if f["failure_clusters"]:
             ct = Table(title="Failure clusters", show_edge=False)
-            ct.add_column("cluster"); ct.add_column("count", justify="right")
+            ct.add_column("cluster")
+            ct.add_column("count", justify="right")
             for k, v in f["failure_clusters"].items():
                 ct.add_row(k, str(v))
             console.print(ct)
 
         if f["failure_histogram"]:
             ft = Table(title="Failure detail", show_edge=False)
-            ft.add_column("status"); ft.add_column("count", justify="right")
+            ft.add_column("status")
+            ft.add_column("count", justify="right")
             for k, v in f["failure_histogram"].items():
                 ft.add_row(k, str(v))
             console.print(ft)
 
         if f["per_source"]:
             st = Table(title="Per source", show_edge=False)
-            st.add_column("source"); st.add_column("attempts", justify="right")
-            st.add_column("submitted", justify="right"); st.add_column("rate", justify="right")
+            st.add_column("source")
+            st.add_column("attempts", justify="right")
+            st.add_column("submitted", justify="right")
+            st.add_column("rate", justify="right")
             for src, d in sorted(f["per_source"].items(), key=lambda x: -x[1]["attempts"]):
                 st.add_row(src, str(d["attempts"]), str(d["submitted"]), f"{d['rate']*100:.0f}%")
             console.print(st)

@@ -62,7 +62,7 @@ class ExternalApplySession(BaseScraper):
         from .greenhouse import GreenhouseAdapter
         from .lever import LeverAdapter
         from .ashby import AshbyAdapter
-        
+
         reg = AtsAdapterRegistry(fallback=GenericAtsAdapter())
         reg.register(GreenhouseAdapter())
         reg.register(LeverAdapter())
@@ -101,7 +101,7 @@ class ExternalApplySession(BaseScraper):
         adapter = await self.registry.pick(ctx)
         console.print(f"[cyan]ExternalApplySession:[/cyan] adapter={adapter.name} url={page.url[:80]}")
         res = await adapter.apply(ctx)
-        
+
         # Trigger P5 self-healing Browser Use recovery fallback on form-completion failure
         if not res.submitted and res.status in ("submit_not_found", "form_not_reached", "blocked"):
             from .recovery_browseruse import BrowserUseRecovery
@@ -110,6 +110,6 @@ class ExternalApplySession(BaseScraper):
             recovery_res = await recovery.apply(ctx)
             if recovery_res.submitted:
                 return recovery_res
-                
+
         return res
 
