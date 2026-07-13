@@ -55,13 +55,17 @@ MCP_SCRAPED_FILE = Path(__file__).parent.parent / "state" / "mcp_scraped.json"
 
 class Orchestrator:
     def __init__(self, config_path: str = "config.json"):
-        # BAND-AID / TODO(secrets): defensively load the project .env so credentials
-        # are present even when a launcher didn't go through main.load_env(). override=False
-        # so it never stomps intentionally-set shell/launchd vars; main.py stays the
-        # authoritative override=True load. Replace with single-source store — see roadmap.
+        # Single-source secrets resolution (SECRETS.md). Defensively load the project
+        # .env — with override=False so it never stomps intentionally-set shell/launchd
+        # vars; main.py stays the authoritative override=True load — then let the central
+        # AI Commander store fill anything still missing. This path matters because
+        # scheduled/launchd runs construct the Orchestrator directly without going through
+        # main.load_env(); that gap is what broke reauth before.
         try:
             from dotenv import load_dotenv
             load_dotenv(Path(__file__).parent.parent / ".env", override=False)
+            from src.secrets import fill_missing
+            fill_missing()
         except Exception:
             pass
         self.config = self._load_config(config_path)
