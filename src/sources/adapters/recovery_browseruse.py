@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import logging
 import urllib.parse
@@ -15,11 +14,11 @@ logger = logging.getLogger("job-agent.adapters.recovery_browseruse")
 
 class BrowserUseRecovery(AtsAdapter):
     """Fallback LLM browser agent to handle form-completion failures and unknown ATS interfaces.
-    
+
     Acts as a self-healing layer, saving successfully resolved navigation/input steps
     to local 'domain skills' JSON to replay them deterministically on subsequent runs.
     """
-    
+
     name = "browser_use_recovery"
     SKILLS_FILE = Path("state/browseruse_skills.json")
 
@@ -36,7 +35,7 @@ class BrowserUseRecovery(AtsAdapter):
     async def apply(self, ctx: AtsApplyContext) -> AtsApplyResult:
         logger.info(f"Initiating Browser Use recovery for job URL: {ctx.url}")
         domain = urllib.parse.urlparse(ctx.url).netloc.lower()
-        
+
         # 1. Attempt to replay existing domain skills if recorded
         skills = self._load_skills(domain)
         if skills:
@@ -56,16 +55,16 @@ class BrowserUseRecovery(AtsAdapter):
         steps_recorded = []
         max_steps = 6
         step = 0
-        
+
         while step < max_steps:
             step += 1
             logger.info(f"Running LLM agent step {step}/{max_steps}...")
-            
+
             # Analyze interactive elements and text
             elements = await self._get_interactive_elements(ctx.page)
             body_text = await ctx.page.locator("body").inner_text()
             title = await ctx.page.title()
-            
+
             # Check success indicators
             if any(w in body_text.lower() for w in ["thank you", "thanks", "thank", "received", "submitted", "success"]):
                 logger.info("Success screen detected in visible body text.")
@@ -73,14 +72,14 @@ class BrowserUseRecovery(AtsAdapter):
                 if steps_recorded:
                     self._save_skills(domain, steps_recorded)
                 return AtsApplyResult.ok(detail="Application submitted successfully.")
-                
+
             state_desc = {
                 "url": ctx.page.url,
                 "title": title,
                 "text_snippet": body_text[:800],
                 "interactive_elements": elements
             }
-            
+
             # Build prompt
             system_prompt = (
                 "You are an autonomous browser agent filling out a job application form.\n"
@@ -94,16 +93,16 @@ class BrowserUseRecovery(AtsAdapter):
                 "  \"explanation\": \"Short reason for this step\"\n"
                 "}"
             )
-            
+
             user_prompt = (
                 f"Applicant Profile:\n{json.dumps(ctx.profile, indent=2)}\n\n"
                 f"Page State:\n{json.dumps(state_desc, indent=2)}\n\n"
                 f"Resume file path: {ctx.resume_path}\n"
                 "Choose the next action."
             )
-            
+
             messages = [{"role": "user", "content": user_prompt}]
-            
+
             try:
                 response = await self.mc.complete(messages=messages, system=system_prompt, task_type="general")
                 action_data = self._clean_json_response(response)
@@ -111,11 +110,11 @@ class BrowserUseRecovery(AtsAdapter):
             except Exception as e:
                 logger.error(f"Failed to get LLM action decision: {e}")
                 return AtsApplyResult.blocked(status="external_ats_error", detail=f"LLM decision failure: {e}")
-                
+
             action = action_data.get("action")
             selector = action_data.get("selector")
             val = action_data.get("value")
-            
+
             if action == "done":
                 logger.info("LLM declared form filling complete.")
                 if steps_recorded:
@@ -124,7 +123,7 @@ class BrowserUseRecovery(AtsAdapter):
             elif action == "fail":
                 logger.warning(f"LLM declared failure: {action_data.get('explanation')}")
                 return AtsApplyResult.blocked(status="submit_not_found", detail=f"LLM failed: {action_data.get('explanation')}")
-                
+
             # Execute selected action
             success = await self._execute_action(ctx.page, action, selector, val, ctx.resume_path)
             if success:
@@ -137,7 +136,7 @@ class BrowserUseRecovery(AtsAdapter):
                 await asyncio.sleep(1.5)
             else:
                 logger.warning(f"Failed to execute action {action} on selector {selector}.")
-                
+
         return AtsApplyResult.blocked(status="form_not_reached", detail="Browser Use recovery loop exceeded step limit.")
 
     def _clean_json_response(self, text: str) -> dict:
@@ -161,13 +160,13 @@ class BrowserUseRecovery(AtsAdapter):
                 placeholder = await el.get_attribute("placeholder") or ""
                 type_val = await el.get_attribute("type") or "text"
                 aria_label = await el.get_attribute("aria-label") or ""
-                
+
                 selector = "input"
                 if id_val:
                     selector += f"#{id_val}"
                 elif name:
                     selector += f"[name='{name}']"
-                    
+
                 elements.append({
                     "tag": "input",
                     "type": type_val,
@@ -177,7 +176,7 @@ class BrowserUseRecovery(AtsAdapter):
                     "aria_label": aria_label,
                     "selector": selector
                 })
-                
+
             # File inputs
             file_inputs = await page.query_selector_all('input[type="file"]')
             for el in file_inputs:
@@ -194,7 +193,7 @@ class BrowserUseRecovery(AtsAdapter):
                     "id": id_val,
                     "selector": selector
                 })
-                
+
             # Dropdowns
             selects = await page.query_selector_all("select")
             for el in selects:
@@ -211,20 +210,20 @@ class BrowserUseRecovery(AtsAdapter):
                     "id": id_val,
                     "selector": selector
                 })
-                
+
             # Buttons
             buttons = await page.query_selector_all('button, input[type="submit"], [role="button"]')
             for el in buttons[:15]:
                 text = (await el.inner_text() or "").strip()
                 type_val = await el.get_attribute("type") or ""
                 id_val = await el.get_attribute("id") or ""
-                
+
                 selector = "button"
                 if id_val:
                     selector += f"#{id_val}"
                 elif text:
                     selector = f"button:has-text('{text}')"
-                    
+
                 if text or id_val or type_val:
                     elements.append({
                         "tag": "button",
@@ -235,7 +234,7 @@ class BrowserUseRecovery(AtsAdapter):
                     })
         except Exception as e:
             logger.error(f"Error extracting interactive elements: {e}")
-            
+
         return elements
 
     async def _execute_action(self, page: Page, action: str, selector: str, value: Any, resume_path: Optional[str]) -> bool:
@@ -259,7 +258,7 @@ class BrowserUseRecovery(AtsAdapter):
                 return False
         except Exception as e:
             logger.error(f"Action execution failed on {selector} ({action}): {e}")
-            
+
         return False
 
     async def _replay_skills(self, page: Page, skills: List[Dict[str, Any]], resume_path: Optional[str]) -> bool:
@@ -268,7 +267,7 @@ class BrowserUseRecovery(AtsAdapter):
             selector = step.get("selector")
             val = step.get("value")
             logger.info(f"Replaying skill step {idx + 1}: {action} on {selector}")
-            
+
             try:
                 # Wait briefly for selector to become visible before replay
                 await page.wait_for_selector(selector, timeout=8000)
@@ -300,7 +299,7 @@ class BrowserUseRecovery(AtsAdapter):
                     data = json.load(f)
             except Exception:
                 pass
-        
+
         data[domain] = steps
         try:
             with open(self.SKILLS_FILE, "w") as f:

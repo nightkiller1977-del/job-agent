@@ -5,7 +5,7 @@ from pathlib import Path
 
 class ApplyEvidence:
     """Represents a structured evidence record of a single job application attempt."""
-    
+
     def __init__(
         self,
         vendor: str,
@@ -23,7 +23,7 @@ class ApplyEvidence:
         self.blocker_detected = blocker_detected
         self.screenshot_path = screenshot_path
         self.extra_meta = extra_meta or {}
-        
+
         # Calculate MD5 hash of the submitted resume file if provided and accessible
         self.resume_hash = None
         if resume_path:
@@ -50,7 +50,7 @@ class ApplyEvidence:
 
 class EvidenceBuilder:
     """Builder pattern to construct ApplyEvidence instances incrementally during apply execution."""
-    
+
     def __init__(self, vendor: str, url: str):
         self.vendor = vendor
         self.url = url

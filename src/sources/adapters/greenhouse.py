@@ -1,5 +1,5 @@
 from .generic import GenericAtsAdapter, detect_vendor
-from .context import AtsApplyContext, AtsApplyResult
+from .context import AtsApplyContext
 
 class GreenhouseAdapter(GenericAtsAdapter):
     """Specialized adapter for Greenhouse job boards."""
