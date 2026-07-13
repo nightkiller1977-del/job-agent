@@ -1,0 +1,192 @@
+{
+  "initiative": "roadmap-delivery-pipeline",
+  "repo": "job-agent",
+  "schemaVersion": "1.0",
+  "items": [
+    {
+      "id": "ja.p0.success-rate-instrumentation",
+      "phase": "P0",
+      "priority": "P0",
+      "owner": "codex",
+      "title": "Success-rate instrumentation, blocker classifier & session preflight",
+      "summary": "stats report on the measured ~11% baseline, blocker classifier + circuit breaker, and auth preflight/re-auth (ATS plan P1-P3).",
+      "seededStatus": "complete",
+      "confidence": 1,
+      "dependsOn": [],
+      "pullRequests": [
+        {
+          "number": 30,
+          "url": "https://github.com/nightkiller1977-del/job-agent/pull/30",
+          "title": "Raise apply success rate: instrumentation + blocker classifier + preflight",
+          "status": "merged",
+          "branch": "feat/apply-success-rate"
+        }
+      ],
+      "evidence": [
+        { "path": "src/blocker_classifier.py", "note": "P2 blocker classifier + circuit breaker" },
+        { "path": "ATS_ADAPTER_PLAN.md", "note": "P1-P3 marked done; baseline 528 discovered, ~11% success" }
+      ]
+    },
+    {
+      "id": "ja.p1.adapter-contract",
+      "phase": "P1",
+      "priority": "P1",
+      "owner": "codex",
+      "title": "ATS adapter contract & registry scaffolding",
+      "summary": "Registry/context/generic/session adapter contract plus Greenhouse/Lever/Ashby JSON discovery APIs (ATS plan 7a).",
+      "seededStatus": "complete",
+      "confidence": 1,
+      "dependsOn": [],
+      "pullRequests": [
+        {
+          "number": 31,
+          "url": "https://github.com/nightkiller1977-del/job-agent/pull/31",
+          "title": "ATS adapter contract",
+          "status": "merged",
+          "branch": "feat/ats-adapter-contract"
+        }
+      ],
+      "evidence": [
+        { "path": "src/sources/adapters/base.py", "note": "abstract AtsAdapter contract" },
+        { "path": "src/discovery/ats_api.py", "note": "Greenhouse/Lever/Ashby discovery (PR #29)" }
+      ]
+    },
+    {
+      "id": "ja.p2.browser-verify-form-completion",
+      "phase": "P2",
+      "priority": "P0",
+      "owner": "claude",
+      "title": "Browser-verify P4 form-completion & patchright",
+      "summary": "Run the unit-tested submit/selector fixes against the real form-completion failure cluster on the Mac; measure via stats.",
+      "seededStatus": "partial",
+      "confidence": 0.5,
+      "dependsOn": ["ja.p1.adapter-contract"],
+      "evidence": [
+        { "path": "ATS_ADAPTER_PLAN.md", "note": "P4 done but unit-tested only, not browser-verified" },
+        { "path": "src/discovery/patchright_spike.py", "note": "patchright swap spike" }
+      ]
+    },
+    {
+      "id": "ja.p3.adapter-registry-go-live",
+      "phase": "P3",
+      "priority": "P0",
+      "owner": "claude",
+      "title": "Go-live the adapter registry",
+      "summary": "Flip USE_ADAPTER_REGISTRY on after browser-verifying the generic + vendor apply path; retire the legacy monolith path.",
+      "seededStatus": "partial",
+      "confidence": 0.4,
+      "dependsOn": ["ja.p2.browser-verify-form-completion"],
+      "evidence": [
+        { "path": "src/sources/jobright.py", "note": "USE_ADAPTER_REGISTRY gate defaults OFF (~line 257)" },
+        { "path": "src/sources/adapters/session.py", "note": "registry wired but dormant" }
+      ]
+    },
+    {
+      "id": "ja.p4.reauth-reliability",
+      "phase": "P4",
+      "priority": "P1",
+      "owner": "codex",
+      "title": "Harden re-auth reliability",
+      "summary": "Retry cap + backoff; fix the _auto_login-returns-True-but-still-logged-out false positive; stop notification storms.",
+      "seededStatus": "partial",
+      "confidence": 0.5,
+      "dependsOn": [],
+      "pullRequests": [
+        {
+          "number": 39,
+          "url": "https://github.com/nightkiller1977-del/job-agent/pull/39",
+          "title": "feat/reauth-noninteractive",
+          "status": "merged",
+          "branch": "feat/reauth-noninteractive"
+        }
+      ],
+      "evidence": [
+        { "path": "src/reauth.py", "note": "no retry cap; documented false-positive" },
+        { "path": "docs/DIAGNOSTICS_2026-07-10.md", "note": "100 consecutive reauth-failed events" }
+      ]
+    },
+    {
+      "id": "ja.p5.browser-launch-robustness",
+      "phase": "P5",
+      "priority": "P1",
+      "owner": "claude",
+      "title": "Browser-launch robustness",
+      "summary": "Serial-launch guard + retry-with-backoff on 180s persistent-context timeouts and concurrent-Chrome collisions.",
+      "seededStatus": "not_started",
+      "confidence": 0.3,
+      "dependsOn": [],
+      "evidence": [
+        { "path": "docs/DIAGNOSTICS_2026-07-10.md", "note": "launch_persistent_context Timeout 180000ms; browser-closed errors" },
+        { "path": "CLAUDE.md", "note": "Chrome profile-isolation constraints" }
+      ]
+    },
+    {
+      "id": "ja.p6.vendor-apply-adapters",
+      "phase": "P6",
+      "priority": "P2",
+      "owner": "antigravity",
+      "title": "Ship real vendor apply adapters",
+      "summary": "Flesh out greenhouse/lever/ashby beyond can_handle() delegation with vendor-specific form handling.",
+      "seededStatus": "partial",
+      "confidence": 0.3,
+      "dependsOn": ["ja.p3.adapter-registry-go-live"],
+      "evidence": [
+        { "path": "src/sources/adapters/greenhouse.py", "note": "10-line stub delegating to generic" },
+        { "path": "src/sources/adapters/generic.py", "note": "real generic fill/submit (dormant behind flag)" }
+      ]
+    },
+    {
+      "id": "ja.p7.browseruse-recovery",
+      "phase": "P7",
+      "priority": "P2",
+      "owner": "antigravity",
+      "title": "Land Browser Use AI recovery (P5)",
+      "summary": "Wire the bounded LLM recovery fallback into the registry with submission gating; consider the real browser_use library.",
+      "seededStatus": "partial",
+      "confidence": 0.3,
+      "dependsOn": ["ja.p3.adapter-registry-go-live"],
+      "evidence": [
+        { "path": "src/sources/adapters/recovery_browseruse.py", "note": "built + unit-tested, not wired into default path" }
+      ]
+    },
+    {
+      "id": "ja.p8.secrets-phases-2-4",
+      "phase": "P8",
+      "priority": "P2",
+      "owner": "claude",
+      "title": "Complete secrets-store phases 2-4",
+      "summary": "SOPS+age encryption, aicc-secrets CLI adoption, optional Key Vault; retire the TODO(secrets) band-aids.",
+      "seededStatus": "partial",
+      "confidence": 0.4,
+      "dependsOn": [],
+      "pullRequests": [
+        {
+          "number": 38,
+          "url": "https://github.com/nightkiller1977-del/job-agent/pull/38",
+          "title": "feat/secrets-store-phase1",
+          "status": "merged",
+          "branch": "feat/secrets-store-phase1"
+        }
+      ],
+      "evidence": [
+        { "path": "SECRETS.md", "note": "Phase 0-1 done; 2-4 pending" },
+        { "path": "src/orchestrator.py", "note": "TODO(secrets) band-aids (~lines 1065, 1104)" }
+      ]
+    },
+    {
+      "id": "ja.p9.deployment-and-refactor",
+      "phase": "P9",
+      "priority": "P3",
+      "owner": "claude",
+      "title": "Render/hybrid deployment & monolith refactor",
+      "summary": "24/7 residential-proxy egress + persistent disk deploy, and extract adapters from the 3,790-line jobright.py behind characterization tests.",
+      "seededStatus": "not_started",
+      "confidence": 0.2,
+      "dependsOn": ["ja.p3.adapter-registry-go-live"],
+      "evidence": [
+        { "path": "src/sources/jobright.py", "note": "3,790-line monolith (P7 extraction target)" },
+        { "path": "render.yaml", "note": "deployment target; residential-IP anti-bot advantage" }
+      ]
+    }
+  ]
+}
