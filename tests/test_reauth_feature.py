@@ -54,6 +54,26 @@ def orchestrator(tmp_path):
         orc.state = StateManager(config["state_db_path"])
         orc.scorer = MagicMock()
         orc.scorer.score = AsyncMock(return_value=(90, "Good fit", "remote", "apply"))
+
+        # discover() scores via scorer.batch_score() (not .score directly), so it must
+        # be awaitable. Mirror the real batch_score contract — annotate each job with the
+        # score fields via the mocked .score and fire on_result per job — otherwise the
+        # auto-generated MagicMock attribute returns a non-awaitable and discover blows up
+        # with "object MagicMock can't be used in 'await' expression".
+        async def _batch_score(jobs, concurrency=5, on_result=None):
+            out = []
+            for job in jobs:
+                score, reason, flags, action = await orc.scorer.score(job)
+                job["score"] = score
+                job["score_reason"] = reason
+                job["flags"] = flags
+                job["recommended_action"] = action
+                if on_result is not None:
+                    on_result()
+                out.append(job)
+            return out
+
+        orc.scorer.batch_score = AsyncMock(side_effect=_batch_score)
     return orc
 
 
