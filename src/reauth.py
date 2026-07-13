@@ -13,7 +13,8 @@ Human-assisted path (usajobs):
 On every successful correction:
     1. A regression test is appended to tests/test_reauth_regressions.py
        documenting the exact failure pattern so it can be caught in CI.
-    2. An iMessage is sent to NOTIFY_PHONE summarising what was fixed.
+    2. A success notification is sent through the shared notifier, which routes to
+       Telegram when configured.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from .sources.base import SESSIONS_DIR
-from .notifier import notify_error, notify_info, notify_warning, record_reauth_event, _macos_notify
+from .notifier import notify_error, notify_info, notify_success, notify_warning, record_reauth_event, _macos_notify
 
 _log = logging.getLogger(__name__)
 
@@ -304,16 +305,17 @@ async def test_regression_{source}_{ts_slug}():
         _log.info("ReauthManager: regression test written for %s (%s)", source, ts_slug)
 
     def _notify_correction(self, source: str, mode: str, detail: str) -> None:
-        """Send an iMessage summarising the successful self-heal."""
+        """Notify through the shared notifier after a successful self-heal."""
         ts_human = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        msg = (
-            f"✅ Job Agent self-healed: {source.upper()}\n"
+        notify_success(
+            f"Job Agent self-healed: {source.upper()}",
+            (
             f"What failed: {detail}\n"
             f"How fixed: {mode} reauth\n"
             f"When: {ts_human}\n"
             f"Status: Session refreshed — source will be retried"
+            ),
         )
-        _send_imessage(self.notify_phone, msg)
 
 
 # ------------------------------------------------------------------
