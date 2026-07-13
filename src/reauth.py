@@ -21,6 +21,7 @@ import asyncio
 import os
 import re
 import subprocess
+import sys
 import time
 import logging
 
@@ -33,6 +34,13 @@ _log = logging.getLogger(__name__)
 
 AUTOMATED_SOURCES = {"jobright", "indeed", "linkedin"}
 HUMAN_SOURCES     = {"usajobs"}
+
+
+def _is_interactive() -> bool:
+    """True when attached to a terminal, i.e. a human is present to complete an
+    interactive re-login. launchd/cron set stdin to /dev/null → not a TTY.
+    Factored out so it can be patched in tests."""
+    return bool(sys.stdin and sys.stdin.isatty())
 
 # Map source name → scraper class (populated lazily to avoid circular imports)
 def _get_source_map():
@@ -163,6 +171,13 @@ class ReauthManager:
         session_file = SESSIONS_DIR / f"{source}_chromium.json"
         baseline_mtime = session_file.stat().st_mtime if session_file.exists() else 0
 
+        interactive = _is_interactive()
+        retry_line = (
+            f"Agent will auto-retry within {timeout_minutes} min."
+            if interactive
+            else "Agent is running in the background — it won't wait now. Refresh the "
+                 "session when you can and it'll be used on the next run."
+        )
         msg = (
             f"Job agent: {source.upper()} session expired.\n"
             f"{detail}\n\n"
@@ -172,7 +187,7 @@ class ReauthManager:
             f"  cd ~/Dev/Projects/job-agent\n"
             f"  python src/main.py prepare-sessions --source {source}\n\n"
             f"Log in / complete 2FA in the browser, then close it.\n"
-            f"Agent will auto-retry within {timeout_minutes} min."
+            f"{retry_line}"
         )
         _send_imessage(self.notify_phone, msg)
         # Also send via Telegram for the clickable deep-link
@@ -185,10 +200,32 @@ class ReauthManager:
         except Exception:
             pass
         _log.info(
-            "reauth.human_notified source=%s timeout_min=%d phone_set=%s",
-            source, timeout_minutes, bool(self.notify_phone),
+            "reauth.human_notified source=%s timeout_min=%d phone_set=%s interactive=%s",
+            source, timeout_minutes, bool(self.notify_phone), interactive,
         )
         record_reauth_event(source, "human_notified", "waiting", detail)
+
+        # Non-interactive (launchd/cron/background): we cannot block for a human to
+        # complete an interactive login. Blocking would freeze the run up to
+        # `timeout_minutes` PER blocked source — several sources could stall the run
+        # for close to an hour until it's killed, applying to nothing. So notify and
+        # skip immediately; the orchestrator moves on to other sources, and the
+        # refreshed session is picked up on the next scheduled run.
+        if not interactive:
+            record_reauth_event(
+                source, "human", "skipped_noninteractive",
+                "Notified user; not waiting because there is no TTY (background run)",
+            )
+            _log.warning(
+                "reauth.skipped_noninteractive source=%s — notified, not blocking", source,
+            )
+            notify_warning(
+                f"{source} session expired — action needed",
+                f"iMessage sent to {self.notify_phone or 'N/A'}. Skipping this source in the "
+                f"background run; it will retry once you refresh the session.",
+            )
+            return False
+
         notify_warning(
             f"{source} session expired — action needed",
             f"iMessage sent to {self.notify_phone or 'N/A'}. Waiting up to {timeout_minutes} min for refresh.",

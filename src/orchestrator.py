@@ -660,6 +660,7 @@ class Orchestrator:
         skipped_count  = 0
         outcomes: list[dict] = []
         reauthed_this_run: set[str] = set()  # P3: reauth each source at most once per run
+        apply_reauth_mgr = ReauthManager(self.config)
 
         for job in ready:
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
@@ -706,7 +707,7 @@ class Orchestrator:
 
                 console.print(f"[cyan]P3 preflight:[/cyan] prior auth blocker ({_last}) — refreshing {src} session…")
                 try:
-                    _refreshed = await ReauthManager(self.config).handle(src, _last or "", context="apply")
+                    _refreshed = await apply_reauth_mgr.handle(src, _last or "", context="apply")
                 except Exception as _re:
                     _refreshed = False
                     console.print(f"[yellow]P3 preflight reauth error for {src}:[/yellow] {_re}")
@@ -754,8 +755,25 @@ class Orchestrator:
                     outcomes.append({"job": job, "status": code, "reason": reason})
             except AuthFailedError as auth_exc:
                 console.print(f"[yellow]{src} apply: session expired — attempting reauth…[/yellow]")
-                reauth_mgr = ReauthManager(self.config)
-                refreshed = await reauth_mgr.handle(src, auth_exc.detail, context="apply")
+                if src in reauthed_this_run:
+                    console.print(
+                        f"[yellow]{src} reauth already attempted this run — skipping duplicate notification.[/yellow]"
+                    )
+                    self.state.record_apply_attempt(
+                        job["job_id"],
+                        "reauth_failed",
+                        f"Reauth already attempted for {src} this run; skipping duplicate notification.",
+                    )
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    skipped_count += 1
+                    outcomes.append({
+                        "job": job,
+                        "status": "reauth_failed",
+                        "reason": f"reauth already attempted for {src} this run",
+                    })
+                    continue
+                reauthed_this_run.add(src)
+                refreshed = await apply_reauth_mgr.handle(src, auth_exc.detail, context="apply")
                 if refreshed:
                     try:
                         scraper2 = SOURCE_MAP[src](self.config)
