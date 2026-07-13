@@ -31,8 +31,20 @@ mkdir -p "$STORE_DIR"
 # Return 0 if KEY has a non-empty value in the store.
 store_has() {
   local key="$1"
+  local line val
   [[ -f "$STORE" ]] || return 1
-  grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=[^[:space:]].*" "$STORE"
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+    line="${line#export }"
+    [[ "${line%%=*}" == "$key" ]] || continue
+    val="${line#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+    val="${val%\"}"; val="${val#\"}"
+    val="${val%\'}"; val="${val#\'}"
+    [[ -n "$val" ]] && return 0
+  done < "$STORE"
+  return 1
 }
 
 added=()
