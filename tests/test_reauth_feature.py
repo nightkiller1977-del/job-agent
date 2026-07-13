@@ -207,6 +207,38 @@ class TestApplyReauth:
         assert extra.get("apply_last_status") == "reauth_failed"
 
     @pytest.mark.asyncio
+    async def test_apply_auth_failure_reauth_attempted_once_per_source(self, orchestrator, tmp_status):
+        """Repeated AuthFailedError for one source must not re-notify for every job."""
+        job1 = _approved_job("job1", "usajobs")
+        job2 = _approved_job("job2", "usajobs")
+        self._seed_job(orchestrator, job1)
+        self._seed_job(orchestrator, job2)
+
+        scraper1 = AsyncMock()
+        scraper1.apply = AsyncMock(side_effect=AuthFailedError("usajobs", "2FA required"))
+        scraper2 = AsyncMock()
+        scraper2.apply = AsyncMock(side_effect=AuthFailedError("usajobs", "2FA still required"))
+        scraper_cls = MagicMock(side_effect=[scraper1, scraper2])
+
+        mock_reauth = AsyncMock(return_value=False)
+
+        with patch.dict("src.orchestrator.SOURCE_MAP", {"usajobs": scraper_cls}), \
+             patch("src.orchestrator.ReauthManager") as MockReauthMgr, \
+             patch("src.orchestrator.Orchestrator._classify_apply_readiness", return_value=("ready", "")), \
+             patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+            MockReauthMgr.return_value.handle = mock_reauth
+            await orchestrator.apply_approved(auto_submit=True)
+
+        mock_reauth.assert_called_once_with("usajobs", "2FA required", context="apply")
+        for job_id in ("job1", "job2"):
+            db_job = orchestrator.state.get_job(job_id)
+            extra = json.loads(db_job.get("extra_json") or "{}")
+            assert extra.get("apply_last_status") == "reauth_failed"
+
+    @pytest.mark.asyncio
     async def test_auth_failure_reauth_success_retry_apply_fails(self, orchestrator, tmp_status):
         """AuthFailedError → reauth returns True → retry apply raises → error recorded."""
         job = _approved_job()
