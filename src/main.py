@@ -38,13 +38,21 @@ console = Console()
 
 
 def load_env() -> None:
-    """Load .env file from project root. Use override=True so .env wins over
-    any empty shell env vars (Claude Code sets ANTHROPIC_API_KEY="" in env)."""
+    """Load credentials following the single-source resolution order.
+
+    1. project .env wins over empty shell vars (Claude Code sets ANTHROPIC_API_KEY=""),
+       so we load it with override=True.
+    2. The central AI Commander store then FILLS ONLY what is still missing/empty —
+       it never overrides a value the project .env set. See src/secrets.py + SECRETS.md.
+    """
     env_path = project_root / ".env"
     if env_path.exists():
         load_dotenv(str(env_path), override=True)
     else:
         load_dotenv(override=True)
+
+    from src.secrets import fill_missing
+    fill_missing()
 
 
 def check_api_key() -> bool:
