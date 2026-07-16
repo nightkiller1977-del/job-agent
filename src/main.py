@@ -17,6 +17,7 @@ Usage:
   python src/main.py prune                     # Archive jobs older than 30 days (discovered/approved with no apply)
   python src/main.py prune --max-age-days 14   # Use a shorter staleness window
   python src/main.py prune --dry-run           # Preview what would be pruned without changing anything
+  python src/main.py reset-failures --reason keyword-validation --dry-run
 """
 from __future__ import annotations
 
@@ -296,6 +297,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show what would be pruned without making any changes",
     )
 
+    # reset-failures
+    reset_parser = subparsers.add_parser(
+        "reset-failures",
+        help="Reset apply failure metadata for a safe, targeted retry",
+    )
+    reset_parser.add_argument(
+        "--reason",
+        required=True,
+        choices=["keyword-validation"],
+        help="Failure family to reset",
+    )
+    reset_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show how many jobs would be reset without changing the database",
+    )
+
     # commander
     commander_parser = subparsers.add_parser(
         "commander",
@@ -411,6 +429,12 @@ async def main_async(args: argparse.Namespace) -> int:
     elif args.command == "prune":
         orchestrator.prune_stale_jobs(
             max_age_days=args.max_age_days,
+            dry_run=args.dry_run,
+        )
+
+    elif args.command == "reset-failures":
+        orchestrator.reset_failures(
+            reason=args.reason,
             dry_run=args.dry_run,
         )
 

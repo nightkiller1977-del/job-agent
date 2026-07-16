@@ -13,11 +13,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 from rich.console import Console
 
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_success
-from src.resume_helper import ResumeFieldFixer, resolve_resume_path, check_ats_readability, ATSReadabilityError
+from src.resume_helper import ResumeFieldFixer, resolve_resume_path, check_ats_readability, ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
+from src.model_client import ModelCascadeError
 from src.latex_compiler import LaTeXCompiler
 from src.telemetry import model_span
 
@@ -51,6 +53,34 @@ class JobrightScraper(BaseScraper):
         self.last_apply_status = status
         self.last_apply_detail = detail
         return False
+
+    def _validation_metrics_from_error(self, exc: Exception) -> dict:
+        result = getattr(exc, "result", None)
+        if not result:
+            return {
+                "passed": False,
+                "coverage": 0.0,
+                "matched_keywords": [],
+                "unmatched_keywords": [],
+                "failure_type": "unknown_validation_error",
+                "detail": str(exc),
+            }
+        return {
+            "passed": result.passed,
+            "coverage": result.coverage,
+            "matched_keywords": result.matched_keywords,
+            "unmatched_keywords": result.unmatched_keywords,
+            "failure_type": result.failure_type or "",
+            "detail": result.detail or str(exc),
+        }
+
+    def _classify_external_ats_exception(self, exc: Exception) -> str:
+        msg = str(exc).lower()
+        if any(token in msg for token in ("resume", "upload", "file input", "set_input_files")):
+            return "resume_upload_failed"
+        if any(token in msg for token in ("selector", "locator", "element", "click", "fill")):
+            return "ats_selector_failed"
+        return "unknown_external_ats_error"
 
     async def tailor_resume_for_external_job(self, job: dict) -> str:
         """Use Jobright/Orion to tailor a resume for a non-Jobright job.
@@ -271,6 +301,7 @@ class JobrightScraper(BaseScraper):
         self.auto_submit = auto_submit
         self.last_apply_status = "started"
         self.last_apply_detail = ""
+        self._apply_validation_metrics = {}
         self._workday_session_expired = False
         self._field_fixer = ResumeFieldFixer()
         submitted = False
@@ -376,10 +407,18 @@ class JobrightScraper(BaseScraper):
                                 self._last_tailored_resume_path = pdf_cv_path
                                 self._last_application_method = "Claude Tailored"
 
-                                # Check ATS Readability
-                                all_keywords = list(profile.get("skills", [])) + _tailored.get("missing_keywords", [])
-                                check_ats_readability(pdf_cv_path, all_keywords)
-                                console.print("[green]ATS readability check passed successfully ✓[/green]")
+                                # Check ATS Readability: check only Claude's matching keywords (profile-supported)
+                                matching_keywords = list(_tailored.get("matching_keywords", []))
+                                val_res = check_ats_readability(pdf_cv_path, matching_keywords, minimum_coverage=0.70)
+                                self._apply_validation_metrics = {
+                                    "passed": val_res.passed,
+                                    "coverage": val_res.coverage,
+                                    "matched_keywords": val_res.matched_keywords,
+                                    "unmatched_keywords": val_res.unmatched_keywords,
+                                    "failure_type": val_res.failure_type or "",
+                                    "detail": val_res.detail or ""
+                                }
+                                console.print(f"[green]ATS readability check passed successfully ✓ (Coverage: {val_res.coverage*100:.1f}%)[/green]")
 
                             # Compile Cover Letter
                             if _tailored.get("cover_letter"):
@@ -453,10 +492,28 @@ class JobrightScraper(BaseScraper):
             if submitted:
                 self.last_apply_status = "submitted"
                 self.last_apply_detail = "External ATS application submitted successfully."
+        except KeywordCoverageError as exc:
+            self._apply_validation_metrics = self._validation_metrics_from_error(exc)
+            console.print(f"[red]Keyword coverage failure:[/red] {exc}")
+            return self._set_apply_outcome("keyword_coverage_failed", str(exc))
+        except PDFTextLayerError as exc:
+            self._apply_validation_metrics = self._validation_metrics_from_error(exc)
+            console.print(f"[red]PDF text-layer failure:[/red] {exc}")
+            return self._set_apply_outcome("pdf_text_layer_failed", str(exc))
+        except ModelCascadeError as exc:
+            console.print(f"[red]Model cascade failure:[/red] {exc}")
+            return self._set_apply_outcome("model_timeout", str(exc))
+        except PlaywrightTimeoutError as exc:
+            console.print(f"[red]External ATS browser timeout:[/red] {exc}")
+            return self._set_apply_outcome("browser_timeout", str(exc))
+        except PlaywrightError as exc:
+            status = self._classify_external_ats_exception(exc)
+            console.print(f"[red]External ATS {status}:[/red] {exc}")
+            return self._set_apply_outcome(status, str(exc))
         except Exception as exc:
-            console.print(f"[red]External ATS apply error:[/red] {exc}")
-            self.last_apply_status = "external_ats_error"
-            self.last_apply_detail = str(exc)
+            status = self._classify_external_ats_exception(exc)
+            console.print(f"[red]External ATS {status}:[/red] {exc}")
+            return self._set_apply_outcome(status, str(exc))
         finally:
             await self._close_browser()
 
