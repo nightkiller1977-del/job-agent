@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 from rich.console import Console
@@ -274,16 +275,62 @@ class ResumeFieldFixer:
         return False
 
 
+@dataclass
+class ATSValidationResult:
+    """Carries detailed metrics from PDF verification."""
+    passed: bool
+    coverage: float
+    matched_keywords: list[str]
+    unmatched_keywords: list[str]
+    failure_type: str | None = None
+    detail: str = ""
+
+
 class ATSReadabilityError(Exception):
-    """Raised when a generated resume PDF fails ATS keyword or parseability checks."""
+    """Base exception raised when a generated resume PDF fails verification checks."""
     pass
 
 
-def check_ats_readability(pdf_path: str, target_keywords: list[str]) -> None:
-    """Extracts text layer from the PDF using pypdf and verifies that target keywords are present.
-    If the text layer is unreadable raises ATSReadabilityError.
-    If keywords are missing raises ATSReadabilityError (keyword variant — skip-only, not loop-halt).
+class ATSValidationError(ATSReadabilityError):
+    """Base validation error for structured ATS checks."""
+    pass
+
+
+class PDFTextLayerError(ATSValidationError):
+    """Raised when the generated PDF has no readable/extractable text layer."""
+    def __init__(self, result: ATSValidationResult):
+        self.result = result
+        super().__init__(result.detail)
+
+
+class KeywordCoverageError(ATSValidationError):
+    """Raised when keyword coverage is below the minimum threshold."""
+    def __init__(self, result: ATSValidationResult):
+        self.result = result
+        super().__init__(result.detail)
+
+
+def check_ats_readability(
+    pdf_path: str,
+    target_keywords: list[str],
+    *,
+    minimum_coverage: float = 0.70,
+) -> ATSValidationResult:
+    """Extracts text layer from the PDF and verifies target keyword presence.
+
+    Args:
+        pdf_path: Path to the generated PDF.
+        target_keywords: List of target keywords to find in the PDF.
+        minimum_coverage: Required proportion of keywords that must match (0.0 to 1.0).
+
+    Raises:
+        FileNotFoundError: If the PDF does not exist.
+        PDFTextLayerError: If the PDF is unreadable or has no text.
+        KeywordCoverageError: If matching keywords fall below minimum_coverage.
     """
+    if not (0.0 <= minimum_coverage <= 1.0):
+        raise ValueError("minimum_coverage threshold must be between 0.0 and 1.0")
+
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
@@ -295,32 +342,101 @@ def check_ats_readability(pdf_path: str, target_keywords: list[str]) -> None:
             if page_text:
                 text += page_text + " "
     except Exception as e:
-        raise ATSReadabilityError(f"Failed to parse PDF text layer: {e}")
+        result = ATSValidationResult(
+            passed=False,
+            coverage=0.0,
+            matched_keywords=[],
+            unmatched_keywords=[],
+            failure_type="pdf_text_layer",
+            detail=f"Failed to parse PDF text layer: {e}",
+        )
+        raise PDFTextLayerError(result)
 
     if not text.strip():
-        raise ATSReadabilityError(
-            "ATS check failed: Generated PDF has no extractable text layer. "
-            "It might have compiled as a flat image or fonts are unreadable."
+        result = ATSValidationResult(
+            passed=False,
+            coverage=0.0,
+            matched_keywords=[],
+            unmatched_keywords=list(target_keywords),
+            failure_type="pdf_text_layer",
+            detail=(
+                "ATS check failed: Generated PDF has no extractable text layer. "
+                "It might have compiled as a flat image or fonts are unreadable."
+            ),
+        )
+        raise PDFTextLayerError(result)
+
+    # Clean and deduplicate target keywords (case-insensitive)
+    unique_targets = []
+    seen = set()
+    for kw in target_keywords:
+        if not kw or not kw.strip():
+            continue
+        norm_kw = kw.strip().lower()
+        if norm_kw not in seen:
+            seen.add(norm_kw)
+            unique_targets.append(kw.strip())
+
+    if not unique_targets:
+        return ATSValidationResult(
+            passed=True,
+            coverage=1.0,
+            matched_keywords=[],
+            unmatched_keywords=[],
+            failure_type="keyword_validation_skipped",
+            detail="Claude returned no matching keywords."
         )
 
     normalized_text = text.lower()
+    
+    # Text normalization for robust punctuation-invariant matching
+    def normalize_str(s: str) -> str:
+        s_clean = s.lower()
+        s_clean = re.sub(r"[\-_/\\,.;:]", " ", s_clean)
+        return " ".join(s_clean.split())
 
-    missing_keywords = []
-    for keyword in target_keywords:
-        if not keyword or not keyword.strip():
-            continue
+    text_norm = normalize_str(normalized_text)
+
+    matched_keywords = []
+    unmatched_keywords = []
+
+    for keyword in unique_targets:
         kw_clean = keyword.lower().strip()
-        # Use word boundaries for short keywords (≤4 chars) to avoid false positives
-        # e.g. "Go" matching "Google", "AWS" matching "drawsome"
+        kw_norm = normalize_str(kw_clean)
+        
+        found = False
         if len(kw_clean) <= 4:
-            if not re.search(r"\b" + re.escape(kw_clean) + r"\b", normalized_text):
-                missing_keywords.append(keyword)
+            # Use word boundaries for short words to avoid false positive substring matches
+            if re.search(r"\b" + re.escape(kw_clean) + r"\b", normalized_text):
+                found = True
+            elif re.search(r"\b" + re.escape(kw_norm) + r"\b", text_norm):
+                found = True
         else:
-            if kw_clean not in normalized_text:
-                missing_keywords.append(keyword)
+            if kw_clean in normalized_text or kw_norm in text_norm:
+                found = True
 
-    if missing_keywords:
-        raise ATSReadabilityError(
-            f"ATS check failed: Generated PDF is missing critical target keywords: {', '.join(missing_keywords)}"
+        if found:
+            matched_keywords.append(keyword)
+        else:
+            unmatched_keywords.append(keyword)
+
+    total_count = len(unique_targets)
+    matched_count = len(matched_keywords)
+    coverage = matched_count / total_count if total_count > 0 else 1.0
+
+    result = ATSValidationResult(
+        passed=(coverage >= minimum_coverage),
+        coverage=coverage,
+        matched_keywords=matched_keywords,
+        unmatched_keywords=unmatched_keywords,
+    )
+
+    if not result.passed:
+        result.failure_type = "keyword_coverage"
+        result.detail = (
+            f"ATS check failed: Keyword coverage ({coverage*100:.1f}%) is below threshold "
+            f"({minimum_coverage*100:.0f}%). Missing target keywords: {', '.join(unmatched_keywords)}"
         )
+        raise KeywordCoverageError(result)
 
+    return result
