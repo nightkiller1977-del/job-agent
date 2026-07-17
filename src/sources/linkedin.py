@@ -17,7 +17,7 @@ from urllib.parse import quote_plus
 from rich.console import Console
 
 from .base import BaseScraper, AuthFailedError, JobExpiredError
-from src.resume_helper import resolve_resume_path
+from src.resume_helper import resolve_resume_path, PDFTextLayerError
 
 console = Console()
 
@@ -1003,6 +1003,11 @@ class LinkedInScraper(BaseScraper):
 
         except JobExpiredError:
             raise
+        except PDFTextLayerError:
+            # Same reasoning as _apply_external_ats: an unreadable generated
+            # PDF must reach orchestrator.apply_approved() so it can pause the
+            # loop for self-healing, not get relabeled as a generic apply error.
+            raise
         except Exception as exc:
             console.print(f"[red]LinkedIn apply error:[/red] {exc}")
             self._set_apply_outcome("linkedin_error", str(exc))
@@ -1272,6 +1277,11 @@ class LinkedInScraper(BaseScraper):
             self.last_apply_status = scraper.last_apply_status
             self.last_apply_detail = scraper.last_apply_detail
             return result
+        except PDFTextLayerError:
+            # Let this propagate to orchestrator.apply_approved(), which pauses
+            # the whole apply loop for self-healing on a genuinely unreadable
+            # generated PDF — don't collapse it into a per-job False outcome.
+            raise
         except Exception as exc:
             return self._set_apply_outcome("linkedin_external_apply_error", str(exc))
 

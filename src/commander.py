@@ -12,7 +12,7 @@ from rich.table import Table
 
 from .state_manager import StateManager
 from .notifier import _load_status, notify_info, notify_error
-from .model_client import ModelClient
+from .model_client import ModelClient, ModelCascadeError
 
 _log = logging.getLogger(__name__)
 SESSIONS_DIR = Path(__file__).parent.parent / "state" / "sessions"
@@ -218,7 +218,10 @@ class AgentCommander:
                 "content": f"Agent state:\n{context}\n\nQuestion: {question}",
             }
         ]
-        return await self._model_client.complete(messages, system=system, task_type="reasoning")
+        try:
+            return await self._model_client.complete(messages, system=system, task_type="reasoning")
+        except ModelCascadeError as exc:
+            return str(exc)
 
     # ------------------------------------------------------------------
     # Diagnose
