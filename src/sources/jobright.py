@@ -433,10 +433,8 @@ class JobrightScraper(BaseScraper):
                                 f"[yellow]⚠  ATS score {self._last_ats_score}/100 is below 85 — "
                                 "proceeding anyway (warn-only gate).[/yellow]"
                             )
-            except ATSReadabilityError:
-                # Let ATSReadabilityError propagate to the orchestrator, which decides
-                # per-job: pause the loop on a genuinely unreadable PDF, or skip just
-                # this job on a keyword mismatch and continue with the rest.
+            except (ATSReadabilityError, ModelCascadeError):
+                # Let ATSReadabilityError and ModelCascadeError propagate to the outer block or orchestrator
                 raise
             except Exception as _ce:
                 console.print(f"[dim]Claude ATS block error (non-fatal): {_ce}[/dim]")
@@ -3456,6 +3454,8 @@ class JobrightScraper(BaseScraper):
                 "tailored_bullets": result.get("tailored_bullets", []),
                 "cover_letter": result.get("cover_letter", ""),
             }
+        except ModelCascadeError:
+            raise
         except Exception as _e:
             console.print(f"[dim]ATS/tailor failed: {_e}[/dim]")
             return {}
