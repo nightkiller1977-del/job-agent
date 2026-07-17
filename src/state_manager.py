@@ -270,7 +270,13 @@ class StateManager:
                 ),
             )
 
-    def record_apply_attempt(self, job_id: str, status: str, detail: str = "") -> None:
+    def record_apply_attempt(
+        self,
+        job_id: str,
+        status: str,
+        detail: str = "",
+        metadata: dict | None = None,
+    ) -> None:
         """Persist the most recent apply attempt outcome into extra_json.
         Does NOT change the job status field. Increments attempt_count each call.
         Callers: orchestrator.apply_approved() after every attempt, success or block.
@@ -298,6 +304,8 @@ class StateManager:
             # can reason about this outcome without re-deriving it.
             from .blocker_classifier import classify
             extra["blocker_class"] = classify(status).value
+            if metadata:
+                extra.update(metadata)
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
                 (json.dumps(extra), job_id),
@@ -418,6 +426,7 @@ class StateManager:
         "form_completion": {
             "external_ats_error", "form_not_reached", "submit_not_found",
             "linkedin_external_apply_not_found", "microsoft_apply_not_reached",
+            "ats_selector_failed", "resume_upload_failed",
         },
         "auth_session": {
             "workday_session_expired", "brassring_login_required",
@@ -425,6 +434,10 @@ class StateManager:
         },
         "field_completion": {
             "linkedin_stuck_on_required_field", "ats_failure",
+            "keyword_coverage_failed", "pdf_text_layer_failed",
+        },
+        "transient": {
+            "browser_timeout", "model_timeout", "unknown_external_ats_error",
         },
         "config_error": {"bad_ats_url", "unknown_source", "error"},
     }
@@ -498,6 +511,65 @@ class StateManager:
             "failure_clusters": dict(sorted(cluster_hist.items(), key=lambda x: -x[1])),
             "per_source": per_source,
             "wasted_retries": wasted_retries,
+        }
+
+    def reset_failed_keyword_jobs(self, dry_run: bool = False) -> dict:
+        """Reset approved jobs blocked by the old keyword-validation failure.
+
+        Matches both legacy failures recorded as an ATS failure detail and the
+        structured telemetry produced by the normalized keyword coverage check.
+        """
+        reset_keys = {
+            "apply_last_status",
+            "apply_attempt_count",
+            "submitted",
+            "blocker_class",
+            "circuit_broken",
+            "circuit_class",
+            "circuit_reason",
+            "circuit_broken_at",
+            "apply_last_attempt",
+            "apply_validation_metrics",
+        }
+        matched: list[tuple[str, dict]] = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, extra_json FROM jobs WHERE status = 'approved'"
+            ).fetchall()
+
+            for row in rows:
+                extra: dict = {}
+                if row["extra_json"]:
+                    try:
+                        extra = json.loads(row["extra_json"])
+                    except Exception:
+                        extra = {}
+                metrics = extra.get("apply_validation_metrics") or {}
+                detail = str(extra.get("apply_last_detail") or "")
+                status = str(extra.get("apply_last_status") or "")
+                legacy_keyword_detail = detail.startswith("ATS check failed") and "keyword" in detail.lower()
+                is_match = (
+                    metrics.get("failure_type") == "keyword_coverage"
+                    or status == "keyword_coverage_failed"
+                    or legacy_keyword_detail
+                )
+                if is_match:
+                    matched.append((row["job_id"], extra))
+
+            if not dry_run:
+                for job_id, extra in matched:
+                    for key in reset_keys:
+                        extra.pop(key, None)
+                    extra.pop("apply_last_detail", None)
+                    conn.execute(
+                        "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                        (json.dumps(extra) if extra else None, job_id),
+                    )
+
+        return {
+            "matched": len(matched),
+            "reset": 0 if dry_run else len(matched),
+            "unmatched": max(0, len(rows) - len(matched)),
         }
 
     def already_seen(self, job_id: str) -> bool:
