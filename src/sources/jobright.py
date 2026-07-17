@@ -495,9 +495,17 @@ class JobrightScraper(BaseScraper):
             console.print(f"[red]Keyword coverage failure:[/red] {exc}")
             return self._set_apply_outcome("keyword_coverage_failed", str(exc))
         except PDFTextLayerError as exc:
+            # Don't swallow this into a per-job False outcome: an unreadable/corrupt
+            # PDF means the resume-compilation pipeline itself is broken, not just
+            # this one job. Re-raise so it reaches orchestrator.apply_approved()'s
+            # `except ATSReadabilityError` handler, which pauses the whole apply
+            # loop for self-healing instead of burning through the rest of the
+            # approved queue with the same broken PDF generation path.
             self._apply_validation_metrics = self._validation_metrics_from_error(exc)
+            self.last_apply_status = "pdf_text_layer_failed"
+            self.last_apply_detail = str(exc)
             console.print(f"[red]PDF text-layer failure:[/red] {exc}")
-            return self._set_apply_outcome("pdf_text_layer_failed", str(exc))
+            raise
         except ModelCascadeError as exc:
             console.print(f"[red]Model cascade failure:[/red] {exc}")
             return self._set_apply_outcome("model_timeout", str(exc))
