@@ -3435,12 +3435,19 @@ class JobrightScraper(BaseScraper):
                 f"DRAFT TAILORED CONTENT:\n{_draft_text}\n\n"
                 "Respond ONLY with valid JSON in the exact same format as the draft (no markdown format, no other text)."
             )
-            with model_span("model_client", "cascade", agent="job-agent", task="ats_review") as span:
-                _final_text = await self._model_client.complete(
-                    messages=[{"role": "user", "content": _review_prompt}],
-                    task_type="reasoning",
-                    max_tokens=1800,
-                )
+            try:
+                with model_span("model_client", "cascade", agent="job-agent", task="ats_review") as span:
+                    _final_text = await self._model_client.complete(
+                        messages=[{"role": "user", "content": _review_prompt}],
+                        task_type="reasoning",
+                        max_tokens=1800,
+                    )
+            except ModelCascadeError:
+                # The grounding/review pass is a quality check on top of an
+                # already-usable draft — if the cascade is exhausted here,
+                # fall back to the draft rather than discarding it and
+                # failing the whole job as model_timeout.
+                _final_text = ""
 
             if not _final_text or _final_text.startswith("No model available"):
                 _final_text = _draft_text
