@@ -388,7 +388,7 @@ def check_ats_readability(
         )
 
     normalized_text = text.lower()
-    
+
     # Text normalization for robust punctuation-invariant matching.
     # Only collapse separators that sit between two word characters — a
     # leading/trailing symbol (e.g. the "." in ".NET") is semantically part
@@ -420,7 +420,7 @@ def check_ats_readability(
     for keyword in unique_targets:
         kw_clean = keyword.lower().strip()
         kw_norm = normalize_str(kw_clean)
-        
+
         found = contains_keyword(kw_clean, normalized_text) or contains_keyword(kw_norm, text_norm)
 
         if found:
