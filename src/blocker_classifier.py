@@ -40,6 +40,9 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     # transient — worth a bounded retry (external_ats_error is often bot-detection,
     # which the patchright work may fix; cap keeps it from looping forever)
     "external_ats_error": BlockerClass.TRANSIENT,
+    "browser_timeout": BlockerClass.TRANSIENT,
+    "model_timeout": BlockerClass.TRANSIENT,
+    "unknown_external_ats_error": BlockerClass.TRANSIENT,
     "error": BlockerClass.TRANSIENT,
     "reauth_retry_error": BlockerClass.TRANSIENT,
     # auth — route to reauth / session prep
@@ -57,6 +60,10 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     "linkedin_external_apply_not_found": BlockerClass.NEEDS_HUMAN,
     "microsoft_apply_not_reached": BlockerClass.NEEDS_HUMAN,
     "ats_failure": BlockerClass.NEEDS_HUMAN,
+    "keyword_coverage_failed": BlockerClass.NEEDS_HUMAN,
+    "pdf_text_layer_failed": BlockerClass.NEEDS_HUMAN,
+    "resume_upload_failed": BlockerClass.NEEDS_HUMAN,
+    "ats_selector_failed": BlockerClass.NEEDS_HUMAN,
     # permanent — structurally cannot succeed
     "bad_ats_url": BlockerClass.PERMANENT,
     "unknown_source": BlockerClass.PERMANENT,
