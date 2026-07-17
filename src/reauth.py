@@ -30,11 +30,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from .sources.base import SESSIONS_DIR
 from .notifier import notify_error, notify_info, notify_success, notify_warning, record_reauth_event, _macos_notify
+from .auth_constants import AUTOMATED_SOURCES, HUMAN_SOURCES
 
 _log = logging.getLogger(__name__)
-
-AUTOMATED_SOURCES = {"jobright", "indeed", "linkedin"}
-HUMAN_SOURCES     = {"usajobs"}
 
 
 def _is_interactive() -> bool:
@@ -76,7 +74,7 @@ class ReauthManager:
         """
         _log.info("reauth.start source=%s context=%s", source, context)
         if source in AUTOMATED_SOURCES:
-            return await self._reauth_automated(source)
+            return await self._reauth_automated(source, context)
         elif source in HUMAN_SOURCES:
             timeout = self.timeout_discover if context == "discover" else self.timeout_apply
             return await self._reauth_human(source, detail, timeout)
@@ -87,7 +85,7 @@ class ReauthManager:
     # Automated path
     # ------------------------------------------------------------------
 
-    async def _reauth_automated(self, source: str) -> bool:
+    async def _reauth_automated(self, source: str, context: str) -> bool:
         source_map = _get_source_map()
         scraper_cls = source_map.get(source)
         if not scraper_cls:
@@ -129,7 +127,13 @@ class ReauthManager:
                 self._notify_correction(source, "automated", "_auto_login returned True after session expiry")
                 return True
             else:
-                record_reauth_event(source, "automated", "failed", "_auto_login returned False")
+                record_reauth_event(source, "automated", "failed", "auto_login returned False")
+                if source == "indeed":
+                    _log.warning("reauth.escalated source=%s reason='auto_login returned False'", source)
+                    notify_warning(f"{source} reauth escalated", "Auto-login failed, escalating to human-assisted flow.")
+                    timeout = self.timeout_discover if context == "discover" else self.timeout_apply
+                    return await self._reauth_human(source, "Auto-login failed (e.g. CAPTCHA)", timeout)
+                
                 _log.warning("reauth.failed source=%s mode=automated reason=login_returned_false", source)
                 notify_warning(
                     f"{source} automated reauth failed",
@@ -235,7 +239,20 @@ class ReauthManager:
         deadline = time.monotonic() + timeout_minutes * 60
         while time.monotonic() < deadline:
             await asyncio.sleep(30)
-            if session_file.exists() and session_file.stat().st_mtime > baseline_mtime:
+            
+            # Use deep JSON inspection (cookie expiry) instead of just mtime
+            from .session_watchdog import check_session_health
+            health = next((h for h in check_session_health([source]) if h.source == source), None)
+            
+            # If the session is healthy, we consider it refreshed.
+            # (Previously we just checked if mtime > baseline_mtime, which only meant the file was touched).
+            is_refreshed = False
+            if health and health.status == "healthy":
+                is_refreshed = True
+            elif session_file.exists() and session_file.stat().st_mtime > baseline_mtime:
+                is_refreshed = True
+                
+            if is_refreshed:
                 record_reauth_event(source, "human", "session_refreshed")
                 _log.info("reauth.success source=%s mode=human", source)
                 notify_info(f"{source} session refreshed", "Session file updated — retrying source")

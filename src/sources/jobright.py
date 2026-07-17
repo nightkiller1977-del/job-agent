@@ -1,3 +1,4 @@
+from src.apply_outcome import ApplyOutcomeCode
 """
 Jobright.ai scraper.
 Navigates to the matched/recommended jobs section and extracts listings.
@@ -348,9 +349,7 @@ class JobrightScraper(BaseScraper):
                 entered_form = await self._click_ats_apply_button(page)
             await self._delay(3, 5)
             if getattr(self, "_workday_session_expired", False):
-                return self._set_apply_outcome(
-                    "workday_session_expired",
-                    "Workday redirected to sign-in. Re-authenticate this company Workday portal, then rerun apply.",
+                return self._set_apply_outcome(ApplyOutcomeCode.WORKDAY_SESSION_EXPIRED, "Workday redirected to sign-in. Re-authenticate this company Workday portal, then rerun apply.",
                 )
 
             # Teamtailor forms are public — their email field is for the applicant,
@@ -493,7 +492,7 @@ class JobrightScraper(BaseScraper):
         except KeywordCoverageError as exc:
             self._apply_validation_metrics = self._validation_metrics_from_error(exc)
             console.print(f"[red]Keyword coverage failure:[/red] {exc}")
-            return self._set_apply_outcome("keyword_coverage_failed", str(exc))
+            return self._set_apply_outcome(ApplyOutcomeCode.KEYWORD_COVERAGE_FAILED, str(exc))
         except PDFTextLayerError as exc:
             # Don't swallow this into a per-job False outcome: an unreadable/corrupt
             # PDF means the resume-compilation pipeline itself is broken, not just
@@ -508,10 +507,10 @@ class JobrightScraper(BaseScraper):
             raise
         except ModelCascadeError as exc:
             console.print(f"[red]Model cascade failure:[/red] {exc}")
-            return self._set_apply_outcome("model_timeout", str(exc))
+            return self._set_apply_outcome(ApplyOutcomeCode.MODEL_TIMEOUT, str(exc))
         except PlaywrightTimeoutError as exc:
             console.print(f"[red]External ATS browser timeout:[/red] {exc}")
-            return self._set_apply_outcome("browser_timeout", str(exc))
+            return self._set_apply_outcome(ApplyOutcomeCode.BROWSER_TIMEOUT, str(exc))
         except PlaywrightError as exc:
             status = self._classify_external_ats_exception(exc)
             console.print(f"[red]External ATS {status}:[/red] {exc}")
@@ -526,18 +525,39 @@ class JobrightScraper(BaseScraper):
         return submitted
 
     def _best_jobright_match(self, source_job: dict, candidates: list[dict]) -> dict | None:
+        source_url = (source_job.get("url") or "").split("?")[0].rstrip("/").lower()
         wanted_title = self._tokenize_match_text(source_job.get("title", ""))
         wanted_company = self._tokenize_match_text(source_job.get("company", ""))
         best = None
         best_score = 0.0
+
         for candidate in candidates:
-            title_score = self._overlap_score(wanted_title, self._tokenize_match_text(candidate.get("title", "")))
-            company_score = self._overlap_score(wanted_company, self._tokenize_match_text(candidate.get("company", "")))
+            # Bypass if JD is unavailable
+            desc = (candidate.get("title", "") + " " + candidate.get("description", "")).lower()
+            if "jd unavailable" in desc or "job description unavailable" in desc or "no description" in desc:
+                continue
+
+            # Exact URL correlation logic
+            cand_url = (candidate.get("url") or "").split("?")[0].rstrip("/").lower()
+            if source_url and cand_url and source_url == cand_url:
+                return candidate
+
+            # Calculate token overlap
+            cand_title_tokens = self._tokenize_match_text(candidate.get("title", ""))
+            cand_company_tokens = self._tokenize_match_text(candidate.get("company", ""))
+            title_score = self._overlap_score(wanted_title, cand_title_tokens)
+            company_score = self._overlap_score(wanted_company, cand_company_tokens)
+
+            # Independent minimum thresholds (Title >= 35%, Company >= 40%)
+            if title_score < 0.35 or company_score < 0.40:
+                continue
+
             score = (title_score * 0.75) + (company_score * 0.25)
             if score > best_score:
                 best = candidate
                 best_score = score
-        return best if best and best_score >= 0.28 else None
+
+        return best
 
     def _tokenize_match_text(self, value: str) -> set[str]:
         stop = {"and", "the", "of", "for", "to", "in", "a", "an", "remote", "senior"}
@@ -1664,9 +1684,7 @@ class JobrightScraper(BaseScraper):
 
             if not ext_url:
                 console.print("[red]Jobright:[/red] Could not find company ATS URL — skipping.")
-                return self._set_apply_outcome(
-                    "missing_ats_url",
-                    "Could not extract the company ATS URL from the Jobright posting.",
+                return self._set_apply_outcome(ApplyOutcomeCode.MISSING_ATS_URL, "Could not extract the company ATS URL from the Jobright posting.",
                 )
 
             # Validate the URL has a real hostname
@@ -1676,9 +1694,7 @@ class JobrightScraper(BaseScraper):
                 _host = _p.hostname or ""
                 if not _host or _host in ("www.", "www") or "." not in _host:
                     console.print(f"[red]Jobright:[/red] ATS URL has no valid hostname ({ext_url!r}) — skipping.")
-                    return self._set_apply_outcome(
-                        "bad_ats_url",
-                        f"Extracted ATS URL has no valid hostname: {ext_url!r}. Check the Jobright posting manually.",
+                    return self._set_apply_outcome(ApplyOutcomeCode.BAD_ATS_URL, f"Extracted ATS URL has no valid hostname: {ext_url!r}. Check the Jobright posting manually.",
                     )
             except Exception:
                 pass
@@ -1746,9 +1762,7 @@ class JobrightScraper(BaseScraper):
             if resume_path:
                 await self._upload_resume_if_prompted(company_page, resume_path)
             if getattr(self, "_workday_session_expired", False):
-                return self._set_apply_outcome(
-                    "workday_session_expired",
-                    "Workday redirected to sign-in. Re-authenticate this company Workday portal in the Playwright profile, then rerun apply.",
+                return self._set_apply_outcome(ApplyOutcomeCode.WORKDAY_SESSION_EXPIRED, "Workday redirected to sign-in. Re-authenticate this company Workday portal in the Playwright profile, then rerun apply.",
                 )
             if not entered_form and self.last_apply_status not in ("started", "", None):
                 console.print(
@@ -1861,9 +1875,7 @@ class JobrightScraper(BaseScraper):
                 if "myworkdayjobs.com" in portal_url and "BUTTON Sign In" in controls_text:
                     console.print("[yellow]Jobright:[/yellow] Workday portal requires sign-in — marking as session-needed.")
                     self._workday_session_expired = True
-                    return self._set_apply_outcome(
-                        "workday_session_expired",
-                        f"Workday portal at {portal_url} requires sign-in. "
+                    return self._set_apply_outcome(ApplyOutcomeCode.WORKDAY_SESSION_EXPIRED, f"Workday portal at {portal_url} requires sign-in. "
                         "Run: python src/main.py prepare-sessions to authenticate this tenant.",
                     )
 
@@ -2878,9 +2890,7 @@ class JobrightScraper(BaseScraper):
     async def _handle_microsoft_apply(self, page) -> bool:
         console.print("[magenta]Jobright:[/magenta] Microsoft portal — locating apply flow…")
         if await self._looks_like_login_wall(page):
-            self._set_apply_outcome(
-                "microsoft_login_required",
-                "Microsoft careers is showing a login/account wall. Sign in once in the Playwright profile, then rerun apply.",
+            self._set_apply_outcome(ApplyOutcomeCode.MICROSOFT_LOGIN_REQUIRED, "Microsoft careers is showing a login/account wall. Sign in once in the Playwright profile, then rerun apply.",
             )
             return False
 
@@ -2912,9 +2922,7 @@ class JobrightScraper(BaseScraper):
         if clicked:
             await self._delay(5, 8)
             if await self._looks_like_login_wall(page):
-                self._set_apply_outcome(
-                    "microsoft_login_required",
-                    f"Microsoft careers redirected to login at {page.url}.",
+                self._set_apply_outcome(ApplyOutcomeCode.MICROSOFT_LOGIN_REQUIRED, f"Microsoft careers redirected to login at {page.url}.",
                 )
                 return False
             apply_still_visible = await self._has_visible_control_matching(page, ['^apply now$', '^apply$'])
@@ -2933,9 +2941,7 @@ class JobrightScraper(BaseScraper):
     async def _handle_brassring_apply(self, page) -> bool:
         console.print("[magenta]Jobright:[/magenta] BrassRing portal — locating apply flow…")
         if await self._looks_like_login_wall(page):
-            self._set_apply_outcome(
-                "brassring_login_required",
-                "BrassRing is showing a login wall before the application form is reachable.",
+            self._set_apply_outcome(ApplyOutcomeCode.BRASSRING_LOGIN_REQUIRED, "BrassRing is showing a login wall before the application form is reachable.",
             )
             return False
 
@@ -2952,9 +2958,7 @@ class JobrightScraper(BaseScraper):
         if clicked:
             await self._delay(5, 8)
             if await self._looks_like_login_wall(page):
-                self._set_apply_outcome(
-                    "brassring_login_required",
-                    f"BrassRing redirected to login/profile page at {page.url}.",
+                self._set_apply_outcome(ApplyOutcomeCode.BRASSRING_LOGIN_REQUIRED, f"BrassRing redirected to login/profile page at {page.url}.",
                 )
                 return False
             if await self._looks_like_application_form(page):
@@ -2962,9 +2966,7 @@ class JobrightScraper(BaseScraper):
                 return True
 
         controls = await self._visible_controls_snapshot(page)
-        self._set_apply_outcome(
-            "brassring_apply_not_reached",
-            f"Could not enter BrassRing application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
+        self._set_apply_outcome(ApplyOutcomeCode.BRASSRING_APPLY_NOT_REACHED, f"Could not enter BrassRing application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
         )
         return False
 
@@ -3646,77 +3648,60 @@ class JobrightScraper(BaseScraper):
 
     async def _confirm_and_submit(self, page, job: dict, auto_submit: bool = False) -> bool:
         """
-        Find the final Submit / Apply button on the ATS page, show a preview,
-        optionally ask for confirmation, then click.
+        Phase 1: Detect Submit / Apply button using evaluate (does NOT click).
+        Returns a stable descriptor.
+        Phase 2: Validate fields and block auto-submit if invalid.
+        Phase 3: Click and explicitly verify success signal (differentially).
         """
-        submit_selectors = [
-            # Workday final-step submit (data-automation-id) — highly specific, safe
-            '[data-automation-id="bottom-navigation-next-button"]',
-            '[data-automation-id*="submit" i]',
-            'input[type="submit"][value*="Submit" i]',
-            'input[type="button"][value*="Submit" i]',
-            # Generic button text — Submit variants (unambiguous, final-step only)
-            'button:text-matches("^Submit$", "i")',
-            'button:text-matches("Submit Application", "i")',
-            'button:text-matches("Send Application", "i")',
-            'button:text-matches("Complete Application", "i")',
-            'button:text-matches("Submit My Application", "i")',
-            # Apply variants on BUTTONS (buttons inside forms are usually final-step)
-            'button:text-matches("^Apply$", "i")',
-            'button:text-matches("Apply Now", "i")',
-            'button:text-matches("Apply for this job", "i")',
-            'button:text-matches("Apply for Job", "i")',
-            # aria-label submit (reliable signal)
-            # NOTE: "I'm interested" is intentionally NOT here — it is a SmartRecruiters
-            # entry CTA on the job listing page, handled by _click_ats_apply_button.
-            '[aria-label*="submit" i]',
-            # NOTE: Removed broad a:text-matches("Apply*") and partial-match fallbacks.
-            # Those matched "Apply" entry buttons on job listing pages, causing false submits.
-            # Portal-specific <a> Apply buttons are handled by _click_ats_apply_button first.
-        ]
-
-        # P4: prepend curated per-vendor submit selectors (Greenhouse #submit_app,
-        # Lever #post-submit-btn / [data-qa='btn-submit'], Ashby, Workday submit/next
-        # data-automation-ids). These are SPECIFIC ids/data-attrs — not broad text
-        # matches — so they raise submit detection (baseline: 5 submit_not_found) without
-        # the false-submit risk the empty-form guard below still backstops.
-        try:
-            from ..adapters_patterns.ats_selectors import SELECTORS as _VENDOR_SEL
-            _vendor_submits = [
-                s
-                for vendor in _VENDOR_SEL.values()
-                for s in vendor.get("submit_button", [])
-            ]
-            # vendor-specific first, then the existing list; dedupe preserving order
-            _seen: set[str] = set()
-            submit_selectors = [
-                s for s in (_vendor_submits + submit_selectors)
-                if not (s in _seen or _seen.add(s))
-            ]
-        except Exception:
-            pass
-
-        submit_btn = None
-        for sel in submit_selectors:
-            try:
-                btn = await page.wait_for_selector(sel, timeout=8000)
-                if btn and await btn.is_visible():
-                    submit_btn = btn
-                    break
-            except Exception:
-                continue
-
         try:
             portal_url = page.url
         except Exception:
             portal_url = "(unknown)"
         family = await self._detect_portal_family(page)
 
+        # ── Phase 1: Detect ──
+        submit_descriptor = await self._safe_evaluate(page, """() => {
+            const patterns = [
+                '^Submit$', 'Submit Application', 'Send Application',
+                'Complete Application', 'Submit My Application',
+                '^Apply$', 'Apply Now', 'Apply for this job', 'Apply for Job'
+            ];
+            const regexes = patterns.map(p => new RegExp(p, 'i'));
+            const candidates = Array.from(document.querySelectorAll([
+                'button', 'a', '[role="button"]', 'input[type="button"]', 'input[type="submit"]',
+                '[data-automation-id="bottom-navigation-next-button"]',
+                '[data-automation-id*="submit" i]',
+                '[aria-label*="submit" i]'
+            ].join(',')));
+            
+            const visible = el => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.visibility !== 'hidden' && style.display !== 'none' && !el.disabled && rect.width > 0 && rect.height > 0;
+            };
+
+            for (const el of candidates) {
+                if (!visible(el)) continue;
+                
+                const is_vendor = el.matches('[data-automation-id="bottom-navigation-next-button"]') || el.matches('[data-automation-id*="submit" i]');
+                const text = (el.innerText || el.value || el.textContent || '').trim();
+                const aria = (el.getAttribute('aria-label') || '').trim();
+                
+                if (is_vendor || regexes.some(r => r.test(text)) || regexes.some(r => r.test(aria))) {
+                    return {
+                        tag: el.tagName.toLowerCase(),
+                        text: text,
+                        aria: aria,
+                        data_automation: el.getAttribute('data-automation-id') || ''
+                    };
+                }
+            }
+            return null;
+        }""", default=None)
+
         # ── Guard: refuse to submit if no form fields appear to be filled ────
-        # This prevents false "Application submitted!" when the agent is on a
-        # job listing page (not the actual application form) — the broad Apply
-        # button selectors above can match entry CTAs on listing pages.
-        if submit_btn:
+        has_filled_fields = False
+        if submit_descriptor:
             try:
                 has_filled_fields = await page.evaluate("""
                     () => {
@@ -3724,7 +3709,6 @@ class JobrightScraper(BaseScraper):
                             'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="file"]):not([type="checkbox"]):not([type="radio"]),' +
                             'textarea, select'
                         )];
-                        // At least one visible input must have a non-empty value
                         return inputs.some(el => {
                             const val = (el.value || el.textContent || '').trim();
                             return val.length > 0 && !el.disabled;
@@ -3735,19 +3719,19 @@ class JobrightScraper(BaseScraper):
                 has_filled_fields = True  # assume filled if we can't check
 
             if not has_filled_fields:
+                from ..console import console
                 console.print(
                     "[yellow]Jobright: Submit button found but form appears empty — "
                     "autofill did not run or this is a listing page, not the application form.[/yellow]"
                 )
                 console.print(f"[dim]Portal: {portal_url}[/dim]")
-                return self._set_apply_outcome(
-                    "form_empty_not_submitted",
-                    f"Submit button was found at {portal_url} but all form fields were empty. "
+                return self._set_apply_outcome(ApplyOutcomeCode.FORM_EMPTY_NOT_SUBMITTED, f"Submit button was found at {portal_url} but all form fields were empty. "
                     "Jobright autofill did not populate the form — ensure the extension is active "
-                    "and the Jobright session is logged in, then re-run.",
+                    "and the Jobright session is logged in, then re-run."
                 )
 
-        if not submit_btn and (auto_submit or not (sys.stdin and sys.stdin.isatty())):
+        if not submit_descriptor and (auto_submit or not (import sys; sys.stdin and sys.stdin.isatty())):
+            from ..console import console
             console.print(
                 "[yellow]Jobright: Submit button not found and this run is non-interactive — "
                 "skipping instead of prompting.[/yellow]"
@@ -3758,8 +3742,8 @@ class JobrightScraper(BaseScraper):
             if tailored_hint:
                 console.print(f"[green]Jobright:[/green] Tailored resume ready for manual apply → {tailored_hint}")
             return self._set_apply_outcome(
-                f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
-                (
+                ApplyOutcomeCode.SUBMIT_NOT_FOUND, portal_family=family if family != "generic" else "",
+                detail=(
                     f"Reached portal but could not find a final Submit/Apply button at "
                     f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
                     + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
@@ -3769,10 +3753,11 @@ class JobrightScraper(BaseScraper):
         # Run pre-submission validation checklist before showing the submit banner
         await self._run_pre_submission_validation(page)
 
+        from ..console import console
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
         console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
         console.print(f"  Portal: {portal_url}")
-        if submit_btn:
+        if submit_descriptor:
             console.print(f"  [green]Submit button found ✓[/green]")
         else:
             console.print(f"  [yellow]Submit button not found — navigate to the final step in the browser[/yellow]")
@@ -3787,22 +3772,60 @@ class JobrightScraper(BaseScraper):
                 confirm = "n"
         if confirm != "y":
             console.print("[yellow]Jobright: Submission cancelled.[/yellow]")
-            return self._set_apply_outcome(
-                "submission_cancelled",
-                "Final submission was not confirmed by the user.",
-            )
+            return self._set_apply_outcome(ApplyOutcomeCode.SUBMISSION_CANCELLED, "Final submission was not confirmed by the user.")
 
-        if submit_btn:
-            # Use JS click to bypass Workday overlay divs that intercept pointer events
-            try:
-                await page.evaluate("btn => btn.click()", submit_btn)
-            except Exception:
-                # Fallback: dispatch a MouseEvent directly
-                await self._safe_evaluate(page, """btn => {
-                    btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-                }""", submit_btn, default=None)
+        if submit_descriptor:
+            pre_click_text = await page.evaluate("document.body.innerText.toLowerCase()")
+            
+            clicked = await page.evaluate("""(desc) => {
+                const visible = el => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden' && style.display !== 'none' && !el.disabled && rect.width > 0 && rect.height > 0;
+                };
+                const candidates = Array.from(document.querySelectorAll(desc.tag)).filter(el => {
+                    if (!visible(el)) return false;
+                    const text = (el.innerText || el.value || el.textContent || '').trim();
+                    const aria = (el.getAttribute('aria-label') || '').trim();
+                    if (desc.text && text !== desc.text) return false;
+                    if (desc.aria && aria !== desc.aria) return false;
+                    if (desc.data_automation && el.getAttribute('data-automation-id') !== desc.data_automation) return false;
+                    return true;
+                });
+                if (candidates.length === 1) {
+                    try { candidates[0].click(); } catch(e) { candidates[0].dispatchEvent(new MouseEvent('click', {bubbles: true})); }
+                    return true;
+                }
+                return false;
+            }""", submit_descriptor)
+            
+            if not clicked:
+                console.print("[red]Jobright: Submit button became ambiguous or disappeared before click.[/red]")
+                return self._set_apply_outcome(ApplyOutcomeCode.SUBMIT_NOT_FOUND, "Submit button descriptor became ambiguous or detached.")
+            
             await self._delay(3, 5)
+
+            success_signal = False
+            try:
+                await page.wait_for_function(f"""(oldText) => {{
+                    if (window.location.href !== "{portal_url}") return true;
+                    const body = document.body.innerText.toLowerCase();
+                    const newText = body.replace(oldText, '');
+                    return newText.includes("application submitted") || 
+                           newText.includes("success") || 
+                           newText.includes("thank you for applying");
+                }}""", arg=pre_click_text, timeout=5000)
+                success_signal = True
+            except Exception:
+                success_signal = False
+                
+            if not success_signal:
+                console.print("[yellow]Jobright: Clicked submit but no clear success signal was detected.[/yellow]")
+                return self._set_apply_outcome(ApplyOutcomeCode.SUBMISSION_UNVERIFIED, "Clicked submit button but no new confirmation page or success message was detected.")
+
             # ── Record analytics for orchestrator to persist via extra_json ──
+            from datetime import datetime
+            import os
             self._apply_analytics = {
                 "submitted": True,
                 "submissionTime": datetime.utcnow().isoformat(),
@@ -3826,8 +3849,8 @@ class JobrightScraper(BaseScraper):
                 if tailored_hint:
                     console.print(f"[green]Jobright:[/green] Tailored resume ready for manual apply → {tailored_hint}")
                 return self._set_apply_outcome(
-                    f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
-                    (
+                    ApplyOutcomeCode.SUBMIT_NOT_FOUND, portal_family=family if family != "generic" else "",
+                    detail=(
                         f"Auto-submit requested, but no submit button was found at "
                         f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
                         + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
@@ -3835,11 +3858,12 @@ class JobrightScraper(BaseScraper):
                 )
             console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")
             try:
-                input("  Press Enter after submitting (or to skip) > ")
+                confirm_ans = input("  Press Enter after submitting (or to skip) > ")
                 answer = input("  Did you successfully submit? [y/N] > ").strip().lower()
                 return answer == "y"
             except (EOFError, KeyboardInterrupt):
                 return False
+e
 
 
 def _infer_remote_type(remote_raw: str, location: str) -> str:

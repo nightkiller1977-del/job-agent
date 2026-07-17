@@ -14,15 +14,10 @@ from __future__ import annotations
 import os
 from enum import Enum
 
-# Mirror of reauth.HUMAN_SOURCES + per-source credential env pairs. Kept here (a
-# pure, import-light module) so the preflight guard is testable without pulling
-# reauth.py's playwright/browser import chain. If reauth's sets change, update both.
-_HUMAN_SOURCES = {"usajobs"}
-_REAUTH_CREDS = {
-    "jobright": ("JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD"),
-    "linkedin": ("LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"),
-    "indeed": ("INDEED_EMAIL", "INDEED_PASSWORD"),
-}
+import re
+from typing import Dict, List, Optional
+from .auth_constants import HUMAN_SOURCES, AUTOMATED_SOURCES, REAUTH_CREDS
+from .apply_outcome import ApplyOutcomeCode
 
 
 class BlockerClass(str, Enum):
@@ -34,39 +29,53 @@ class BlockerClass(str, Enum):
     UNKNOWN = "unknown"           # unmapped status — cautious retry
 
 
-# Explicit status → class map (statuses observed in the live DB + known emitters).
-_STATUS_TO_CLASS: dict[str, BlockerClass] = {
-    "applied": BlockerClass.SUCCESS,
-    # transient — worth a bounded retry (external_ats_error is often bot-detection,
-    # which the patchright work may fix; cap keeps it from looping forever)
-    "external_ats_error": BlockerClass.TRANSIENT,
-    "browser_timeout": BlockerClass.TRANSIENT,
-    "model_timeout": BlockerClass.TRANSIENT,
-    "unknown_external_ats_error": BlockerClass.TRANSIENT,
-    "error": BlockerClass.TRANSIENT,
-    "reauth_retry_error": BlockerClass.TRANSIENT,
-    # auth — route to reauth / session prep
-    "workday_session_expired": BlockerClass.AUTH_REQUIRED,
-    "brassring_login_required": BlockerClass.AUTH_REQUIRED,
-    "reauth_failed": BlockerClass.AUTH_REQUIRED,
-    "session_expired": BlockerClass.AUTH_REQUIRED,
-    "needs_session_prep": BlockerClass.AUTH_REQUIRED,  # P3: human source, run prepare-sessions
-    # config — user must fix .env / creds; never auto-retry
-    "credentials_missing": BlockerClass.PERMANENT,
-    # needs human — retrying without a code/profile fix won't help
-    "submit_not_found": BlockerClass.NEEDS_HUMAN,
-    "form_not_reached": BlockerClass.NEEDS_HUMAN,
-    "linkedin_stuck_on_required_field": BlockerClass.NEEDS_HUMAN,
-    "linkedin_external_apply_not_found": BlockerClass.NEEDS_HUMAN,
-    "microsoft_apply_not_reached": BlockerClass.NEEDS_HUMAN,
-    "ats_failure": BlockerClass.NEEDS_HUMAN,
-    "keyword_coverage_failed": BlockerClass.NEEDS_HUMAN,
-    "pdf_text_layer_failed": BlockerClass.NEEDS_HUMAN,
-    "resume_upload_failed": BlockerClass.NEEDS_HUMAN,
-    "ats_selector_failed": BlockerClass.NEEDS_HUMAN,
-    # permanent — structurally cannot succeed
-    "bad_ats_url": BlockerClass.PERMANENT,
-    "unknown_source": BlockerClass.PERMANENT,
+# Explicit status → class map
+_STATUS_TO_CLASS: dict[ApplyOutcomeCode, BlockerClass] = {
+    ApplyOutcomeCode.APPLIED: BlockerClass.SUCCESS,
+    
+    # transient
+    ApplyOutcomeCode.EXTERNAL_ATS_ERROR: BlockerClass.TRANSIENT,
+    ApplyOutcomeCode.BROWSER_TIMEOUT: BlockerClass.TRANSIENT,
+    ApplyOutcomeCode.MODEL_TIMEOUT: BlockerClass.TRANSIENT,
+    ApplyOutcomeCode.UNKNOWN_EXTERNAL_ATS_ERROR: BlockerClass.TRANSIENT,
+    ApplyOutcomeCode.ERROR: BlockerClass.TRANSIENT,
+    ApplyOutcomeCode.REAUTH_RETRY_ERROR: BlockerClass.TRANSIENT,
+    
+    # auth
+    ApplyOutcomeCode.SESSION_EXPIRED: BlockerClass.AUTH_REQUIRED,
+    ApplyOutcomeCode.LOGIN_REQUIRED: BlockerClass.AUTH_REQUIRED,
+    ApplyOutcomeCode.REAUTH_FAILED: BlockerClass.AUTH_REQUIRED,
+    ApplyOutcomeCode.NEEDS_SESSION: BlockerClass.AUTH_REQUIRED,
+    ApplyOutcomeCode.NEEDS_SESSION_PREP: BlockerClass.AUTH_REQUIRED,
+    ApplyOutcomeCode.HUMAN_ACTION_REQUIRED: BlockerClass.AUTH_REQUIRED,
+    
+    # config / permanent
+    ApplyOutcomeCode.CREDENTIALS_MISSING: BlockerClass.PERMANENT,
+    ApplyOutcomeCode.BAD_ATS_URL: BlockerClass.PERMANENT,
+    ApplyOutcomeCode.UNKNOWN_SOURCE: BlockerClass.PERMANENT,
+    ApplyOutcomeCode.MISSING_ATS_URL: BlockerClass.PERMANENT,
+    ApplyOutcomeCode.INDEED_EASY_APPLY_OR_NO_ATS: BlockerClass.PERMANENT,
+    
+    # needs human
+    ApplyOutcomeCode.SUBMIT_NOT_FOUND: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.FORM_NOT_REACHED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.FORM_NOT_DETECTED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.STUCK_ON_REQUIRED_FIELD: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.EXTERNAL_APPLY_NOT_FOUND: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.ATS_FAILURE: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.KEYWORD_COVERAGE_FAILED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.PDF_TEXT_LAYER_FAILED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.RESUME_UPLOAD_FAILED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.ATS_SELECTOR_FAILED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.REQUIRED_FIELD_UNANSWERED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.FORM_EMPTY_NOT_SUBMITTED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.SUBMISSION_CANCELLED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.SUBMISSION_UNVERIFIED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.STEP_BLOCKED: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.NEEDS_ANSWER: BlockerClass.NEEDS_HUMAN,
+    ApplyOutcomeCode.NEEDS_HYDRATION: BlockerClass.NEEDS_HUMAN,
+    
+    ApplyOutcomeCode.UNKNOWN: BlockerClass.UNKNOWN,
 }
 
 # Per-class attempt caps. Once apply_attempt_count reaches the cap for a job's
@@ -81,11 +90,20 @@ _MAX_ATTEMPTS: dict[BlockerClass, int] = {
 }
 
 
-def classify(status: str | None) -> BlockerClass:
-    """Map an apply-outcome status string to its control-flow class."""
+def classify(status: str | ApplyOutcomeCode | None) -> BlockerClass:
+    """Map an ApplyOutcomeCode to its control-flow class."""
     if not status:
         return BlockerClass.UNKNOWN
-    return _STATUS_TO_CLASS.get(status.strip(), BlockerClass.UNKNOWN)
+    
+    if isinstance(status, ApplyOutcomeCode):
+        code = status
+    else:
+        try:
+            code = ApplyOutcomeCode(status.strip())
+        except ValueError:
+            return BlockerClass.UNKNOWN
+
+    return _STATUS_TO_CLASS.get(code, BlockerClass.UNKNOWN)
 
 
 def max_attempts(status: str | None) -> int:
@@ -117,13 +135,15 @@ def preflight_reauth_viable(source: str) -> tuple[bool, str]:
 
     - Human sources (usajobs): not viable mid-apply — they wait for a person and
       time out. Handle via `prepare-sessions` instead → "needs_session_prep".
-    - Automated sources missing credentials: not viable → "credentials_missing".
+    - Automated sources missing credentials: not viable — check if a source in AUTOMATED_SOURCES lacks env credentials
     """
-    if source in _HUMAN_SOURCES:
+    if source in HUMAN_SOURCES:
         return False, "needs_session_prep"
-    missing = [c for c in _REAUTH_CREDS.get(source, ()) if not os.environ.get(c)]
-    if missing:
-        return False, "credentials_missing"
+    
+    if source in AUTOMATED_SOURCES:
+        missing = [c for c in REAUTH_CREDS.get(source, ()) if not os.environ.get(c)]
+        if missing:
+            return False, "credentials_missing"
     return True, ""
 
 

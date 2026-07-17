@@ -64,7 +64,7 @@ class Orchestrator:
         try:
             from dotenv import load_dotenv
             load_dotenv(Path(__file__).parent.parent / ".env", override=False)
-            from src.secrets import fill_missing
+            from src.secret_store import fill_missing
             fill_missing()
         except Exception:
             pass
@@ -648,7 +648,7 @@ class Orchestrator:
                 console.print(f"    [dim]{reason}[/dim]")
                 blocked_sources.add(bj.get("source", ""))
                 # Persist so dashboard and future runs can surface the reason
-                self.state.record_apply_attempt(bj["job_id"], readiness, reason)
+                self.state.record_apply_attempt(bj["job_id"], readiness, reason, is_preflight=True)
                 await self._push_apply_attempt_to_cloud(bj["job_id"])
             # Emit deep-link notifications for each blocked source
             if not is_interactive and blocked_sources:
@@ -699,6 +699,16 @@ class Orchestrator:
                 continue
 
             src = job.get("source", "")
+            
+            # P3 preflight: dead-end URLs (e.g. Workday maintenance page)
+            url = job.get("url") or ""
+            if "community.workday.com/maintenance-page" in url or "workday.com/maintenance" in url:
+                console.print(f"[yellow]P3 preflight: skipping dead-end URL ({url})[/yellow]")
+                self.state.record_apply_attempt(job["job_id"], "needs-hydration", "Dead-end maintenance page URL", is_preflight=True)
+                await self._push_apply_attempt_to_cloud(job["job_id"])
+                skipped_count += 1
+                outcomes.append({"job": job, "status": "needs-hydration", "reason": "dead-end URL"})
+                continue
 
             # P3 session/auth preflight: if this job last failed on an auth blocker,
             # refresh the source session BEFORE attempting (once per source per run),
@@ -714,7 +724,7 @@ class Orchestrator:
                         f"[yellow]P3 preflight: skipping {src} — {_why} "
                         f"({'run prepare-sessions' if _why == 'needs_session_prep' else 'add credentials to .env'}).[/yellow]"
                     )
-                    self.state.record_apply_attempt(job["job_id"], _why, f"P3 preflight: {_why}")
+                    self.state.record_apply_attempt(job["job_id"], _why, f"P3 preflight: {_why}", is_preflight=True)
                     await self._push_apply_attempt_to_cloud(job["job_id"])
                     skipped_count += 1
                     outcomes.append({"job": job, "status": _why, "reason": f"P3 preflight: {_why}"})
@@ -728,7 +738,7 @@ class Orchestrator:
                     console.print(f"[yellow]P3 preflight reauth error for {src}:[/yellow] {_re}")
                 if not _refreshed:
                     console.print(f"[yellow]P3 preflight: {src} session not refreshed — skipping this job.[/yellow]")
-                    self.state.record_apply_attempt(job["job_id"], "reauth_failed", "P3 preflight reauth failed")
+                    self.state.record_apply_attempt(job["job_id"], "reauth_failed", "P3 preflight reauth failed", is_preflight=True)
                     await self._push_apply_attempt_to_cloud(job["job_id"])
                     skipped_count += 1
                     outcomes.append({"job": job, "status": "reauth_failed", "reason": "preflight reauth failed"})
@@ -738,7 +748,7 @@ class Orchestrator:
                 console.print(f"[red]Unknown source '{src}' — skipping.[/red]")
                 skipped_count += 1
                 outcomes.append({"job": job, "status": "skipped", "reason": f"unknown source {src}"})
-                self.state.record_apply_attempt(job["job_id"], "unknown_source", f"source '{src}' not in SOURCE_MAP")
+                self.state.record_apply_attempt(job["job_id"], "unknown_source", f"source '{src}' not in SOURCE_MAP", is_preflight=True)
                 await self._push_apply_attempt_to_cloud(job["job_id"])
                 continue
 

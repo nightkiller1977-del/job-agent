@@ -46,8 +46,7 @@ _EXPIRED_HOURS = 48
 # Sources that support background heartbeat visits
 _HEARTBEAT_SOURCES = {"linkedin", "indeed", "jobright"}
 
-# Sources that need a visible browser for the user to complete login
-_HUMAN_SOURCES = {"linkedin", "usajobs"}
+from .auth_constants import HUMAN_SOURCES as _HUMAN_SOURCES
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +95,8 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
         age_sec = time.time() - found.stat().st_mtime
         age_hours = age_sec / 3600
 
-        # Also peek inside for LinkedIn expiry timestamps if available
-        cookie_expiry_hours = _parse_linkedin_expiry(found) if src == "linkedin" else None
+        # Also peek inside for expiry timestamps if available
+        cookie_expiry_hours = _parse_cookie_expiry(found, src)
 
         is_expired = (age_hours >= _EXPIRED_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 0)
         is_stale = (age_hours >= _STALE_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 4)
@@ -105,13 +104,13 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
         if is_expired:
             status = "expired"
             if cookie_expiry_hours is not None and cookie_expiry_hours <= 0:
-                detail = f"LinkedIn cookies expired {abs(cookie_expiry_hours):.1f}h ago."
+                detail = f"Cookies expired {abs(cookie_expiry_hours):.1f}h ago."
             else:
                 detail = f"Session is {age_hours:.0f}h old — cookies very likely invalid."
         elif is_stale:
             status = "stale"
             if cookie_expiry_hours is not None and cookie_expiry_hours <= 4:
-                detail = f"LinkedIn cookies expire in {cookie_expiry_hours:.1f}h — heartbeat recommended."
+                detail = f"Cookies expire in {cookie_expiry_hours:.1f}h — heartbeat recommended."
             else:
                 detail = f"Session is {age_hours:.0f}h old — heartbeat recommended."
         else:
@@ -128,8 +127,8 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
     return results
 
 
-def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
-    """Extract the earliest LinkedIn cookie expiry from the session JSON.
+def _parse_cookie_expiry(session_path: Path, source: str) -> Optional[float]:
+    """Extract the earliest cookie expiry for the given source from the session JSON.
 
     Returns hours until expiry (can be negative if already expired),
     or None if parsing fails.
@@ -137,15 +136,25 @@ def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
     try:
         data = json.loads(session_path.read_text())
         cookies = data.get("cookies", [])
-        li_cookies = [c for c in cookies if "linkedin" in c.get("domain", "")]
-        if not li_cookies:
-            return None
+        
+        # Map source to target domains
+        domains = {
+            "linkedin": ["linkedin"],
+            "indeed": ["indeed"],
+            "jobright": ["jobright"],
+            "usajobs": ["usajobs"],
+        }.get(source, [source])
+        
+        target_cookies = [c for c in cookies if any(d in c.get("domain", "") for d in domains)]
+        if not target_cookies:
+            return -1.0 # Explicitly expired/missing
+            
         now = time.time()
-        expiries = [c["expires"] for c in li_cookies if c.get("expires", -1) > 0]
+        expiries = [c["expires"] for c in target_cookies if c.get("expires", -1) > 0]
         if not expiries:
             return None
         earliest = min(expiries)
-        return (earliest - now) / 3600  # hours until expiry (negative = already expired)
+        return (earliest - now) / 3600  # hours until expiry
     except Exception:
         return None
 

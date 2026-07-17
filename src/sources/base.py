@@ -95,10 +95,19 @@ class BaseScraper(ABC):
             )
         return self._mc
 
-    def _set_apply_outcome(self, status: str, detail: str) -> bool:
+    def _set_apply_outcome(self, status: str, detail: str, portal_family: str = "") -> bool:
         """Record why an apply attempt did or did not submit."""
-        self.last_apply_status = status
+        try:
+            from src.apply_outcome import ApplyOutcomeCode
+            if isinstance(status, ApplyOutcomeCode):
+                self.last_apply_status = status.value
+            else:
+                self.last_apply_status = ApplyOutcomeCode(status).value
+        except ValueError:
+            self.last_apply_status = status
+            
         self.last_apply_detail = detail
+        self.last_portal_family = portal_family
         return False
 
     @property
@@ -217,11 +226,17 @@ class BaseScraper(ABC):
             # Validate the file before trusting it — a partial write from a prior crash
             # would produce opaque Playwright errors inside new_context().
             try:
-                json.loads(self._session_export_path.read_text())
+                data = json.loads(self._session_export_path.read_text())
+                if "cookies" not in data or not isinstance(data["cookies"], list):
+                    raise ValueError("Missing or invalid 'cookies' array")
+                from src.session_watchdog import _parse_cookie_expiry
+                hours = _parse_cookie_expiry(self._session_export_path, self.name)
+                if hours is not None and hours <= 0:
+                    raise ValueError(f"Cookies expired {-hours:.1f}h ago")
                 use_chromium_fallback = True
-            except (json.JSONDecodeError, OSError) as exc:
+            except (json.JSONDecodeError, OSError, ValueError) as exc:
                 _log.warning(
-                    "%s: session export is corrupt (%s) — deleting and falling back to Chrome profile.",
+                    "%s: session export is corrupt or expired (%s) — deleting and falling back to Chrome profile.",
                     self.name, exc,
                 )
                 self._session_export_path.unlink(missing_ok=True)
@@ -422,7 +437,11 @@ class BaseScraper(ABC):
     def _make_job_id(self, url: str) -> str:
         """Generate a stable job_id from a URL."""
         import hashlib
-        return hashlib.md5(url.encode()).hexdigest()[:16]
+        from src.url_utils import normalize_external_url
+        norm_url = normalize_external_url(url)
+        if not norm_url:
+            norm_url = url.strip()
+        return hashlib.md5(norm_url.encode()).hexdigest()[:16]
 
     async def _upload_resume_if_prompted(self, page, resume_path: str) -> None:
         path = Path(resume_path).expanduser()
