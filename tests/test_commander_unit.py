@@ -172,6 +172,20 @@ class TestQuery:
             asyncio.run(commander.query("test"))
         assert "job application agent" in captured.get("system", "").lower()
 
+    def test_returns_degraded_message_when_model_cascade_raises(self, tmp_path, monkeypatch):
+        """query() must not let ModelCascadeError escape — main.py's `commander ask`
+        command has no try/except around this call, so an uncaught raise here
+        crashes the CLI instead of printing a graceful degraded message."""
+        from src.model_client import ModelCascadeError
+        commander, _ = _make_commander(tmp_path, monkeypatch)
+        with patch.object(
+            commander._model_client,
+            "complete",
+            new=AsyncMock(side_effect=ModelCascadeError("No model available: all tiers failed.")),
+        ):
+            result = asyncio.run(commander.query("How are things?"))
+        assert "no model available" in result.lower()
+
     def test_user_message_contains_context_and_question(self, tmp_path, monkeypatch):
         """query() includes context and the original question in the messages passed to ModelClient."""
         commander, _ = _make_commander(tmp_path, monkeypatch)

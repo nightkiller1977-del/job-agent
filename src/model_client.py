@@ -311,6 +311,11 @@ class SystemPerformanceGate:
 # ModelClient
 # ---------------------------------------------------------------------------
 
+class ModelCascadeError(Exception):
+    """Raised when all inference tiers in the cascade fail."""
+    pass
+
+
 class ModelClient:
     """Routes completions through Ollama first (resource-aware), Claude second, OpenAI last.
 
@@ -324,6 +329,13 @@ class ModelClient:
       5. Escalate to Claude (Anthropic) on failure or empty response
       6. Escalate to OpenAI as final fallback
     """
+
+    _semaphores: dict[str, asyncio.Semaphore] = {}
+
+    @classmethod
+    def reset_semaphores(cls) -> None:
+        """Reset all cached concurrency semaphores."""
+        cls._semaphores.clear()
 
     def __init__(
         self,
@@ -404,7 +416,7 @@ class ModelClient:
                 "Model cascade total failure",
                 f"All tiers failed (Ollama + Claude + OpenAI). Scoring degraded. Last error: {last_error}",
             )
-        return degraded
+        raise ModelCascadeError(degraded)
 
     async def get_ollama_models(self) -> dict:
         """Return {'pulled': [...], 'warm': [...]} from Ollama /api/tags and /api/ps."""
@@ -500,45 +512,57 @@ class ModelClient:
         system: str,
         max_tokens: int,
     ) -> str:
-        full_messages = list(messages)
-        if system:
-            full_messages = [{"role": "system", "content": system}] + full_messages
+        sem_key = self.ollama_base_url
 
-        # Adaptive context sizing: mirrors TASK_CTX_DEFAULTS in modelService.js
-        num_ctx = 8192 if max_tokens > 1024 else 4096
-        total_chars = sum(len(str(m.get("content", ""))) for m in full_messages)
-        estimated_tokens = total_chars // 3
-        if estimated_tokens > num_ctx:
-            num_ctx = min(32768, ((estimated_tokens // 4096) + 1) * 4096)
-
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": full_messages,
-            "options": {"temperature": 0.2, "num_ctx": num_ctx},
-            "keep_alive": "10m",
-            "stream": False,
-        }
-
-        max_attempts = 3
-        backoff_s = 1.5
-        last_exc: Exception | None = None
-
-        for attempt in range(1, max_attempts + 1):
+        # Lazily instantiate the semaphore for this scope
+        if sem_key not in self._semaphores:
             try:
-                async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
-                    resp = await client.post(f"{self.ollama_base_url}/api/chat", json=payload)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    return data.get("message", {}).get("content", "")
-            except Exception as exc:
-                last_exc = exc
-                if "404" in str(exc) or "Model not found" in str(exc):
-                    raise
-                if attempt < max_attempts:
-                    _log.warning("ModelClient: Ollama attempt %d failed (%s), retrying…", attempt, exc)
-                    await asyncio.sleep(backoff_s)
+                max_concurrency = max(1, int(os.getenv("OLLAMA_MAX_CONCURRENCY", "1")))
+            except (ValueError, TypeError):
+                max_concurrency = 1
+            self._semaphores[sem_key] = asyncio.Semaphore(max_concurrency)
 
-        raise last_exc  # type: ignore[misc]
+        sem = self._semaphores[sem_key]
+        async with sem:
+            full_messages = list(messages)
+            if system:
+                full_messages = [{"role": "system", "content": system}] + full_messages
+
+            # Adaptive context sizing: mirrors TASK_CTX_DEFAULTS in modelService.js
+            num_ctx = 8192 if max_tokens > 1024 else 4096
+            total_chars = sum(len(str(m.get("content", ""))) for m in full_messages)
+            estimated_tokens = total_chars // 3
+            if estimated_tokens > num_ctx:
+                num_ctx = min(32768, ((estimated_tokens // 4096) + 1) * 4096)
+
+            payload: dict[str, Any] = {
+                "model": model,
+                "messages": full_messages,
+                "options": {"temperature": 0.2, "num_ctx": num_ctx},
+                "keep_alive": "10m",
+                "stream": False,
+            }
+
+            max_attempts = 3
+            backoff_s = 1.5
+            last_exc: Exception | None = None
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+                        resp = await client.post(f"{self.ollama_base_url}/api/chat", json=payload)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        return data.get("message", {}).get("content", "")
+                except Exception as exc:
+                    last_exc = exc
+                    if "404" in str(exc) or "Model not found" in str(exc):
+                        raise
+                    if attempt < max_attempts:
+                        _log.warning("ModelClient: Ollama attempt %d failed (%s), retrying…", attempt, exc)
+                        await asyncio.sleep(backoff_s)
+
+            raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------
     # Claude (Anthropic)
@@ -560,7 +584,7 @@ class ModelClient:
         return ""
 
     # ------------------------------------------------------------------
-    # OpenAI / Codex
+    # OpenAI
     # ------------------------------------------------------------------
 
     async def _call_openai(self, messages: list[dict], system: str, max_tokens: int) -> str:

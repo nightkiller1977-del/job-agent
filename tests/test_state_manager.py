@@ -1,6 +1,7 @@
 import pytest
 import sqlite3
 import tempfile
+import json
 from pathlib import Path
 from src.state_manager import StateManager
 
@@ -91,3 +92,50 @@ def test_init_db_removes_existing_expired_jobs(temp_db):
     # Verify expired job was deleted on init, but active job remains
     assert state.get_job("exp1") is None
     assert state.get_job("act1") is not None
+
+def test_record_apply_attempt_merges_metadata_without_truncating(temp_db):
+    state = StateManager(db_path=temp_db)
+    state.upsert_job({"job_id": "meta1", "source": "linkedin", "title": "Role"})
+    long_detail = "x" * 700
+    metrics = {
+        "apply_validation_metrics": {
+            "failure_type": "keyword_coverage",
+            "detail": long_detail,
+        }
+    }
+
+    state.record_apply_attempt("meta1", "keyword_coverage_failed", "short", metadata=metrics)
+
+    extra = json.loads(state.get_job("meta1")["extra_json"])
+    assert extra["apply_last_detail"] == "short"
+    assert extra["apply_validation_metrics"]["detail"] == long_detail
+
+def test_reset_failed_keyword_jobs_clears_circuit_and_attempt_metadata(temp_db):
+    state = StateManager(db_path=temp_db)
+    state.upsert_job({"job_id": "kw1", "source": "linkedin", "title": "Role", "status": "approved"})
+    state.record_apply_attempt(
+        "kw1",
+        "keyword_coverage_failed",
+        "ATS check failed: Keyword coverage low",
+        metadata={"apply_validation_metrics": {"failure_type": "keyword_coverage"}},
+    )
+    state.flag_circuit_break("kw1", "needs_human", "cap reached")
+
+    stats = state.reset_failed_keyword_jobs(dry_run=False)
+
+    assert stats == {"matched": 1, "reset": 1, "unmatched": 0}
+    extra = json.loads(state.get_job("kw1")["extra_json"] or "{}")
+    for key in (
+        "apply_last_status",
+        "apply_attempt_count",
+        "apply_last_detail",
+        "submitted",
+        "blocker_class",
+        "circuit_broken",
+        "circuit_class",
+        "circuit_reason",
+        "circuit_broken_at",
+        "apply_last_attempt",
+        "apply_validation_metrics",
+    ):
+        assert key not in extra
