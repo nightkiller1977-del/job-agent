@@ -22,13 +22,14 @@ class FakeElement:
 
 
 class FakePage:
-    def __init__(self, present_selectors, evaluate_result=None):
+    def __init__(self, present_selectors, evaluate_result=None, receipt_result=None):
         self._present = set(present_selectors)
         self.filled = {}
         self.clicked = []
         self.uploaded = {}
         self.url = "https://boards.greenhouse.io/acme/jobs/1"
         self._evaluate_result = evaluate_result
+        self._receipt_result = receipt_result  # signal returned by the receipt check
 
     async def query_selector(self, sel):
         return FakeElement(self, sel) if sel in self._present else None
@@ -39,11 +40,14 @@ class FakePage:
         self.uploaded[sel] = path
 
     async def evaluate(self, script):
-        # First evaluate call in apply() is blocker detection; questions call second.
+        # blocker detection (captcha), questions (label), and the post-submit
+        # receipt check (thank-you copy) are distinguished by script signature.
         if "captcha" in script:
             return self._evaluate_result if not isinstance(self._evaluate_result, list) else None
         if "label" in script:
             return self._evaluate_result if isinstance(self._evaluate_result, list) else []
+        if "thank you for" in script:
+            return self._receipt_result
         return None
 
 
@@ -91,14 +95,29 @@ async def test_fills_identity_and_withholds_submit_by_default():
 
 
 @pytest.mark.asyncio
-async def test_submits_when_auto_submit_and_present():
+async def test_click_without_receipt_is_unverified_not_applied():
+    """Phase 0.1: a submit click with no confirmation must NOT count as applied."""
     page = FakePage(present_selectors={
         "input[name*='email' i], input[id*='email' i]",
         "#submit_app",
-    }, evaluate_result=None)
+    }, evaluate_result=None, receipt_result=None)
     res = await GenericAtsAdapter().apply(_ctx(page, auto_submit=True))
-    assert res.submitted is True and res.status == "applied"
+    assert "#submit_app" in page.clicked            # it did click submit
+    assert res.submitted is False                    # but no receipt -> not success
+    assert res.verified is False
+    assert res.status == "submission_unverified"
+
+
+@pytest.mark.asyncio
+async def test_applied_only_with_verified_receipt():
+    """Phase 0.1: applied requires an observed receipt/confirmation."""
+    page = FakePage(present_selectors={
+        "input[name*='email' i], input[id*='email' i]",
+        "#submit_app",
+    }, evaluate_result=None, receipt_result="t:thank you for applying")
+    res = await GenericAtsAdapter().apply(_ctx(page, auto_submit=True))
     assert "#submit_app" in page.clicked
+    assert res.submitted is True and res.verified is True and res.status == "applied"
 
 
 @pytest.mark.asyncio
