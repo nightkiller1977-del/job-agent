@@ -54,7 +54,25 @@ CREATE TABLE IF NOT EXISTS archived_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_archived_at ON archived_jobs(archived_at);
+
+CREATE TABLE IF NOT EXISTS apply_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    run_id TEXT,
+    source TEXT,
+    event_type TEXT NOT NULL,
+    status TEXT,
+    blocker_class TEXT,
+    occurred_at TEXT NOT NULL,
+    submission_verified INTEGER DEFAULT 0,
+    detail TEXT,
+    blocker_fingerprint TEXT,
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_apply_events_job ON apply_events(job_id);
+CREATE INDEX IF NOT EXISTS idx_apply_events_type ON apply_events(event_type);
 """
+
 
 
 class StateManager:
@@ -269,6 +287,43 @@ class StateManager:
                     job_id,
                 ),
             )
+        if job.get("url"):
+            # URL changed/hydrated, unblock it if it was permanently blocked
+            self.clear_circuit_state(job_id)
+
+    def record_apply_event(
+        self,
+        job_id: str,
+        event_type: str,
+        source: str = "",
+        status: str = "",
+        blocker_class: str = "",
+        submission_verified: bool = False,
+        detail: str = "",
+        blocker_fingerprint: str = "",
+        run_id: str = "",
+    ) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO apply_events
+                (job_id, run_id, source, event_type, status, blocker_class, occurred_at, submission_verified, detail, blocker_fingerprint)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    run_id,
+                    source,
+                    event_type,
+                    status,
+                    blocker_class,
+                    now,
+                    int(submission_verified),
+                    (detail or "")[:500],
+                    blocker_fingerprint,
+                ),
+            )
 
     def record_apply_attempt(
         self,
@@ -276,12 +331,37 @@ class StateManager:
         status: str,
         detail: str = "",
         metadata: dict | None = None,
+        is_preflight: bool = False,
+        blocker_fingerprint: str = "",
+        run_id: str = "",
     ) -> None:
-        """Persist the most recent apply attempt outcome into extra_json.
-        Does NOT change the job status field. Increments attempt_count each call.
-        Callers: orchestrator.apply_approved() after every attempt, success or block.
+        """Persist the most recent apply attempt outcome into extra_json and apply_events.
+        Does NOT change the job status field.
         """
         now = datetime.utcnow().isoformat()
+        from .blocker_classifier import classify
+        bclass = classify(status).value
+
+        is_applied = (str(status).strip().lower() == "applied")
+        if is_applied:
+            event_type = "submission_verified"
+        elif is_preflight:
+            event_type = "preflight_blocked"
+        else:
+            event_type = "attempt_failed"
+            
+        self.record_apply_event(
+            job_id=job_id,
+            event_type=event_type,
+            source=metadata.get("source", "") if metadata else "",
+            status=status,
+            blocker_class=bclass,
+            submission_verified=is_applied,
+            detail=detail,
+            blocker_fingerprint=blocker_fingerprint,
+            run_id=run_id,
+        )
+
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
@@ -292,18 +372,28 @@ class StateManager:
                     extra = json.loads(row["extra_json"])
                 except Exception:
                     pass
+                    
             extra["apply_last_attempt"] = now
             extra["apply_last_status"]  = status
             extra["apply_last_detail"]  = (detail or "")[:500]
-            extra["apply_attempt_count"] = extra.get("apply_attempt_count", 0) + 1
-            # P1 instrumentation: a durable success flag on EVERY attempt (success or
-            # failure) so success-rate is computable. Previously only rich analytics
-            # were recorded, and only on success — leaving `submitted` null everywhere.
-            extra["submitted"] = str(status).strip().lower() == "applied"
-            # P2: stamp the control-flow class so the circuit breaker and dashboards
-            # can reason about this outcome without re-deriving it.
-            from .blocker_classifier import classify
-            extra["blocker_class"] = classify(status).value
+            extra["blocker_class"] = bclass
+            
+            if not is_preflight:
+                extra["lifetime_attempt_count"] = extra.get("lifetime_attempt_count", 0) + 1
+                
+            current_fp = extra.get("blocker_fingerprint", "")
+            if is_applied or (blocker_fingerprint and blocker_fingerprint != current_fp):
+                extra["consecutive_failure_count"] = 0
+                extra["circuit_open"] = False
+                extra["circuit_broken"] = False
+            else:
+                if not is_applied and not is_preflight:
+                    extra["consecutive_failure_count"] = extra.get("consecutive_failure_count", 0) + 1
+
+            if blocker_fingerprint:
+                extra["blocker_fingerprint"] = blocker_fingerprint
+
+            extra["submitted"] = is_applied
             if metadata:
                 extra.update(metadata)
             conn.execute(
@@ -335,6 +425,63 @@ class StateManager:
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
                 (json.dumps(extra), job_id),
             )
+
+    def clear_circuit_state(self, job_id: str) -> None:
+        """Clear circuit breaker and streak counts so a job can be re-attempted.
+        Called when underlying data changes (e.g. URL hydrated, profile answered).
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if not row or not row["extra_json"]:
+                return
+            try:
+                extra = json.loads(row["extra_json"])
+            except Exception:
+                return
+            keys_to_remove = [
+                "circuit_broken", "circuit_class", "circuit_reason", "circuit_broken_at",
+                "apply_last_status", "blocker_class", "consecutive_failure_count", "circuit_open"
+            ]
+            changed = False
+            for k in keys_to_remove:
+                if k in extra:
+                    del extra[k]
+                    changed = True
+            if changed:
+                conn.execute(
+                    "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                    (json.dumps(extra), job_id)
+                )
+
+    def clear_circuit_state_for_source(self, source: str, blocker_classes: list[str]) -> None:
+        """Clear circuit breaker for all jobs of a source that failed with specific blocker classes.
+        Used when a session is refreshed to unblock all AUTH_REQUIRED jobs.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, extra_json FROM jobs WHERE source = ? AND status = 'approved'",
+                (source,)
+            ).fetchall()
+            for row in rows:
+                if not row["extra_json"]:
+                    continue
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    continue
+                if extra.get("blocker_class") in blocker_classes or extra.get("circuit_class") in blocker_classes:
+                    keys_to_remove = [
+                        "circuit_broken", "circuit_class", "circuit_reason", "circuit_broken_at",
+                        "apply_last_status", "blocker_class", "consecutive_failure_count", "circuit_open"
+                    ]
+                    for k in keys_to_remove:
+                        extra.pop(k, None)
+                    conn.execute(
+                        "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                        (json.dumps(extra), row["job_id"])
+                    )
 
     def record_application_analytics(self, job_id: str, analytics: dict) -> None:
         """Merge analytics dict (atsScore, resumeVersion, applicationMethod, etc.) into extra_json.
@@ -451,53 +598,67 @@ class StateManager:
         return "other"
 
     def get_apply_funnel(self) -> dict:
-        """Compute the apply funnel and success rate from persisted extra_json.
-
-        Reads what P1 records on every attempt (`apply_last_status`, `submitted`,
-        `apply_attempt_count`). Pure read; safe to call anytime. Returns a dict:
-        totals, funnel counts, attempt_success_rate, failure histogram + clusters,
-        per-source breakdown, and wasted-retry count.
+        """Compute the apply funnel and success rate from append-only events.
         """
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT source, status, extra_json FROM jobs"
+            job_rows = conn.execute("SELECT status FROM jobs").fetchall()
+            events = conn.execute(
+                """
+                SELECT job_id, source, event_type, status, blocker_class 
+                FROM apply_events
+                ORDER BY occurred_at ASC
+                """
             ).fetchall()
 
-        total = len(rows)
+        total = len(job_rows)
         status_counts: dict = {}
+        for r in job_rows:
+            status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+
         attempts = 0
         submitted = 0
         wasted_retries = 0
         failure_hist: dict = {}
         cluster_hist: dict = {}
         per_source: dict = {}
-
-        for r in rows:
-            status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
-            try:
-                extra = json.loads(r["extra_json"]) if r["extra_json"] else {}
-            except Exception:
-                extra = {}
-            last = extra.get("apply_last_status")
-            if not last:
-                continue  # no apply attempt recorded for this job
-
-            attempts += 1
-            was_submitted = bool(extra.get("submitted")) or str(last).lower() == "applied"
-            src = r["source"] or "unknown"
+        
+        job_events = {}
+        for e in events:
+            job_events.setdefault(e["job_id"], []).append(e)
+            
+        for jid, evs in job_events.items():
+            browser_attempts = [e for e in evs if e["event_type"] == "browser_attempt_started"]
+            
+            if not browser_attempts and not evs:
+                continue
+                
+            src = evs[0]["source"] or "unknown"
             ps = per_source.setdefault(src, {"attempts": 0, "submitted": 0})
-            ps["attempts"] += 1
-
-            if was_submitted:
+            
+            is_submitted = any(e["event_type"] == "submission_verified" for e in evs)
+            
+            job_attempts = len(browser_attempts)
+            if job_attempts == 0 and any(e["event_type"] == "attempt_failed" for e in evs):
+                job_attempts = 1
+            
+            attempts += job_attempts
+            ps["attempts"] += job_attempts
+            
+            if is_submitted:
                 submitted += 1
                 ps["submitted"] += 1
             else:
-                failure_hist[last] = failure_hist.get(last, 0) + 1
-                cluster = self._cluster_for(last)
-                cluster_hist[cluster] = cluster_hist.get(cluster, 0) + 1
-                # Attempts beyond the first on a job that never succeeded = wasted effort.
-                wasted_retries += max(0, int(extra.get("apply_attempt_count", 1)) - 1)
-
+                failed_events = [e for e in evs if e["event_type"] == "attempt_failed"]
+                if failed_events:
+                    last_fail = failed_events[-1]
+                    last_status = last_fail["status"]
+                    failure_hist[last_status] = failure_hist.get(last_status, 0) + 1
+                    
+                    cluster = self._cluster_for(last_status)
+                    cluster_hist[cluster] = cluster_hist.get(cluster, 0) + 1
+                    
+                wasted_retries += max(0, job_attempts - 1)
+                
         for ps in per_source.values():
             ps["rate"] = (ps["submitted"] / ps["attempts"]) if ps["attempts"] else 0.0
 

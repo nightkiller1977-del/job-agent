@@ -1,3 +1,4 @@
+from src.apply_outcome import ApplyOutcomeCode
 """
 Indeed scraper.
 Navigates Indeed's recommended / personalized job feed and extracts listings.
@@ -386,9 +387,7 @@ class IndeedScraper(BaseScraper):
             await self._close_browser()
 
         if not ext_url:
-            return self._set_apply_outcome(
-                "indeed_easy_apply_or_no_ats",
-                f"No external company ATS URL found at {url}. "
+            return self._set_apply_outcome(ApplyOutcomeCode.INDEED_EASY_APPLY_OR_NO_ATS, f"No external company ATS URL found at {url}. "
                 "This may be an Indeed Easy Apply job — open it manually to apply.",
             )
 
