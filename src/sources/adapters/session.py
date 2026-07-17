@@ -83,7 +83,8 @@ class ExternalApplySession(BaseScraper):
     def __init__(self, config, registry: AtsAdapterRegistry | None = None,
                  policy: SubmissionPolicy | None = None,
                  ledger: SubmissionLedger | None = None,
-                 run_log: RunLog | None = None):
+                 run_log: RunLog | None = None,
+                 dispatcher=None):
         super().__init__(config)
         self.registry = registry or self._create_default_registry()
         # Optional policy override; when None a per-call AutoSubmitPolicy is used so
@@ -92,6 +93,16 @@ class ExternalApplySession(BaseScraper):
         self.ledger = ledger if ledger is not None else SubmissionLedger()
         # One run_id spans all applies on this session instance (Phase 2a).
         self.run_log = run_log or RunLog(agent="external_apply")
+        # Optional Phase 2b notification dispatcher; None = no notifications.
+        self.dispatcher = dispatcher
+
+    def _maybe_notify(self, event: str, outcome: str, title: str, message: str = "") -> None:
+        if self.dispatcher is None:
+            return
+        try:  # fail-open at the call site too
+            self.dispatcher.dispatch_event(event, outcome, title, message)
+        except Exception:
+            pass
 
     def _create_default_registry(self) -> AtsAdapterRegistry:
         from .greenhouse import GreenhouseAdapter
@@ -149,6 +160,9 @@ class ExternalApplySession(BaseScraper):
             stale = self.ledger.is_stale_in_progress(key)
             _event("submit_in_progress_blocked", AttemptPhase.UNKNOWN,
                    outcome="submit_in_progress", stale=stale)
+            self._maybe_notify("submit_in_progress_blocked", "submit_in_progress",
+                               f"{vendor}: apply needs attention",
+                               "A prior submit is unresolved — review before retrying.")
             return AtsApplyResult.blocked(
                 "submit_in_progress",
                 f"a prior submit for {key} is unresolved "
@@ -174,6 +188,9 @@ class ExternalApplySession(BaseScraper):
             lock = ProfileLock(self._profile_dir).acquire()
         except ProfileLockError as e:
             _event("profile_locked", AttemptPhase.FAILED, outcome="profile_locked")
+            self._maybe_notify("profile_locked", "profile_locked",
+                               f"{vendor}: apply blocked",
+                               "Another Chrome holds the profile — close it and retry.")
             return AtsApplyResult.blocked(
                 "profile_locked", str(e), attempt_id=attempt_id,
             )
@@ -236,6 +253,8 @@ class ExternalApplySession(BaseScraper):
                 else:
                     self.ledger.clear(key)
             _event("attempt_finished", _phase_for(res), outcome=res.status, verified=res.verified)
+            self._maybe_notify("attempt_finished", res.status,
+                               f"{vendor}: {res.status}", res.detail)
             return res
         except Exception as exc:
             # a browser/adapter crash must still close the attempt in the audit stream,
