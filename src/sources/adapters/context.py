@@ -27,8 +27,9 @@ class AtsApplyContext:
     resume_path: Optional[str] = None
     cover_letter_path: Optional[str] = None
     auto_submit: bool = False
-    policy: Any = None                 # PolicyGate (P5b/P6); no-op until wired
+    policy: Any = None                 # SubmissionPolicy (Phase 0.3); set by the session
     url: str = ""                      # convenience mirror of page.url at pick time
+    attempt_id: str = ""               # Phase 0.2/0.3: per-attempt id for idempotency + auth
     extra: dict = field(default_factory=dict)
 
 
@@ -36,16 +37,38 @@ class AtsApplyContext:
 class AtsApplyResult:
     """Outcome of an adapter's apply(). `status` uses the existing state-manager
     vocabulary (e.g. "applied", "submit_not_found", "workday_session_expired")
-    so it flows straight into record_apply_attempt + the P2 classifier."""
+    so it flows straight into record_apply_attempt + the P2 classifier.
+
+    Submission-truth invariant (Phase 0.1): `submitted` is True ONLY when a
+    receipt was verified. A submit *click* with no confirmation is NOT `submitted`
+    — it is `unverified()` (status "submission_unverified"), which never counts as
+    success. `verified` records whether a receipt check actually passed.
+    """
     submitted: bool = False
     status: str = "blocked"
     detail: str = ""
+    verified: bool = False
+    attempt_id: str = ""
     analytics: dict = field(default_factory=dict)
 
     @classmethod
     def ok(cls, detail: str = "Application submitted.", **analytics) -> "AtsApplyResult":
-        return cls(submitted=True, status="applied", detail=detail, analytics=analytics)
+        """Verified success: a receipt/confirmation was observed. Only use after a
+        receipt check passes (see adapters.receipt.verify_receipt)."""
+        return cls(submitted=True, status="applied", detail=detail, verified=True,
+                   analytics=analytics)
+
+    @classmethod
+    def unverified(cls, detail: str = "Submit clicked but no receipt confirmation.",
+                   **analytics) -> "AtsApplyResult":
+        """Submit was attempted but the application could not be confirmed. Ambiguous
+        post-click state — never treated as success; must NOT be blindly re-submitted
+        (the idempotency ledger reconciles it)."""
+        from ...apply_outcome import ApplyOutcomeCode
+        return cls(submitted=False, status=ApplyOutcomeCode.SUBMISSION_UNVERIFIED.value,
+                   detail=detail, verified=False, analytics=analytics)
 
     @classmethod
     def blocked(cls, status: str, detail: str = "", **analytics) -> "AtsApplyResult":
-        return cls(submitted=False, status=status, detail=detail, analytics=analytics)
+        return cls(submitted=False, status=status, detail=detail, verified=False,
+                   analytics=analytics)
