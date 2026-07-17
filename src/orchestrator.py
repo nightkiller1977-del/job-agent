@@ -27,7 +27,7 @@ import logging
 from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
-from .resume_helper import ATSReadabilityError
+from .resume_helper import ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
 from .blocker_classifier import should_attempt, classify, needs_preflight_reauth, preflight_reauth_viable
 from .session_watchdog import preflight_session_check
 
@@ -451,6 +451,21 @@ class Orchestrator:
         # inline and records a specific block reason for the dashboard.
         return ("ready", "")
 
+    def _apply_validation_metadata(self, scraper=None, exc: Exception | None = None) -> dict:
+        metrics = getattr(scraper, "_apply_validation_metrics", None) if scraper else None
+        if not metrics and exc is not None:
+            result = getattr(exc, "result", None)
+            if result:
+                metrics = {
+                    "passed": result.passed,
+                    "coverage": result.coverage,
+                    "matched_keywords": result.matched_keywords,
+                    "unmatched_keywords": result.unmatched_keywords,
+                    "failure_type": result.failure_type or "",
+                    "detail": result.detail or str(exc),
+                }
+        return {"apply_validation_metrics": metrics} if metrics else {}
+
     async def preflight_approved(self, source: Optional[str] = None, company: Optional[str] = None) -> None:
         """Pull cloud-approved jobs and print production-readiness blockers."""
         await self.load_credentials_from_dashboard()
@@ -732,7 +747,12 @@ class Orchestrator:
                 result = await scraper.apply(job, auto_submit=auto_submit)
                 if result:
                     self.state.set_status(job["job_id"], "applied")
-                    self.state.record_apply_attempt(job["job_id"], "applied", "Application submitted successfully.")
+                    self.state.record_apply_attempt(
+                        job["job_id"],
+                        "applied",
+                        "Application submitted successfully.",
+                        metadata=self._apply_validation_metadata(scraper),
+                    )
                     # Persist any analytics the scraper collected (atsScore, resumeVersion, etc.)
                     _analytics = getattr(scraper, "_apply_analytics", None)
                     if _analytics:
@@ -749,7 +769,12 @@ class Orchestrator:
                     if reason:
                         console.print(f"[dim]{reason}[/dim]")
                     # Persist the specific block reason
-                    self.state.record_apply_attempt(job["job_id"], code, reason)
+                    self.state.record_apply_attempt(
+                        job["job_id"],
+                        code,
+                        reason,
+                        metadata=self._apply_validation_metadata(scraper),
+                    )
                     await self._push_apply_attempt_to_cloud(job["job_id"])
                     skipped_count += 1
                     outcomes.append({"job": job, "status": code, "reason": reason})
@@ -780,7 +805,12 @@ class Orchestrator:
                         result = await scraper2.apply(job, auto_submit=auto_submit)
                         if result:
                             self.state.set_status(job["job_id"], "applied")
-                            self.state.record_apply_attempt(job["job_id"], "applied", "Submitted after reauth.")
+                            self.state.record_apply_attempt(
+                                job["job_id"],
+                                "applied",
+                                "Submitted after reauth.",
+                                metadata=self._apply_validation_metadata(scraper2),
+                            )
                             applied_count += 1
                             outcomes.append({"job": job, "status": "applied", "reason": "submitted after reauth"})
                             console.print("[green]Applied after reauth! Status updated.[/green]")
@@ -789,7 +819,12 @@ class Orchestrator:
                         else:
                             reason = getattr(scraper2, "last_apply_detail", "") or "not submitted"
                             code   = getattr(scraper2, "last_apply_status",  "") or "blocked"
-                            self.state.record_apply_attempt(job["job_id"], code, reason)
+                            self.state.record_apply_attempt(
+                                job["job_id"],
+                                code,
+                                reason,
+                                metadata=self._apply_validation_metadata(scraper2),
+                            )
                             await self._push_apply_attempt_to_cloud(job["job_id"])
                             skipped_count += 1
                             outcomes.append({"job": job, "status": code, "reason": reason})
@@ -810,13 +845,19 @@ class Orchestrator:
                 outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
                 await self._push_status_to_cloud(job["job_id"], "expired")
             except ATSReadabilityError as exc:
-                _is_unreadable = "no extractable text layer" in str(exc).lower() or "failed to parse" in str(exc).lower()
-                console.print(f"[red]ATS Readability Failure for {job.get('title')} (ATS_FAILURE):[/red] {exc}")
-                self.state.record_apply_attempt(job["job_id"], "ats_failure", str(exc)[:400])
+                _is_unreadable = isinstance(exc, PDFTextLayerError) or "no extractable text layer" in str(exc).lower() or "failed to parse" in str(exc).lower()
+                status = "keyword_coverage_failed" if isinstance(exc, KeywordCoverageError) else "pdf_text_layer_failed" if isinstance(exc, PDFTextLayerError) else "ats_failure"
+                console.print(f"[red]ATS Readability Failure for {job.get('title')} ({status}):[/red] {exc}")
+                self.state.record_apply_attempt(
+                    job["job_id"],
+                    status,
+                    str(exc)[:400],
+                    metadata=self._apply_validation_metadata(scraper, exc),
+                )
                 await self._push_apply_attempt_to_cloud(job["job_id"])
-                notify_error("ATS Readability Failure (ATS_FAILURE)", f"Job ID {job.get('job_id')} failed ATS check: {exc}")
+                notify_error("ATS Readability Failure", f"Job ID {job.get('job_id')} failed ATS check ({status}): {exc}")
                 failed_count += 1
-                outcomes.append({"job": job, "status": "ats_failure", "reason": str(exc)})
+                outcomes.append({"job": job, "status": status, "reason": str(exc)})
                 if _is_unreadable:
                     # Unreadable PDF (image-only or corrupt) — pause the whole loop; self-healing required.
                     console.print("[bold yellow]Pausing application loop: PDF is unreadable. Self-healing/repair required.[/bold yellow]")
@@ -901,6 +942,19 @@ class Orchestrator:
             console.print(f"[yellow]Would archive {len(pruned)} job(s). Run without --dry-run to apply.[/yellow]")
 
         return {"pruned": pruned, "total": len(pruned)}
+
+    def reset_failures(self, reason: str, dry_run: bool = False) -> None:
+        """Reset selected failed approved jobs so the apply circuit can retry them."""
+        if reason != "keyword-validation":
+            console.print(f"[red]Unsupported reset reason:[/red] {reason}")
+            return
+        stats = self.state.reset_failed_keyword_jobs(dry_run=dry_run)
+        mode = "would reset" if dry_run else "reset"
+        console.print(
+            f"[green]Failure reset complete:[/green] matched={stats['matched']} "
+            f"{mode}={stats['reset'] if not dry_run else stats['matched']} "
+            f"unmatched={stats['unmatched']}"
+        )
 
     async def _pull_approved_from_cloud(self) -> None:
         """Fetch jobs marked 'approved' on the cloud dashboard and upsert them
