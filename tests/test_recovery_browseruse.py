@@ -3,6 +3,7 @@ import json
 from unittest.mock import patch, AsyncMock, MagicMock
 from src.sources.adapters.context import AtsApplyContext, AtsApplyResult
 from src.sources.adapters.recovery_browseruse import BrowserUseRecovery
+from src.sources.adapters.policy import AutoSubmitPolicy, DenyAllPolicy
 
 # Mark as async tests
 pytestmark = pytest.mark.asyncio
@@ -19,7 +20,8 @@ async def test_recovery_skills_replay(mock_mc_class, tmp_path):
         job={"url": "https://jobs.lever.co/mycompany/123"},
         profile={},
         resume_path="/tmp/resume.pdf",
-        url="https://jobs.lever.co/mycompany/123"
+        url="https://jobs.lever.co/mycompany/123",
+        auto_submit=True, attempt_id="t1", policy=AutoSubmitPolicy(allow=True),
     )
     
     recovery = BrowserUseRecovery()
@@ -68,17 +70,19 @@ async def test_recovery_llm_loop(mock_mc_class, tmp_path):
         job={"url": "https://boards.greenhouse.io/myco/jobs/1"},
         profile={"personal_info": {"email": "test@example.com"}},
         resume_path=None,
-        url="https://boards.greenhouse.io/myco/jobs/1"
+        url="https://boards.greenhouse.io/myco/jobs/1",
+        auto_submit=True, attempt_id="t2", policy=AutoSubmitPolicy(allow=True),
     )
-    
+
     recovery = BrowserUseRecovery()
     recovery.SKILLS_FILE = tmp_path / "skills.json"
-    
+
     res = await recovery.apply(ctx)
-    
+
     # Verify fill was called
     mock_page.fill.assert_called_once_with("input#email", "test@example.com")
-    assert res.submitted is True
+    # Phase 0.1: LLM "done" without a verified receipt is readiness, NOT a submission.
+    assert res.submitted is False
     assert res.status == "review_ready"
     
     # Verify skills were saved dynamically
@@ -86,3 +90,26 @@ async def test_recovery_llm_loop(mock_mc_class, tmp_path):
     assert len(skills) == 1
     assert skills[0]["action"] == "fill"
     assert skills[0]["selector"] == "input#email"
+
+
+@patch("src.sources.adapters.recovery_browseruse.ModelClient")
+async def test_recovery_refuses_without_policy_authorization(mock_mc_class, tmp_path):
+    """Phase 0.3: the LLM agent must not run (and cannot submit) unless the policy
+    authorizes submission."""
+    mock_mc = MagicMock()
+    mock_mc.complete = AsyncMock()
+    mock_mc_class.return_value = mock_mc
+    mock_page = MagicMock()
+    mock_page.url = "https://boards.greenhouse.io/myco/jobs/1"
+
+    ctx = AtsApplyContext(
+        page=mock_page,
+        job={"url": "https://boards.greenhouse.io/myco/jobs/1"},
+        profile={},
+        url="https://boards.greenhouse.io/myco/jobs/1",
+        auto_submit=True, attempt_id="t3", policy=DenyAllPolicy(),
+    )
+    res = await BrowserUseRecovery().apply(ctx)
+    assert res.submitted is False
+    assert res.status == "submit_denied_by_policy"
+    mock_mc.complete.assert_not_called()   # never even asked the LLM for an action
