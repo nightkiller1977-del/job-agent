@@ -1,4 +1,3 @@
-from src.apply_outcome import ApplyOutcomeCode
 """
 Jobright.ai scraper.
 Navigates to the matched/recommended jobs section and extracts listings.
@@ -23,6 +22,7 @@ from src.resume_helper import ResumeFieldFixer, resolve_resume_path, check_ats_r
 from src.model_client import ModelCascadeError
 from src.latex_compiler import LaTeXCompiler
 from src.telemetry import model_span
+from src.apply_outcome import ApplyOutcomeCode
 
 console = Console()
 
@@ -3730,7 +3730,7 @@ class JobrightScraper(BaseScraper):
                     "and the Jobright session is logged in, then re-run."
                 )
 
-        if not submit_descriptor and (auto_submit or not (import sys; sys.stdin and sys.stdin.isatty())):
+        if not submit_descriptor and (auto_submit or not (sys.stdin and sys.stdin.isatty())):
             from ..console import console
             console.print(
                 "[yellow]Jobright: Submit button not found and this run is non-interactive — "
