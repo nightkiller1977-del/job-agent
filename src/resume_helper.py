@@ -395,6 +395,19 @@ def check_ats_readability(
         s_clean = re.sub(r"[\-_/\\,.;:]", " ", s_clean)
         return " ".join(s_clean.split())
 
+    def contains_keyword(keyword: str, haystack: str) -> bool:
+        if not keyword:
+            return False
+        if " " in keyword:
+            return keyword in haystack
+        pattern = ""
+        if keyword[0].isalnum() or keyword[0] == "_":
+            pattern += r"(?<!\w)"
+        pattern += re.escape(keyword)
+        if keyword[-1].isalnum() or keyword[-1] == "_":
+            pattern += r"(?!\w)"
+        return bool(re.search(pattern, haystack))
+
     text_norm = normalize_str(normalized_text)
 
     matched_keywords = []
@@ -404,16 +417,7 @@ def check_ats_readability(
         kw_clean = keyword.lower().strip()
         kw_norm = normalize_str(kw_clean)
         
-        found = False
-        if len(kw_clean) <= 4:
-            # Use word boundaries for short words to avoid false positive substring matches
-            if re.search(r"\b" + re.escape(kw_clean) + r"\b", normalized_text):
-                found = True
-            elif re.search(r"\b" + re.escape(kw_norm) + r"\b", text_norm):
-                found = True
-        else:
-            if kw_clean in normalized_text or kw_norm in text_norm:
-                found = True
+        found = contains_keyword(kw_clean, normalized_text) or contains_keyword(kw_norm, text_norm)
 
         if found:
             matched_keywords.append(keyword)
