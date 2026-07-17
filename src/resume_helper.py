@@ -389,10 +389,14 @@ def check_ats_readability(
 
     normalized_text = text.lower()
     
-    # Text normalization for robust punctuation-invariant matching
+    # Text normalization for robust punctuation-invariant matching.
+    # Only collapse separators that sit between two word characters — a
+    # leading/trailing symbol (e.g. the "." in ".NET") is semantically part
+    # of the token, and stripping it would collapse it into a common word
+    # ("net") that can false-positive match unrelated text.
     def normalize_str(s: str) -> str:
         s_clean = s.lower()
-        s_clean = re.sub(r"[\-_/\\,.;:]", " ", s_clean)
+        s_clean = re.sub(r"(?<=\w)[\-_/\\,.;:](?=\w)", " ", s_clean)
         return " ".join(s_clean.split())
 
     def contains_keyword(keyword: str, haystack: str) -> bool:

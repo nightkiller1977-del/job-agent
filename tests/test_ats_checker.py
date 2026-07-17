@@ -89,3 +89,21 @@ def test_ats_checker_does_not_match_long_keywords_inside_other_words():
             check_ats_readability("dummy_resume.pdf", ["React"], minimum_coverage=1.0)
         assert exc.value.result.matched_keywords == []
         assert exc.value.result.unmatched_keywords == ["React"]
+
+def test_ats_checker_leading_symbol_keyword_does_not_false_positive_on_common_word():
+    """Regression: normalizing ".NET" by stripping its leading "." collapses it to
+    the common word "net", which would previously false-match unrelated text like
+    "safety net" even though the resume never mentions .NET."""
+    mock_reader = MagicMock()
+    mock_page = MagicMock()
+    mock_page.extract_text.return_value = (
+        "Built a comprehensive safety net program and internet security policies. "
+        "No mention of the dotnet framework here."
+    )
+    mock_reader.pages = [mock_page]
+
+    with patch("src.resume_helper.PdfReader", return_value=mock_reader), patch("os.path.exists", return_value=True):
+        with pytest.raises(KeywordCoverageError) as exc:
+            check_ats_readability("dummy_resume.pdf", [".NET"], minimum_coverage=1.0)
+        assert exc.value.result.matched_keywords == []
+        assert exc.value.result.unmatched_keywords == [".NET"]
