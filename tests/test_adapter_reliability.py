@@ -55,9 +55,11 @@ class _RecordingAdapter(AtsAdapter):
 
 
 def _make_session(tmp_path, adapter, monkeypatch, page=None, ledger=None):
+    from src.events import RunLog
     reg = AtsAdapterRegistry(fallback=adapter)
     ledger = ledger or SubmissionLedger(tmp_path / "ledger.json")
-    sess = ExternalApplySession({}, registry=reg, ledger=ledger)
+    sess = ExternalApplySession({}, registry=reg, ledger=ledger,
+                                run_log=RunLog(agent="test", runs_dir=tmp_path / "runs"))
     fake_page = page or _FakePage()
     sess._closed = False
 
@@ -285,6 +287,25 @@ async def test_session_refuses_when_profile_locked(tmp_path, monkeypatch):
     res = await sess.apply(JOB, auto_submit=True)
     assert res.status == "profile_locked"
     assert page.goto_called is False
+
+
+@pytest.mark.asyncio
+async def test_session_emits_attempt_lifecycle_events(tmp_path, monkeypatch):
+    """Phase 2a: the session emits a structured per-run event stream."""
+    from src.events import read_run
+    good = _RecordingAdapter(AtsApplyResult.ok("done"), call_policy=True)
+    sess, page, led = _make_session(tmp_path, good, monkeypatch)
+    await sess.apply(JOB, auto_submit=True)
+    events = read_run(sess.run_log.run_id, runs_dir=tmp_path / "runs")
+    names = [e["event"] for e in events]
+    assert "attempt_started" in names
+    assert "form_reached" in names
+    assert "attempt_finished" in names
+    finished = next(e for e in events if e["event"] == "attempt_finished")
+    assert finished["phase"] == "receipt_verified" and finished["outcome"] == "applied"
+    assert finished["vendor"] == "greenhouse"
+    # never leak the raw URL / PII — only the host is recorded
+    assert all("resume" not in e and "url" not in e for e in events)
 
 
 @pytest.mark.asyncio
