@@ -15,6 +15,12 @@ import time
 from pathlib import Path
 
 
+# An empty lock file is tolerated for this many quick cycles (a create->write TOCTOU
+# window) before being treated as a crashed-mid-create lock and reclaimed.
+_EMPTY_GRACE_CYCLES = 3
+_EMPTY_POLL = 0.05
+
+
 class ProfileLockError(RuntimeError):
     """Raised when the profile is held by another live process."""
 
@@ -53,21 +59,38 @@ class ProfileLock:
             f.write(str(os.getpid()))
         return True
 
+    def _steal(self) -> None:
+        try:
+            os.unlink(self.lock_path)
+        except FileNotFoundError:
+            pass
+
     def acquire(self) -> "ProfileLock":
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.time() + self.timeout
+        empty_seen = 0
         while True:
             if self._try_create():
                 self._acquired = True
                 return self
-            # Lock exists — reclaim it only if the owner is gone.
             owner = self._read_owner_pid()
-            if owner is None or not self._pid_alive(owner):
-                try:
-                    os.unlink(self.lock_path)
-                except FileNotFoundError:
-                    pass
-                continue  # retry create immediately
+            if owner is not None and not self._pid_alive(owner):
+                self._steal()          # owner PID is dead -> reclaim
+                empty_seen = 0
+                continue
+            if owner is None:
+                # Empty/unreadable: another process may have just created the file and
+                # not yet written its PID (a create->write TOCTOU). Give it a few short
+                # grace cycles before assuming a crash-mid-create and reclaiming — so we
+                # don't steal a lock that is about to become valid.
+                empty_seen += 1
+                if empty_seen >= _EMPTY_GRACE_CYCLES:
+                    self._steal()
+                    empty_seen = 0
+                    continue
+                time.sleep(_EMPTY_POLL)
+                continue
+            empty_seen = 0             # a live owner holds it
             if time.time() >= deadline:
                 raise ProfileLockError(
                     f"profile locked by live PID {owner}: {self.lock_path} "

@@ -99,6 +99,18 @@ async def test_receipt_absent():
     assert ok is False and sig == ""
 
 
+@pytest.mark.asyncio
+async def test_receipt_url_ignores_job_title_substrings():
+    # 'success'/'applied' inside a posting slug must NOT be read as a receipt
+    for u in ("https://acme.com/jobs/customer-success-manager",
+              "https://acme.com/jobs/applied-scientist",
+              "https://acme.com/jobs/submitted-samples-analyst"):
+        ok, _ = await verify_receipt(_FakePage(url=u, receipt=None))
+        assert ok is False, u
+    ok, _ = await verify_receipt(_FakePage(url="https://acme.com/apply/confirmation"))
+    assert ok is True
+
+
 # --------------------------------------------------------------------------- #
 # 0.3 policy
 # --------------------------------------------------------------------------- #
@@ -148,6 +160,7 @@ def test_ledger_unverified_is_not_applied(tmp_path):
     led.begin(key, "att1")
     led.complete(key, "att1", verified=False)
     assert led.already_applied(key) is False
+    assert led.needs_reconciliation(key) is True   # must block a blind resubmit
 
 
 def test_ledger_stale_in_progress(tmp_path):
@@ -236,6 +249,16 @@ async def test_session_blocks_unresolved_in_progress(tmp_path, monkeypatch):
     res = await sess.apply(JOB, auto_submit=True)
     assert res.status == "submit_in_progress"
     assert page.goto_called is False
+
+
+@pytest.mark.asyncio
+async def test_session_blocks_unverified_until_reconciled(tmp_path, monkeypatch):
+    led = SubmissionLedger(tmp_path / "l.json")
+    led.complete(canonical_key(JOB), "prev", verified=False)   # a prior unconfirmed submit
+    sess, page, _ = _make_session(tmp_path, _RecordingAdapter(AtsApplyResult.ok()), monkeypatch, ledger=led)
+    res = await sess.apply(JOB, auto_submit=True)
+    assert res.status == "submit_unverified_unresolved"
+    assert page.goto_called is False                            # never resubmits blindly
 
 
 @pytest.mark.asyncio

@@ -115,6 +115,14 @@ class ExternalApplySession(BaseScraper):
                 f"({'stale/crashed' if stale else 'in flight'}) — not resubmitting blindly",
                 attempt_id=attempt_id,
             )
+        if key and self.ledger.needs_reconciliation(key):
+            # A prior attempt clicked submit but no receipt was confirmed — resubmitting
+            # blindly risks a duplicate. Hold until reconciled (human/receipt re-check).
+            return AtsApplyResult.blocked(
+                "submit_unverified_unresolved",
+                f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
+                attempt_id=attempt_id,
+            )
 
         policy: SubmissionPolicy = self._policy_override or AutoSubmitPolicy(allow=auto_submit)
         hints = _detect_pre_launch_vendor(external_url)
