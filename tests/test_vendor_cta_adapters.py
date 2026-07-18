@@ -36,7 +36,7 @@ class FakePage:
             return self.login_wall
         if "regexes" in script:            # CTA click
             return self.cta_clicked
-        if "cover letter" in script:       # form probe
+        if "applicant fields" in script:   # form probe (requires real fields)
             return self.has_form
         if "captcha" in script:            # generic blocker probe
             return None
@@ -70,6 +70,17 @@ ADAPTERS = {
 @pytest.mark.parametrize("vendor", list(ADAPTERS))
 def test_detect_vendor_recognizes(vendor):
     assert detect_vendor(URLS[vendor]) == vendor
+
+
+def test_detect_vendor_microsoft_careers_path():
+    # the /careers path form (not just careers.microsoft.com host) must still map
+    assert detect_vendor("https://www.microsoft.com/en-us/careers/job/123") == "microsoft"
+
+
+def test_smartrecruiters_cta_allows_curly_apostrophe():
+    import re
+    pat = SmartRecruitersAdapter.cta_patterns[0]
+    assert re.search(pat, "I’m interested", re.I) and re.search(pat, "I'm interested", re.I)
 
 
 @pytest.mark.parametrize("vendor,cls", list(ADAPTERS.items()))
