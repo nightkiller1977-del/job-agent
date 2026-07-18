@@ -230,3 +230,64 @@ async def test_close_browser_releases_lock_on_cancellation(scraper, monkeypatch)
         await s._close_browser(save_session=True)
     assert s._profile_lock is None
     assert not prof.with_suffix(".applylock").exists()
+
+
+def test_independent_same_process_operation_does_not_borrow(tmp_path):
+    """Codex r3 P1: a DIFFERENT logical operation in the same process must not
+    borrow the lock just because the PID matches — it waits/refuses instead."""
+    import contextvars
+    prof = tmp_path / "p"
+    prof.mkdir()
+
+    # operation A acquires in its own context
+    ctx_a = contextvars.copy_context()
+    lock_a = ctx_a.run(lambda: ProfileLock(prof).acquire())
+
+    # operation B (independent context, same PID) must be refused, not borrowed
+    ctx_b = contextvars.copy_context()
+    with pytest.raises(ProfileLockError):
+        ctx_b.run(lambda: ProfileLock(prof, timeout=0).acquire())
+
+    # nested acquire INSIDE operation A's context still borrows
+    def _nested():
+        inner = ProfileLock(prof).acquire()
+        assert inner._borrowed is True
+        inner.release()
+
+    ctx_a.run(_nested)
+    ctx_a.run(lock_a.release)
+    assert not prof.with_suffix(".applylock").exists()
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_completes_teardown_before_release(scraper):
+    """Codex r3 P2: cancelling the owning task mid-close must not release the lock
+    before the browser resources are closed — the shielded teardown finishes first."""
+    import asyncio as _asyncio
+    s, prof = scraper
+    order = []
+    release_gate = _asyncio.Event()
+
+    class _SlowCtx:
+        async def close(self):
+            await release_gate.wait()      # keep teardown in-flight while we cancel
+            order.append("context_closed")
+
+    s._context = _SlowCtx()
+    s._profile_lock = ProfileLock(prof).acquire()
+
+    task = _asyncio.ensure_future(s._close_browser(save_session=False))
+    await _asyncio.sleep(0.05)             # let teardown reach context.close()
+    task.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+    # lock must still be held: teardown is completing in the background
+    assert prof.with_suffix(".applylock").exists()
+    release_gate.set()
+    # let the shielded inner task finish (includes the 2s SQLite-flush sleep)
+    for _ in range(60):
+        if not prof.with_suffix(".applylock").exists():
+            break
+        await _asyncio.sleep(0.1)
+    assert order == ["context_closed"]
+    assert not prof.with_suffix(".applylock").exists()   # released AFTER close
