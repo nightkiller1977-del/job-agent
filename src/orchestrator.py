@@ -64,7 +64,7 @@ class Orchestrator:
         try:
             from dotenv import load_dotenv
             load_dotenv(Path(__file__).parent.parent / ".env", override=False)
-            from src.secrets import fill_missing
+            from src.secret_store import fill_missing
             fill_missing()
         except Exception:
             pass

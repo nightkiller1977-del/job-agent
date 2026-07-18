@@ -48,9 +48,9 @@ def _load_telegram_config() -> tuple[str, str]:
     """
     # 1 + 2. Process env, then the central AI Commander store (CLI → sops → .env),
     # via the shared resolver so there is only one reader of that file — see
-    # src/secrets.py and SECRETS.md.
+    # src/secret_store.py and SECRETS.md.
     try:
-        from .secrets import resolve_secret
+        from .secret_store import resolve_secret
         token = resolve_secret("TELEGRAM_BOT_TOKEN") or ""
         chat_id = resolve_secret("TELEGRAM_CHAT_ID") or ""
     except Exception:
