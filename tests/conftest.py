@@ -11,6 +11,11 @@ import pytest
 # dir; tests that exercise the resolver override AICC_SECRETS_DIR themselves.
 os.environ["AICC_SECRETS_DIR"] = tempfile.mkdtemp(prefix="aicc-secrets-test-")
 
+# Stub the telemetry stack (openlit / logging_loki) — not installed in the test
+# env; telemetry.setup() is a no-op without them and model_span degrades cleanly.
+sys.modules.setdefault("openlit", _MM())
+sys.modules.setdefault("logging_loki", _MM())
+
 # Stub playwright at session scope — lets any test import src.sources.*
 # without needing the real package. Per-test reauth mocking is done via
 # dependency injection (_reauth_cls=) rather than sys.modules mutation.
