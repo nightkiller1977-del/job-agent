@@ -91,6 +91,12 @@ class SubmissionLedger:
         rec = self.record(key)
         return bool(rec and rec.get("phase") == PHASE_IN_PROGRESS)
 
+    def needs_reconciliation(self, key: str) -> bool:
+        """A prior attempt clicked submit but the receipt could not be verified.
+        We must not blindly resubmit — it may or may not have gone through."""
+        rec = self.record(key)
+        return bool(rec and rec.get("phase") == PHASE_UNVERIFIED)
+
     def is_stale_in_progress(self, key: str) -> bool:
         rec = self.record(key)
         if not rec or rec.get("phase") != PHASE_IN_PROGRESS:
