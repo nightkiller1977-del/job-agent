@@ -1,10 +1,11 @@
-from src.apply_outcome import ApplyOutcomeCode
 """
 USAJobs.gov scraper + application executor.
 Searches for GS-15, SES, SL, and target role titles.
 User is assumed to be logged in with a saved resume.
 """
 from __future__ import annotations
+
+from src.apply_outcome import ApplyOutcomeCode
 
 import asyncio
 import os
@@ -653,7 +654,7 @@ class USAJobsScraper(BaseScraper):
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
             if not await self._is_logged_in(page):
-                return self._set_apply_outcome(ApplyOutcomeCode.USAJOBS_LOGIN_REQUIRED, "USAJobs session is not authenticated. Run prepare-sessions --source usajobs and sign in once.",
+                return self._set_apply_outcome(ApplyOutcomeCode.LOGIN_REQUIRED, "USAJobs session is not authenticated. Run prepare-sessions --source usajobs and sign in once.",
                 )
 
             # Check if job is expired/closed
@@ -682,7 +683,7 @@ class USAJobsScraper(BaseScraper):
 
             if not apply_btn:
                 console.print("[yellow]USAJobs: Apply button not found.[/yellow]")
-                return self._set_apply_outcome(ApplyOutcomeCode.USAJOBS_APPLY_BUTTON_NOT_FOUND, "USAJobs did not expose an Apply button for this announcement.",
+                return self._set_apply_outcome(ApplyOutcomeCode.SUBMIT_NOT_FOUND, "USAJobs did not expose an Apply button for this announcement.",
                 )
 
             await apply_btn.click()
@@ -769,7 +770,7 @@ class USAJobsScraper(BaseScraper):
                         if not submitted:
                             if auto_submit:
                                 console.print("[red]USAJobs: Could not find submit button in auto-submit mode.[/red]")
-                                return self._set_apply_outcome(ApplyOutcomeCode.USAJOBS_SUBMIT_NOT_FOUND, "Reached USAJobs final review but could not find the final submit button.",
+                                return self._set_apply_outcome(ApplyOutcomeCode.SUBMIT_NOT_FOUND, "Reached USAJobs final review but could not find the final submit button.",
                                 )
                             else:
                                 console.print("[yellow]USAJobs: Could not find submit button. Please submit manually.[/yellow]")
@@ -785,7 +786,7 @@ class USAJobsScraper(BaseScraper):
                 if not navigated:
                     if auto_submit or not (sys.stdin and sys.stdin.isatty()):
                         console.print("[red]USAJobs: Could not navigate automatically and running non-interactively/auto-submit. Aborting application.[/red]")
-                        return self._set_apply_outcome(ApplyOutcomeCode.USAJOBS_STEP_BLOCKED, f"USAJobs wizard could not navigate beyond step {step} at {apply_page.url}.",
+                        return self._set_apply_outcome(ApplyOutcomeCode.STEP_BLOCKED, f"USAJobs wizard could not navigate beyond step {step} at {apply_page.url}.",
                         )
                         break
                     console.print("[yellow]USAJobs: Could not navigate to next step.[/yellow]")
@@ -798,7 +799,7 @@ class USAJobsScraper(BaseScraper):
             raise
         except Exception as exc:
             console.print(f"[red]USAJobs apply error:[/red] {exc}")
-            self._set_apply_outcome(ApplyOutcomeCode.USAJOBS_ERROR, str(exc))
+            self._set_apply_outcome(ApplyOutcomeCode.ERROR, str(exc))
         finally:
             if submitted:
                 await self._delay(3, 4)
@@ -808,7 +809,7 @@ class USAJobsScraper(BaseScraper):
             self.last_apply_status = "submitted"
             self.last_apply_detail = "USAJobs application submitted successfully."
         elif self.last_apply_status in ("started", "", None):
-            self._set_apply_outcome(ApplyOutcomeCode.USAJOBS_NOT_SUBMITTED, "USAJobs apply flow ended without reaching a submitted state.",
+            self._set_apply_outcome(ApplyOutcomeCode.SUBMISSION_UNVERIFIED, "USAJobs apply flow ended without reaching a submitted state.",
             )
         return submitted
 

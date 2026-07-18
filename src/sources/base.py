@@ -435,13 +435,23 @@ class BaseScraper(ABC):
         ...
 
     def _make_job_id(self, url: str) -> str:
-        """Generate a stable job_id from a URL."""
+        """Generate a stable job_id from a URL.
+
+        NOTE: hashes the raw URL. Do not normalize here — job_ids are the primary
+        key in jobs.db, and re-normalizing would re-key every existing row and
+        break dedup/state continuity.
+        """
         import hashlib
-        from src.url_utils import normalize_external_url
-        norm_url = normalize_external_url(url)
-        if not norm_url:
-            norm_url = url.strip()
-        return hashlib.md5(norm_url.encode()).hexdigest()[:16]
+        return hashlib.md5(url.encode()).hexdigest()[:16]
+
+    def _normalize_url(self, raw: str, base: str = "") -> str:
+        """Resolve a possibly-relative ATS URL to a safe absolute http(s) URL.
+
+        Delegates to url_utils.normalize_nav_url. Returns "" when the input is
+        empty, an unsafe scheme, or resolves to a hostless URL.
+        """
+        from src.url_utils import normalize_nav_url
+        return normalize_nav_url(raw, base)
 
     async def _upload_resume_if_prompted(self, page, resume_path: str) -> None:
         path = Path(resume_path).expanduser()

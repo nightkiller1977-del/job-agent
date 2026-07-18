@@ -598,13 +598,25 @@ class StateManager:
         return "other"
 
     def get_apply_funnel(self) -> dict:
-        """Compute the apply funnel and success rate from append-only events.
+        """Compute the apply funnel and success rate.
+
+        Attempt counting, per job, in priority order:
+          1. `browser_attempt_started` events (one per real browser apply) — the
+             truthful per-run count when the orchestrator emitted them.
+          2. else the count of real attempt events (`attempt_failed` +
+             `submission_verified`).
+          3. else, for a legacy row with no events at all, 1 if it carries a
+             terminal `apply_last_status` in extra_json.
+        Preflight-only jobs (only `preflight_blocked` events) count as 0 attempts.
+        Source is taken from the jobs table (events don't reliably carry it).
         """
         with self._connect() as conn:
-            job_rows = conn.execute("SELECT status FROM jobs").fetchall()
+            job_rows = conn.execute(
+                "SELECT job_id, status, source, extra_json FROM jobs"
+            ).fetchall()
             events = conn.execute(
                 """
-                SELECT job_id, source, event_type, status, blocker_class 
+                SELECT job_id, source, event_type, status, blocker_class
                 FROM apply_events
                 ORDER BY occurred_at ASC
                 """
@@ -621,44 +633,58 @@ class StateManager:
         failure_hist: dict = {}
         cluster_hist: dict = {}
         per_source: dict = {}
-        
-        job_events = {}
+
+        job_events: dict = {}
         for e in events:
             job_events.setdefault(e["job_id"], []).append(e)
-            
-        for jid, evs in job_events.items():
+
+        for row in job_rows:
+            jid = row["job_id"]
+            evs = job_events.get(jid, [])
+            try:
+                extra = json.loads(row["extra_json"] or "{}")
+            except Exception:
+                extra = {}
+
             browser_attempts = [e for e in evs if e["event_type"] == "browser_attempt_started"]
-            
-            if not browser_attempts and not evs:
-                continue
-                
-            src = evs[0]["source"] or "unknown"
+            real_events = [e for e in evs if e["event_type"] in ("attempt_failed", "submission_verified")]
+            last_status = extra.get("apply_last_status")
+
+            if browser_attempts:
+                job_attempts = len(browser_attempts)
+            elif real_events:
+                job_attempts = len(real_events)
+            elif not evs and last_status:
+                job_attempts = 1  # legacy pre-event row
+            else:
+                job_attempts = 0  # never attempted, or preflight-only
+
+            is_submitted = (
+                any(e["event_type"] == "submission_verified" for e in evs)
+                or extra.get("submitted") is True
+                or last_status == "applied"
+            )
+
+            if job_attempts == 0 and not is_submitted:
+                continue  # discovered/never-attempted — not in the funnel
+
+            src = row["source"] or "unknown"
             ps = per_source.setdefault(src, {"attempts": 0, "submitted": 0})
-            
-            is_submitted = any(e["event_type"] == "submission_verified" for e in evs)
-            
-            job_attempts = len(browser_attempts)
-            if job_attempts == 0 and any(e["event_type"] == "attempt_failed" for e in evs):
-                job_attempts = 1
-            
             attempts += job_attempts
             ps["attempts"] += job_attempts
-            
+
             if is_submitted:
                 submitted += 1
                 ps["submitted"] += 1
             else:
                 failed_events = [e for e in evs if e["event_type"] == "attempt_failed"]
-                if failed_events:
-                    last_fail = failed_events[-1]
-                    last_status = last_fail["status"]
-                    failure_hist[last_status] = failure_hist.get(last_status, 0) + 1
-                    
-                    cluster = self._cluster_for(last_status)
+                fail_status = failed_events[-1]["status"] if failed_events else last_status
+                if fail_status:
+                    failure_hist[fail_status] = failure_hist.get(fail_status, 0) + 1
+                    cluster = self._cluster_for(fail_status)
                     cluster_hist[cluster] = cluster_hist.get(cluster, 0) + 1
-                    
                 wasted_retries += max(0, job_attempts - 1)
-                
+
         for ps in per_source.values():
             ps["rate"] = (ps["submitted"] / ps["attempts"]) if ps["attempts"] else 0.0
 
@@ -682,7 +708,11 @@ class StateManager:
         """
         reset_keys = {
             "apply_last_status",
-            "apply_attempt_count",
+            "apply_attempt_count",         # legacy key (pre-rename); cleared if present
+            "lifetime_attempt_count",
+            "consecutive_failure_count",
+            "circuit_open",
+            "blocker_fingerprint",
             "submitted",
             "blocker_class",
             "circuit_broken",

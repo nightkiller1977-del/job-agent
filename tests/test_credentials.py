@@ -318,7 +318,7 @@ class TestAgentCredentialsSync(unittest.IsolatedAsyncioTestCase):
             extra = json.loads(payload[0]["extra_json"])
             self.assertEqual(extra["apply_last_status"], "linkedin_stuck_on_required_field")
             self.assertEqual(extra["apply_last_detail"], "Required question needs an answer.")
-            self.assertEqual(extra["apply_attempt_count"], 1)
+            self.assertEqual(extra["lifetime_attempt_count"], 1)
         finally:
             for k, v in [("DASHBOARD_URL", old_url), ("SYNC_SECRET", old_secret)]:
                 if v is not None:

@@ -90,17 +90,53 @@ _MAX_ATTEMPTS: dict[BlockerClass, int] = {
 }
 
 
+# Legacy readiness-vocabulary aliases + vendor prefixes that the scrapers /
+# orchestrator emit as free strings. Normalized (hyphens→underscores) before lookup.
+_STATUS_ALIASES: dict[str, ApplyOutcomeCode] = {
+    "needs_session": ApplyOutcomeCode.NEEDS_SESSION,
+    "needs_hydration": ApplyOutcomeCode.NEEDS_HYDRATION,
+    "needs_answer": ApplyOutcomeCode.NEEDS_ANSWER,
+    "needs_portal_login": ApplyOutcomeCode.LOGIN_REQUIRED,
+    "needs_review": ApplyOutcomeCode.NEEDS_ANSWER,   # manual setup — surface, don't blind-retry
+    "started": ApplyOutcomeCode.UNKNOWN,
+}
+# Vendor prefixes stripped as a last resort (e.g. "workday_session_expired").
+_VENDOR_PREFIXES = ("workday_", "linkedin_", "usajobs_", "indeed_", "microsoft_",
+                    "brassring_", "greenhouse_", "lever_", "ashby_")
+
+
+def _coerce_code(status: str) -> ApplyOutcomeCode | None:
+    """Best-effort map a free-form status string to an ApplyOutcomeCode."""
+    norm = status.strip().lower().replace("-", "_")
+    if not norm:
+        return None
+    try:
+        return ApplyOutcomeCode(norm)
+    except ValueError:
+        pass
+    if norm in _STATUS_ALIASES:
+        return _STATUS_ALIASES[norm]
+    for pfx in _VENDOR_PREFIXES:
+        if norm.startswith(pfx):
+            stripped = norm[len(pfx):]
+            try:
+                return ApplyOutcomeCode(stripped)
+            except ValueError:
+                if stripped in _STATUS_ALIASES:
+                    return _STATUS_ALIASES[stripped]
+    return None
+
+
 def classify(status: str | ApplyOutcomeCode | None) -> BlockerClass:
-    """Map an ApplyOutcomeCode to its control-flow class."""
+    """Map an ApplyOutcomeCode (or free-form status string) to its control-flow class."""
     if not status:
         return BlockerClass.UNKNOWN
-    
+
     if isinstance(status, ApplyOutcomeCode):
         code = status
     else:
-        try:
-            code = ApplyOutcomeCode(status.strip())
-        except ValueError:
+        code = _coerce_code(status)
+        if code is None:
             return BlockerClass.UNKNOWN
 
     return _STATUS_TO_CLASS.get(code, BlockerClass.UNKNOWN)

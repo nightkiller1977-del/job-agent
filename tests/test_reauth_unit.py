@@ -248,7 +248,7 @@ class TestReauthManagerRouting:
             with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock_auto, \
                  patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock_human:
                 result = await mgr.handle(source, "test")
-                mock_auto.assert_called_once_with(source)
+                mock_auto.assert_called_once_with(source, "discover")
                 mock_human.assert_not_called()
                 assert result is True
 

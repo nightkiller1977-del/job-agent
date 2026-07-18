@@ -1,10 +1,11 @@
-from src.apply_outcome import ApplyOutcomeCode
 """
 LinkedIn scraper + Easy Apply executor.
 Searches for each target role, filters by Easy Apply + last 7 days + Director+.
 Handles multi-step Easy Apply forms.
 """
 from __future__ import annotations
+
+from src.apply_outcome import ApplyOutcomeCode
 
 import asyncio
 import os
@@ -657,7 +658,7 @@ class LinkedInScraper(BaseScraper):
                 except Exception:
                     continue
             if await self._needs_login(page):
-                return self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_LOGIN_REQUIRED, "LinkedIn redirected to login/authwall. Run prepare-sessions --source linkedin and sign in once.",
+                return self._set_apply_outcome(ApplyOutcomeCode.LOGIN_REQUIRED, "LinkedIn redirected to login/authwall. Run prepare-sessions --source linkedin and sign in once.",
                 )
 
             # Check if job is expired/closed
@@ -703,7 +704,7 @@ class LinkedInScraper(BaseScraper):
                         continue
                 external_url = await self._extract_external_apply_url(page)
                 if not external_url:
-                    return self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_EXTERNAL_APPLY_NOT_FOUND, "Non-Easy-Apply LinkedIn job: no external ATS URL could be captured. "
+                    return self._set_apply_outcome(ApplyOutcomeCode.EXTERNAL_APPLY_NOT_FOUND, "Non-Easy-Apply LinkedIn job: no external ATS URL could be captured. "
                         "The job may require manual application or use a login-gated ATS.",
                     )
                 console.print(f"[blue]LinkedIn Apply:[/blue] External apply URL: {external_url[:100]}")
@@ -804,7 +805,7 @@ class LinkedInScraper(BaseScraper):
                         raise JobExpiredError("LinkedIn: job is closed/no longer accepting applications.")
                     if "sign in" in page_text and "apply" in page_text:
                         console.print("[yellow]LinkedIn: 'Sign in to apply' detected — session may need refresh.[/yellow]")
-                        return self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_LOGIN_REQUIRED, "LinkedIn job page shows 'Sign in to apply' — run prepare-sessions --source linkedin to refresh session.",
+                        return self._set_apply_outcome(ApplyOutcomeCode.LOGIN_REQUIRED, "LinkedIn job page shows 'Sign in to apply' — run prepare-sessions --source linkedin to refresh session.",
                         )
                 except JobExpiredError:
                     raise
@@ -813,7 +814,7 @@ class LinkedInScraper(BaseScraper):
                 console.print("[yellow]LinkedIn: No apply button found. May not be Easy Apply or page not fully loaded.[/yellow]")
                 external_url = await self._extract_external_apply_url(page)
                 if not external_url:
-                    return self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_EASY_APPLY_NOT_FOUND, "LinkedIn did not expose an Easy Apply button or a usable external apply link for this job.",
+                    return self._set_apply_outcome(ApplyOutcomeCode.EXTERNAL_APPLY_NOT_FOUND, "LinkedIn did not expose an Easy Apply button or a usable external apply link for this job.",
                     )
                 console.print(f"[blue]LinkedIn Apply:[/blue] External apply URL found: {external_url[:100]}")
                 return await self._apply_external_ats(job, external_url, resume_path, auto_submit=auto_submit)
@@ -862,7 +863,7 @@ class LinkedInScraper(BaseScraper):
                         )
                         err_str = "; ".join(errors) if errors else "unknown validation error"
                         console.print(f"[yellow]LinkedIn: Stuck on '{page_text}' — {err_str}[/yellow]")
-                        return self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_STUCK_ON_REQUIRED_FIELD, f"Easy Apply stuck on page '{page_text}' after 3 Next clicks. "
+                        return self._set_apply_outcome(ApplyOutcomeCode.STUCK_ON_REQUIRED_FIELD, f"Easy Apply stuck on page '{page_text}' after 3 Next clicks. "
                             f"Validation errors: {err_str}. "
                             "Add a resume file at ~/resume.pdf or check state/profile.json for missing fields.",
                         )
@@ -978,12 +979,12 @@ class LinkedInScraper(BaseScraper):
                     await self._delay(1, 2)
                 else:
                     console.print("[yellow]LinkedIn: No navigable button found. Stopping.[/yellow]")
-                    return self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_STEP_BLOCKED, "Easy Apply modal opened, but no Next/Review/Submit control was found on the current step.",
+                    return self._set_apply_outcome(ApplyOutcomeCode.STEP_BLOCKED, "Easy Apply modal opened, but no Next/Review/Submit control was found on the current step.",
                     )
                     break
 
             if step >= max_steps and not submitted and self.last_apply_status in ("started", "", None):
-                self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_MAX_STEPS_REACHED, f"LinkedIn apply flow reached {max_steps} steps without exposing a final Submit control.",
+                self._set_apply_outcome(ApplyOutcomeCode.STEP_BLOCKED, f"LinkedIn apply flow reached {max_steps} steps without exposing a final Submit control.",
                 )
 
         except JobExpiredError:
@@ -995,7 +996,7 @@ class LinkedInScraper(BaseScraper):
             raise
         except Exception as exc:
             console.print(f"[red]LinkedIn apply error:[/red] {exc}")
-            self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_ERROR, str(exc))
+            self._set_apply_outcome(ApplyOutcomeCode.ERROR, str(exc))
         finally:
             # Keep browser open briefly so user can see result
             if submitted:
@@ -1006,7 +1007,7 @@ class LinkedInScraper(BaseScraper):
             self.last_apply_status = "submitted"
             self.last_apply_detail = "LinkedIn application submitted successfully."
         elif self.last_apply_status in ("started", "", None):
-            self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_NOT_SUBMITTED, "LinkedIn apply flow ended without reaching a submitted state.",
+            self._set_apply_outcome(ApplyOutcomeCode.SUBMISSION_UNVERIFIED, "LinkedIn apply flow ended without reaching a submitted state.",
             )
         return submitted
 
@@ -1266,7 +1267,7 @@ class LinkedInScraper(BaseScraper):
             # generated PDF — don't collapse it into a per-job False outcome.
             raise
         except Exception as exc:
-            return self._set_apply_outcome(ApplyOutcomeCode.LINKEDIN_EXTERNAL_APPLY_ERROR, str(exc))
+            return self._set_apply_outcome(ApplyOutcomeCode.EXTERNAL_ATS_ERROR, str(exc))
 
     async def _click_linkedin_button_by_text(self, page, patterns: list[str]) -> bool:
         try:

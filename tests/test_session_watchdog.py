@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 import pytest
 
-from src.session_watchdog import check_session_health, _parse_linkedin_expiry
+from src.session_watchdog import check_session_health, _parse_cookie_expiry
 
 def test_parse_linkedin_expiry_expired():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -19,7 +19,7 @@ def test_parse_linkedin_expiry_expired():
         }
         session_file.write_text(json.dumps(session_data))
         
-        expiry_hours = _parse_linkedin_expiry(session_file)
+        expiry_hours = _parse_cookie_expiry(session_file, "linkedin")
         assert expiry_hours is not None
         assert expiry_hours < 0
         assert pytest.approx(expiry_hours, rel=1e-2) == -5
@@ -36,7 +36,7 @@ def test_parse_linkedin_expiry_healthy():
         }
         session_file.write_text(json.dumps(session_data))
         
-        expiry_hours = _parse_linkedin_expiry(session_file)
+        expiry_hours = _parse_cookie_expiry(session_file, "linkedin")
         assert expiry_hours is not None
         assert expiry_hours > 0
         assert pytest.approx(expiry_hours, rel=1e-2) == 10
