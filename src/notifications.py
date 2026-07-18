@@ -47,11 +47,18 @@ _BLOCKED_OUTCOMES = {
 }
 
 
+def _is_auth_outcome(o: str) -> bool:
+    return o.endswith("_login_required") or o.endswith("_session_expired") or o in (
+        "session_expired", "credentials_missing",
+    )
+
+
 def notice_for(event: str, outcome: str = "") -> NoticeClass | None:
     o = (outcome or "").lower()
     if event in ("profile_locked",) or o in _BLOCKED_OUTCOMES:
         return NoticeClass.SUBMISSION_BLOCKED
-    if o in _HUMAN_OUTCOMES:
+    # An expired/locked ATS session needs a human to re-auth (prepare-sessions).
+    if _is_auth_outcome(o) or o in _HUMAN_OUTCOMES:
         return NoticeClass.HUMAN_ACTION_REQUIRED
     if event == "attempt_finished" and o == "applied":
         return NoticeClass.FYI
