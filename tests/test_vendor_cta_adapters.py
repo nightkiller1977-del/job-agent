@@ -114,7 +114,7 @@ async def test_apply_not_reached_when_no_cta_and_no_form(vendor, cls):
 @pytest.mark.asyncio
 async def test_reaches_form_then_defers_to_generic(vendor, cls):
     # entered the form, auto_submit off -> generic withholds submit for review
-    page = FakePage(URLS[vendor], cta_clicked=True)
+    page = FakePage(URLS[vendor], cta_clicked=True, has_form=True)
     res = await cls().apply(_ctx(page, vendor, auto_submit=False))
     assert res.status == "review_ready"
 
@@ -134,3 +134,20 @@ async def test_registered_and_selected(vendor):
                           profile={}, url=URLS[vendor])
     adapter = await sess.registry.pick(ctx)
     assert adapter.name == vendor
+
+
+@pytest.mark.asyncio
+async def test_skips_cta_when_form_already_present():
+    # form already open (Teamtailor after /applications/new) -> do NOT click a CTA
+    # (could be the final submit); go straight to the gated filler.
+    page = FakePage(URLS["teamtailor"], cta_clicked=False, has_form=True)
+    res = await TeamtailorAdapter().apply(_ctx(page, "teamtailor", auto_submit=False))
+    assert res.status == "review_ready"           # reached the filler without a CTA click
+
+
+@pytest.mark.asyncio
+async def test_apply_not_reached_when_cta_click_lands_on_no_form():
+    # CTA "clicked" but no real form materializes -> not_reached, never fills the page
+    page = FakePage(URLS["microsoft"], cta_clicked=True, has_form=False)
+    res = await MicrosoftAdapter().apply(_ctx(page, "microsoft", auto_submit=True))
+    assert res.status == "microsoft_apply_not_reached"
