@@ -20,6 +20,8 @@ Structured with small awaitable helpers so it is unit-testable with a fake page.
 """
 from __future__ import annotations
 
+import urllib.parse
+
 from .context import AtsApplyContext, AtsApplyResult
 from .generic import GenericAtsAdapter, detect_vendor, ev_to_dict
 from .receipt import verify_receipt  # noqa: F401  (kept for symmetry / future use)
@@ -104,7 +106,11 @@ class WorkdayAdapter(GenericAtsAdapter):
         except Exception:
             url = ""
         if url and "/apply" not in url:
-            target = url.rstrip("/") + "/apply/autofillWithResume"
+            # modify the PATH only — string-concatenating onto a URL with a query or
+            # fragment (…/job/R123?source=linkedin) would append into the query.
+            parsed = urllib.parse.urlparse(url)
+            new_path = parsed.path.rstrip("/") + "/apply/autofillWithResume"
+            target = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, new_path, "", "", ""))
             try:
                 await page.goto(target, wait_until="domcontentloaded", timeout=30000)
             except Exception:
@@ -141,7 +147,13 @@ class WorkdayAdapter(GenericAtsAdapter):
             return bool(await page.evaluate(
                 """() => {
                     const t = (document.body && document.body.innerText || '').toLowerCase();
-                    return /create account\\/?sign in|sign in with email|sign in with google|sign in with linkedin/.test(t);
+                    if (/create account\\/?sign in|sign in with email|sign in with google|sign in with linkedin/.test(t)) return true;
+                    // plain Workday Sign In gate: a 'Sign In' control and no application inputs
+                    const signIn = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]'))
+                        .some(el => /^\\s*sign in\\s*$/i.test((el.innerText || el.textContent || el.value || '').trim()));
+                    const fields = document.querySelectorAll(
+                        "input[data-automation-id='text-input'], textarea, input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=search])").length;
+                    return signIn && fields === 0;
                 }"""
             ))
         except Exception:

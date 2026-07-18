@@ -137,6 +137,13 @@ async def test_review_page_next_submits_through_gate_with_receipt():
 
 
 @pytest.mark.asyncio
+async def test_enter_apply_preserves_path_over_query_params():
+    page = FakeWorkdayPage(url="https://acme.wd5.myworkdayjobs.com/careers/job/R123?source=linkedin")
+    await WorkdayAdapter()._enter_apply(page)
+    assert page.url == "https://acme.wd5.myworkdayjobs.com/careers/job/R123/apply/autofillWithResume"
+
+
+@pytest.mark.asyncio
 async def test_stuck_wizard_returns_form_not_reached():
     page = FakeWorkdayPage(stuck=True)
     res = await WorkdayAdapter().apply(_ctx(page, auto_submit=True))
