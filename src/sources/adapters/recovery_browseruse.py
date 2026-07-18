@@ -9,6 +9,7 @@ from playwright.async_api import Page
 from src.model_client import ModelClient
 from .base import AtsAdapter
 from .context import AtsApplyContext, AtsApplyResult
+from .receipt import verify_receipt
 
 logger = logging.getLogger("job-agent.adapters.recovery_browseruse")
 
@@ -34,6 +35,25 @@ class BrowserUseRecovery(AtsAdapter):
 
     async def apply(self, ctx: AtsApplyContext) -> AtsApplyResult:
         logger.info(f"Initiating Browser Use recovery for job URL: {ctx.url}")
+
+        # Phase 0.3 — policy containment: an autonomous LLM agent that can click a
+        # submit control must NOT run unless the session's policy authorizes submission.
+        # No LLM path submits outside the gate.
+        allow_submit = False
+        policy = getattr(ctx, "policy", None)
+        if policy is not None:
+            try:
+                allow_submit = bool(await policy.confirm_submit(ctx, {"via": "browser_use_recovery"}))
+            except Exception as e:  # a broken policy fails closed
+                logger.warning(f"policy.confirm_submit raised, failing closed: {e}")
+                allow_submit = False
+        if not allow_submit:
+            logger.info("BrowserUse recovery withheld: submission not authorized by policy.")
+            return AtsApplyResult.blocked(
+                "submit_denied_by_policy",
+                "BrowserUse recovery withheld: submission not authorized by policy.",
+            )
+
         domain = urllib.parse.urlparse(ctx.url).netloc.lower()
 
         # 1. Attempt to replay existing domain skills if recorded
@@ -47,7 +67,11 @@ class BrowserUseRecovery(AtsAdapter):
                 body_text = await ctx.page.locator("body").inner_text()
                 if any(w in body_text.lower() for w in ["thank you", "thanks", "thank", "received", "submitted", "success"]):
                     return AtsApplyResult.ok(detail="Application submitted via domain skills replay.")
-                return AtsApplyResult(submitted=True, status="review_ready", detail="Domain skills completed, form ready for review.")
+                # Filled but NOT confirmed submitted — this is readiness, not success (Phase 0.1).
+                return AtsApplyResult.blocked(
+                    "review_ready",
+                    "Domain skills completed, form ready for review (not confirmed submitted).",
+                )
 
             logger.warning(f"Replay failed for {domain}, falling back to LLM agent loop.")
 
@@ -119,7 +143,15 @@ class BrowserUseRecovery(AtsAdapter):
                 logger.info("LLM declared form filling complete.")
                 if steps_recorded:
                     self._save_skills(domain, steps_recorded)
-                return AtsApplyResult(submitted=True, status="review_ready", detail="Form filled, ready for manual review.")
+                # "done" means the LLM finished filling, NOT that a receipt was seen.
+                # Confirm via a real receipt check before claiming submission (Phase 0.1).
+                verified, signal = await verify_receipt(ctx.page)
+                if verified:
+                    return AtsApplyResult.ok(detail=f"Application submitted (receipt {signal}).")
+                return AtsApplyResult.blocked(
+                    "review_ready",
+                    "Form filled, ready for manual review (not confirmed submitted).",
+                )
             elif action == "fail":
                 logger.warning(f"LLM declared failure: {action_data.get('explanation')}")
                 return AtsApplyResult.blocked(status="submit_not_found", detail=f"LLM failed: {action_data.get('explanation')}")
