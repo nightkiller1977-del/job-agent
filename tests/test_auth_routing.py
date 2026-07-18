@@ -17,10 +17,13 @@ def test_is_auth_required():
 
 
 def test_directive_for_vendor_portal():
-    d = directive_for("teamtailor_login_required", {"source": "jobright"})
-    assert d.vendor == "teamtailor" and d.source == "jobright"
+    d = directive_for("teamtailor_login_required", {"source": "linkedin"})
+    assert d.vendor == "teamtailor" and d.source == "linkedin"
     assert d.action == "prepare_sessions"
-    assert "prepare-sessions" in d.remediation
+    # remediation must target the external apply profile + the portal, NOT the job source
+    assert "prepare-sessions --source jobright" in d.remediation
+    assert "--source linkedin" not in d.remediation
+    assert "teamtailor" in d.remediation
     d2 = directive_for("workday_session_expired", {})
     assert d2.vendor == "workday" and d2.action == "prepare_sessions"
     assert directive_for("applied", {}) is None
