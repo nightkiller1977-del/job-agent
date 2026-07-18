@@ -150,3 +150,13 @@ async def test_policy_gate_can_withhold_submit():
     res = await GenericAtsAdapter().apply(ctx)
     assert res.status == "submit_denied_by_policy"
     assert page.clicked == []
+
+
+@pytest.mark.asyncio
+async def test_combined_name_derived_from_first_last():
+    # Lever/Teamtailor use a single combined "name" field; profiles store first/last.
+    page = FakePage(present_selectors={"input[name='name' i]"}, evaluate_result=None)
+    page.url = "https://jobs.lever.co/acme/1"
+    ctx = AtsApplyContext(page=page, job={"url": page.url}, profile=PROFILE, url=page.url)
+    await GenericAtsAdapter().apply(ctx)
+    assert page.filled.get("input[name='name' i]") == "Ada Lovelace"
