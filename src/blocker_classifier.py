@@ -48,6 +48,9 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     # auth — route to reauth / session prep
     "workday_session_expired": BlockerClass.AUTH_REQUIRED,
     "brassring_login_required": BlockerClass.AUTH_REQUIRED,
+    "microsoft_login_required": BlockerClass.AUTH_REQUIRED,
+    "smartrecruiters_login_required": BlockerClass.AUTH_REQUIRED,
+    "teamtailor_login_required": BlockerClass.AUTH_REQUIRED,
     "reauth_failed": BlockerClass.AUTH_REQUIRED,
     "session_expired": BlockerClass.AUTH_REQUIRED,
     "needs_session_prep": BlockerClass.AUTH_REQUIRED,  # P3: human source, run prepare-sessions
