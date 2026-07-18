@@ -158,6 +158,8 @@ class ExternalApplySession(BaseScraper):
         if key and self.ledger.needs_reconciliation(key):
             # A prior attempt clicked submit but no receipt was confirmed — resubmitting
             # blindly risks a duplicate. Hold until reconciled (human/receipt re-check).
+            _event("submit_unverified_blocked", AttemptPhase.UNKNOWN,
+                   outcome="submit_unverified_unresolved")
             return AtsApplyResult.blocked(
                 "submit_unverified_unresolved",
                 f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
@@ -180,6 +182,9 @@ class ExternalApplySession(BaseScraper):
         try:
             page = await self._start_browser(load_extensions=hints["load_extensions"])
             await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
+            # a company/external URL may redirect to the real ATS — re-derive the vendor
+            # from the navigated URL so post-nav events aren't mislabeled 'generic'.
+            vendor = detect_vendor(getattr(page, "url", "") or external_url) or vendor
             _event("form_reached", AttemptPhase.FORM_REACHED)
 
             ctx = AtsApplyContext(
@@ -200,7 +205,9 @@ class ExternalApplySession(BaseScraper):
                 marked = True
 
             adapter = await self.registry.pick(ctx)
-            _event("adapter_selected", AttemptPhase.FIELDS_FILLED, adapter=adapter.name)
+            # selecting an adapter does NOT mean fields were filled — keep the phase at
+            # FORM_REACHED so failed attempts don't overstate how far they progressed.
+            _event("adapter_selected", AttemptPhase.FORM_REACHED, adapter=adapter.name)
             console.print(f"[cyan]ExternalApplySession:[/cyan] adapter={adapter.name} url={page.url[:80]}")
             res = self._enforce_authorization(await adapter.apply(ctx), ctx, policy)
 
