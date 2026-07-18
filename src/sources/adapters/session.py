@@ -110,12 +110,19 @@ class ExternalApplySession(BaseScraper):
         from .lever import LeverAdapter
         from .ashby import AshbyAdapter
         from .workday import WorkdayAdapter
+        from .vendor_cta import (
+            MicrosoftAdapter, BrassRingAdapter, SmartRecruitersAdapter, TeamtailorAdapter,
+        )
 
         reg = AtsAdapterRegistry(fallback=GenericAtsAdapter())
         reg.register(GreenhouseAdapter())
         reg.register(LeverAdapter())
         reg.register(AshbyAdapter())
         reg.register(WorkdayAdapter())
+        reg.register(MicrosoftAdapter())
+        reg.register(BrassRingAdapter())
+        reg.register(SmartRecruitersAdapter())
+        reg.register(TeamtailorAdapter())
         return reg
 
 
