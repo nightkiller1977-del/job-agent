@@ -1276,6 +1276,9 @@ class LinkedInScraper(BaseScraper):
             )
             self.last_apply_status = scraper.last_apply_status
             self.last_apply_detail = scraper.last_apply_detail
+            # propagate adapter analytics (e.g. reauth_refreshed) so the orchestrator's
+            # same-run retry and analytics persistence see them through this wrapper
+            self._apply_analytics = getattr(scraper, "_apply_analytics", None) or {}
             return result
         except PDFTextLayerError:
             # Let this propagate to orchestrator.apply_approved(), which pauses
