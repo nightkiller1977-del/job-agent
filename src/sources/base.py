@@ -350,9 +350,18 @@ class BaseScraper(ABC):
         await self._export_session_json()
 
     async def _close_browser(self, save_session: bool = True) -> None:
-        # The whole teardown runs inside try/finally: even a task CANCELLATION during
-        # session export, context shutdown, or the flush sleep must not strand the
-        # all-owners profile lock (a stranded lock names a live PID forever).
+        # Shield the teardown from EXTERNAL task cancellation: if the owning task is
+        # cancelled mid-close, the inner task keeps running to completion in the
+        # background — so the profile lock is only ever released AFTER the browser
+        # resources are actually closed (releasing early would hand the profile to
+        # the next owner while our Chrome is still alive).
+        inner = asyncio.ensure_future(self._close_browser_unshielded(save_session))
+        await asyncio.shield(inner)
+
+    async def _close_browser_unshielded(self, save_session: bool = True) -> None:
+        # The whole teardown runs inside try/finally: even a CANCELLATION raised from
+        # within (session export, context shutdown, the flush sleep) must not strand
+        # the all-owners profile lock (a stranded lock names a live PID forever).
         try:
             # Export session before closing — must happen while context is still live.
             # Separated from the close() call so that close() is always reached even if
