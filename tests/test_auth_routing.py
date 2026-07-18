@@ -3,6 +3,7 @@ import pytest
 
 from src.sources.adapters.auth_routing import (
     is_auth_required, directive_for, ReauthRouter, ManagerReauthRouter,
+    external_ats_url, needs_external_portal_prep,
 )
 
 
@@ -21,8 +22,9 @@ def test_directive_for_vendor_portal():
     assert d.vendor == "teamtailor" and d.source == "linkedin"
     assert d.action == "prepare_sessions"
     # remediation must target the job's origin source + company (prepare-sessions
-    # filters on job["source"], so '--source jobright' would never open this portal)
-    assert 'prepare-sessions --source linkedin --company "Acme Corp"' in d.remediation
+    # filters on job["source"]/company, then routes portal-blocked jobs to the
+    # external-portal prep flow regardless of discovery source)
+    assert "prepare-sessions --source linkedin --company 'Acme Corp'" in d.remediation
     assert "--source jobright" not in d.remediation
     assert "teamtailor" in d.remediation
     d2 = directive_for("workday_session_expired", {})
@@ -30,6 +32,115 @@ def test_directive_for_vendor_portal():
     assert "prepare-sessions --source jobright" in d2.remediation  # default source, no company
     assert "--company" not in d2.remediation
     assert directive_for("applied", {}) is None
+
+
+def test_directive_shell_quotes_scraped_company():
+    import shlex
+    # Company names come from scraped listings — a hostile/odd name must not be
+    # able to smuggle shell syntax into the copy-pasteable remediation command.
+    evil = 'Acme"; rm -rf ~; echo "'
+    d = directive_for("workday_session_expired", {"source": "indeed", "company": evil})
+    assert f"--company {shlex.quote(evil)}" in d.remediation
+    # the quoted form round-trips to the original single argv token
+    cmd_tail = d.remediation.split("--company ", 1)[1]
+    assert shlex.split(cmd_tail) == [evil]
+
+
+def test_external_ats_url_extraction():
+    ats = "https://acme.wd1.myworkdayjobs.com/job/123"
+    assert external_ats_url({"ats_url": ats}) == ats
+    assert external_ats_url({"extra_json": {"ats_url": ats}}) == ats
+    assert external_ats_url({"extra_json": f'{{"ats_url": "{ats}"}}'}) == ats  # serialized
+    assert external_ats_url({"extra_json": "not json"}) == ""
+    assert external_ats_url({"ats_url": "javascript:alert(1)"}) == ""  # non-http scheme
+    assert external_ats_url({}) == "" and external_ats_url(None) == ""
+
+
+def test_needs_external_portal_prep_routes_any_origin_portal_job():
+    ats = "https://acme.wd1.myworkdayjobs.com/job/123"
+    # THE P1: LinkedIn/Indeed-origin job blocked on an external ATS wall must go
+    # through the external-portal prep flow, not LinkedInScraper/IndeedScraper
+    # prepare_session (which only open linkedin.com / indeed.com).
+    for src in ("linkedin", "indeed"):
+        job = {"source": src,
+               "extra_json": {"apply_last_status": "workday_session_expired", "ats_url": ats}}
+        assert needs_external_portal_prep("needs-session", job), src
+        assert needs_external_portal_prep("needs-portal-login", job), src
+
+
+def test_needs_external_portal_prep_negative_cases():
+    ats = "https://careers.microsoft.com/apply/123"
+    # jobright/external sources already dispatch to the portal prep flow
+    for src in ("jobright", "external"):
+        job = {"source": src,
+               "extra_json": {"apply_last_status": "microsoft_login_required", "ats_url": ats}}
+        assert not needs_external_portal_prep("needs-session", job), src
+    # source's own session is the blocker -> the source's prepare_session is right
+    for status in ("linkedin_authwall", "linkedin_login_required"):
+        job = {"source": "linkedin", "extra_json": {"apply_last_status": status, "ats_url": ats}}
+        assert not needs_external_portal_prep("needs-session", job), status
+    # no recorded portal URL -> nothing to open directly
+    job = {"source": "linkedin", "extra_json": {"apply_last_status": "workday_session_expired"}}
+    assert not needs_external_portal_prep("needs-session", job)
+    # readiness classes outside the portal-login set never reroute
+    ok = {"source": "linkedin",
+          "extra_json": {"apply_last_status": "workday_session_expired", "ats_url": ats}}
+    for readiness in ("ready", "needs-review", "needs-hydration", "needs-answer"):
+        assert not needs_external_portal_prep(readiness, ok), readiness
+
+
+@pytest.mark.asyncio
+async def test_prepare_sessions_dispatches_portal_blocked_jobs_to_external_prep(monkeypatch):
+    """P1 regression: a LinkedIn/Indeed-origin job blocked on an external ATS
+    auth wall must be prepped via the external-portal flow (jobright path), while
+    a job blocked on the source's own session keeps the source's prep."""
+    import json as _json
+    from src import orchestrator as orch_mod
+
+    calls = []
+
+    def make_scraper(name):
+        class _Scraper:
+            def __init__(self, config):
+                pass
+
+            async def prepare_session(self, job):
+                calls.append((name, job.get("job_id")))
+        return _Scraper
+
+    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {
+        "jobright": make_scraper("jobright"),
+        "linkedin": make_scraper("linkedin"),
+        "indeed": make_scraper("indeed"),
+    })
+
+    ats = "https://acme.wd1.myworkdayjobs.com/job/1"
+    jobs = [
+        {"job_id": "portal", "source": "linkedin", "title": "T", "company": "C",
+         "url": "https://www.linkedin.com/jobs/view/1",
+         "extra_json": _json.dumps(
+             {"apply_last_status": "workday_session_expired", "ats_url": ats})},
+        {"job_id": "authwall", "source": "linkedin", "title": "T2", "company": "C2",
+         "url": "https://www.linkedin.com/jobs/view/2",
+         "extra_json": _json.dumps({"apply_last_status": "linkedin_authwall"})},
+    ]
+
+    class _State:
+        def get_approved_unapplied(self):
+            return jobs
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
+    o.config = {}
+    o.state = _State()
+    o.load_credentials_from_dashboard = _noop
+    o._pull_approved_from_cloud = _noop
+
+    await o.prepare_sessions()
+    assert ("jobright", "portal") in calls    # external ATS wall -> portal prep flow
+    assert ("linkedin", "authwall") in calls  # source-session block -> source prep
 
 
 @pytest.mark.asyncio
