@@ -96,11 +96,12 @@ class ExternalApplySession(BaseScraper):
         # Optional Phase 2b notification dispatcher; None = no notifications.
         self.dispatcher = dispatcher
 
-    def _maybe_notify(self, event: str, outcome: str, title: str, message: str = "") -> None:
+    def _maybe_notify(self, event: str, outcome: str, title: str, message: str = "",
+                      key: str | None = None) -> None:
         if self.dispatcher is None:
             return
         try:  # fail-open at the call site too
-            self.dispatcher.dispatch_event(event, outcome, title, message)
+            self.dispatcher.dispatch_event(event, outcome, title, message, key=key)
         except Exception:
             pass
 
@@ -162,7 +163,8 @@ class ExternalApplySession(BaseScraper):
                    outcome="submit_in_progress", stale=stale)
             self._maybe_notify("submit_in_progress_blocked", "submit_in_progress",
                                f"{vendor}: apply needs attention",
-                               "A prior submit is unresolved — review before retrying.")
+                               "A prior submit is unresolved — review before retrying.",
+                               key=f"{key or attempt_id}:submit_in_progress")
             return AtsApplyResult.blocked(
                 "submit_in_progress",
                 f"a prior submit for {key} is unresolved "
@@ -190,7 +192,8 @@ class ExternalApplySession(BaseScraper):
             _event("profile_locked", AttemptPhase.FAILED, outcome="profile_locked")
             self._maybe_notify("profile_locked", "profile_locked",
                                f"{vendor}: apply blocked",
-                               "Another Chrome holds the profile — close it and retry.")
+                               "Another Chrome holds the profile — close it and retry.",
+                               key=f"{key or attempt_id}:profile_locked")
             return AtsApplyResult.blocked(
                 "profile_locked", str(e), attempt_id=attempt_id,
             )
@@ -254,7 +257,8 @@ class ExternalApplySession(BaseScraper):
                     self.ledger.clear(key)
             _event("attempt_finished", _phase_for(res), outcome=res.status, verified=res.verified)
             self._maybe_notify("attempt_finished", res.status,
-                               f"{vendor}: {res.status}", res.detail)
+                               f"{vendor}: {res.status}", res.detail,
+                               key=f"{key or attempt_id}:{res.status}")
             return res
         except Exception as exc:
             # a browser/adapter crash must still close the attempt in the audit stream,

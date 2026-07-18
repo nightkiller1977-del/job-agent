@@ -37,8 +37,12 @@ class NoticeClass(str, Enum):
 _HUMAN_OUTCOMES = {
     "review_ready", "needs_answer", "needs_session", "needs_session_prep",
     "needs_hydration", "submission_unverified", "submit_in_progress",
+    "login_required",   # generic adapter's pre-fill login wall needs a human
 }
-_BLOCKED_OUTCOMES = {"submit_denied_by_policy", "profile_locked", "credentials_missing"}
+_BLOCKED_OUTCOMES = {
+    "submit_denied_by_policy", "profile_locked", "credentials_missing",
+    "captcha",           # a captcha/bot wall stops the attempt — surface it
+}
 
 
 def notice_for(event: str, outcome: str = "") -> NoticeClass | None:
