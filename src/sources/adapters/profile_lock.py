@@ -7,23 +7,33 @@ on the profile directory: acquire before launch, release in a finally.
 
 Implemented with O_CREAT|O_EXCL (no third-party dep). A lock whose owning PID is dead
 is treated as stale and reclaimed, so a crashed run does not wedge the profile forever.
+
+Ownership model (same-process reentrancy):
+  - Each OUTERMOST acquisition mints an operation token, records it in the global
+    `_OWNERS[key]` registry, and adds it to the caller's `_OP_IDS` contextvar.
+  - A borrow is allowed only when `_OWNERS[key]` is one of the tokens carried by the
+    current call chain — so nested acquires (ExternalApplySession -> _start_browser)
+    borrow, while an INDEPENDENT concurrent operation in the same process waits or
+    refuses like a foreign owner.
+  - Release clears the GLOBAL registry entry, so it works from any task/context
+    (e.g. the shielded teardown task); a stale token left in some context is harmless
+    because the registry no longer maps the key to it.
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import os
 import time
+import uuid
 from pathlib import Path
 
-# Lock paths held by the CURRENT logical operation (task/callers' context). Borrowing
-# is allowed only when the acquiring code runs within the holder's context — a PID
-# match alone is not enough, or two independent concurrent operations in one process
-# would both "own" the profile and race (the second's _clear_profile_locks could
-# pkill the first's live Chrome).
-_HELD_IN_CONTEXT: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
-    "profile_locks_held", default=frozenset()
+# operation tokens carried by the current call chain (copied into child tasks)
+_OP_IDS: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
+    "profile_lock_op_ids", default=frozenset()
 )
-
+# key -> operation token of the current outermost holder (process-global)
+_OWNERS: dict = {}
 
 # An empty lock file is tolerated for this many quick cycles (a create->write TOCTOU
 # window) before being treated as a crashed-mid-create lock and reclaimed.
@@ -38,13 +48,14 @@ class ProfileLockError(RuntimeError):
 class ProfileLock:
     """Exclusive cross-process lock on a Chrome profile dir.
 
-    REENTRANT within a logical operation: when the CURRENT context already holds
-    this lock (e.g. ExternalApplySession holds it and BaseScraper._start_browser
-    acquires again in the same call chain), acquire() is a borrow — depth-counted
-    per lock path — and only the outermost release() removes the file. Two
-    INDEPENDENT concurrent operations in the same process do NOT borrow from each
-    other (context-scoped, not PID-scoped); the second waits/refuses like any
-    foreign owner. Cross-process exclusivity is unchanged.
+    REENTRANT within a logical operation (see module docstring): nested acquires in
+    the holder's call chain borrow — depth-counted per lock path — and only the
+    outermost release() removes the file. Independent concurrent operations in the
+    same process do NOT borrow from each other. Cross-process exclusivity unchanged.
+
+    `acquire()` is the synchronous form (blocking waits); `acquire_async()` performs
+    the same protocol with `await asyncio.sleep(...)` waits so contention never
+    blocks the event loop.
     """
 
     # per-process reentrancy depth, keyed by resolved lock path
@@ -56,7 +67,6 @@ class ProfileLock:
         self.poll = poll
         self._acquired = False
         self._borrowed = False  # reentrant borrow: don't unlink on release
-        self._ctx_token = None  # contextvar token held by the OUTERMOST acquisition
 
     def _read_owner_pid(self) -> int | None:
         try:
@@ -91,28 +101,37 @@ class ProfileLock:
         except FileNotFoundError:
             pass
 
-    def acquire(self) -> "ProfileLock":
+    def _mark_acquired(self, key: str, *, borrowed: bool) -> None:
+        self._acquired = True
+        self._borrowed = borrowed
+        ProfileLock._depth[key] = ProfileLock._depth.get(key, 0) + 1
+        if not borrowed:
+            # mint an operation token: the global registry names the owner; the
+            # contextvar lets only OUR call chain (incl. child tasks, which copy
+            # the context) borrow this lock.
+            op = uuid.uuid4().hex
+            _OWNERS[key] = op
+            _OP_IDS.set(_OP_IDS.get() | {op})
+
+    def _acquire_attempts(self):
+        """Drive the acquisition protocol; yields sleep durations between attempts.
+        Returns (having set acquired state) or raises ProfileLockError. The caller
+        decides HOW to sleep (time.sleep vs asyncio.sleep)."""
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.time() + self.timeout
         empty_seen = 0
         key = str(self.lock_path.resolve())
         while True:
             if self._try_create():
-                self._acquired = True
-                ProfileLock._depth[key] = ProfileLock._depth.get(key, 0) + 1
-                # mark this lock as held by the current logical operation so only
-                # code in OUR call chain may borrow it
-                self._ctx_token = _HELD_IN_CONTEXT.set(_HELD_IN_CONTEXT.get() | {key})
-                return self
+                self._mark_acquired(key, borrowed=False)
+                return
             owner = self._read_owner_pid()
-            if owner == os.getpid() and key in _HELD_IN_CONTEXT.get():
-                # reentrant: OUR call chain already holds this profile — borrow it.
-                # (Same PID but a different concurrent operation does NOT match the
-                # context and falls through to wait/refuse like a foreign owner.)
-                self._acquired = True
-                self._borrowed = True
-                ProfileLock._depth[key] = ProfileLock._depth.get(key, 0) + 1
-                return self
+            if owner == os.getpid() and _OWNERS.get(key) in _OP_IDS.get():
+                # reentrant: OUR call chain holds this profile — borrow it. Same PID
+                # but a different concurrent operation doesn't carry the owner token
+                # and falls through to wait/refuse like a foreign owner.
+                self._mark_acquired(key, borrowed=True)
+                return
             if owner is not None and not self._pid_alive(owner):
                 self._steal()          # owner PID is dead -> reclaim
                 empty_seen = 0
@@ -127,7 +146,7 @@ class ProfileLock:
                     self._steal()
                     empty_seen = 0
                     continue
-                time.sleep(_EMPTY_POLL)
+                yield _EMPTY_POLL
                 continue
             empty_seen = 0             # a live owner holds it
             if time.time() >= deadline:
@@ -135,7 +154,19 @@ class ProfileLock:
                     f"profile locked by live PID {owner}: {self.lock_path} "
                     f"(refusing a second Chrome on this profile)"
                 )
-            time.sleep(self.poll)
+            yield self.poll
+
+    def acquire(self) -> "ProfileLock":
+        for delay in self._acquire_attempts():
+            time.sleep(delay)
+        return self
+
+    async def acquire_async(self) -> "ProfileLock":
+        """Same protocol as acquire(), but waits with asyncio.sleep so contention
+        never blocks the event loop."""
+        for delay in self._acquire_attempts():
+            await asyncio.sleep(delay)
+        return self
 
     def release(self) -> None:
         if not self._acquired:
@@ -148,15 +179,12 @@ class ProfileLock:
             if depth <= 0 and self._read_owner_pid() == os.getpid():
                 os.unlink(self.lock_path)
                 ProfileLock._depth.pop(key, None)
+                # clearing the GLOBAL registry revokes ownership from any context
+                # still carrying the token — works from any task (shielded teardown).
+                _OWNERS.pop(key, None)
         except FileNotFoundError:
             pass
         finally:
-            if self._ctx_token is not None:
-                try:
-                    _HELD_IN_CONTEXT.reset(self._ctx_token)
-                except ValueError:
-                    pass  # released from a different context than acquire — best effort
-                self._ctx_token = None
             self._acquired = False
             self._borrowed = False
 
