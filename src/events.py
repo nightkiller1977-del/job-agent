@@ -90,9 +90,11 @@ class RunLog:
 
     def _ship(self, event: str, record: dict) -> None:
         try:
-            # tags mirror telemetry.model_span so Loki queries are consistent
-            _log.info(event, extra={"tags": {k: record[k] for k in (
-                "run_id", "event", "agent") if k in record}})
+            # Ship the full structured record (minus the raw timestamp) as Loki tags so
+            # vendor/job_id/phase/outcome/duration are queryable in Grafana, not just the
+            # event name. Values are already redacted by _sanitize; stringify for tags.
+            tags = {k: str(v) for k, v in record.items() if k != "ts"}
+            _log.info(event, extra={"tags": tags})
         except Exception:
             pass
 

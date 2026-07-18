@@ -40,8 +40,10 @@ console = Console()
 
 
 def _host(url: str) -> str:
+    # hostname (NOT netloc) so embedded credentials like user:pass@host never leak
+    # into the audit stream.
     try:
-        return urllib.parse.urlparse(url).netloc.lower()
+        return (urllib.parse.urlparse(url).hostname or "").lower()
     except Exception:
         return ""
 
@@ -228,6 +230,12 @@ class ExternalApplySession(BaseScraper):
                     self.ledger.clear(key)
             _event("attempt_finished", _phase_for(res), outcome=res.status, verified=res.verified)
             return res
+        except Exception as exc:
+            # a browser/adapter crash must still close the attempt in the audit stream,
+            # or per-run failure metrics silently undercount real crashes.
+            _event("attempt_finished", AttemptPhase.FAILED, outcome="error",
+                   error=type(exc).__name__)
+            raise
         finally:
             try:
                 await self._close_browser()
