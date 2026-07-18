@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock as _MM
 import pytest
 
 # Isolate the whole suite from the developer's REAL central secrets store
-# (~/Library/Application Support/ai-command-center/.env). Without this, src.secrets
+# (~/Library/Application Support/ai-command-center/.env). Without this, src.secret_store
 # would fill env vars from the machine's actual secrets, making credential-precedence
 # tests non-deterministic and leaking real values into test env. Point it at an empty
 # dir; tests that exercise the resolver override AICC_SECRETS_DIR themselves.
