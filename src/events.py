@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -39,16 +40,39 @@ _SENSITIVE = (
 )
 _MAX_STR = 300
 
+# Emails can end up in generically-named string fields; scrub them by pattern even
+# when the field name looks innocent. Opaque tokens/secrets are dropped by field-name
+# (see _SENSITIVE) rather than a length regex, which would also clobber legitimate ids
+# like a 32-char attempt_id.
+_EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.I)
+
+# Only bounded, low-cardinality dimensions belong in Loki stream labels. High-cardinality
+# values (run_id, attempt_id, ids, durations) go in the log payload instead.
+_TAG_KEYS = ("agent", "event", "vendor", "phase", "outcome", "source", "action")
+
+
+def _scrub_str(s: str) -> str:
+    s = _EMAIL_RE.sub("[redacted-email]", s)
+    return s[:_MAX_STR] + "…" if len(s) > _MAX_STR else s
+
+
+def _sanitize_value(v):
+    if isinstance(v, dict):
+        out = {}
+        for k, val in v.items():
+            if any(s in str(k).lower() for s in _SENSITIVE):
+                continue  # drop sensitive fields entirely, at any nesting depth
+            out[k] = _sanitize_value(val)
+        return out
+    if isinstance(v, (list, tuple)):
+        return [_sanitize_value(x) for x in v]
+    if isinstance(v, str):
+        return _scrub_str(v)
+    return v
+
 
 def _sanitize(fields: dict) -> dict:
-    clean: dict[str, Any] = {}
-    for k, v in fields.items():
-        if any(s in k.lower() for s in _SENSITIVE):
-            continue  # drop sensitive fields entirely
-        if isinstance(v, str) and len(v) > _MAX_STR:
-            v = v[:_MAX_STR] + "…"
-        clean[k] = v
-    return clean
+    return _sanitize_value(dict(fields))
 
 
 class RunLog:
@@ -90,11 +114,12 @@ class RunLog:
 
     def _ship(self, event: str, record: dict) -> None:
         try:
-            # Ship the full structured record (minus the raw timestamp) as Loki tags so
-            # vendor/job_id/phase/outcome/duration are queryable in Grafana, not just the
-            # event name. Values are already redacted by _sanitize; stringify for tags.
-            tags = {k: str(v) for k, v in record.items() if k != "ts"}
-            _log.info(event, extra={"tags": tags})
+            # Only bounded dimensions become Loki stream labels (unbounded run_id/
+            # attempt_id/duration as labels would explode cardinality). The full
+            # structured record travels in the log message payload instead.
+            tags = {k: str(record[k]) for k in _TAG_KEYS if k in record}
+            payload = {k: v for k, v in record.items() if k != "ts"}
+            _log.info(json.dumps(payload, default=str), extra={"tags": tags})
         except Exception:
             pass
 
