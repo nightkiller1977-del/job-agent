@@ -26,11 +26,23 @@ class ProfileLockError(RuntimeError):
 
 
 class ProfileLock:
+    """Exclusive cross-process lock on a Chrome profile dir.
+
+    REENTRANT within a process: when this process already owns the lock file
+    (e.g. ExternalApplySession holds it and BaseScraper._start_browser acquires
+    again), acquire() is a borrow — depth-counted per lock path — and only the
+    outermost release() removes the file. Cross-process exclusivity is unchanged.
+    """
+
+    # per-process reentrancy depth, keyed by resolved lock path
+    _depth: dict = {}
+
     def __init__(self, profile_dir: Path | str, *, timeout: float = 0.0, poll: float = 0.5):
         self.lock_path = Path(profile_dir).with_suffix(".applylock")
         self.timeout = timeout
         self.poll = poll
         self._acquired = False
+        self._borrowed = False  # reentrant borrow: don't unlink on release
 
     def _read_owner_pid(self) -> int | None:
         try:
@@ -69,11 +81,19 @@ class ProfileLock:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.time() + self.timeout
         empty_seen = 0
+        key = str(self.lock_path.resolve())
         while True:
             if self._try_create():
                 self._acquired = True
+                ProfileLock._depth[key] = ProfileLock._depth.get(key, 0) + 1
                 return self
             owner = self._read_owner_pid()
+            if owner == os.getpid():
+                # reentrant: this process already holds the profile — borrow it.
+                self._acquired = True
+                self._borrowed = True
+                ProfileLock._depth[key] = ProfileLock._depth.get(key, 0) + 1
+                return self
             if owner is not None and not self._pid_alive(owner):
                 self._steal()          # owner PID is dead -> reclaim
                 empty_seen = 0
@@ -101,13 +121,19 @@ class ProfileLock:
     def release(self) -> None:
         if not self._acquired:
             return
+        key = str(self.lock_path.resolve())
+        depth = ProfileLock._depth.get(key, 1) - 1
+        ProfileLock._depth[key] = depth
         try:
-            if self._read_owner_pid() == os.getpid():
+            # only the OUTERMOST holder removes the file; inner borrows just decrement.
+            if depth <= 0 and self._read_owner_pid() == os.getpid():
                 os.unlink(self.lock_path)
+                ProfileLock._depth.pop(key, None)
         except FileNotFoundError:
             pass
         finally:
             self._acquired = False
+            self._borrowed = False
 
     def __enter__(self) -> "ProfileLock":
         return self.acquire()
