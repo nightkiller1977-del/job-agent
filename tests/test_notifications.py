@@ -22,7 +22,9 @@ def test_notice_for_mapping():
     assert notice_for("profile_locked", "profile_locked") is NoticeClass.SUBMISSION_BLOCKED
     assert notice_for("attempt_finished", "login_required") is NoticeClass.HUMAN_ACTION_REQUIRED
     assert notice_for("attempt_finished", "captcha") is NoticeClass.SUBMISSION_BLOCKED
-    assert notice_for("attempt_finished", "submit_not_found") is None  # not notify-worthy
+    assert notice_for("attempt_finished", "submit_not_found") is NoticeClass.HUMAN_ACTION_REQUIRED
+    assert notice_for("attempt_finished", "form_not_reached") is NoticeClass.HUMAN_ACTION_REQUIRED
+    assert notice_for("attempt_finished", "external_ats_error") is None  # transient, not notify-worthy
 
 
 def test_routes_only_to_accepting_channels():
@@ -69,10 +71,22 @@ def test_dedup_within_ttl_then_expires():
 def test_dispatch_event_skips_non_notify_worthy():
     got, send = _recorder()
     d = Dispatcher(channels=[Channel("c", set(NoticeClass), send)])
-    assert d.dispatch_event("attempt_finished", "submit_not_found", "t") is None
+    assert d.dispatch_event("attempt_finished", "external_ats_error", "t") is None
     assert got == []
     d.dispatch_event("attempt_finished", "applied", "done")
     assert got and got[0][0] is NoticeClass.FYI
+
+
+def test_dedup_cache_evicts_expired_entries():
+    state, clock = _fixed_clock()
+    got, send = _recorder()
+    d = Dispatcher(channels=[Channel("c", {NoticeClass.FYI}, send)], dedup_ttl=100.0, now=clock)
+    d.dispatch(NoticeClass.FYI, "a", key="k1")
+    d.dispatch(NoticeClass.FYI, "b", key="k2")
+    assert len(d._seen) == 2
+    state["t"] += 101                       # both expire
+    d.dispatch(NoticeClass.FYI, "c", key="k3")
+    assert len(d._seen) == 1                # k1/k2 evicted, only k3 remains
 
 
 @pytest.mark.asyncio
