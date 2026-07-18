@@ -144,3 +144,42 @@ async def test_session_outer_lock_composes_with_base(tmp_path, monkeypatch):
     res = await sess.apply({"url": "https://boards.greenhouse.io/acme/jobs/1"})
     assert res.status == "review_ready"               # no profile_locked deadlock
     assert not prof.with_suffix(".applylock").exists()  # fully released
+
+
+@pytest.mark.asyncio
+async def test_lock_released_when_startup_fails(scraper, monkeypatch):
+    """Codex P1: a launch failure after acquisition must release the lock, or the
+    still-live process holds the profile forever."""
+    s, prof = scraper
+
+    async def _boom(load_extensions, use_chromium_fallback):
+        raise RuntimeError("chrome failed to start")
+
+    monkeypatch.setattr(s, "_launch_browser", _boom)
+    with pytest.raises(RuntimeError):
+        await s._start_browser()
+    assert s._profile_lock is None
+    assert not prof.with_suffix(".applylock").exists()   # lock released
+    # another owner can acquire immediately
+    lk = ProfileLock(prof).acquire(); lk.release()
+
+
+@pytest.mark.asyncio
+async def test_chromium_fallback_takes_no_lock(scraper, monkeypatch):
+    """Codex P1: the JSON-session bundled-Chromium path never opens the profile dir,
+    so it must not take (or wait on) the profile lock."""
+    s, prof = scraper
+    monkeypatch.setattr(s, "_should_use_chromium_fallback", lambda: True)
+    launched = {}
+
+    async def _fake_launch(load_extensions, use_chromium_fallback):
+        launched["fallback"] = use_chromium_fallback
+        return object()
+
+    monkeypatch.setattr(s, "_launch_browser", _fake_launch)
+    # a live FOREIGN owner holds the profile — fallback path must not care
+    prof.with_suffix(".applylock").write_text("1")
+    await s._start_browser()
+    assert launched["fallback"] is True
+    assert s._profile_lock is None
+    assert prof.with_suffix(".applylock").read_text() == "1"   # untouched
