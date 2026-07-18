@@ -2,7 +2,7 @@
 
 One authoritative store, one resolution order, shared by every consumer:
 
-- **job-agent** (Python) — `src/secrets.py`
+- **job-agent** (Python) — `src/secret_store.py`
 - **email-agent** (Node) — `src/lib/secrets.js`
 - **AI Commander** (Electron) — owns the store and, in Phase 3, ships the `aicc-secrets` CLI.
 
