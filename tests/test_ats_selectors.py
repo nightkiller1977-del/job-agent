@@ -47,3 +47,14 @@ def test_question_patterns_structure():
         assert len(patterns) > 0
         for pat in patterns:
             assert isinstance(pat, str)
+
+
+def test_submit_buttons_exclude_cta_entry_classes():
+    # entry CTAs like `.careersite-button` (Teamtailor Apply) must never sit in a
+    # vendor's submit_button list — the live path prepends these before final-submit
+    # candidates and can click a non-final CTA, marking a job submitted prematurely.
+    banned = ("careersite-button", "apply-button", "btn-apply")
+    for vendor, spec in SELECTORS.items():
+        for sel in spec.get("submit_button", []):
+            low = sel.lower()
+            assert not any(b in low for b in banned), f"{vendor}: {sel}"
