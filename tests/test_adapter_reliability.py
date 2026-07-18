@@ -181,16 +181,15 @@ def test_ledger_stale_in_progress(tmp_path):
 # --------------------------------------------------------------------------- #
 # 0.4 profile lock
 # --------------------------------------------------------------------------- #
-def test_profile_lock_is_exclusive(tmp_path):
+def test_profile_lock_is_exclusive_across_processes(tmp_path):
     prof = tmp_path / "p"
     prof.mkdir()
-    a = ProfileLock(prof).acquire()
-    try:
-        with pytest.raises(ProfileLockError):
-            ProfileLock(prof).acquire()
-    finally:
-        a.release()
-    # released -> reacquire succeeds
+    # a LIVE foreign process (pid 1: always alive, never ours) holds the profile
+    prof.with_suffix(".applylock").write_text("1")
+    with pytest.raises(ProfileLockError):
+        ProfileLock(prof, timeout=0).acquire()
+    # released (foreign lock gone) -> acquire succeeds
+    prof.with_suffix(".applylock").unlink()
     b = ProfileLock(prof).acquire()
     b.release()
 
@@ -281,9 +280,10 @@ async def test_session_clears_marker_on_non_submit_outcome(tmp_path, monkeypatch
 async def test_session_refuses_when_profile_locked(tmp_path, monkeypatch):
     adapter = _RecordingAdapter(AtsApplyResult.ok())
     sess, page, _ = _make_session(tmp_path, adapter, monkeypatch)
-    # simulate a live second Chrome holding the profile
+    # simulate a live FOREIGN process holding the profile (pid 1: alive, not ours —
+    # our own pid would be a reentrant borrow, which is allowed by design)
     lockfile = (tmp_path / "jobright_profile").with_suffix(".applylock")
-    lockfile.write_text(str(os.getpid()))
+    lockfile.write_text("1")
     res = await sess.apply(JOB, auto_submit=True)
     assert res.status == "profile_locked"
     assert page.goto_called is False
