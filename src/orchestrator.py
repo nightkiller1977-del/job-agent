@@ -425,6 +425,8 @@ class Orchestrator:
             "workday_session_expired",
             "brassring_login_required",
             "microsoft_login_required",
+            "smartrecruiters_login_required",
+            "teamtailor_login_required",
             "linkedin_authwall",
             "linkedin_login_required",
         }
@@ -744,7 +746,21 @@ class Orchestrator:
 
             scraper = SOURCE_MAP[src](self.config)
             try:
-                result = await scraper.apply(job, auto_submit=auto_submit)
+                # One-shot same-run retry: when the adapter path reports it refreshed a
+                # session mid-attempt (analytics["reauth_refreshed"], set by
+                # ExternalApplySession._route_auth), the blocked attempt is retried
+                # immediately instead of dead-ending until the next scheduled run.
+                for _reauth_pass in range(2):
+                    result = await scraper.apply(job, auto_submit=auto_submit)
+                    if result:
+                        break
+                    _an = getattr(scraper, "_apply_analytics", None) or {}
+                    if _reauth_pass == 0 and _an.get("reauth_refreshed"):
+                        console.print(
+                            "[cyan]Session refreshed by re-auth — retrying this job in the same run.[/cyan]"
+                        )
+                        continue
+                    break
                 if result:
                     self.state.set_status(job["job_id"], "applied")
                     self.state.record_apply_attempt(

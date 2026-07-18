@@ -286,12 +286,22 @@ class JobrightScraper(BaseScraper):
         # profile-lock collision with ExternalApplySession.
         if os.environ.get("USE_ADAPTER_REGISTRY", "").strip().lower() in ("1", "true", "yes", "on"):
             from .adapters.session import ExternalApplySession
+            from .adapters.runtime import get_run_log, get_dispatcher, get_reauth_router
             console.print("[cyan]apply_external_ats_job:[/cyan] routing via adapter registry (USE_ADAPTER_REGISTRY=1)")
             _job = dict(job)
             _job["url"] = external_url
             if resume_path:
                 _job["resume_path"] = resume_path
-            _res = await ExternalApplySession(self.config).apply(_job, auto_submit=auto_submit)
+            # Production wiring: shared per-invocation RunLog (one run_id per batch),
+            # shared Dispatcher (notification dedup spans jobs/retries), and the real
+            # re-auth router — instead of per-call defaults that only ran in tests.
+            _sess = ExternalApplySession(
+                self.config,
+                run_log=get_run_log(),
+                dispatcher=get_dispatcher(),
+                reauth_router=get_reauth_router(self.config),
+            )
+            _res = await _sess.apply(_job, auto_submit=auto_submit)
             self.last_apply_status = _res.status
             self.last_apply_detail = _res.detail
             if _res.analytics:
