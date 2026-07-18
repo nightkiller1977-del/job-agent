@@ -226,7 +226,7 @@ class ExternalApplySession(BaseScraper):
 
         # --- 0.4 exclusive profile lock: never a 2nd Chrome on the jobright profile ---
         try:
-            lock = ProfileLock(self._profile_dir).acquire()
+            lock = await ProfileLock(self._profile_dir).acquire_async()
         except ProfileLockError as e:
             _event("profile_locked", AttemptPhase.FAILED, outcome="profile_locked")
             self._maybe_notify("profile_locked", "profile_locked",

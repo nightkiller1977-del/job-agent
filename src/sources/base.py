@@ -191,9 +191,10 @@ class BaseScraper(ABC):
         self._profile_lock = None
         if not use_chromium_fallback:
             from .adapters.profile_lock import ProfileLock  # local: avoid import weight at module load
-            self._profile_lock = ProfileLock(
+            # acquire_async: contention waits with asyncio.sleep — never blocks the loop
+            self._profile_lock = await ProfileLock(
                 self._profile_dir, timeout=_PROFILE_LOCK_WAIT_S
-            ).acquire()
+            ).acquire_async()
 
         try:
             return await self._launch_browser(load_extensions, use_chromium_fallback)
