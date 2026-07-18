@@ -10,6 +10,7 @@ Kept import-light (no runtime playwright import) and fake-able: it only calls
 """
 from __future__ import annotations
 
+import asyncio
 import re
 
 # Confirmation tokens matched as DELIMITED url segments (not raw substrings), so a
@@ -43,9 +44,7 @@ _RECEIPT_JS = r"""() => {
 }"""
 
 
-async def verify_receipt(page) -> tuple[bool, str]:
-    """Return (verified, signal). `verified` is True only when a confirmation
-    URL or confirmation copy/reference id is observed. Never raises."""
+async def _check_once(page) -> tuple[bool, str]:
     # 1. URL-based confirmation (cheapest, and robust to SPA re-render).
     url = ""
     try:
@@ -62,5 +61,22 @@ async def verify_receipt(page) -> tuple[bool, str]:
         signal = None
     if signal:
         return True, str(signal)
-
     return False, ""
+
+
+async def verify_receipt(page, retries: int = 0, delay: float = 0.4, sleep=None) -> tuple[bool, str]:
+    """Return (verified, signal). `verified` is True only when a confirmation URL or
+    confirmation copy/reference id is observed. Never raises.
+
+    ATS submissions often confirm asynchronously (a follow-up request or SPA render
+    after the click returns), so the submit path polls up to `retries` times before
+    declaring the result ambiguous. `retries=0` (the default) does a single check —
+    used where an immediate answer is wanted."""
+    sleep = sleep or asyncio.sleep
+    ok, sig = await _check_once(page)
+    attempt = 0
+    while not ok and attempt < retries:
+        await sleep(delay)
+        ok, sig = await _check_once(page)
+        attempt += 1
+    return ok, sig
