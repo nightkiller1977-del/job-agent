@@ -52,7 +52,7 @@ async def test_session_routes_auth_outcome(tmp_path, monkeypatch):
     from src.sources.adapters.session import ExternalApplySession
     from src.sources.adapters.context import AtsApplyResult
     from src.sources.adapters.idempotency import SubmissionLedger
-    from tests.test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
+    from test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
 
     router = ReauthRouter()
     reg = AtsAdapterRegistry(
@@ -86,7 +86,7 @@ async def test_session_preserves_reauth_refresh_signal(tmp_path, monkeypatch):
     from src.sources.adapters.session import ExternalApplySession
     from src.sources.adapters.context import AtsApplyResult
     from src.sources.adapters.idempotency import SubmissionLedger
-    from tests.test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
+    from test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
 
     class RefreshRouter(ReauthRouter):
         async def route(self, directive):
@@ -129,7 +129,7 @@ async def test_session_no_routing_on_normal_outcome(tmp_path, monkeypatch):
     from src.sources.adapters.session import ExternalApplySession
     from src.sources.adapters.context import AtsApplyResult
     from src.sources.adapters.idempotency import SubmissionLedger
-    from tests.test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
+    from test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
 
     router = ReauthRouter()
     reg = AtsAdapterRegistry(fallback=_RecordingAdapter(AtsApplyResult.blocked("submit_not_found")))
