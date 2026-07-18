@@ -183,3 +183,50 @@ async def test_chromium_fallback_takes_no_lock(scraper, monkeypatch):
     assert launched["fallback"] is True
     assert s._profile_lock is None
     assert prof.with_suffix(".applylock").read_text() == "1"   # untouched
+
+
+@pytest.mark.asyncio
+async def test_partial_launch_closed_before_release(scraper, monkeypatch):
+    """Codex r2 P1: a launch that dies AFTER creating browser resources must close
+    them before the lock is released (else the next owner's pkill hits live Chrome)."""
+    s, prof = scraper
+    order = []
+
+    class _Ctx:
+        async def close(self):
+            order.append("context_closed")
+
+    async def _boom(load_extensions, use_chromium_fallback):
+        s._context = _Ctx()          # partial launch: context exists...
+        raise RuntimeError("new_page failed")  # ...then a later step dies
+
+    monkeypatch.setattr(s, "_launch_browser", _boom)
+    real_release = ProfileLock.release
+
+    def _spy_release(self):
+        order.append("lock_released")
+        real_release(self)
+
+    monkeypatch.setattr(ProfileLock, "release", _spy_release)
+    with pytest.raises(RuntimeError):
+        await s._start_browser()
+    assert order.index("context_closed") < order.index("lock_released")
+    assert s._context is None
+    assert not prof.with_suffix(".applylock").exists()
+
+
+@pytest.mark.asyncio
+async def test_close_browser_releases_lock_on_cancellation(scraper, monkeypatch):
+    """Codex r2 P2: cancellation during teardown must still release the lock."""
+    import asyncio as _asyncio
+    s, prof = scraper
+
+    async def _cancelled_export():
+        raise _asyncio.CancelledError()
+
+    monkeypatch.setattr(s, "_export_session_json", _cancelled_export)
+    s._profile_lock = ProfileLock(prof).acquire()
+    with pytest.raises(_asyncio.CancelledError):
+        await s._close_browser(save_session=True)
+    assert s._profile_lock is None
+    assert not prof.with_suffix(".applylock").exists()
