@@ -1276,6 +1276,9 @@ class LinkedInScraper(BaseScraper):
             )
             self.last_apply_status = scraper.last_apply_status
             self.last_apply_detail = scraper.last_apply_detail
+            # propagate the discovered portal URL so the orchestrator persists it
+            # (extra_json.ats_url) and prepare-sessions can reopen the portal directly
+            self.last_apply_ats_url = getattr(scraper, "last_apply_ats_url", "") or external_url
             # propagate adapter analytics (e.g. reauth_refreshed) so the orchestrator's
             # same-run retry and analytics persistence see them through this wrapper
             self._apply_analytics = getattr(scraper, "_apply_analytics", None) or {}

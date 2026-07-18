@@ -398,6 +398,9 @@ class IndeedScraper(BaseScraper):
         result = await jr.apply_external_ats_job(job, ext_url, auto_submit=auto_submit)
         self.last_apply_status = jr.last_apply_status
         self.last_apply_detail = jr.last_apply_detail
+        # propagate the discovered portal URL so the orchestrator persists it
+        # (extra_json.ats_url) and prepare-sessions can reopen the portal directly
+        self.last_apply_ats_url = getattr(jr, "last_apply_ats_url", "") or ext_url
         # propagate adapter analytics (e.g. reauth_refreshed) so the orchestrator's
         # same-run retry and analytics persistence see them through this wrapper
         self._apply_analytics = getattr(jr, "_apply_analytics", None) or {}
