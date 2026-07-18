@@ -18,14 +18,28 @@ URLS = {
 }
 
 
+class _El:
+    def __init__(self, page, sel):
+        self.page, self.sel = page, sel
+
+    async def fill(self, v):
+        self.page.filled[self.sel] = v
+
+    async def click(self):
+        self.page.clicks.append(self.sel)
+
+
 class FakePage:
-    def __init__(self, url, login_wall=False, cta_clicked=False, has_form=False, receipt=None):
+    def __init__(self, url, login_wall=False, cta_clicked=False, has_form=False,
+                 receipt=None, present=()):
         self.url = url
         self.login_wall = login_wall
         self.cta_clicked = cta_clicked
         self.has_form = has_form
         self.receipt = receipt
+        self.present = set(present)
         self.goto_urls = []
+        self.filled, self.clicks = {}, []
 
     async def goto(self, url, **kw):
         self.goto_urls.append(url)
@@ -47,7 +61,7 @@ class FakePage:
         return None
 
     async def query_selector(self, sel):
-        return None
+        return _El(self, sel) if sel in self.present else None
 
     async def set_input_files(self, sel, path):
         pass
@@ -117,6 +131,30 @@ async def test_reaches_form_then_defers_to_generic(vendor, cls):
     page = FakePage(URLS[vendor], cta_clicked=True, has_form=True)
     res = await cls().apply(_ctx(page, vendor, auto_submit=False))
     assert res.status == "review_ready"
+
+
+@pytest.mark.parametrize("vendor,cls", list(ADAPTERS.items()))
+@pytest.mark.asyncio
+async def test_auto_submits_with_selectors_and_receipt(vendor, cls):
+    """With vendor field/submit selectors present, a reached form auto-submits and,
+    given a receipt, resolves to `applied`."""
+    from src.adapters_patterns.ats_selectors import SELECTORS
+    submit_sels = set(SELECTORS[vendor]["submit_button"])
+    page = FakePage(URLS[vendor], cta_clicked=True, has_form=True, present=submit_sels,
+                    receipt="t:thank you for applying")
+    res = await cls().apply(_ctx(page, vendor, auto_submit=True))
+    assert res.submitted is True and res.verified is True and res.status == "applied"
+    assert page.clicks  # a submit control was clicked
+
+
+@pytest.mark.parametrize("vendor,cls", list(ADAPTERS.items()))
+@pytest.mark.asyncio
+async def test_auto_submit_without_receipt_is_unverified(vendor, cls):
+    from src.adapters_patterns.ats_selectors import SELECTORS
+    submit_sels = set(SELECTORS[vendor]["submit_button"])
+    page = FakePage(URLS[vendor], cta_clicked=True, has_form=True, present=submit_sels, receipt=None)
+    res = await cls().apply(_ctx(page, vendor, auto_submit=True))
+    assert res.submitted is False and res.status == "submission_unverified"
 
 
 @pytest.mark.asyncio
