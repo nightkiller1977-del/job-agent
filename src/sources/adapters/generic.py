@@ -47,7 +47,8 @@ def detect_vendor(url: str) -> str:
         return "smartrecruiters"
     if "brassring.com" in u or "kenexa" in u:
         return "brassring"
-    if "careers.microsoft.com" in u or "jobs.careers.microsoft" in u:
+    if ("careers.microsoft.com" in u or "jobs.careers.microsoft" in u
+            or ("microsoft.com" in u and "career" in u)):
         return "microsoft"
     return "generic"
 
