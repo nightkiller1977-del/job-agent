@@ -178,24 +178,63 @@ class BaseScraper(ABC):
         load_extensions=True: also loads the Jobright Autofill extension from
         state/extensions/jobright-autofill so it can fill company ATS forms.
         """
-        # All-owners profile lock: EVERY path that opens a profile (scrape, apply,
-        # hydration, prepare-sessions, ExternalApplySession) goes through here, so
-        # acquiring the lock here makes every owner participate in the protocol.
+        use_chromium_fallback = self._should_use_chromium_fallback()
+
+        # All-owners profile lock: EVERY path that opens the persistent profile
+        # (scrape, apply, hydration, prepare-sessions, ExternalApplySession) funnels
+        # through here, so acquiring makes every owner participate in the protocol.
         # If another LIVE process holds this profile we refuse — _clear_profile_locks'
-        # pkill below must never terminate a legitimate owner's Chrome. Reentrant
-        # within a process (ExternalApplySession's outer lock borrows, not deadlocks).
-        from .adapters.profile_lock import ProfileLock, ProfileLockError  # local: avoid import weight at module load
-        try:
+        # pkill must never terminate a legitimate owner's Chrome. Reentrant within a
+        # process (ExternalApplySession's outer lock borrows, not deadlocks).
+        # The bundled-Chromium JSON-session fallback never opens _profile_dir, so it
+        # takes no lock — background discovery keeps running alongside a live apply.
+        self._profile_lock = None
+        if not use_chromium_fallback:
+            from .adapters.profile_lock import ProfileLock  # local: avoid import weight at module load
             self._profile_lock = ProfileLock(
                 self._profile_dir, timeout=_PROFILE_LOCK_WAIT_S
             ).acquire()
-        except ProfileLockError:
-            self._profile_lock = None
+
+        try:
+            return await self._launch_browser(load_extensions, use_chromium_fallback)
+        except BaseException:
+            # startup failed after acquisition — release, or the still-live process
+            # would hold the profile forever (callers launch before their try/finally).
+            lock, self._profile_lock = self._profile_lock, None
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
             raise
 
-        # Remove stale lock files so Playwright can acquire the profile — safe now:
-        # holding the applylock means any Chrome still on this profile is stale.
-        self._clear_profile_locks()
+    def _should_use_chromium_fallback(self) -> bool:
+        """Background runs with a valid <source>_chromium.json use bundled Chromium
+        with a fresh context — they never open the persistent profile dir."""
+        # Background detection: launchd sets stdin=/dev/null (not a TTY).
+        # Use sys.stdin, not sys.stdout — stdout piped to `tee` would incorrectly
+        # classify an interactive run as background.
+        in_background = not sys.stdin.isatty()
+        if not (in_background and self._session_export_path.exists()):
+            return False
+        # Validate the file before trusting it — a partial write from a prior crash
+        # would produce opaque Playwright errors inside new_context().
+        try:
+            json.loads(self._session_export_path.read_text())
+            return True
+        except (json.JSONDecodeError, OSError) as exc:
+            _log.warning(
+                "%s: session export is corrupt (%s) — deleting and falling back to Chrome profile.",
+                self.name, exc,
+            )
+            self._session_export_path.unlink(missing_ok=True)
+            return False
+
+    async def _launch_browser(self, load_extensions: bool, use_chromium_fallback: bool) -> Page:
+        if not use_chromium_fallback:
+            # Remove stale lock files so Playwright can acquire the profile — safe:
+            # holding the applylock means any Chrome still on this profile is stale.
+            self._clear_profile_locks()
 
         console.print(f"[dim]Browser engine: {_BROWSER_ENGINE}[/dim]")
         self._playwright = await async_playwright().start()
@@ -217,36 +256,12 @@ class BaseScraper(ABC):
                 args.append(f"--load-extension={str(ext_path)}")
             # Extensions already installed in the Chrome profile load automatically.
 
-        # Decide whether to use bundled Chromium + JSON session (background/unattended)
-        # or persistent Chrome context (interactive).
-        #
-        # Background detection: launchd sets stdin=/dev/null (not a TTY).
-        # Use sys.stdin, not sys.stdout — stdout piped to `tee` would incorrectly
-        # classify an interactive run as background.
-        #
-        # Interactive runs (prepare-sessions, apply) always use persistent Chrome so:
-        #   1. freshly-refreshed cookies land in the profile, not just the JSON;
-        #   2. Chrome Web Store extensions remain available for apply.
+        # The bundled-Chromium vs persistent-Chrome decision was made in
+        # _should_use_chromium_fallback() (before the profile lock); the flag arrives
+        # as a parameter. Interactive runs (prepare-sessions, apply) always use
+        # persistent Chrome so freshly-refreshed cookies land in the profile and
+        # Chrome Web Store extensions remain available for apply.
         in_background = not sys.stdin.isatty()
-
-        # When a valid JSON export exists, background runs always use bundled Chromium.
-        # Background discover never needs channel="chrome" — it only needs cookies,
-        # which the JSON export provides. This completely avoids the ProcessSingleton
-        # conflict (two Chrome binaries sharing the same global IPC socket) regardless
-        # of whether Chrome happens to be running at the time.
-        use_chromium_fallback = False
-        if in_background and self._session_export_path.exists():
-            # Validate the file before trusting it — a partial write from a prior crash
-            # would produce opaque Playwright errors inside new_context().
-            try:
-                json.loads(self._session_export_path.read_text())
-                use_chromium_fallback = True
-            except (json.JSONDecodeError, OSError) as exc:
-                _log.warning(
-                    "%s: session export is corrupt (%s) — deleting and falling back to Chrome profile.",
-                    self.name, exc,
-                )
-                self._session_export_path.unlink(missing_ok=True)
 
         if use_chromium_fallback:
             self._browser = await self._playwright.chromium.launch(
