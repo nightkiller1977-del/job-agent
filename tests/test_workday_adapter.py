@@ -26,13 +26,15 @@ class _El:
 
 
 class FakeWorkdayPage:
-    def __init__(self, url=WD_URL, final_step=0, login_gate=False, receipt=None, stuck=False):
+    def __init__(self, url=WD_URL, final_step=0, login_gate=False, receipt=None,
+                 stuck=False, review=False):
         self.url = url
         self.step = 0
         self.final_step = final_step
         self.login_gate = login_gate
         self.receipt = receipt
         self.stuck = stuck
+        self.review = review
         self.filled, self.clicks, self.uploaded = {}, [], {}
 
     async def goto(self, url, **kw):
@@ -45,6 +47,8 @@ class FakeWorkdayPage:
             return self.login_gate
         if "thank you for" in script:    # receipt probe
             return self.receipt
+        if "review your application" in script:  # review-page probe
+            return self.review
         return None
 
     async def query_selector(self, sel):
@@ -112,6 +116,24 @@ async def test_steps_through_multi_page_wizard():
     res = await WorkdayAdapter().apply(_ctx(page, auto_submit=True))
     assert res.status == "applied"
     assert page.clicks.count(_NEXT_SELECTORS[0]) == 2   # advanced two pages
+
+
+@pytest.mark.asyncio
+async def test_review_page_next_is_gated_not_auto_clicked():
+    # review page: no submitButton, the Next control is the real submit — must NOT be
+    # clicked while advancing when auto_submit is off.
+    page = FakeWorkdayPage(final_step=99, review=True)
+    res = await WorkdayAdapter().apply(_ctx(page, auto_submit=False))
+    assert res.status == "review_ready"
+    assert page.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_review_page_next_submits_through_gate_with_receipt():
+    page = FakeWorkdayPage(final_step=99, review=True, receipt="t:application received")
+    res = await WorkdayAdapter().apply(_ctx(page, auto_submit=True))
+    assert res.status == "applied" and res.verified is True
+    assert page.clicks  # the next-as-submit was clicked, but via the gated path
 
 
 @pytest.mark.asyncio
