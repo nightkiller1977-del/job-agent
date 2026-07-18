@@ -98,7 +98,7 @@ async def test_session_dispatches_on_outcome(tmp_path, monkeypatch):
     from src.sources.adapters.context import AtsApplyResult
     from src.sources.adapters.idempotency import SubmissionLedger
     # reuse the fakes from the reliability test module
-    from tests.test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
+    from test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
 
     got, send = _recorder()
     disp = Dispatcher(channels=[Channel("all", set(NoticeClass), send)])
