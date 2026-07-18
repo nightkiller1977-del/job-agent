@@ -341,3 +341,51 @@ async def test_acquire_async_does_not_block_event_loop(tmp_path):
     t.cancel()
     # the loop kept servicing other tasks during the ~0.4s contention window
     assert len(ticks) >= 5
+
+
+@pytest.mark.asyncio
+async def test_session_cancellation_during_teardown_releases_outer_lock(tmp_path, monkeypatch):
+    """Codex r5 P1: cancelling the session while its finally awaits _close_browser
+    must still release the OUTER lock (nested finally), with the file disappearing
+    only after the shielded teardown drops the last borrow."""
+    import asyncio as _asyncio
+    from src.events import RunLog
+    from src.sources.adapters.registry import AtsAdapterRegistry
+    from src.sources.adapters.session import ExternalApplySession
+    from src.sources.adapters.context import AtsApplyResult
+    from src.sources.adapters.idempotency import SubmissionLedger
+    from test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
+
+    reg = AtsAdapterRegistry(fallback=_RecordingAdapter(AtsApplyResult.blocked("review_ready")))
+    sess = ExternalApplySession({}, registry=reg,
+                                ledger=SubmissionLedger(tmp_path / "l.json"),
+                                run_log=RunLog(agent="t", runs_dir=tmp_path / "runs"))
+    prof = tmp_path / "jobright_profile"
+    prof.mkdir()
+    monkeypatch.setattr(type(sess), "_profile_dir", property(lambda self: prof))
+
+    async def _start(load_extensions=False):
+        return _FakePage()
+
+    monkeypatch.setattr(sess, "_start_browser", _start)
+
+    gate = _asyncio.Event()
+    inner_done = _asyncio.Event()
+
+    async def _slow_close(save_session=True):
+        # simulate the shielded teardown: hangs until gated, then releases a borrow
+        try:
+            await gate.wait()
+        finally:
+            inner_done.set()
+
+    monkeypatch.setattr(sess, "_close_browser", _slow_close)
+
+    task = _asyncio.ensure_future(sess.apply(JOB))
+    await _asyncio.sleep(0.05)          # reach the finally's _close_browser await
+    task.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+    # outer lock must be RELEASED despite cancellation mid-teardown
+    assert not prof.with_suffix(".applylock").exists()
+    gate.set()

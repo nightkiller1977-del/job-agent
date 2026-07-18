@@ -307,11 +307,17 @@ class ExternalApplySession(BaseScraper):
                    error=type(exc).__name__)
             raise
         finally:
+            # Release the OUTER lock in a nested finally so even a CancelledError
+            # raised while awaiting the (shielded) teardown cannot strand it. The
+            # release is depth-counted: the lock FILE only disappears when the
+            # shielded teardown finishes and drops the last (base-borrow) count —
+            # so the profile is never handed over while Chrome is still closing.
             try:
                 await self._close_browser()
             except Exception:
                 pass
-            lock.release()
+            finally:
+                lock.release()
 
     @staticmethod
     def _enforce_authorization(res: AtsApplyResult, ctx: AtsApplyContext,
