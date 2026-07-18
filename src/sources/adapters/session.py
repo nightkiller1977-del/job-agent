@@ -35,6 +35,7 @@ from .attempt import AttemptPhase
 from .policy import AutoSubmitPolicy, SubmissionPolicy
 from .idempotency import SubmissionLedger, canonical_key
 from .profile_lock import ProfileLock, ProfileLockError
+from .auth_routing import directive_for
 
 console = Console()
 
@@ -84,7 +85,8 @@ class ExternalApplySession(BaseScraper):
                  policy: SubmissionPolicy | None = None,
                  ledger: SubmissionLedger | None = None,
                  run_log: RunLog | None = None,
-                 dispatcher=None):
+                 dispatcher=None,
+                 reauth_router=None):
         super().__init__(config)
         self.registry = registry or self._create_default_registry()
         # Optional policy override; when None a per-call AutoSubmitPolicy is used so
@@ -95,6 +97,25 @@ class ExternalApplySession(BaseScraper):
         self.run_log = run_log or RunLog(agent="external_apply")
         # Optional Phase 2b notification dispatcher; None = no notifications.
         self.dispatcher = dispatcher
+        # Optional Phase 3 re-auth router; None = auth outcomes are surfaced but not acted on.
+        self.reauth_router = reauth_router
+
+    async def _route_auth(self, res: AtsApplyResult, job: dict, attempt_id: str) -> None:
+        """If an adapter reported an auth wall, surface it and hand to re-auth routing."""
+        directive = directive_for(res.status, job)
+        if directive is None:
+            return
+        self.run_log.emit(
+            "auth_required", attempt_id=attempt_id, status=res.status,
+            vendor=directive.vendor, source=directive.source, action=directive.action,
+        )
+        res.analytics["reauth_directive"] = directive.to_dict()
+        # human-action notification is emitted by the attempt_finished _maybe_notify path
+        if self.reauth_router is not None:
+            try:
+                await self.reauth_router.route(directive)
+            except Exception:
+                pass
 
     def _maybe_notify(self, event: str, outcome: str, title: str, message: str = "",
                       key: str | None = None) -> None:
@@ -268,6 +289,7 @@ class ExternalApplySession(BaseScraper):
             self._maybe_notify("attempt_finished", res.status,
                                f"{vendor}: {res.status}", res.detail,
                                key=f"{key or attempt_id}:{res.status}")
+            await self._route_auth(res, job, attempt_id)
             return res
         except Exception as exc:
             # a browser/adapter crash must still close the attempt in the audit stream,
