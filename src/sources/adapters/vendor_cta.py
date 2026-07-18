@@ -47,9 +47,12 @@ _CLICK_CTA_JS = r"""(patterns) => {
 }"""
 
 _FORM_PROBE_JS = r"""() => {
-    const hasField = !!document.querySelector('input:not([type="hidden"]), textarea, select, [data-automation-id]');
-    const applied = /application|apply|resume|cover letter/i.test(document.body && document.body.innerText || '');
-    return hasField || applied;
+    // Require REAL applicant fields — not just the words "apply"/"application" in the
+    // page text, which appear on plain job-listing pages too. A genuine application
+    // form has multiple fillable inputs.
+    const fields = document.querySelectorAll(
+        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="search"]), textarea, select');
+    return fields.length >= 2;
 }"""
 
 
@@ -141,7 +144,8 @@ class BrassRingAdapter(CtaApplyAdapter):
 
 class SmartRecruitersAdapter(CtaApplyAdapter):
     name = "smartrecruiters"
-    cta_patterns = ["i'?m interested", "^apply$", "^apply now$", "apply for this job"]
+    # allow straight and curly apostrophes: I'm / I’m / I‘m interested
+    cta_patterns = ["i['’‘]?m interested", "^apply$", "^apply now$", "apply for this job"]
 
 
 class TeamtailorAdapter(CtaApplyAdapter):
