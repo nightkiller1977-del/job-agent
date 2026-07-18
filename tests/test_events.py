@@ -41,6 +41,15 @@ def test_redaction_drops_sensitive_fields(tmp_path):
         assert leaked not in rec
 
 
+def test_redaction_is_recursive_and_scrubs_emails(tmp_path):
+    rl = RunLog(runs_dir=tmp_path)
+    rec = rl.emit("x", context={"applicant_email": "me@example.com", "ok": "fine"},
+                  note="reach me at me@example.com please")
+    assert "applicant_email" not in rec["context"]      # nested sensitive key dropped
+    assert rec["context"]["ok"] == "fine"
+    assert "me@example.com" not in rec["note"] and "redacted-email" in rec["note"]
+
+
 def test_long_strings_truncated(tmp_path):
     rl = RunLog(runs_dir=tmp_path)
     rec = rl.emit("note", detail="x" * 1000)
