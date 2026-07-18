@@ -94,7 +94,7 @@ def directive_for(status: str, job: dict | None = None) -> ReauthDirective | Non
 
 # Readiness classes whose remediation is an interactive ATS-portal login
 # (orchestrator._classify_apply_readiness / prepare_sessions vocabulary).
-PORTAL_PREP_READINESS = {"needs-session", "needs-portal-login"}
+PORTAL_PREP_READINESS = {"needs-session", "needs-portal-login", "needs-review"}
 
 
 def _job_extra(job: dict | None) -> dict:

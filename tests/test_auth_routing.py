@@ -66,6 +66,13 @@ def test_needs_external_portal_prep_routes_any_origin_portal_job():
                "extra_json": {"apply_last_status": "workday_session_expired", "ats_url": ats}}
         assert needs_external_portal_prep("needs-session", job), src
         assert needs_external_portal_prep("needs-portal-login", job), src
+    # needs-review (workday_account_required / brassring_registration_required)
+    # must also route to the external portal — the account setup page is on the
+    # ATS portal, not on LinkedIn/Indeed.
+    for status in ("workday_account_required", "brassring_registration_required"):
+        job = {"source": "linkedin",
+               "extra_json": {"apply_last_status": status, "ats_url": ats}}
+        assert needs_external_portal_prep("needs-review", job), status
 
 
 def test_needs_external_portal_prep_negative_cases():
@@ -85,7 +92,7 @@ def test_needs_external_portal_prep_negative_cases():
     # readiness classes outside the portal-login set never reroute
     ok = {"source": "linkedin",
           "extra_json": {"apply_last_status": "workday_session_expired", "ats_url": ats}}
-    for readiness in ("ready", "needs-review", "needs-hydration", "needs-answer"):
+    for readiness in ("ready", "needs-hydration", "needs-answer"):
         assert not needs_external_portal_prep(readiness, ok), readiness
 
 
