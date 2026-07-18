@@ -277,6 +277,9 @@ class JobrightScraper(BaseScraper):
         This is used by LinkedIn jobs that do not expose Easy Apply. It reuses
         the persistent Jobright profile so the autofill extension is available.
         """
+        # Expose the portal URL for the orchestrator to persist (extra_json.ats_url)
+        # so prepare-sessions can reopen this portal directly for any-origin jobs.
+        self.last_apply_ats_url = external_url
         # Go-live (flag-gated): route through the new adapter registry instead of the
         # legacy body when USE_ADAPTER_REGISTRY is truthy. Default OFF, so the proven
         # path runs unless explicitly opted in for live verification. All external
@@ -1693,6 +1696,8 @@ class JobrightScraper(BaseScraper):
             except Exception:
                 pass
 
+            self.last_apply_ats_url = ext_url
+
             # ── Preferred: click Apply on the Jobright card to trigger extension ──
             # The Jobright autofill extension fires its full form-fill routine when
             # the ATS page is opened via the Jobright "Apply Now" button, rather than
@@ -1926,16 +1931,26 @@ class JobrightScraper(BaseScraper):
         self._workday_recovery_attempted = False
         page = await self._start_browser(load_extensions=True)
         try:
-            await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
-            await self._delay(2, 3)
-            popup_ext_url = await self._dismiss_jobright_popups(page)
-            ext_url = popup_ext_url or await self._extract_external_url(page)
-            if not ext_url:
-                console.print("[red]Jobright:[/red] Could not find company ATS URL for session prep.")
-                return
+            # Jobs routed here from other discovery sources (LinkedIn/Indeed) carry
+            # a recorded external portal URL instead of a Jobright listing — open
+            # the portal directly, there is no Jobright page to extract from.
+            from .adapters.auth_routing import external_ats_url
+            known_ext_url = external_ats_url(job)
+            if known_ext_url:
+                console.print(f"[cyan]Opening recorded ATS portal:[/cyan] {known_ext_url[:100]}")
+                company_page = page
+                await company_page.goto(known_ext_url, wait_until="domcontentloaded", timeout=45000)
+            else:
+                await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
+                await self._delay(2, 3)
+                popup_ext_url = await self._dismiss_jobright_popups(page)
+                ext_url = popup_ext_url or await self._extract_external_url(page)
+                if not ext_url:
+                    console.print("[red]Jobright:[/red] Could not find company ATS URL for session prep.")
+                    return
 
-            company_page = await self._context.new_page()
-            await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
+                company_page = await self._context.new_page()
+                await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
             await self._delay(4, 6)
             family = await self._detect_portal_family(company_page)
             console.print(f"[cyan]Portal:[/cyan] {company_page.url}")
