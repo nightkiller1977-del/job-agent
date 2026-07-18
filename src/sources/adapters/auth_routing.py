@@ -66,11 +66,17 @@ def directive_for(status: str, job: dict | None = None) -> ReauthDirective | Non
     portal = bool(vendor) or status == "needs_session_prep"
     action = "prepare_sessions" if portal else "reauth"
     who = vendor or source
-    remediation = (
-        f"python src/main.py prepare-sessions --source {source}"
-        if action == "prepare_sessions"
-        else "add credentials to .env / re-run to refresh the session"
-    )
+    if action == "prepare_sessions":
+        # The ATS portal (Workday/Microsoft/...) session lives in the shared EXTERNAL
+        # ('jobright') profile, NOT the originating scraper's session — so
+        # 'prepare-sessions --source linkedin' would open LinkedIn and leave the portal
+        # wall untouched. Point the human at the external profile + the specific portal.
+        remediation = (
+            f"sign in to the {who} portal in the external apply profile: "
+            f"python src/main.py prepare-sessions --source jobright"
+        )
+    else:
+        remediation = "add credentials to .env / re-run to refresh the session"
     return ReauthDirective(
         status=status, vendor=vendor, source=source, action=action,
         reason=f"{who} requires an authenticated session before applying",
