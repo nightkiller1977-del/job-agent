@@ -1,5 +1,11 @@
 """Data-only module containing CSS selectors, XPath selectors, and regex matching patterns
-for common ATS platforms (Greenhouse, Lever, Ashby, Workday).
+for common ATS platforms (Greenhouse, Lever, Ashby, Workday, Microsoft, BrassRing,
+SmartRecruiters, Teamtailor).
+
+The Microsoft/BrassRing/SmartRecruiters/Teamtailor entries are heuristic, attribute-based
+selectors (name/id/aria/type contains) — robust across portal variants but best refined
+against live DOM. They let the CTA adapters (vendor_cta.py) fill + auto-submit via the
+shared GenericAtsAdapter path once a form is reached.
 """
 
 SELECTORS = {
@@ -82,6 +88,81 @@ SELECTORS = {
             "address": "input[data-automation-id='addressSection_addressLine1']",
             "city": "input[data-automation-id='addressSection_city']",
             "postal_code": "input[data-automation-id='addressSection_postalCode']"
+        }
+    },
+    "teamtailor": {
+        "form": "form[action*='application' i], form.form, form",
+        "submit_button": [
+            "button[type='submit']",
+            "input[type='submit']",
+            "//button[contains(., 'Submit application')]",
+            "//button[contains(., 'Send application')]"
+        ],
+        "file_inputs": {
+            "resume": "input[type='file'][name*='resume' i], input[type='file'][name*='cv' i], input[type='file']"
+        },
+        "fields": {
+            "first_name": "input[name*='first' i], input[id*='first' i]",
+            "last_name": "input[name*='last' i], input[id*='last' i]",
+            "name": "input[name='job_application[name]'], input[id*='full-name' i], input[name*='full_name' i]",
+            "email": "input[type='email'], input[name*='email' i], input[id*='email' i]",
+            "phone": "input[type='tel'], input[name*='phone' i], input[id*='phone' i]",
+            "linkedin": "input[name*='linkedin' i], input[id*='linkedin' i]"
+        }
+    },
+    "smartrecruiters": {
+        "form": "form[data-test='application-form'], form",
+        "submit_button": [
+            "#submitButton",
+            "button[type='submit']",
+            "button[data-test='form-submit-button']",
+            "//button[contains(., 'Submit application')]",
+            "//button[contains(., 'Send application')]"
+        ],
+        "file_inputs": {
+            "resume": "input[type='file'][name*='resume' i], input[type='file']"
+        },
+        "fields": {
+            "first_name": "#firstName, input[name*='firstName' i], input[name*='first_name' i], input[id*='first' i]",
+            "last_name": "#lastName, input[name*='lastName' i], input[name*='last_name' i], input[id*='last' i]",
+            "email": "#email, input[type='email'], input[name*='email' i]",
+            "phone": "#phoneNumber, input[type='tel'], input[name*='phone' i]",
+            "linkedin": "input[name*='linkedin' i], input[id*='linkedin' i]"
+        }
+    },
+    "brassring": {
+        "submit_button": [
+            "input[type='submit']",
+            "button[type='submit']",
+            "//input[@value='Submit']",
+            "//a[contains(., 'Submit')]",
+            "//button[contains(., 'Submit')]"
+        ],
+        "file_inputs": {
+            "resume": "input[type='file'][id*='resume' i], input[type='file'][name*='resume' i], input[type='file']"
+        },
+        "fields": {
+            "first_name": "input[id*='FirstName' i], input[name*='FirstName' i], input[id*='first' i]",
+            "last_name": "input[id*='LastName' i], input[name*='LastName' i], input[id*='last' i]",
+            "email": "input[id*='Email' i], input[name*='Email' i], input[type='email']",
+            "phone": "input[id*='Phone' i], input[name*='Phone' i], input[type='tel']"
+        }
+    },
+    "microsoft": {
+        "submit_button": [
+            "button[aria-label*='Submit' i]",
+            "button[type='submit']",
+            "//button[contains(., 'Submit')]",
+            "//button[contains(., 'Apply')]"
+        ],
+        "file_inputs": {
+            "resume": "input[type='file']"
+        },
+        "fields": {
+            "first_name": "input[aria-label*='First' i], input[name*='first' i], input[id*='first' i]",
+            "last_name": "input[aria-label*='Last' i], input[name*='last' i], input[id*='last' i]",
+            "email": "input[type='email'], input[aria-label*='Email' i], input[name*='email' i]",
+            "phone": "input[type='tel'], input[aria-label*='Phone' i], input[name*='phone' i]"
         }
     }
 }
