@@ -43,7 +43,9 @@ _CHOOSER_TEXTS = (
 )
 _LOGIN_URL_TOKENS = ("/login", "/signin", "/sign-in", "/auth", "login.", "sso.")
 
-_MAX_WIZARD_STEPS = 8
+# Workday applications can run long (GDIT/CVS/Citi see 15-20+ pages); the legacy path
+# used a 30-step bound.
+_MAX_WIZARD_STEPS = 30
 
 
 class WorkdayAdapter(GenericAtsAdapter):
@@ -86,8 +88,13 @@ class WorkdayAdapter(GenericAtsAdapter):
                 evidence=ev_to_dict(ev),
             )
 
-        # 5. Shared policy-gated submit + receipt verification.
-        return await self._gated_submit(page, ctx, _SUBMIT_SELECTORS, ev, "workday")
+        # 5. Shared policy-gated submit + receipt verification. Include the Next
+        #    selectors as a fallback: on the review page Workday renders its FINAL
+        #    submit as `bottom-navigation-next-button`, and _advance_to_submit stops
+        #    (without clicking) there — so the real submit is clicked here, through the
+        #    policy + receipt gate, never auto-clicked while advancing.
+        return await self._gated_submit(
+            page, ctx, _SUBMIT_SELECTORS + _NEXT_SELECTORS, ev, "workday")
 
     # ---- Workday-specific steps ---------------------------------------------
     async def _enter_apply(self, page) -> None:
@@ -164,6 +171,11 @@ class WorkdayAdapter(GenericAtsAdapter):
             _, submit_el = await self._first_selector(page, _SUBMIT_SELECTORS)
             if submit_el:
                 return True
+            # On the final review page the "Next" control IS the real submit. Stop here
+            # WITHOUT clicking so the shared gate (policy + receipt) performs that click,
+            # rather than burning the submit while advancing.
+            if await self._is_review_page(page):
+                return True
             _, next_el = await self._first_selector(page, _NEXT_SELECTORS)
             if not next_el:
                 return False  # neither next nor submit — stuck
@@ -173,6 +185,18 @@ class WorkdayAdapter(GenericAtsAdapter):
                 return False
             # each new page may carry more identity fields
             await self._fill_identity(page, ctx, ev)
-        # exhausted steps — reached submit only if it is now present
+        # exhausted steps — reached submit only if a submit/review control is present
         _, submit_el = await self._first_selector(page, _SUBMIT_SELECTORS)
-        return bool(submit_el)
+        return bool(submit_el) or await self._is_review_page(page)
+
+    async def _is_review_page(self, page) -> bool:
+        """Detect the Workday final review/submit step by its copy."""
+        try:
+            return bool(await page.evaluate(
+                """() => {
+                    const t = (document.body && document.body.innerText || '').toLowerCase();
+                    return /review your application|submit your application|by (clicking )?submit|i (accept|agree)|please review your/.test(t);
+                }"""
+            ))
+        except Exception:
+            return False
