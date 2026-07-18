@@ -10,9 +10,19 @@ is treated as stale and reclaimed, so a crashed run does not wedge the profile f
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import time
 from pathlib import Path
+
+# Lock paths held by the CURRENT logical operation (task/callers' context). Borrowing
+# is allowed only when the acquiring code runs within the holder's context — a PID
+# match alone is not enough, or two independent concurrent operations in one process
+# would both "own" the profile and race (the second's _clear_profile_locks could
+# pkill the first's live Chrome).
+_HELD_IN_CONTEXT: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
+    "profile_locks_held", default=frozenset()
+)
 
 
 # An empty lock file is tolerated for this many quick cycles (a create->write TOCTOU
@@ -28,10 +38,13 @@ class ProfileLockError(RuntimeError):
 class ProfileLock:
     """Exclusive cross-process lock on a Chrome profile dir.
 
-    REENTRANT within a process: when this process already owns the lock file
-    (e.g. ExternalApplySession holds it and BaseScraper._start_browser acquires
-    again), acquire() is a borrow — depth-counted per lock path — and only the
-    outermost release() removes the file. Cross-process exclusivity is unchanged.
+    REENTRANT within a logical operation: when the CURRENT context already holds
+    this lock (e.g. ExternalApplySession holds it and BaseScraper._start_browser
+    acquires again in the same call chain), acquire() is a borrow — depth-counted
+    per lock path — and only the outermost release() removes the file. Two
+    INDEPENDENT concurrent operations in the same process do NOT borrow from each
+    other (context-scoped, not PID-scoped); the second waits/refuses like any
+    foreign owner. Cross-process exclusivity is unchanged.
     """
 
     # per-process reentrancy depth, keyed by resolved lock path
@@ -43,6 +56,7 @@ class ProfileLock:
         self.poll = poll
         self._acquired = False
         self._borrowed = False  # reentrant borrow: don't unlink on release
+        self._ctx_token = None  # contextvar token held by the OUTERMOST acquisition
 
     def _read_owner_pid(self) -> int | None:
         try:
@@ -86,10 +100,15 @@ class ProfileLock:
             if self._try_create():
                 self._acquired = True
                 ProfileLock._depth[key] = ProfileLock._depth.get(key, 0) + 1
+                # mark this lock as held by the current logical operation so only
+                # code in OUR call chain may borrow it
+                self._ctx_token = _HELD_IN_CONTEXT.set(_HELD_IN_CONTEXT.get() | {key})
                 return self
             owner = self._read_owner_pid()
-            if owner == os.getpid():
-                # reentrant: this process already holds the profile — borrow it.
+            if owner == os.getpid() and key in _HELD_IN_CONTEXT.get():
+                # reentrant: OUR call chain already holds this profile — borrow it.
+                # (Same PID but a different concurrent operation does NOT match the
+                # context and falls through to wait/refuse like a foreign owner.)
                 self._acquired = True
                 self._borrowed = True
                 ProfileLock._depth[key] = ProfileLock._depth.get(key, 0) + 1
@@ -132,6 +151,12 @@ class ProfileLock:
         except FileNotFoundError:
             pass
         finally:
+            if self._ctx_token is not None:
+                try:
+                    _HELD_IN_CONTEXT.reset(self._ctx_token)
+                except ValueError:
+                    pass  # released from a different context than acquire — best effort
+                self._ctx_token = None
             self._acquired = False
             self._borrowed = False
 
