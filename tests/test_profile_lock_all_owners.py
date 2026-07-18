@@ -291,3 +291,53 @@ async def test_external_cancellation_completes_teardown_before_release(scraper):
         await _asyncio.sleep(0.1)
     assert order == ["context_closed"]
     assert not prof.with_suffix(".applylock").exists()   # released AFTER close
+
+
+@pytest.mark.asyncio
+async def test_release_from_other_task_revokes_ownership(tmp_path):
+    """Codex r4 P1: a release performed in a DIFFERENT task (the shielded teardown)
+    must fully revoke ownership — the original chain must not retain a stale borrow
+    right against a later independent owner."""
+    import asyncio as _asyncio
+    import contextvars as _cv
+    prof = tmp_path / "p"
+    prof.mkdir()
+
+    lock = ProfileLock(prof).acquire()          # outer acquire in THIS chain
+
+    async def _release_elsewhere():
+        lock.release()                           # separate task, copied context
+
+    await _asyncio.ensure_future(_release_elsewhere())
+    assert not prof.with_suffix(".applylock").exists()
+
+    # an INDEPENDENT operation can now own the profile...
+    ctx_b = _cv.copy_context()
+    lock_b = ctx_b.run(lambda: ProfileLock(prof).acquire())
+    # ...and OUR (stale) chain must NOT borrow it, despite the matching PID
+    with pytest.raises(ProfileLockError):
+        ProfileLock(prof, timeout=0).acquire()
+    ctx_b.run(lock_b.release)
+
+
+@pytest.mark.asyncio
+async def test_acquire_async_does_not_block_event_loop(tmp_path):
+    """Codex r4 P2: waiting on a contended lock must keep the event loop running."""
+    import asyncio as _asyncio
+    prof = tmp_path / "p"
+    prof.mkdir()
+    prof.with_suffix(".applylock").write_text("1")   # live foreign owner
+
+    ticks = []
+
+    async def _ticker():
+        while True:
+            ticks.append(1)
+            await _asyncio.sleep(0.02)
+
+    t = _asyncio.ensure_future(_ticker())
+    with pytest.raises(ProfileLockError):
+        await ProfileLock(prof, timeout=0.4, poll=0.05).acquire_async()
+    t.cancel()
+    # the loop kept servicing other tasks during the ~0.4s contention window
+    assert len(ticks) >= 5
