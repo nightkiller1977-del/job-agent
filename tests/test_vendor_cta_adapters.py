@@ -140,7 +140,7 @@ async def test_auto_submits_with_selectors_and_receipt(vendor, cls):
     given a receipt, resolves to `applied`."""
     from src.adapters_patterns.ats_selectors import SELECTORS
     submit_sels = set(SELECTORS[vendor]["submit_button"])
-    page = FakePage(URLS[vendor], cta_clicked=True, present=submit_sels,
+    page = FakePage(URLS[vendor], cta_clicked=True, has_form=True, present=submit_sels,
                     receipt="t:thank you for applying")
     res = await cls().apply(_ctx(page, vendor, auto_submit=True))
     assert res.submitted is True and res.verified is True and res.status == "applied"
@@ -152,7 +152,7 @@ async def test_auto_submits_with_selectors_and_receipt(vendor, cls):
 async def test_auto_submit_without_receipt_is_unverified(vendor, cls):
     from src.adapters_patterns.ats_selectors import SELECTORS
     submit_sels = set(SELECTORS[vendor]["submit_button"])
-    page = FakePage(URLS[vendor], cta_clicked=True, present=submit_sels, receipt=None)
+    page = FakePage(URLS[vendor], cta_clicked=True, has_form=True, present=submit_sels, receipt=None)
     res = await cls().apply(_ctx(page, vendor, auto_submit=True))
     assert res.submitted is False and res.status == "submission_unverified"
 
