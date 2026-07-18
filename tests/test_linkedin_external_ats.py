@@ -40,4 +40,7 @@ async def test_apply_external_ats_still_swallows_other_errors():
         result = await scraper._apply_external_ats(job, "https://boards.greenhouse.io/acme/jobs/1", "")
 
     assert result is False
-    assert scraper.last_apply_status == "linkedin_external_apply_error"
+    # Generic delegated-apply failures record as the transient external_ats_error
+    # outcome (classifies TRANSIENT). The former "linkedin_external_apply_error"
+    # string had no matching ApplyOutcomeCode and classified as UNKNOWN.
+    assert scraper.last_apply_status == "external_ats_error"

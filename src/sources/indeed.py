@@ -1,4 +1,3 @@
-from src.apply_outcome import ApplyOutcomeCode
 """
 Indeed scraper.
 Navigates Indeed's recommended / personalized job feed and extracts listings.
@@ -15,6 +14,8 @@ Apply strategy:
   scripted Easy Apply unreliable.
 """
 from __future__ import annotations
+
+from src.apply_outcome import ApplyOutcomeCode
 
 import asyncio
 import os

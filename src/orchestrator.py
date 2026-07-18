@@ -28,7 +28,7 @@ from .sources.base import AuthFailedError, JobExpiredError
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats
 from .reauth import ReauthManager
 from .resume_helper import ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
-from .blocker_classifier import should_attempt, classify, needs_preflight_reauth, preflight_reauth_viable
+from .blocker_classifier import should_attempt, classify, needs_preflight_reauth, preflight_reauth_viable, BlockerClass
 from .session_watchdog import preflight_session_check
 
 console = Console()
@@ -688,7 +688,11 @@ class Orchestrator:
             except Exception:
                 _extra = {}
             _last = _extra.get("apply_last_status")
-            _attempts = int(_extra.get("apply_attempt_count", 0) or 0)
+            # consecutive_failure_count is what record_apply_attempt maintains:
+            # it increments on each non-preflight failure and resets to 0 on
+            # success or when the blocker fingerprint changes. (The old key
+            # "apply_attempt_count" was never written, so the breaker never tripped.)
+            _attempts = int(_extra.get("consecutive_failure_count", 0) or 0)
             _ok, _skip_reason = should_attempt(_last, _attempts)
             if not _ok:
                 _cls = classify(_last).value
@@ -743,6 +747,12 @@ class Orchestrator:
                     skipped_count += 1
                     outcomes.append({"job": job, "status": "reauth_failed", "reason": "preflight reauth failed"})
                     continue
+                else:
+                    # Session refreshed: unblock this source's jobs that were
+                    # circuit-broken on an auth blocker so they get re-attempted.
+                    self.state.clear_circuit_state_for_source(
+                        src, [BlockerClass.AUTH_REQUIRED.value]
+                    )
 
             if src not in SOURCE_MAP:
                 console.print(f"[red]Unknown source '{src}' — skipping.[/red]")
@@ -753,6 +763,11 @@ class Orchestrator:
                 continue
 
             scraper = SOURCE_MAP[src](self.config)
+            # Emit a browser_attempt_started event so the success funnel counts
+            # this as a real attempt (get_apply_funnel keys attempts off this
+            # event; without it, successfully-submitted jobs registered 0 attempts
+            # and per-source success rate computed as submitted/0).
+            self.state.record_apply_event(job["job_id"], "browser_attempt_started", source=src)
             try:
                 result = await scraper.apply(job, auto_submit=auto_submit)
                 if result:

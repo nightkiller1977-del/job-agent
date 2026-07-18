@@ -117,4 +117,4 @@ def test_flag_circuit_break_preserves_real_status_and_count(sm):
     assert "cap reached" in after["circuit_reason"]
     # ...without clobbering the real outcome or inflating the attempt count
     assert after["apply_last_status"] == before["apply_last_status"] == "submit_not_found"
-    assert after["apply_attempt_count"] == before["apply_attempt_count"] == 2
+    assert after["lifetime_attempt_count"] == before["lifetime_attempt_count"] == 2

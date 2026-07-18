@@ -85,7 +85,7 @@ class ReauthManager:
     # Automated path
     # ------------------------------------------------------------------
 
-    async def _reauth_automated(self, source: str, context: str) -> bool:
+    async def _reauth_automated(self, source: str, context: str = "discover") -> bool:
         source_map = _get_source_map()
         scraper_cls = source_map.get(source)
         if not scraper_cls:

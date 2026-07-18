@@ -50,9 +50,13 @@ class JobrightScraper(BaseScraper):
         """
         cls._orion_tailoring_available = True
 
-    def _set_apply_outcome(self, status: str, detail: str) -> bool:
-        self.last_apply_status = status
+    def _set_apply_outcome(self, status: str, detail: str, portal_family: str = "") -> bool:
+        try:
+            self.last_apply_status = status.value if isinstance(status, ApplyOutcomeCode) else str(status)
+        except Exception:
+            self.last_apply_status = str(status)
         self.last_apply_detail = detail
+        self.last_portal_family = portal_family
         return False
 
     def _validation_metrics_from_error(self, exc: Exception) -> dict:
@@ -349,7 +353,7 @@ class JobrightScraper(BaseScraper):
                 entered_form = await self._click_ats_apply_button(page)
             await self._delay(3, 5)
             if getattr(self, "_workday_session_expired", False):
-                return self._set_apply_outcome(ApplyOutcomeCode.WORKDAY_SESSION_EXPIRED, "Workday redirected to sign-in. Re-authenticate this company Workday portal, then rerun apply.",
+                return self._set_apply_outcome(ApplyOutcomeCode.SESSION_EXPIRED, "Workday redirected to sign-in. Re-authenticate this company Workday portal, then rerun apply.",
                 )
 
             # Teamtailor forms are public — their email field is for the applicant,
@@ -450,7 +454,7 @@ class JobrightScraper(BaseScraper):
                     family = await self._detect_portal_family(page)
                     controls = await self._visible_controls_snapshot(page)
                     return self._set_apply_outcome(
-                        f"{family}_form_not_reached" if family != "generic" else "form_not_reached",
+                        ApplyOutcomeCode.FORM_NOT_REACHED,
                         (
                             f"Company portal did not expose an application form after opening "
                             f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
@@ -478,7 +482,7 @@ class JobrightScraper(BaseScraper):
                 family = await self._detect_portal_family(page)
                 controls = await self._visible_controls_snapshot(page)
                 return self._set_apply_outcome(
-                    f"{family}_form_not_detected" if family != "generic" else "form_not_detected",
+                    ApplyOutcomeCode.FORM_NOT_DETECTED,
                     (
                         f"ATS page loaded but no application/review form was detected at "
                         f"{page.url}. Visible controls: {self._format_controls_snapshot(controls)}"
@@ -1634,6 +1638,11 @@ class JobrightScraper(BaseScraper):
         self.last_apply_detail = ""
         self._workday_session_expired = False
         self._field_fixer = ResumeFieldFixer()
+        # Reset per-job tailoring/ATS state so scores, missing-keyword lists, and
+        # tailored-resume paths cannot bleed from a previous job's attempt.
+        self._last_ats_score = 0
+        self._last_ats_missing_keywords = []
+        self._last_tailored_resume_path = ""
         console.print(f"\n[magenta]Jobright Apply:[/magenta] {job.get('title')} @ {job.get('company')}")
         page = await self._start_browser(load_extensions=True)
         submitted = False
@@ -1762,7 +1771,7 @@ class JobrightScraper(BaseScraper):
             if resume_path:
                 await self._upload_resume_if_prompted(company_page, resume_path)
             if getattr(self, "_workday_session_expired", False):
-                return self._set_apply_outcome(ApplyOutcomeCode.WORKDAY_SESSION_EXPIRED, "Workday redirected to sign-in. Re-authenticate this company Workday portal in the Playwright profile, then rerun apply.",
+                return self._set_apply_outcome(ApplyOutcomeCode.SESSION_EXPIRED, "Workday redirected to sign-in. Re-authenticate this company Workday portal in the Playwright profile, then rerun apply.",
                 )
             if not entered_form and self.last_apply_status not in ("started", "", None):
                 console.print(
@@ -1801,7 +1810,7 @@ class JobrightScraper(BaseScraper):
                     family = await self._detect_portal_family(company_page)
                     controls = await self._visible_controls_snapshot(company_page)
                     return self._set_apply_outcome(
-                        f"{family}_form_not_reached" if family != "generic" else "form_not_reached",
+                        ApplyOutcomeCode.FORM_NOT_REACHED,
                         (
                             f"Company portal did not expose an application form after opening "
                             f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
@@ -1875,12 +1884,12 @@ class JobrightScraper(BaseScraper):
                 if "myworkdayjobs.com" in portal_url and "BUTTON Sign In" in controls_text:
                     console.print("[yellow]Jobright:[/yellow] Workday portal requires sign-in — marking as session-needed.")
                     self._workday_session_expired = True
-                    return self._set_apply_outcome(ApplyOutcomeCode.WORKDAY_SESSION_EXPIRED, f"Workday portal at {portal_url} requires sign-in. "
+                    return self._set_apply_outcome(ApplyOutcomeCode.SESSION_EXPIRED, f"Workday portal at {portal_url} requires sign-in. "
                         "Run: python src/main.py prepare-sessions to authenticate this tenant.",
                     )
 
                 return self._set_apply_outcome(
-                    f"{family}_form_not_detected" if family != "generic" else "form_not_detected",
+                    ApplyOutcomeCode.FORM_NOT_DETECTED,
                     (
                         f"ATS page loaded but no application/review form was detected at "
                         f"{portal_url}. Visible controls: {controls_text}"
@@ -2367,7 +2376,14 @@ class JobrightScraper(BaseScraper):
         }
         """, default="")
         if url:
-            return url
+            # Resolve relative/JSON-sourced links against the page URL and reject
+            # unsafe/hostless values (fixes net::ERR_NAME_NOT_RESOLVED on
+            # relative externalApplyLink like "content/acom/..."). If the extracted
+            # value can't be made into a safe absolute URL, fall through to the
+            # autofill-reveal path rather than navigating to a broken URL.
+            normalized = self._normalize_url(url, getattr(page, "url", "") or "")
+            if normalized:
+                return normalized
         return await self._reveal_external_url_with_autofill(page)
 
     async def _reveal_external_url_with_autofill(self, page) -> str:
@@ -2890,7 +2906,7 @@ class JobrightScraper(BaseScraper):
     async def _handle_microsoft_apply(self, page) -> bool:
         console.print("[magenta]Jobright:[/magenta] Microsoft portal — locating apply flow…")
         if await self._looks_like_login_wall(page):
-            self._set_apply_outcome(ApplyOutcomeCode.MICROSOFT_LOGIN_REQUIRED, "Microsoft careers is showing a login/account wall. Sign in once in the Playwright profile, then rerun apply.",
+            self._set_apply_outcome(ApplyOutcomeCode.LOGIN_REQUIRED, "Microsoft careers is showing a login/account wall. Sign in once in the Playwright profile, then rerun apply.",
             )
             return False
 
@@ -2922,7 +2938,7 @@ class JobrightScraper(BaseScraper):
         if clicked:
             await self._delay(5, 8)
             if await self._looks_like_login_wall(page):
-                self._set_apply_outcome(ApplyOutcomeCode.MICROSOFT_LOGIN_REQUIRED, f"Microsoft careers redirected to login at {page.url}.",
+                self._set_apply_outcome(ApplyOutcomeCode.LOGIN_REQUIRED, f"Microsoft careers redirected to login at {page.url}.",
                 )
                 return False
             apply_still_visible = await self._has_visible_control_matching(page, ['^apply now$', '^apply$'])
@@ -2933,7 +2949,7 @@ class JobrightScraper(BaseScraper):
 
         controls = await self._visible_controls_snapshot(page)
         self._set_apply_outcome(
-            "microsoft_apply_control_not_activated" if clicked else "microsoft_apply_not_reached",
+            ApplyOutcomeCode.FORM_NOT_REACHED,
             f"Could not enter Microsoft application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
         )
         return False
@@ -2941,7 +2957,7 @@ class JobrightScraper(BaseScraper):
     async def _handle_brassring_apply(self, page) -> bool:
         console.print("[magenta]Jobright:[/magenta] BrassRing portal — locating apply flow…")
         if await self._looks_like_login_wall(page):
-            self._set_apply_outcome(ApplyOutcomeCode.BRASSRING_LOGIN_REQUIRED, "BrassRing is showing a login wall before the application form is reachable.",
+            self._set_apply_outcome(ApplyOutcomeCode.LOGIN_REQUIRED, "BrassRing is showing a login wall before the application form is reachable.",
             )
             return False
 
@@ -2958,7 +2974,7 @@ class JobrightScraper(BaseScraper):
         if clicked:
             await self._delay(5, 8)
             if await self._looks_like_login_wall(page):
-                self._set_apply_outcome(ApplyOutcomeCode.BRASSRING_LOGIN_REQUIRED, f"BrassRing redirected to login/profile page at {page.url}.",
+                self._set_apply_outcome(ApplyOutcomeCode.LOGIN_REQUIRED, f"BrassRing redirected to login/profile page at {page.url}.",
                 )
                 return False
             if await self._looks_like_application_form(page):
@@ -2966,7 +2982,7 @@ class JobrightScraper(BaseScraper):
                 return True
 
         controls = await self._visible_controls_snapshot(page)
-        self._set_apply_outcome(ApplyOutcomeCode.BRASSRING_APPLY_NOT_REACHED, f"Could not enter BrassRing application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
+        self._set_apply_outcome(ApplyOutcomeCode.FORM_NOT_REACHED, f"Could not enter BrassRing application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
         )
         return False
 
@@ -3719,7 +3735,6 @@ class JobrightScraper(BaseScraper):
                 has_filled_fields = True  # assume filled if we can't check
 
             if not has_filled_fields:
-                from ..console import console
                 console.print(
                     "[yellow]Jobright: Submit button found but form appears empty — "
                     "autofill did not run or this is a listing page, not the application form.[/yellow]"
@@ -3731,7 +3746,6 @@ class JobrightScraper(BaseScraper):
                 )
 
         if not submit_descriptor and (auto_submit or not (sys.stdin and sys.stdin.isatty())):
-            from ..console import console
             console.print(
                 "[yellow]Jobright: Submit button not found and this run is non-interactive — "
                 "skipping instead of prompting.[/yellow]"
@@ -3753,7 +3767,6 @@ class JobrightScraper(BaseScraper):
         # Run pre-submission validation checklist before showing the submit banner
         await self._run_pre_submission_validation(page)
 
-        from ..console import console
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
         console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
         console.print(f"  Portal: {portal_url}")
@@ -3863,7 +3876,6 @@ class JobrightScraper(BaseScraper):
                 return answer == "y"
             except (EOFError, KeyboardInterrupt):
                 return False
-e
 
 
 def _infer_remote_type(remote_raw: str, location: str) -> str:

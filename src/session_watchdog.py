@@ -147,7 +147,11 @@ def _parse_cookie_expiry(session_path: Path, source: str) -> Optional[float]:
         
         target_cookies = [c for c in cookies if any(d in c.get("domain", "") for d in domains)]
         if not target_cookies:
-            return -1.0 # Explicitly expired/missing
+            # Domain didn't match any cookie — this is unknown, NOT expired.
+            # Returning a negative value here would let callers delete or
+            # invalidate an otherwise-valid session (e.g. cookies stored under
+            # an auth-provider domain like login.gov / accounts.google.com).
+            return None
             
         now = time.time()
         expiries = [c["expires"] for c in target_cookies if c.get("expires", -1) > 0]
