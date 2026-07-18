@@ -398,6 +398,9 @@ class IndeedScraper(BaseScraper):
         result = await jr.apply_external_ats_job(job, ext_url, auto_submit=auto_submit)
         self.last_apply_status = jr.last_apply_status
         self.last_apply_detail = jr.last_apply_detail
+        # propagate adapter analytics (e.g. reauth_refreshed) so the orchestrator's
+        # same-run retry and analytics persistence see them through this wrapper
+        self._apply_analytics = getattr(jr, "_apply_analytics", None) or {}
         return result
 
     async def _extract_apply_url(self, page) -> str:
