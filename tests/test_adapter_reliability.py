@@ -55,9 +55,11 @@ class _RecordingAdapter(AtsAdapter):
 
 
 def _make_session(tmp_path, adapter, monkeypatch, page=None, ledger=None):
+    from src.events import RunLog
     reg = AtsAdapterRegistry(fallback=adapter)
     ledger = ledger or SubmissionLedger(tmp_path / "ledger.json")
-    sess = ExternalApplySession({}, registry=reg, ledger=ledger)
+    sess = ExternalApplySession({}, registry=reg, ledger=ledger,
+                                run_log=RunLog(agent="test", runs_dir=tmp_path / "runs"))
     fake_page = page or _FakePage()
     sess._closed = False
 
@@ -288,7 +290,27 @@ async def test_session_refuses_when_profile_locked(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_session_emits_attempt_lifecycle_events(tmp_path, monkeypatch):
+    """Phase 2a: the session emits a structured per-run event stream."""
+    from src.events import read_run
+    good = _RecordingAdapter(AtsApplyResult.ok("done"), call_policy=True)
+    sess, page, led = _make_session(tmp_path, good, monkeypatch)
+    await sess.apply(JOB, auto_submit=True)
+    events = read_run(sess.run_log.run_id, runs_dir=tmp_path / "runs")
+    names = [e["event"] for e in events]
+    assert "attempt_started" in names
+    assert "form_reached" in names
+    assert "attempt_finished" in names
+    finished = next(e for e in events if e["event"] == "attempt_finished")
+    assert finished["phase"] == "receipt_verified" and finished["outcome"] == "applied"
+    assert finished["vendor"] == "greenhouse"
+    # never leak the raw URL / PII — only the host is recorded
+    assert all("resume" not in e and "url" not in e for e in events)
+
+
+@pytest.mark.asyncio
 async def test_session_closes_browser_and_releases_lock_on_error(tmp_path, monkeypatch):
+    from src.events import read_run
     boom = _RecordingAdapter(AtsApplyResult.ok(), raises=True)
     sess, page, _ = _make_session(tmp_path, boom, monkeypatch)
     with pytest.raises(RuntimeError):
@@ -296,3 +318,13 @@ async def test_session_closes_browser_and_releases_lock_on_error(tmp_path, monke
     assert sess._closed is True                       # 0.4 finally ran
     lockfile = (tmp_path / "jobright_profile").with_suffix(".applylock")
     assert lockfile.exists() is False                 # lock released
+    # a crash must still close the attempt in the audit stream (no dangling start)
+    events = read_run(sess.run_log.run_id, runs_dir=tmp_path / "runs")
+    finished = [e for e in events if e["event"] == "attempt_finished"]
+    assert finished and finished[-1]["outcome"] == "error"
+
+
+def test_host_uses_hostname_not_netloc():
+    from src.sources.adapters.session import _host
+    assert _host("https://token@boards.greenhouse.io/acme/jobs/1") == "boards.greenhouse.io"
+    assert _host("https://user:pass@careers.example.com:443/x") == "careers.example.com"
