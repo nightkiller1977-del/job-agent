@@ -20,19 +20,40 @@ Verified corrections honored here:
 """
 from __future__ import annotations
 
+import time
+import urllib.parse
 import uuid
 
 from rich.console import Console
 
 from ..base import BaseScraper
+from ...events import RunLog
 from .context import AtsApplyContext, AtsApplyResult
 from .registry import AtsAdapterRegistry
-from .generic import GenericAtsAdapter
+from .generic import GenericAtsAdapter, detect_vendor
+from .attempt import AttemptPhase
 from .policy import AutoSubmitPolicy, SubmissionPolicy
 from .idempotency import SubmissionLedger, canonical_key
 from .profile_lock import ProfileLock, ProfileLockError
 
 console = Console()
+
+
+def _host(url: str) -> str:
+    # hostname (NOT netloc) so embedded credentials like user:pass@host never leak
+    # into the audit stream.
+    try:
+        return (urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _phase_for(res: AtsApplyResult) -> AttemptPhase:
+    if res.verified:
+        return AttemptPhase.RECEIPT_VERIFIED
+    if res.status == "submission_unverified":
+        return AttemptPhase.UNKNOWN          # clicked but unconfirmed — never success
+    return AttemptPhase.FAILED
 
 
 def _detect_pre_launch_vendor(external_url: str) -> dict:
@@ -61,13 +82,16 @@ class ExternalApplySession(BaseScraper):
 
     def __init__(self, config, registry: AtsAdapterRegistry | None = None,
                  policy: SubmissionPolicy | None = None,
-                 ledger: SubmissionLedger | None = None):
+                 ledger: SubmissionLedger | None = None,
+                 run_log: RunLog | None = None):
         super().__init__(config)
         self.registry = registry or self._create_default_registry()
         # Optional policy override; when None a per-call AutoSubmitPolicy is used so
         # the gate tracks the run's auto_submit flag.
         self._policy_override = policy
         self.ledger = ledger if ledger is not None else SubmissionLedger()
+        # One run_id spans all applies on this session instance (Phase 2a).
+        self.run_log = run_log or RunLog(agent="external_apply")
 
     def _create_default_registry(self) -> AtsAdapterRegistry:
         from .greenhouse import GreenhouseAdapter
@@ -100,15 +124,31 @@ class ExternalApplySession(BaseScraper):
         external_url = job.get("url") or job.get("external_url") or ""
         attempt_id = uuid.uuid4().hex
         key = canonical_key(job)
+        vendor = detect_vendor(external_url)
+        job_id = str(job.get("job_id") or "")
+        started = time.time()
+
+        def _event(event: str, phase: AttemptPhase, **extra):
+            # host only (never the full URL — it can carry tokens); no PII fields.
+            self.run_log.emit(
+                event, attempt_id=attempt_id, job_id=job_id, vendor=vendor,
+                host=_host(external_url), phase=phase.value,
+                duration_ms=int((time.time() - started) * 1000), **extra,
+            )
+
+        _event("attempt_started", AttemptPhase.STARTED, auto_submit=auto_submit)
 
         # --- 0.2 pre-flight duplicate/interrupted checks (before launching Chrome) ---
         if key and self.ledger.already_applied(key):
+            _event("duplicate_prevented", AttemptPhase.UNKNOWN, outcome="duplicate_application_prevented")
             return AtsApplyResult.blocked(
                 "duplicate_application_prevented",
                 f"already applied to {key} — not resubmitting", attempt_id=attempt_id,
             )
         if key and self.ledger.in_progress(key):
             stale = self.ledger.is_stale_in_progress(key)
+            _event("submit_in_progress_blocked", AttemptPhase.UNKNOWN,
+                   outcome="submit_in_progress", stale=stale)
             return AtsApplyResult.blocked(
                 "submit_in_progress",
                 f"a prior submit for {key} is unresolved "
@@ -118,6 +158,8 @@ class ExternalApplySession(BaseScraper):
         if key and self.ledger.needs_reconciliation(key):
             # A prior attempt clicked submit but no receipt was confirmed — resubmitting
             # blindly risks a duplicate. Hold until reconciled (human/receipt re-check).
+            _event("submit_unverified_blocked", AttemptPhase.UNKNOWN,
+                   outcome="submit_unverified_unresolved")
             return AtsApplyResult.blocked(
                 "submit_unverified_unresolved",
                 f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
@@ -131,6 +173,7 @@ class ExternalApplySession(BaseScraper):
         try:
             lock = ProfileLock(self._profile_dir).acquire()
         except ProfileLockError as e:
+            _event("profile_locked", AttemptPhase.FAILED, outcome="profile_locked")
             return AtsApplyResult.blocked(
                 "profile_locked", str(e), attempt_id=attempt_id,
             )
@@ -139,6 +182,10 @@ class ExternalApplySession(BaseScraper):
         try:
             page = await self._start_browser(load_extensions=hints["load_extensions"])
             await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
+            # a company/external URL may redirect to the real ATS — re-derive the vendor
+            # from the navigated URL so post-nav events aren't mislabeled 'generic'.
+            vendor = detect_vendor(getattr(page, "url", "") or external_url) or vendor
+            _event("form_reached", AttemptPhase.FORM_REACHED)
 
             ctx = AtsApplyContext(
                 page=page,
@@ -158,6 +205,9 @@ class ExternalApplySession(BaseScraper):
                 marked = True
 
             adapter = await self.registry.pick(ctx)
+            # selecting an adapter does NOT mean fields were filled — keep the phase at
+            # FORM_REACHED so failed attempts don't overstate how far they progressed.
+            _event("adapter_selected", AttemptPhase.FORM_REACHED, adapter=adapter.name)
             console.print(f"[cyan]ExternalApplySession:[/cyan] adapter={adapter.name} url={page.url[:80]}")
             res = self._enforce_authorization(await adapter.apply(ctx), ctx, policy)
 
@@ -165,6 +215,7 @@ class ExternalApplySession(BaseScraper):
             # (re-driving that risks a duplicate submit).
             if not res.submitted and res.status in ("submit_not_found", "form_not_reached", "blocked"):
                 from .recovery_browseruse import BrowserUseRecovery
+                _event("recovery_triggered", AttemptPhase.FIELDS_FILLED, after=res.status)
                 console.print("[yellow]Triggering Browser Use self-healing recovery...[/yellow]")
                 recovery_res = self._enforce_authorization(
                     await BrowserUseRecovery().apply(ctx), ctx, policy
@@ -184,7 +235,14 @@ class ExternalApplySession(BaseScraper):
                     self.ledger.complete(key, attempt_id, verified=False)
                 else:
                     self.ledger.clear(key)
+            _event("attempt_finished", _phase_for(res), outcome=res.status, verified=res.verified)
             return res
+        except Exception as exc:
+            # a browser/adapter crash must still close the attempt in the audit stream,
+            # or per-run failure metrics silently undercount real crashes.
+            _event("attempt_finished", AttemptPhase.FAILED, outcome="error",
+                   error=type(exc).__name__)
+            raise
         finally:
             try:
                 await self._close_browser()
