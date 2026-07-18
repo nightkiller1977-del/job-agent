@@ -113,9 +113,18 @@ class ExternalApplySession(BaseScraper):
         # human-action notification is emitted by the attempt_finished _maybe_notify path
         if self.reauth_router is not None:
             try:
-                await self.reauth_router.route(directive)
+                refreshed = await self.reauth_router.route(directive)
             except Exception:
-                pass
+                refreshed = False
+            if refreshed:
+                # ReauthManager.handle() returning True means the session was refreshed
+                # and the caller should retry. Preserve that signal instead of dropping
+                # it, so the orchestrator re-queues the job this run rather than next.
+                res.analytics["reauth_refreshed"] = True
+                self.run_log.emit(
+                    "reauth_refreshed", attempt_id=attempt_id,
+                    source=directive.source, vendor=directive.vendor,
+                )
 
     def _maybe_notify(self, event: str, outcome: str, title: str, message: str = "",
                       key: str | None = None) -> None:

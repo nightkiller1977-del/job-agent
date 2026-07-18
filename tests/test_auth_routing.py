@@ -77,6 +77,49 @@ async def test_session_routes_auth_outcome(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_session_preserves_reauth_refresh_signal(tmp_path, monkeypatch):
+    from src.events import RunLog, read_run
+    from src.sources.adapters.registry import AtsAdapterRegistry
+    from src.sources.adapters.session import ExternalApplySession
+    from src.sources.adapters.context import AtsApplyResult
+    from src.sources.adapters.idempotency import SubmissionLedger
+    from tests.test_adapter_reliability import _RecordingAdapter, _FakePage, JOB
+
+    class RefreshRouter(ReauthRouter):
+        async def route(self, directive):
+            await super().route(directive)
+            return True   # ReauthManager refreshed the session -> caller should retry
+
+    router = RefreshRouter()
+    reg = AtsAdapterRegistry(fallback=_RecordingAdapter(AtsApplyResult.blocked("session_expired", "x")))
+    sess = ExternalApplySession({}, registry=reg, ledger=SubmissionLedger(tmp_path / "l.json"),
+                                run_log=RunLog(agent="t", runs_dir=tmp_path / "runs"),
+                                reauth_router=router)
+
+    async def _start(load_extensions=False):
+        return _FakePage()
+
+    monkeypatch.setattr(sess, "_start_browser", _start)
+    monkeypatch.setattr(sess, "_close_browser", lambda save_session=True: _noop())
+    prof = tmp_path / "jobright_profile"
+    prof.mkdir()
+    monkeypatch.setattr(type(sess), "_profile_dir", property(lambda self: prof))
+
+    res = await sess.apply(JOB, auto_submit=True)
+    assert res.analytics.get("reauth_refreshed") is True   # retry signal preserved
+    events = read_run(sess.run_log.run_id, runs_dir=tmp_path / "runs")
+    assert any(e["event"] == "reauth_refreshed" for e in events)
+
+
+def test_blocker_classifier_maps_vendor_login_statuses():
+    from src.blocker_classifier import classify, BlockerClass
+    for s in ("microsoft_login_required", "smartrecruiters_login_required",
+              "teamtailor_login_required", "brassring_login_required",
+              "workday_session_expired"):
+        assert classify(s) is BlockerClass.AUTH_REQUIRED, s
+
+
+@pytest.mark.asyncio
 async def test_session_no_routing_on_normal_outcome(tmp_path, monkeypatch):
     from src.events import RunLog
     from src.sources.adapters.registry import AtsAdapterRegistry
