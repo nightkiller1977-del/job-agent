@@ -44,7 +44,7 @@ def load_env() -> None:
     1. project .env wins over empty shell vars (Claude Code sets ANTHROPIC_API_KEY=""),
        so we load it with override=True.
     2. The central AI Commander store then FILLS ONLY what is still missing/empty —
-       it never overrides a value the project .env set. See src/secrets.py + SECRETS.md.
+       it never overrides a value the project .env set. See src/secret_store.py + SECRETS.md.
     """
     env_path = project_root / ".env"
     if env_path.exists():
@@ -52,7 +52,7 @@ def load_env() -> None:
     else:
         load_dotenv(override=True)
 
-    from src.secrets import fill_missing
+    from src.secret_store import fill_missing
     fill_missing()
 
 
