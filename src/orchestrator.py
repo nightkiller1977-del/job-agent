@@ -466,7 +466,14 @@ class Orchestrator:
                     "failure_type": result.failure_type or "",
                     "detail": result.detail or str(exc),
                 }
-        return {"apply_validation_metrics": metrics} if metrics else {}
+        md = {"apply_validation_metrics": metrics} if metrics else {}
+        # Persist the external ATS portal URL discovered during the attempt so
+        # prepare-sessions can open the portal directly for LinkedIn/Indeed-origin
+        # jobs (needs_external_portal_prep reads extra_json.ats_url).
+        ats_url = getattr(scraper, "last_apply_ats_url", "") if scraper else ""
+        if ats_url:
+            md["ats_url"] = ats_url
+        return md
 
     async def preflight_approved(self, source: Optional[str] = None, company: Optional[str] = None) -> None:
         """Pull cloud-approved jobs and print production-readiness blockers."""
@@ -548,11 +555,11 @@ class Orchestrator:
             source=source,
             company=company,
         )
-        session_jobs = []
+        session_jobs = []  # (job, readiness)
         for job in approved:
             readiness, _detail = self._classify_apply_readiness(job)
             if readiness in {"needs-session", "needs-portal-login", "needs-review"}:
-                session_jobs.append(job)
+                session_jobs.append((job, readiness))
         if limit is not None:
             session_jobs = session_jobs[: max(0, limit)]
 
@@ -570,8 +577,21 @@ class Orchestrator:
         console.print(f"\n[bold]Preparing sessions for {len(session_jobs)} approved job(s)[/bold]")
         console.print("[dim]Sign in or complete portal account prompts in each browser window, then return here.[/dim]")
 
-        for job in session_jobs:
-            scraper_cls = SOURCE_MAP.get(job.get("source", ""))
+        from .sources.adapters.auth_routing import needs_external_portal_prep
+
+        for job, readiness in session_jobs:
+            # Portal-blocked jobs (needs-session/needs-portal-login with a known
+            # external ATS URL) must open the ATS portal in the shared
+            # external-apply profile regardless of discovery source: LinkedIn's
+            # and Indeed's prepare_session only refresh their own site session,
+            # which never clears a Workday/Microsoft/BrassRing auth wall.
+            if needs_external_portal_prep(readiness, job):
+                scraper_cls = SOURCE_MAP["jobright"]
+                console.print(
+                    f"[cyan]Routing {job.get('source')} job to external ATS portal prep.[/cyan]"
+                )
+            else:
+                scraper_cls = SOURCE_MAP.get(job.get("source", ""))
             if not scraper_cls:
                 console.print(f"[yellow]Skipping unknown source: {job.get('source')}[/yellow]")
                 continue
