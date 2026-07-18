@@ -95,8 +95,6 @@ SELECTORS = {
         "submit_button": [
             "button[type='submit']",
             "input[type='submit']",
-            ".careersite-button--primary",
-            ".careersite-button",
             "//button[contains(., 'Submit application')]",
             "//button[contains(., 'Send application')]"
         ],
