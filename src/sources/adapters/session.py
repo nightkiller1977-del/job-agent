@@ -109,11 +109,13 @@ class ExternalApplySession(BaseScraper):
         from .greenhouse import GreenhouseAdapter
         from .lever import LeverAdapter
         from .ashby import AshbyAdapter
+        from .workday import WorkdayAdapter
 
         reg = AtsAdapterRegistry(fallback=GenericAtsAdapter())
         reg.register(GreenhouseAdapter())
         reg.register(LeverAdapter())
         reg.register(AshbyAdapter())
+        reg.register(WorkdayAdapter())
         return reg
 
 
