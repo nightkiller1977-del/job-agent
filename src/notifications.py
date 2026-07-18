@@ -38,6 +38,8 @@ _HUMAN_OUTCOMES = {
     "review_ready", "needs_answer", "needs_session", "needs_session_prep",
     "needs_hydration", "submission_unverified", "submit_in_progress",
     "login_required",   # generic adapter's pre-fill login wall needs a human
+    # terminal 'Needs Human / Structural' outcomes: the application was NOT submitted
+    "submit_not_found", "form_not_reached",
 }
 _BLOCKED_OUTCOMES = {
     "submit_denied_by_policy", "profile_locked", "credentials_missing",
@@ -90,6 +92,10 @@ class Dispatcher:
         {deduped, sent, failed}."""
         dk = self._key(cls, title, message, key)
         now = self._now()
+        # evict expired entries so a long-lived dispatcher's cache doesn't grow
+        # unbounded (every distinct posting key would otherwise persist forever).
+        if self._seen:
+            self._seen = {k: t for k, t in self._seen.items() if (now - t) < self.dedup_ttl}
         last = self._seen.get(dk)
         if last is not None and (now - last) < self.dedup_ttl:
             return {"deduped": True, "sent": [], "failed": []}
