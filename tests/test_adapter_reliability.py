@@ -262,6 +262,20 @@ async def test_session_blocks_unverified_until_reconciled(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_session_clears_marker_on_non_submit_outcome(tmp_path, monkeypatch):
+    # a pre-submit blocker (login wall) must NOT leave an unverified marker that would
+    # permanently block the job — only an actual click can mark unverified.
+    led = SubmissionLedger(tmp_path / "l.json")
+    adapter = _RecordingAdapter(AtsApplyResult.blocked("login_required", "wall"))
+    sess, page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=led)
+    res = await sess.apply(JOB, auto_submit=True)
+    assert res.status == "login_required"
+    key = canonical_key(JOB)
+    assert led.needs_reconciliation(key) is False
+    assert led.in_progress(key) is False
+
+
+@pytest.mark.asyncio
 async def test_session_refuses_when_profile_locked(tmp_path, monkeypatch):
     adapter = _RecordingAdapter(AtsApplyResult.ok())
     sess, page, _ = _make_session(tmp_path, adapter, monkeypatch)
