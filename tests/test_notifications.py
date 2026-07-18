@@ -20,6 +20,8 @@ def test_notice_for_mapping():
     assert notice_for("attempt_finished", "review_ready") is NoticeClass.HUMAN_ACTION_REQUIRED
     assert notice_for("attempt_finished", "submission_unverified") is NoticeClass.HUMAN_ACTION_REQUIRED
     assert notice_for("profile_locked", "profile_locked") is NoticeClass.SUBMISSION_BLOCKED
+    assert notice_for("attempt_finished", "login_required") is NoticeClass.HUMAN_ACTION_REQUIRED
+    assert notice_for("attempt_finished", "captcha") is NoticeClass.SUBMISSION_BLOCKED
     assert notice_for("attempt_finished", "submit_not_found") is None  # not notify-worthy
 
 
