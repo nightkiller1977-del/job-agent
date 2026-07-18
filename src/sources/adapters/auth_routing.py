@@ -17,6 +17,8 @@ lazily) so this module loads anywhere.
 """
 from __future__ import annotations
 
+import json
+import shlex
 from dataclasses import dataclass, field
 
 
@@ -68,13 +70,15 @@ def directive_for(status: str, job: dict | None = None) -> ReauthDirective | Non
     who = vendor or source
     if action == "prepare_sessions":
         # prepare-sessions filters approved jobs by the job's discovery source
-        # (job["source"]), so '--source jobright' would never open the portal for a
-        # LinkedIn/Indeed-origin job. Target the job itself via its origin source +
-        # company; the opened flow lands on the ATS portal for the human to sign in.
+        # (job["source"]) and company, then routes portal-blocked jobs to the
+        # external-portal prep flow (needs_external_portal_prep) regardless of
+        # source — so this origin-source target does open the ATS portal even for
+        # LinkedIn/Indeed-origin jobs. Company names come from scraped listings:
+        # quote them so the hint is safe to paste into a shell.
         company = str(job.get("company") or "")
-        target = f"--source {source}"
+        target = f"--source {shlex.quote(source)}"
         if company:
-            target += f' --company "{company}"'
+            target += f" --company {shlex.quote(company)}"
         remediation = (
             f"sign in to the {who} portal for this job: "
             f"python src/main.py prepare-sessions {target}"
@@ -86,6 +90,61 @@ def directive_for(status: str, job: dict | None = None) -> ReauthDirective | Non
         reason=f"{who} requires an authenticated session before applying",
         remediation=remediation,
     )
+
+
+# Readiness classes whose remediation is an interactive ATS-portal login
+# (orchestrator._classify_apply_readiness / prepare_sessions vocabulary).
+PORTAL_PREP_READINESS = {"needs-session", "needs-portal-login", "needs-review"}
+
+
+def _job_extra(job: dict | None) -> dict:
+    extra = (job or {}).get("extra_json") or {}
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = {}
+    return extra if isinstance(extra, dict) else {}
+
+
+def external_ats_url(job: dict | None) -> str:
+    """Best-known external ATS/portal URL for a job, '' if none was recorded.
+
+    Checks the top-level key first (callers may stamp it), then the persisted
+    ``extra_json.ats_url`` that record_apply_attempt stores after an external
+    apply attempt discovers the portal URL.
+    """
+    job = job or {}
+    url = str(job.get("ats_url") or "").strip()
+    if not url:
+        url = str(_job_extra(job).get("ats_url") or "").strip()
+    return url if url.lower().startswith(("http://", "https://")) else ""
+
+
+def needs_external_portal_prep(readiness: str, job: dict | None) -> bool:
+    """True when session prep for this job must open its external ATS portal
+    (in the shared external-apply profile) rather than the discovery source.
+
+    Dispatching prepare-sessions purely on job["source"] only refreshes the ATS
+    portal for jobright-origin jobs — LinkedIn/Indeed prepare_session just opens
+    LinkedIn/Indeed, so a Workday/Microsoft/etc. auth wall on a job discovered
+    there is never refreshed. Route those to the external prep path instead,
+    when the block is a portal wall (not the source's own session) and the
+    portal URL is known.
+    """
+    if readiness not in PORTAL_PREP_READINESS:
+        return False
+    job = job or {}
+    source = str(job.get("source") or "").lower()
+    if source in ("jobright", "external"):
+        return False  # already dispatched to the external-portal prep flow
+    last_status = str(_job_extra(job).get("apply_last_status") or "").lower()
+    # Statuses named after the discovery source (linkedin_authwall,
+    # linkedin_login_required, indeed_*) mean the SOURCE session is the blocker
+    # — the source's own prepare_session is the right remediation there.
+    if not last_status or (source and last_status.startswith(f"{source}_")):
+        return False
+    return bool(external_ats_url(job))
 
 
 class ReauthRouter:
