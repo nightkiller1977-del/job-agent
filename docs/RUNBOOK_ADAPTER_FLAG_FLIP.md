@@ -72,9 +72,13 @@ Verify, per attempt:
       `tail -50 state/runs/$(ls -t state/runs | head -1)`
       → one `attempt_started` … `attempt_finished` pair per job, host-only URLs,
       no PII/emails in any line.
-- [ ] Auth walls produced a `reauth_directive` pointing at
-      `prepare-sessions --source jobright` (the external profile), and a
-      human-action notification arrived (Telegram/macOS).
+- [ ] Auth walls produced a `reauth_directive` in the result analytics and a
+      human-action notification arrived (Telegram/macOS). To actually refresh the
+      portal session, target THAT job (prepare-sessions filters on the job's
+      discovery source, so `--source jobright` won't open a LinkedIn-origin job's
+      portal — the directive's hint text has this wrong; code follow-up):
+      `python src/main.py prepare-sessions --source <origin-source> --company <company>`
+      then sign in to the ATS portal in the opened persistent profile.
 - [ ] `state/apply_ledger.json` has **no** `receipt_verified`/`submission_unverified`
       entries (nothing was clicked).
 
@@ -102,16 +106,27 @@ USE_ADAPTER_REGISTRY=1 python src/main.py apply --auto-submit --job-id <JOB_ID>
       - agent says `applied` **but** ATS shows nothing → **stop, do not proceed** —
         a false-positive receipt is the exact failure this stack exists to prevent.
         Capture the post-submit URL/page text and tighten `receipt.py`.
-- [ ] Re-run the same command → `duplicate_application_prevented`, browser never
-      launches. (Dedup proof.)
+- [ ] Dedup proof: a verified canary flips the job's status to `applied`, so a plain
+      re-run simply selects nothing (status-level protection). To exercise the
+      **ledger** layer, re-approve the same job (dashboard, or set its status back to
+      `approved`) and re-run → `duplicate_application_prevented`, browser never
+      launches.
 - [ ] While an apply is running, start a second one in another terminal → the second
       exits with `profile_locked` and the first's Chrome survives. (Lock proof.)
 
 ## Stage 3 — Small per-vendor batches
 
-One vendor at a time, small caps, still watching:
+**Note:** `--source` filters by *discovery source* (linkedin/indeed/jobright), NOT by
+ATS vendor — a LinkedIn batch can mix Greenhouse, Lever, Workday, and Easy Apply jobs.
+To canary a specific ATS vendor, pick jobs whose URLs are on that vendor (check
+`preflight` output / the dashboard) and target them with `--job-id` or `--company`:
 
 ```bash
+# per-ATS-vendor canary (preferred): explicit jobs on the target vendor
+USE_ADAPTER_REGISTRY=1 python src/main.py apply --auto-submit --job-id <ID_ON_VENDOR>
+
+# or small mixed batches per discovery source, then split results per vendor
+# using the `vendor` field in the run's JSONL events:
 USE_ADAPTER_REGISTRY=1 python src/main.py apply --auto-submit --source linkedin --limit 5
 python src/main.py stats        # after each batch
 ```
@@ -146,14 +161,25 @@ export USE_ADAPTER_REGISTRY=1
 
 ## Rollback (any stage)
 
+**FIRST, reconcile the ledger** — the legacy path does NOT consult
+`state/apply_ledger.json`, so any posting left in `submission_unverified` or
+`submit_in_progress` loses its double-submit protection the moment you unset the flag
+and could be blindly re-applied by the legacy path:
+
+```bash
+grep -E "submission_unverified|submit_in_progress" state/apply_ledger.json
+# resolve each via the Reconciliation procedure below BEFORE unsetting the flag
+```
+
+Then:
+
 ```bash
 unset USE_ADAPTER_REGISTRY                 # interactive
 # and/or remove the export line from scripts/night_run.sh
 ```
 
-The legacy path resumes immediately. Nothing else to undo — the ledger and event logs
-are additive. (If a ledger entry from adapter-path testing should not gate the legacy
-path's retries, remove that key from `state/apply_ledger.json`.)
+The legacy path resumes immediately. The event logs are additive — nothing else to
+undo.
 
 ---
 
@@ -175,7 +201,7 @@ A posting is blocked because a submit was clicked but no receipt was observed.
 | Symptom | Meaning | Action |
 |---|---|---|
 | `profile_locked` | another live process owns the profile | close it / let it finish; it is **not** killed by design |
-| `<vendor>_login_required`, `workday_session_expired` | portal session expired | `python src/main.py prepare-sessions --source jobright`, sign in to that portal in the opened profile |
+| `<vendor>_login_required`, `workday_session_expired` | portal session expired | `python src/main.py prepare-sessions --source <origin-source> --company <company>` (targets that job's portal), sign in in the opened profile |
 | `review_ready` everywhere on a CTA vendor | form reached, selectors too weak to fill/submit | tune `ats_selectors.py` for that vendor |
 | `submission_unverified` but ATS confirms | receipt heuristics miss this vendor | extend `receipt.py` patterns; reconcile the ledger entry |
 | `submit_in_progress` | a prior attempt crashed mid-submit | check ATS as in reconciliation; stale (>6h) markers are reported as stale |
