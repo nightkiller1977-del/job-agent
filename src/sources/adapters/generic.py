@@ -154,7 +154,8 @@ class GenericAtsAdapter(AtsAdapter):
             )
 
         # A click is not an application (Phase 0.1) — require a receipt before success.
-        verified, signal = await verify_receipt(page)
+        # poll briefly — the ATS may confirm asynchronously after the click returns
+        verified, signal = await verify_receipt(page, retries=3, delay=0.4)
         if verified:
             return AtsApplyResult.ok(
                 f"{vendor}: submitted with {len(ev.fields_filled)} field(s); receipt {signal}",

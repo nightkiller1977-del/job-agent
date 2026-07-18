@@ -97,6 +97,17 @@ class SubmissionLedger:
         rec = self.record(key)
         return bool(rec and rec.get("phase") == PHASE_UNVERIFIED)
 
+    def clear(self, key: str) -> None:
+        """Drop a marker entirely — used when an attempt ended WITHOUT a submit
+        click (e.g. a login wall or blocker), so the in-progress marker must not
+        linger as unverified and block future attempts."""
+        if not key:
+            return
+        data = self._load()
+        if key in data:
+            del data[key]
+            self._save(data)
+
     def is_stale_in_progress(self, key: str) -> bool:
         rec = self.record(key)
         if not rec or rec.get("phase") != PHASE_IN_PROGRESS:
