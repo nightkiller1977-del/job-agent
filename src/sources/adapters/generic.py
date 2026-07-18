@@ -125,6 +125,12 @@ class GenericAtsAdapter(AtsAdapter):
                 continue
             section, pkey = _IDENTITY_MAP[fkey]
             val = self._profile_get(ctx, section, pkey)
+            # combined-name fields (Teamtailor, Lever) — profiles usually store
+            # first_name/last_name, so derive the full name when full_name is absent.
+            if not val and fkey == "name":
+                first = self._profile_get(ctx, "personal_info", "first_name")
+                last = self._profile_get(ctx, "personal_info", "last_name")
+                val = " ".join(p for p in (first, last) if p).strip() or None
             if val and await self._fill(page, sels, val):
                 ev.add_field(fkey)
 
