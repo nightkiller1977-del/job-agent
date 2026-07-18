@@ -10,11 +10,18 @@ Kept import-light (no runtime playwright import) and fake-able: it only calls
 """
 from __future__ import annotations
 
-# Substrings that, in the post-submit URL, indicate the ATS routed to a
-# confirmation page. Kept conservative — these are near-universal across vendors.
-_URL_CONFIRM_TOKENS = (
-    "thank", "confirmation", "confirmed", "submitted", "success",
-    "complete", "applied", "application-received",
+import re
+
+# Confirmation tokens matched as DELIMITED url segments (not raw substrings), so a
+# job title like `/jobs/customer-success-manager` or `/jobs/applied-scientist` is
+# never mistaken for a receipt. Bare "success"/"applied"/"submitted" are excluded on
+# purpose; confirmation routes almost always carry thank-you/confirmation/received.
+_URL_CONFIRM_RE = re.compile(
+    r"(?:^|[/?=&#_-])"
+    r"(thank[-_]?you|thanks|confirmation|confirmed|"
+    r"application[-_]?(?:received|submitted|complete)|"
+    r"successfully[-_]?(?:applied|submitted))"
+    r"(?:$|[/?=&#_-])"
 )
 
 # JS run on the live page: looks for confirmation copy or an application/reference
@@ -45,7 +52,7 @@ async def verify_receipt(page) -> tuple[bool, str]:
         url = (getattr(page, "url", "") or "").lower()
     except Exception:
         url = ""
-    if url and any(tok in url for tok in _URL_CONFIRM_TOKENS):
+    if url and _URL_CONFIRM_RE.search(url):
         return True, f"url:{url[:80]}"
 
     # 2. Confirmation copy / reference id in the rendered body.
