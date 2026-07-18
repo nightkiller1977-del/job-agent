@@ -76,7 +76,7 @@ Verify, per attempt:
       human-action notification arrived (Telegram/macOS). To actually refresh the
       portal session, target THAT job (prepare-sessions filters on the job's
       discovery source, so `--source jobright` won't open a LinkedIn-origin job's
-      portal — the directive's hint text has this wrong; code follow-up):
+      portal — the directive's remediation hint targets this correctly):
       `python src/main.py prepare-sessions --source <origin-source> --company <company>`
       then sign in to the ATS portal in the opened persistent profile.
 - [ ] `state/apply_ledger.json` has **no** `receipt_verified`/`submission_unverified`
