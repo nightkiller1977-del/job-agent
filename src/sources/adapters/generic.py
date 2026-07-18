@@ -14,6 +14,7 @@ from rich.console import Console
 
 from .base import AtsAdapter
 from .context import AtsApplyContext, AtsApplyResult
+from .receipt import verify_receipt
 
 console = Console()
 
@@ -144,16 +145,25 @@ class GenericAtsAdapter(AtsAdapter):
                     evidence=ev_to_dict(ev),
                 )
 
-        submitted = await self._submit(page, selset.get("submit_button"))
-        if submitted:
-            return AtsApplyResult.ok(
-                f"{vendor}: submitted with {len(ev.fields_filled)} field(s)",
-                evidence=ev_to_dict(ev), vendor=vendor,
+        clicked = await self._submit(page, selset.get("submit_button"))
+        if not clicked:
+            ev.blocker_detected = "submit_not_found"
+            return AtsApplyResult.blocked(
+                "submit_not_found", f"{vendor}: no submit control matched",
+                evidence=ev_to_dict(ev),
             )
-        ev.blocker_detected = "submit_not_found"
-        return AtsApplyResult.blocked(
-            "submit_not_found", f"{vendor}: no submit control matched",
-            evidence=ev_to_dict(ev),
+
+        # A click is not an application (Phase 0.1) — require a receipt before success.
+        # poll briefly — the ATS may confirm asynchronously after the click returns
+        verified, signal = await verify_receipt(page, retries=3, delay=0.4)
+        if verified:
+            return AtsApplyResult.ok(
+                f"{vendor}: submitted with {len(ev.fields_filled)} field(s); receipt {signal}",
+                evidence=ev_to_dict(ev), vendor=vendor, receipt=signal,
+            )
+        return AtsApplyResult.unverified(
+            f"{vendor}: submit clicked but no receipt confirmation observed",
+            evidence=ev_to_dict(ev), vendor=vendor,
         )
 
     # ---- sub-steps -----------------------------------------------------------
