@@ -198,8 +198,15 @@ class BaseScraper(ABC):
         try:
             return await self._launch_browser(load_extensions, use_chromium_fallback)
         except BaseException:
-            # startup failed after acquisition — release, or the still-live process
-            # would hold the profile forever (callers launch before their try/finally).
+            # Startup failed after acquisition. Close any PARTIALLY-launched browser
+            # BEFORE the lock goes away — releasing first would let the next owner
+            # acquire and reach _clear_profile_locks' pkill while our Chrome lives.
+            # _close_browser releases the lock in its finally (even on cancellation);
+            # the fallback below covers a close that dies before reaching it.
+            try:
+                await self._close_browser(save_session=False)
+            except BaseException:
+                pass
             lock, self._profile_lock = self._profile_lock, None
             if lock is not None:
                 try:
@@ -343,47 +350,52 @@ class BaseScraper(ABC):
         await self._export_session_json()
 
     async def _close_browser(self, save_session: bool = True) -> None:
-        # Export session before closing — must happen while context is still live.
-        # Separated from the close() call so that close() is always reached even if
-        # the export fails (export has its own internal error handling).
-        if save_session:
-            await self._export_session_json()
+        # The whole teardown runs inside try/finally: even a task CANCELLATION during
+        # session export, context shutdown, or the flush sleep must not strand the
+        # all-owners profile lock (a stranded lock names a live PID forever).
+        try:
+            # Export session before closing — must happen while context is still live.
+            # Separated from the close() call so that close() is always reached even if
+            # the export fails (export has its own internal error handling).
+            if save_session:
+                await self._export_session_json()
 
-        had_context = self._context is not None or self._browser is not None
+            had_context = self._context is not None or self._browser is not None
 
-        if self._context:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
-        if self._browser:
-            try:
-                await self._browser.close()
-            except Exception:
-                pass
-        if self._playwright:
-            try:
-                await self._playwright.stop()
-            except Exception:
-                pass
-        self._browser = None
-        self._context = None
-        self._page = None
-        self._playwright = None
-        # Wait for Chrome to finish flushing its SQLite databases to disk.
-        # Without this, rapid close→open on the same profile causes database
-        # lock errors and renderer crashes in the next session.
-        # Skip the wait if nothing was ever opened (avoids 2s delay on startup errors).
-        if had_context:
-            await asyncio.sleep(2)
-        # Release the all-owners profile lock (reentrant borrows just decrement).
-        lock = getattr(self, "_profile_lock", None)
-        if lock is not None:
-            try:
-                lock.release()
-            except Exception:
-                pass
-            self._profile_lock = None
+            if self._context:
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+            self._browser = None
+            self._context = None
+            self._page = None
+            self._playwright = None
+            # Wait for Chrome to finish flushing its SQLite databases to disk.
+            # Without this, rapid close→open on the same profile causes database
+            # lock errors and renderer crashes in the next session.
+            # Skip the wait if nothing was ever opened (avoids 2s delay on startup errors).
+            if had_context:
+                await asyncio.sleep(2)
+        finally:
+            # Release the all-owners profile lock (reentrant borrows just decrement).
+            lock = getattr(self, "_profile_lock", None)
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+                self._profile_lock = None
 
     async def _delay(self, extra_min: float = 0, extra_max: float = 0) -> None:
         """Random human-like delay between actions."""
