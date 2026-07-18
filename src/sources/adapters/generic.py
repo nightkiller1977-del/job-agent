@@ -130,7 +130,16 @@ class GenericAtsAdapter(AtsAdapter):
         for q in answered:
             ev.add_field(f"q:{q}")
 
-        # 5. Submit gate — never auto-submit unless explicitly allowed + policy-approved.
+        # 5. Submit gate + receipt verification (shared with vendor adapters).
+        return await self._gated_submit(page, ctx, selset.get("submit_button"), ev, vendor)
+
+    async def _gated_submit(self, page, ctx: AtsApplyContext, submit_selectors,
+                            ev, vendor: str) -> AtsApplyResult:
+        """Policy-gated submit + receipt verification, reused by every adapter.
+
+        Never auto-submits unless auto_submit AND the policy approves; a submit
+        *click* is only reported as success (`applied`) when a receipt is verified,
+        otherwise `submission_unverified` (Phase 0.1/0.3)."""
         if not ctx.auto_submit:
             return AtsApplyResult.blocked(
                 "review_ready",
@@ -145,7 +154,7 @@ class GenericAtsAdapter(AtsAdapter):
                     evidence=ev_to_dict(ev),
                 )
 
-        clicked = await self._submit(page, selset.get("submit_button"))
+        clicked = await self._submit(page, submit_selectors)
         if not clicked:
             ev.blocker_detected = "submit_not_found"
             return AtsApplyResult.blocked(
