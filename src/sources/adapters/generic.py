@@ -41,6 +41,14 @@ def detect_vendor(url: str) -> str:
         return "ashby"
     if "myworkdayjobs.com" in u or "workday" in u:
         return "workday"
+    if "teamtailor.com" in u:
+        return "teamtailor"
+    if "smartrecruiters.com" in u:
+        return "smartrecruiters"
+    if "brassring.com" in u or "kenexa" in u:
+        return "brassring"
+    if "careers.microsoft.com" in u or "jobs.careers.microsoft" in u:
+        return "microsoft"
     return "generic"
 
 
