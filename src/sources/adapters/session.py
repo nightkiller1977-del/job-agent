@@ -174,7 +174,16 @@ class ExternalApplySession(BaseScraper):
 
             res.attempt_id = attempt_id
             if marked:
-                self.ledger.complete(key, attempt_id, verified=res.verified)
+                # Only record ambiguity when a submit was ACTUALLY clicked. A pre-submit
+                # blocker (login_required, captcha, submit_not_found, review_ready, ...)
+                # never clicked submit, so it must release the marker rather than be
+                # frozen as unverified and block the job forever.
+                if res.verified:
+                    self.ledger.complete(key, attempt_id, verified=True)
+                elif res.status == "submission_unverified":
+                    self.ledger.complete(key, attempt_id, verified=False)
+                else:
+                    self.ledger.clear(key)
             return res
         finally:
             try:
