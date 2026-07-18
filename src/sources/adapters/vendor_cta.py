@@ -90,20 +90,26 @@ class CtaApplyAdapter(GenericAtsAdapter):
                 f"{self.name}: login/account wall before the form — route to re-auth.",
             )
 
-        entered = await self._click_cta(page)
+        # If a real application form is ALREADY present (e.g. Teamtailor after the
+        # /applications/new rewrite), do NOT click an entry CTA — an "Apply" text match
+        # could be the final submit and fire outside the policy gate. Fill directly.
+        if not await self._looks_like_form(page):
+            entered = await self._click_cta(page)
 
-        # Some portals redirect to login only after the CTA.
-        if entered and await self._login_wall(page):
-            return AtsApplyResult.blocked(
-                f"{self.name}_login_required",
-                f"{self.name}: redirected to login after the apply CTA — route to re-auth.",
-            )
+            # Some portals redirect to login only after the CTA.
+            if entered and await self._login_wall(page):
+                return AtsApplyResult.blocked(
+                    f"{self.name}_login_required",
+                    f"{self.name}: redirected to login after the apply CTA — route to re-auth.",
+                )
 
-        if not entered and not await self._looks_like_form(page):
-            return AtsApplyResult.blocked(
-                f"{self.name}_apply_not_reached",
-                f"{self.name}: could not enter the application flow (no apply CTA / form).",
-            )
+            # after the CTA, a real form must be present before we hand off to the filler
+            # (the click may have navigated, rendered async, or not entered the flow).
+            if not await self._looks_like_form(page):
+                return AtsApplyResult.blocked(
+                    f"{self.name}_apply_not_reached",
+                    f"{self.name}: could not enter the application flow (no apply CTA / form).",
+                )
 
         # Reached the form — reuse generic fill + the shared policy+receipt submit gate.
         return await super().apply(ctx)
