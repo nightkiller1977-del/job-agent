@@ -20,12 +20,17 @@ Verified corrections honored here:
 """
 from __future__ import annotations
 
+import uuid
+
 from rich.console import Console
 
 from ..base import BaseScraper
 from .context import AtsApplyContext, AtsApplyResult
 from .registry import AtsAdapterRegistry
 from .generic import GenericAtsAdapter
+from .policy import AutoSubmitPolicy, SubmissionPolicy
+from .idempotency import SubmissionLedger, canonical_key
+from .profile_lock import ProfileLock, ProfileLockError
 
 console = Console()
 
@@ -54,9 +59,15 @@ class ExternalApplySession(BaseScraper):
 
     name = "jobright"  # forces state/sessions/jobright_profile (extension lives there)
 
-    def __init__(self, config, registry: AtsAdapterRegistry | None = None):
+    def __init__(self, config, registry: AtsAdapterRegistry | None = None,
+                 policy: SubmissionPolicy | None = None,
+                 ledger: SubmissionLedger | None = None):
         super().__init__(config)
         self.registry = registry or self._create_default_registry()
+        # Optional policy override; when None a per-call AutoSubmitPolicy is used so
+        # the gate tracks the run's auto_submit flag.
+        self._policy_override = policy
+        self.ledger = ledger if ledger is not None else SubmissionLedger()
 
     def _create_default_registry(self) -> AtsAdapterRegistry:
         from .greenhouse import GreenhouseAdapter
@@ -77,39 +88,121 @@ class ExternalApplySession(BaseScraper):
         """Parity target for the three migrated call sites (linkedin:1265,
         indeed:397, SOURCE_MAP['external']). Live-verify on the Mac before
         flipping those call sites off JobrightScraper.
+
+        Reliability substrate (Phase 0.1-0.4):
+          - 0.2 idempotency: a canonical (vendor,url) key gates against duplicate
+            applies; a "submit in progress" marker survives a mid-submit crash.
+          - 0.3 policy: the session owns the gate and rejects any `submitted`
+            result that was not authorized through it.
+          - 0.4 lifecycle: an exclusive profile lock (no 2nd Chrome on the shared
+            jobright profile) and a guaranteed browser close in `finally`.
         """
         external_url = job.get("url") or job.get("external_url") or ""
+        attempt_id = uuid.uuid4().hex
+        key = canonical_key(job)
+
+        # --- 0.2 pre-flight duplicate/interrupted checks (before launching Chrome) ---
+        if key and self.ledger.already_applied(key):
+            return AtsApplyResult.blocked(
+                "duplicate_application_prevented",
+                f"already applied to {key} — not resubmitting", attempt_id=attempt_id,
+            )
+        if key and self.ledger.in_progress(key):
+            stale = self.ledger.is_stale_in_progress(key)
+            return AtsApplyResult.blocked(
+                "submit_in_progress",
+                f"a prior submit for {key} is unresolved "
+                f"({'stale/crashed' if stale else 'in flight'}) — not resubmitting blindly",
+                attempt_id=attempt_id,
+            )
+        if key and self.ledger.needs_reconciliation(key):
+            # A prior attempt clicked submit but no receipt was confirmed — resubmitting
+            # blindly risks a duplicate. Hold until reconciled (human/receipt re-check).
+            return AtsApplyResult.blocked(
+                "submit_unverified_unresolved",
+                f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
+                attempt_id=attempt_id,
+            )
+
+        policy: SubmissionPolicy = self._policy_override or AutoSubmitPolicy(allow=auto_submit)
         hints = _detect_pre_launch_vendor(external_url)
 
-        # 1. Pre-launch: start Chrome on the jobright profile with the correct
-        #    extension setting (decided from the URL, before launch).
-        page = await self._start_browser(load_extensions=hints["load_extensions"])
+        # --- 0.4 exclusive profile lock: never a 2nd Chrome on the jobright profile ---
+        try:
+            lock = ProfileLock(self._profile_dir).acquire()
+        except ProfileLockError as e:
+            return AtsApplyResult.blocked(
+                "profile_locked", str(e), attempt_id=attempt_id,
+            )
 
-        # 2. Navigate directly to the ATS URL (the :237 path, not the card handoff).
-        await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
+        marked = False
+        try:
+            page = await self._start_browser(load_extensions=hints["load_extensions"])
+            await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
 
-        # 3. Build the context with the LIVE page, then let the registry pick.
-        ctx = AtsApplyContext(
-            page=page,
-            job=job,
-            profile=getattr(self, "profile", None),
-            resume_path=job.get("resume_path"),
-            cover_letter_path=job.get("cover_letter_path"),
-            auto_submit=auto_submit,
-            url=page.url,
-        )
-        adapter = await self.registry.pick(ctx)
-        console.print(f"[cyan]ExternalApplySession:[/cyan] adapter={adapter.name} url={page.url[:80]}")
-        res = await adapter.apply(ctx)
+            ctx = AtsApplyContext(
+                page=page,
+                job=job,
+                profile=getattr(self, "profile", None),
+                resume_path=job.get("resume_path"),
+                cover_letter_path=job.get("cover_letter_path"),
+                auto_submit=auto_submit,
+                policy=policy,
+                url=page.url,
+                attempt_id=attempt_id,
+            )
 
-        # Trigger P5 self-healing Browser Use recovery fallback on form-completion failure
-        if not res.submitted and res.status in ("submit_not_found", "form_not_reached", "blocked"):
-            from .recovery_browseruse import BrowserUseRecovery
-            recovery = BrowserUseRecovery()
-            console.print("[yellow]Triggering Browser Use self-healing recovery...[/yellow]")
-            recovery_res = await recovery.apply(ctx)
-            if recovery_res.submitted:
-                return recovery_res
+            # A submit may happen -> write the in-progress marker BEFORE it (crash-safe).
+            if key and auto_submit:
+                self.ledger.begin(key, attempt_id)
+                marked = True
 
+            adapter = await self.registry.pick(ctx)
+            console.print(f"[cyan]ExternalApplySession:[/cyan] adapter={adapter.name} url={page.url[:80]}")
+            res = self._enforce_authorization(await adapter.apply(ctx), ctx, policy)
+
+            # Recovery only on form-completion failure — NOT on 'submission_unverified'
+            # (re-driving that risks a duplicate submit).
+            if not res.submitted and res.status in ("submit_not_found", "form_not_reached", "blocked"):
+                from .recovery_browseruse import BrowserUseRecovery
+                console.print("[yellow]Triggering Browser Use self-healing recovery...[/yellow]")
+                recovery_res = self._enforce_authorization(
+                    await BrowserUseRecovery().apply(ctx), ctx, policy
+                )
+                if recovery_res.submitted:
+                    res = recovery_res
+
+            res.attempt_id = attempt_id
+            if marked:
+                # Only record ambiguity when a submit was ACTUALLY clicked. A pre-submit
+                # blocker (login_required, captcha, submit_not_found, review_ready, ...)
+                # never clicked submit, so it must release the marker rather than be
+                # frozen as unverified and block the job forever.
+                if res.verified:
+                    self.ledger.complete(key, attempt_id, verified=True)
+                elif res.status == "submission_unverified":
+                    self.ledger.complete(key, attempt_id, verified=False)
+                else:
+                    self.ledger.clear(key)
+            return res
+        finally:
+            try:
+                await self._close_browser()
+            except Exception:
+                pass
+            lock.release()
+
+    @staticmethod
+    def _enforce_authorization(res: AtsApplyResult, ctx: AtsApplyContext,
+                               policy: SubmissionPolicy) -> AtsApplyResult:
+        """Non-bypassable gate: a `submitted` result is only honored if the policy
+        authorized submission for this attempt. Any route that submits without
+        passing the gate (e.g. an LLM path) is downgraded to unverified."""
+        if res.submitted and not policy.authorized(ctx):
+            return AtsApplyResult.unverified(
+                f"submit reported without policy authorization — downgraded "
+                f"(was status={res.status!r})",
+                **(res.analytics or {}),
+            )
         return res
 
