@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import subprocess
 import sys
@@ -57,6 +58,10 @@ class AuthFailedError(Exception):
 SESSIONS_DIR = Path(__file__).parent.parent.parent / "state" / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
+# How long _start_browser waits for another LIVE process to release a profile
+# before refusing (never pkill a legitimate owner's Chrome). Override via env.
+_PROFILE_LOCK_WAIT_S = float(os.environ.get("PROFILE_LOCK_WAIT_S", "20"))
+
 # Where browser extensions are stored
 EXT_DIR = Path(__file__).parent.parent.parent / "state" / "extensions"
 
@@ -79,6 +84,7 @@ class BaseScraper(ABC):
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._playwright = None
+        self._profile_lock = None  # all-owners profile lock (held while browser is open)
         self.last_apply_status = ""
         self.last_apply_detail = ""
         self._mc = None  # lazy ModelClient — shared across all model calls in this scraper instance
@@ -172,7 +178,23 @@ class BaseScraper(ABC):
         load_extensions=True: also loads the Jobright Autofill extension from
         state/extensions/jobright-autofill so it can fill company ATS forms.
         """
-        # Remove stale lock files so Playwright can acquire the profile
+        # All-owners profile lock: EVERY path that opens a profile (scrape, apply,
+        # hydration, prepare-sessions, ExternalApplySession) goes through here, so
+        # acquiring the lock here makes every owner participate in the protocol.
+        # If another LIVE process holds this profile we refuse — _clear_profile_locks'
+        # pkill below must never terminate a legitimate owner's Chrome. Reentrant
+        # within a process (ExternalApplySession's outer lock borrows, not deadlocks).
+        from .adapters.profile_lock import ProfileLock, ProfileLockError  # local: avoid import weight at module load
+        try:
+            self._profile_lock = ProfileLock(
+                self._profile_dir, timeout=_PROFILE_LOCK_WAIT_S
+            ).acquire()
+        except ProfileLockError:
+            self._profile_lock = None
+            raise
+
+        # Remove stale lock files so Playwright can acquire the profile — safe now:
+        # holding the applylock means any Chrome still on this profile is stale.
         self._clear_profile_locks()
 
         console.print(f"[dim]Browser engine: {_BROWSER_ENGINE}[/dim]")
@@ -339,6 +361,14 @@ class BaseScraper(ABC):
         # Skip the wait if nothing was ever opened (avoids 2s delay on startup errors).
         if had_context:
             await asyncio.sleep(2)
+        # Release the all-owners profile lock (reentrant borrows just decrement).
+        lock = getattr(self, "_profile_lock", None)
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+            self._profile_lock = None
 
     async def _delay(self, extra_min: float = 0, extra_max: float = 0) -> None:
         """Random human-like delay between actions."""
