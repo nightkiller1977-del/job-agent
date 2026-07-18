@@ -1,4 +1,4 @@
-"""Tests for the single-source secrets resolver (src/secrets.py).
+"""Tests for the single-source secrets resolver (src/secret_store.py).
 
 Covers the two invariants that the credential band-aids only approximated:
   * fill-missing, EMPTY-STRING-treated-as-absent (the Claude Code ANTHROPIC_API_KEY=""
@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from src import secrets
+from src import secret_store as secrets
 
 
 @pytest.fixture
