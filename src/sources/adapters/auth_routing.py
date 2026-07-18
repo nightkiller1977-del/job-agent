@@ -67,13 +67,17 @@ def directive_for(status: str, job: dict | None = None) -> ReauthDirective | Non
     action = "prepare_sessions" if portal else "reauth"
     who = vendor or source
     if action == "prepare_sessions":
-        # The ATS portal (Workday/Microsoft/...) session lives in the shared EXTERNAL
-        # ('jobright') profile, NOT the originating scraper's session — so
-        # 'prepare-sessions --source linkedin' would open LinkedIn and leave the portal
-        # wall untouched. Point the human at the external profile + the specific portal.
+        # prepare-sessions filters approved jobs by the job's discovery source
+        # (job["source"]), so '--source jobright' would never open the portal for a
+        # LinkedIn/Indeed-origin job. Target the job itself via its origin source +
+        # company; the opened flow lands on the ATS portal for the human to sign in.
+        company = str(job.get("company") or "")
+        target = f"--source {source}"
+        if company:
+            target += f' --company "{company}"'
         remediation = (
-            f"sign in to the {who} portal in the external apply profile: "
-            f"python src/main.py prepare-sessions --source jobright"
+            f"sign in to the {who} portal for this job: "
+            f"python src/main.py prepare-sessions {target}"
         )
     else:
         remediation = "add credentials to .env / re-run to refresh the session"
