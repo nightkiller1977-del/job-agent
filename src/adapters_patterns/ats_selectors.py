@@ -104,7 +104,7 @@ SELECTORS = {
         "fields": {
             "first_name": "input[name*='first' i], input[id*='first' i]",
             "last_name": "input[name*='last' i], input[id*='last' i]",
-            "name": "input[id*='full-name' i], input[name*='full_name' i]",
+            "name": "input[name='job_application[name]'], input[id*='full-name' i], input[name*='full_name' i]",
             "email": "input[type='email'], input[name*='email' i], input[id*='email' i]",
             "phone": "input[type='tel'], input[name*='phone' i], input[id*='phone' i]",
             "linkedin": "input[name*='linkedin' i], input[id*='linkedin' i]"
@@ -113,10 +113,10 @@ SELECTORS = {
     "smartrecruiters": {
         "form": "form[data-test='application-form'], form",
         "submit_button": [
-            "button[data-test='button-primary']",
             "#submitButton",
             "button[type='submit']",
-            "//button[contains(., 'Submit')]",
+            "button[data-test='form-submit-button']",
+            "//button[contains(., 'Submit application')]",
             "//button[contains(., 'Send application')]"
         ],
         "file_inputs": {
