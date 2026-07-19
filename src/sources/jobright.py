@@ -1916,13 +1916,17 @@ class JobrightScraper(BaseScraper):
 
         return submitted
 
-    async def prepare_session(self, job: dict) -> None:
+    async def prepare_session(self, job: dict) -> bool:
         """Open the external ATS portal in the persistent profile for login/session refresh.
 
         For Workday specifically: navigates to the /apply/autofillWithResume URL and
         displays step-by-step sign-in instructions when the session is expired.
         The persistent profile saves the new cookies automatically so future apply
         runs skip this step entirely.
+
+        Returns True if a usable portal was reached (so the caller may clear the
+        job's session block), False if preparation bailed early — e.g. no external
+        ATS URL could be found for a native Jobright listing.
         """
         console.print(
             f"\n[magenta]Jobright Session Prep:[/magenta] {job.get('title')} @ {job.get('company')}"
@@ -1951,7 +1955,7 @@ class JobrightScraper(BaseScraper):
                 ext_url = popup_ext_url or await self._extract_external_url(page)
                 if not ext_url:
                     console.print("[red]Jobright:[/red] Could not find company ATS URL for session prep.")
-                    return
+                    return False
 
                 company_page = await self._context.new_page()
                 await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
@@ -2010,6 +2014,7 @@ class JobrightScraper(BaseScraper):
                     "[yellow]Non-interactive run: diagnostic prep only. "
                     "Run from Terminal to pause while you sign in.[/yellow]"
                 )
+            return True
         finally:
             await self._close_browser()
 

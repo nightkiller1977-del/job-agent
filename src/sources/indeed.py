@@ -430,12 +430,15 @@ class IndeedScraper(BaseScraper):
         }}
         """, default="")
 
-    async def prepare_session(self, job: dict | None) -> None:
+    async def prepare_session(self, job: dict | None) -> bool:
         """Open Indeed and establish a persistent session.
 
         Tries auto-login with INDEED_EMAIL / INDEED_PASSWORD from env first
         (populated by load_credentials_from_dashboard() at run start).
         Falls back to a manual login prompt in interactive mode.
+
+        Returns True once the Indeed session surface was reached (so the caller
+        may clear the job's session block).
         """
         console.print("\n[blue]Indeed Session Prep:[/blue] Opening Indeed…")
         page = await self._start_browser()
@@ -456,7 +459,7 @@ class IndeedScraper(BaseScraper):
                     if success:
                         console.print("[green]Indeed Session Prep:[/green] Auto-login succeeded — session saved.")
                         await self._delay(2, 3)
-                        return
+                        return True
                     console.print(
                         "[yellow]Indeed Session Prep:[/yellow] Auto-login failed "
                         "(2FA challenge or CAPTCHA). Falling back to manual login."
@@ -478,6 +481,7 @@ class IndeedScraper(BaseScraper):
                     console.print("[yellow]Non-interactive — skipping manual login prompt.[/yellow]")
             else:
                 console.print("[green]Indeed Session Prep:[/green] Already logged in. Session is fresh.")
+            return True
         finally:
             await self._close_browser()
 

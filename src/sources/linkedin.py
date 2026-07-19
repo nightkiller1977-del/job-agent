@@ -1317,8 +1317,12 @@ class LinkedInScraper(BaseScraper):
         except Exception:
             return False
 
-    async def prepare_session(self, job: Optional[dict] = None) -> None:
-        """Open LinkedIn in the persistent profile so the user can refresh login/challenge state."""
+    async def prepare_session(self, job: Optional[dict] = None) -> bool:
+        """Open LinkedIn in the persistent profile so the user can refresh login/challenge state.
+
+        Returns True once the LinkedIn session surface was reached (so the caller
+        may clear the job's session block).
+        """
         console.print("\n[blue]LinkedIn Session Prep:[/blue] Opening LinkedIn session")
         page = await self._start_browser()
         try:
@@ -1335,6 +1339,7 @@ class LinkedInScraper(BaseScraper):
             else:
                 # Session is already good — no interaction needed.
                 console.print("[green]LinkedIn session is authenticated — no action needed.[/green]")
+            return True
         finally:
             await self._close_browser()
 
