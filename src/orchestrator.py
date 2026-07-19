@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -407,12 +408,14 @@ class Orchestrator:
 
         last_status = ""
         last_detail = ""
+        session_prepared_at = ""
         try:
             extra = job.get("extra_json") or {}
             if isinstance(extra, str):
                 extra = _json.loads(extra)
             last_status = str(extra.get("apply_last_status") or "")
             last_detail = str(extra.get("apply_last_detail") or "")
+            session_prepared_at = str(extra.get("session_prepared_at") or "")
         except Exception:
             pass
 
@@ -430,8 +433,6 @@ class Orchestrator:
             "linkedin_authwall",
             "linkedin_login_required",
         }
-        if last_status in session_statuses:
-            return ("needs-session", last_detail or "Portal session or credentials must be refreshed before applying.")
         # "needs-review" was also set by old preflight code; "workday_form_not_detected"
         # means the portal page loaded but looked like a job listing — worth retrying.
         # Only block on "form_not_reached" outcomes that indicate a hard wall.
@@ -439,7 +440,14 @@ class Orchestrator:
             "workday_account_required",
             "brassring_registration_required",
         }
-        if last_status in hard_blocks:
+        if last_status in (session_statuses | hard_blocks):
+            # prepare_sessions() stamped session_prepared_at after a human signed in
+            # to this job's portal — retry it instead of blocking again, without
+            # touching apply_last_status/detail (get_apply_funnel() needs them intact).
+            if session_prepared_at:
+                return ("ready", "Session prepared via prepare-sessions; retrying.")
+            if last_status in session_statuses:
+                return ("needs-session", last_detail or "Portal session or credentials must be refreshed before applying.")
             return ("needs-review", last_detail or "This application requires manual account setup before auto-submit.")
         if last_status in {"linkedin_stuck_on_required_field", "required_field_unanswered"}:
             return ("needs-answer", last_detail or "The apply form has a required field the agent cannot answer yet.")
@@ -602,11 +610,15 @@ class Orchestrator:
                 continue
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
             await prepare(job)
-            # Clear the stale auth-wall status now that the human has had a chance
-            # to sign in — otherwise apply_approved() keeps classifying this job as
-            # needs-session/needs-portal-login/needs-review forever (Codex #56 P1).
-            if job.get("job_id"):
+            # Mark the job retryable now that the human has had a chance to sign
+            # in — otherwise apply_approved() keeps classifying it as needs-session/
+            # needs-portal-login/needs-review forever (Codex #56 P1). Only do this
+            # when interactive: every prepare_session() implementation treats a
+            # non-TTY run as "diagnostic prep only" and skips the login prompt
+            # entirely (Codex #57 P1), so there's no signal the wall was cleared.
+            if job.get("job_id") and sys.stdin and sys.stdin.isatty():
                 self.state.clear_session_block(job["job_id"])
+                await self._push_apply_attempt_to_cloud(job["job_id"])
 
     async def apply_approved(
         self,

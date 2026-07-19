@@ -1,5 +1,6 @@
 """Phase 3 — routing adapter auth-wall outcomes to re-auth / session-prep."""
 import pytest
+from unittest.mock import patch
 
 from src.sources.adapters.auth_routing import (
     is_auth_required, directive_for, ReauthRouter, ManagerReauthRouter,
@@ -142,6 +143,9 @@ async def test_prepare_sessions_dispatches_portal_blocked_jobs_to_external_prep(
         def clear_session_block(self, job_id):
             self.cleared.append(job_id)
 
+        def get_job(self, job_id):
+            return None
+
     async def _noop(*args, **kwargs):
         return None
 
@@ -151,13 +155,72 @@ async def test_prepare_sessions_dispatches_portal_blocked_jobs_to_external_prep(
     o.load_credentials_from_dashboard = _noop
     o._pull_approved_from_cloud = _noop
 
-    await o.prepare_sessions()
+    with patch("sys.stdin") as mock_stdin:
+        mock_stdin.isatty.return_value = True  # interactive: human can actually sign in
+        await o.prepare_sessions()
     assert ("jobright", "portal") in calls    # external ATS wall -> portal prep flow
     assert ("linkedin", "authwall") in calls  # source-session block -> source prep
     # Codex #56 P1: both jobs must have their stale auth-wall status cleared after
     # prepare_session() runs, or apply_approved() would classify them as blocked
     # forever even after the human signs in.
     assert set(o.state.cleared) == {"portal", "authwall"}
+
+
+@pytest.mark.asyncio
+async def test_prepare_sessions_does_not_clear_block_when_non_interactive(monkeypatch):
+    """Codex #57 P1: a non-interactive run is diagnostic-only — every
+    prepare_session() implementation skips the login prompt outright when
+    sys.stdin isn't a TTY, so there is no signal the auth wall was actually
+    cleared. Must not mark the job retryable in that case."""
+    import json as _json
+    from src import orchestrator as orch_mod
+
+    def make_scraper(name):
+        class _Scraper:
+            def __init__(self, config):
+                pass
+
+            async def prepare_session(self, job):
+                pass
+        return _Scraper
+
+    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {
+        "jobright": make_scraper("jobright"),
+        "linkedin": make_scraper("linkedin"),
+    })
+
+    jobs = [
+        {"job_id": "authwall", "source": "linkedin", "title": "T", "company": "C",
+         "url": "https://www.linkedin.com/jobs/view/1",
+         "extra_json": _json.dumps({"apply_last_status": "linkedin_authwall"})},
+    ]
+
+    class _State:
+        def __init__(self):
+            self.cleared = []
+
+        def get_approved_unapplied(self):
+            return jobs
+
+        def clear_session_block(self, job_id):
+            self.cleared.append(job_id)
+
+        def get_job(self, job_id):
+            return None
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
+    o.config = {}
+    o.state = _State()
+    o.load_credentials_from_dashboard = _noop
+    o._pull_approved_from_cloud = _noop
+
+    with patch("sys.stdin") as mock_stdin:
+        mock_stdin.isatty.return_value = False  # non-interactive: diagnostic prep only
+        await o.prepare_sessions()
+    assert o.state.cleared == []
 
 
 @pytest.mark.asyncio
@@ -245,6 +308,68 @@ def test_clear_session_block_resets_status_so_readiness_becomes_ready(tmp_path):
 
     readiness, _ = o._classify_apply_readiness(_job_with_current_extra())
     assert readiness == "ready"
+
+
+def test_clear_session_block_preserves_apply_last_status_for_funnel(tmp_path):
+    """Codex #57 P2: clear_session_block() must NOT blank apply_last_status —
+    get_apply_funnel() skips any job whose apply_last_status is empty, so doing
+    that would silently drop the job from attempt/failure/per-source funnel
+    stats until another apply attempt ran."""
+    import json as _json
+    from src.state_manager import StateManager
+
+    sm = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "jid1", "source": "linkedin", "title": "T", "company": "C",
+        "location": "", "salary_raw": "", "remote_type": "", "url": "https://x",
+        "description": "",
+    }
+    sm.upsert_job(job)
+    sm.record_apply_attempt("jid1", "workday_session_expired", "auth wall")
+
+    sm.clear_session_block("jid1")
+
+    row = sm._connect().execute(
+        "SELECT extra_json FROM jobs WHERE job_id = ?", ("jid1",)
+    ).fetchone()
+    extra = _json.loads(row["extra_json"])
+    assert extra["apply_last_status"] == "workday_session_expired"
+    assert extra["apply_last_detail"] == "auth wall"
+    assert extra["session_prepared_at"]
+
+    funnel = sm.get_apply_funnel()
+    assert funnel["attempts"] >= 1
+    assert funnel["failure_histogram"].get("workday_session_expired", 0) >= 1
+
+
+def test_record_apply_attempt_clears_stale_session_prepared_flag(tmp_path):
+    """A fresh apply attempt must supersede any earlier clear_session_block()
+    flag, or a stale flag from a prior sign-in could mask a brand-new block
+    recorded by this attempt."""
+    import json as _json
+    from src.state_manager import StateManager
+
+    sm = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "jid1", "source": "linkedin", "title": "T", "company": "C",
+        "location": "", "salary_raw": "", "remote_type": "", "url": "https://x",
+        "description": "",
+    }
+    sm.upsert_job(job)
+    sm.record_apply_attempt("jid1", "workday_session_expired", "auth wall")
+    sm.clear_session_block("jid1")
+
+    row = sm._connect().execute(
+        "SELECT extra_json FROM jobs WHERE job_id = ?", ("jid1",)
+    ).fetchone()
+    assert _json.loads(row["extra_json"])["session_prepared_at"]
+
+    sm.record_apply_attempt("jid1", "workday_session_expired", "blocked again")
+
+    row = sm._connect().execute(
+        "SELECT extra_json FROM jobs WHERE job_id = ?", ("jid1",)
+    ).fetchone()
+    assert "session_prepared_at" not in _json.loads(row["extra_json"])
 
 
 @pytest.mark.asyncio

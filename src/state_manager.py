@@ -296,6 +296,10 @@ class StateManager:
             extra["apply_last_status"]  = status
             extra["apply_last_detail"]  = (detail or "")[:500]
             extra["apply_attempt_count"] = extra.get("apply_attempt_count", 0) + 1
+            # A fresh attempt supersedes any earlier clear_session_block() flag —
+            # otherwise a stale flag from a prior sign-in could mask a brand-new
+            # block recorded by this attempt.
+            extra.pop("session_prepared_at", None)
             # P1 instrumentation: a durable success flag on EVERY attempt (success or
             # failure) so success-rate is computable. Previously only rich analytics
             # were recorded, and only on success — leaving `submitted` null everywhere.
@@ -312,17 +316,25 @@ class StateManager:
             )
 
     def clear_session_block(self, job_id: str) -> None:
-        """Clear a recorded auth/session blocker after prepare_sessions() opens the
-        job's portal for a human sign-in.
+        """Mark a session/portal-blocked job retryable after prepare_sessions() opens
+        its portal for a human sign-in.
 
         record_apply_attempt() is the only writer of apply_last_status, and
         prepare_sessions() never calls it — so without this, _classify_apply_readiness
         keeps reading the stale auth-wall status from the job's last apply attempt
         and marks the job blocked forever, even after the human signs in.
-        should_attempt() treats an empty last_status as "never tried — always
-        attempt", so clearing it (rather than needing a new status value) is enough
-        to make the next apply run retry the job.
+
+        Stamps `session_prepared_at` rather than blanking apply_last_status/detail:
+        get_apply_funnel() skips any job whose apply_last_status is empty, so erasing
+        it would silently drop the job from attempt/failure/per-source funnel stats
+        until another apply attempt ran. _classify_apply_readiness treats a truthy
+        session_prepared_at as "ready to retry" for the two readiness classes
+        prepare_sessions() actually acts on (needs-session, needs-review), while
+        leaving apply_last_status intact for telemetry. record_apply_attempt() clears
+        the flag again on the next recorded attempt so a stale flag can't mask a
+        fresh block.
         """
+        now = datetime.utcnow().isoformat()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
@@ -335,8 +347,7 @@ class StateManager:
                     pass
             if not extra.get("apply_last_status"):
                 return
-            extra["apply_last_status"] = ""
-            extra["apply_last_detail"] = ""
+            extra["session_prepared_at"] = now
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
                 (json.dumps(extra), job_id),
