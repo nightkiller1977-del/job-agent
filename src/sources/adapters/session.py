@@ -70,8 +70,11 @@ def _detect_pre_launch_vendor(external_url: str) -> dict:
     return {
         "is_teamtailor": is_teamtailor,
         # Teamtailor is handled by a dedicated form-filler; the extension is not
-        # loaded for it (mirrors jobright.py:268).
+        # loaded for it (mirrors jobright.py). load_extensions=False alone leaves a
+        # Web-Store copy loading, so disable_extensions forces it fully off — its
+        # content scripts can crash the Teamtailor renderer.
         "load_extensions": not is_teamtailor,
+        "disable_extensions": is_teamtailor,
     }
 
 
@@ -239,7 +242,10 @@ class ExternalApplySession(BaseScraper):
 
         marked = False
         try:
-            page = await self._start_browser(load_extensions=hints["load_extensions"])
+            page = await self._start_browser(
+                load_extensions=hints["load_extensions"],
+                disable_extensions=hints.get("disable_extensions", False),
+            )
             await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
             # a company/external URL may redirect to the real ATS — re-derive the vendor
             # from the navigated URL so post-nav events aren't mislabeled 'generic'.

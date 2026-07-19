@@ -330,7 +330,12 @@ class JobrightScraper(BaseScraper):
             external_url = f"{base_url}/applications/new"
 
         console.print(f"[magenta]Jobright ATS:[/magenta] External apply for {job.get('title')} @ {job.get('company')}")
-        page = await self._start_browser(load_extensions=not _is_teamtailor)
+        # For Teamtailor, force extensions fully off: load_extensions=False alone
+        # leaves a Web-Store copy of the Jobright extension loading, whose content
+        # scripts can crash the Teamtailor renderer (mirrors prepare_session).
+        page = await self._start_browser(
+            load_extensions=not _is_teamtailor, disable_extensions=_is_teamtailor
+        )
         try:
             await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
             # For Teamtailor: wait for the SPA to finish its initial auth check and
@@ -1916,26 +1921,39 @@ class JobrightScraper(BaseScraper):
 
         return submitted
 
-    async def prepare_session(self, job: dict) -> None:
+    async def prepare_session(self, job: dict) -> bool:
         """Open the external ATS portal in the persistent profile for login/session refresh.
 
         For Workday specifically: navigates to the /apply/autofillWithResume URL and
         displays step-by-step sign-in instructions when the session is expired.
         The persistent profile saves the new cookies automatically so future apply
         runs skip this step entirely.
+
+        Returns True only when the portal session is confirmed ready to clear —
+        i.e. the run is interactive and the human was prompted to sign in. Returns
+        False when preparation bailed early (no external ATS URL for a native
+        Jobright listing) or when a non-interactive run merely did diagnostic prep
+        without a human completing the login.
         """
         console.print(
             f"\n[magenta]Jobright Session Prep:[/magenta] {job.get('title')} @ {job.get('company')}"
         )
         # Reset recovery flag so the interactive prompt fires if needed
         self._workday_recovery_attempted = False
-        page = await self._start_browser(load_extensions=True)
+        # Jobs routed here from other discovery sources (LinkedIn/Indeed) carry
+        # a recorded external portal URL instead of a Jobright listing — open
+        # the portal directly, there is no Jobright page to extract from.
+        from .adapters.auth_routing import external_ats_url
+        known_ext_url = external_ats_url(job)
+        # Match apply_external_ats_job()'s extension policy: the Jobright extension's
+        # content scripts can crash the Teamtailor renderer tab, so open Teamtailor
+        # with extensions fully disabled (disable_extensions, not just
+        # load_extensions=False, which would leave a Web-Store copy loading).
+        _is_teamtailor = "teamtailor.com" in known_ext_url.lower()
+        page = await self._start_browser(
+            load_extensions=not _is_teamtailor, disable_extensions=_is_teamtailor
+        )
         try:
-            # Jobs routed here from other discovery sources (LinkedIn/Indeed) carry
-            # a recorded external portal URL instead of a Jobright listing — open
-            # the portal directly, there is no Jobright page to extract from.
-            from .adapters.auth_routing import external_ats_url
-            known_ext_url = external_ats_url(job)
             if known_ext_url:
                 console.print(f"[cyan]Opening recorded ATS portal:[/cyan] {known_ext_url[:100]}")
                 company_page = page
@@ -1947,7 +1965,7 @@ class JobrightScraper(BaseScraper):
                 ext_url = popup_ext_url or await self._extract_external_url(page)
                 if not ext_url:
                     console.print("[red]Jobright:[/red] Could not find company ATS URL for session prep.")
-                    return
+                    return False
 
                 company_page = await self._context.new_page()
                 await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
@@ -2001,11 +2019,12 @@ class JobrightScraper(BaseScraper):
                     "Sign in, refresh your portal account, or click through to the application form."
                 )
                 input("  Press Enter when this portal session is ready > ")
-            else:
-                console.print(
-                    "[yellow]Non-interactive run: diagnostic prep only. "
-                    "Run from Terminal to pause while you sign in.[/yellow]"
-                )
+                return True  # human confirmed the portal session
+            console.print(
+                "[yellow]Non-interactive run: diagnostic prep only. "
+                "Run from Terminal to pause while you sign in.[/yellow]"
+            )
+            return False  # no human signed in — not safe to clear the block
         finally:
             await self._close_browser()
 

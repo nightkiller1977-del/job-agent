@@ -37,6 +37,7 @@ jobs:
                  tests/test_state_manager.py \
                  tests/test_reauth_regressions.py \
                  tests/test_reauth_feature.py \
+                 tests/test_auth_routing.py \
                  tests/test_ats_checker.py \
                  tests/test_latex_compiler.py \
                  -q --tb=short --asyncio-mode=auto

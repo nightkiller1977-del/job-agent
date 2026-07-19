@@ -1317,8 +1317,14 @@ class LinkedInScraper(BaseScraper):
         except Exception:
             return False
 
-    async def prepare_session(self, job: Optional[dict] = None) -> None:
-        """Open LinkedIn in the persistent profile so the user can refresh login/challenge state."""
+    async def prepare_session(self, job: Optional[dict] = None) -> bool:
+        """Open LinkedIn in the persistent profile so the user can refresh login/challenge state.
+
+        Returns True when the session is confirmed ready to clear: either it is
+        already authenticated (verified without any human input — safe even under
+        launchd) or an interactive human completed the login. Returns False when a
+        non-interactive run hits a login wall it cannot resolve.
+        """
         console.print("\n[blue]LinkedIn Session Prep:[/blue] Opening LinkedIn session")
         page = await self._start_browser()
         try:
@@ -1330,11 +1336,12 @@ class LinkedInScraper(BaseScraper):
                 console.print("[yellow]LinkedIn needs login or challenge completion in this browser window.[/yellow]")
                 if sys.stdin and sys.stdin.isatty():
                     input("Press Enter after LinkedIn session is ready > ")
-                else:
-                    console.print("[yellow]Non-interactive run: rerun from Terminal to sign in once.[/yellow]")
-            else:
-                # Session is already good — no interaction needed.
-                console.print("[green]LinkedIn session is authenticated — no action needed.[/green]")
+                    return True  # human completed the login
+                console.print("[yellow]Non-interactive run: rerun from Terminal to sign in once.[/yellow]")
+                return False  # login wall unresolved
+            # Session is already good — verified, no interaction needed.
+            console.print("[green]LinkedIn session is authenticated — no action needed.[/green]")
+            return True
         finally:
             await self._close_browser()
 
