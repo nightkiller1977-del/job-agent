@@ -330,7 +330,12 @@ class JobrightScraper(BaseScraper):
             external_url = f"{base_url}/applications/new"
 
         console.print(f"[magenta]Jobright ATS:[/magenta] External apply for {job.get('title')} @ {job.get('company')}")
-        page = await self._start_browser(load_extensions=not _is_teamtailor)
+        # For Teamtailor, force extensions fully off: load_extensions=False alone
+        # leaves a Web-Store copy of the Jobright extension loading, whose content
+        # scripts can crash the Teamtailor renderer (mirrors prepare_session).
+        page = await self._start_browser(
+            load_extensions=not _is_teamtailor, disable_extensions=_is_teamtailor
+        )
         try:
             await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
             # For Teamtailor: wait for the SPA to finish its initial auth check and
