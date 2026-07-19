@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 def is_auth_required(status: str) -> bool:
