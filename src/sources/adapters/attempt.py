@@ -5,7 +5,7 @@ so `applied` can mean exactly one thing: a receipt was verified.
 
     STARTED -> FORM_REACHED -> FIELDS_FILLED -> SUBMIT_AUTHORIZED
             -> SUBMIT_CLICKED -> RECEIPT_VERIFIED        (success)
-                              \-> ...                     -> FAILED / UNKNOWN
+                              \\-> ...                     -> FAILED / UNKNOWN
 
 `SUBMIT_CLICKED` is deliberately distinct from `RECEIPT_VERIFIED`: a click with no
 confirmation lands in `UNKNOWN`, never success. Wire values are strings so they

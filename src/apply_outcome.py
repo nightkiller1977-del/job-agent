@@ -2,7 +2,7 @@ from enum import Enum
 
 class ApplyOutcomeCode(str, Enum):
     APPLIED = "applied"
-    
+
     # Needs Human / Structural
     SUBMIT_NOT_FOUND = "submit_not_found"
     FORM_NOT_REACHED = "form_not_reached"

@@ -125,7 +125,7 @@ async def test_session_outer_lock_composes_with_base(tmp_path, monkeypatch):
         async def evaluate(self, *a, **k):
             return None
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         # the REAL base acquisition (inner, reentrant) without launching Chrome
         from src.sources.adapters.profile_lock import ProfileLock as _PL
         sess._profile_lock = _PL(prof).acquire()
@@ -152,7 +152,7 @@ async def test_lock_released_when_startup_fails(scraper, monkeypatch):
     still-live process holds the profile forever."""
     s, prof = scraper
 
-    async def _boom(load_extensions, use_chromium_fallback):
+    async def _boom(load_extensions, use_chromium_fallback, disable_extensions=False):
         raise RuntimeError("chrome failed to start")
 
     monkeypatch.setattr(s, "_launch_browser", _boom)
@@ -172,7 +172,7 @@ async def test_chromium_fallback_takes_no_lock(scraper, monkeypatch):
     monkeypatch.setattr(s, "_should_use_chromium_fallback", lambda: True)
     launched = {}
 
-    async def _fake_launch(load_extensions, use_chromium_fallback):
+    async def _fake_launch(load_extensions, use_chromium_fallback, disable_extensions=False):
         launched["fallback"] = use_chromium_fallback
         return object()
 
@@ -196,7 +196,7 @@ async def test_partial_launch_closed_before_release(scraper, monkeypatch):
         async def close(self):
             order.append("context_closed")
 
-    async def _boom(load_extensions, use_chromium_fallback):
+    async def _boom(load_extensions, use_chromium_fallback, disable_extensions=False):
         s._context = _Ctx()          # partial launch: context exists...
         raise RuntimeError("new_page failed")  # ...then a later step dies
 
@@ -364,7 +364,7 @@ async def test_session_cancellation_during_teardown_releases_outer_lock(tmp_path
     prof.mkdir()
     monkeypatch.setattr(type(sess), "_profile_dir", property(lambda self: prof))
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         return _FakePage()
 
     monkeypatch.setattr(sess, "_start_browser", _start)
