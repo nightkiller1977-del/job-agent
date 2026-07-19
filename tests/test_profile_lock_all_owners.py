@@ -125,7 +125,7 @@ async def test_session_outer_lock_composes_with_base(tmp_path, monkeypatch):
         async def evaluate(self, *a, **k):
             return None
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         # the REAL base acquisition (inner, reentrant) without launching Chrome
         from src.sources.adapters.profile_lock import ProfileLock as _PL
         sess._profile_lock = _PL(prof).acquire()
@@ -364,7 +364,7 @@ async def test_session_cancellation_during_teardown_releases_outer_lock(tmp_path
     prof.mkdir()
     monkeypatch.setattr(type(sess), "_profile_dir", property(lambda self: prof))
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         return _FakePage()
 
     monkeypatch.setattr(sess, "_start_browser", _start)

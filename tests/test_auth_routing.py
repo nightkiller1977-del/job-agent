@@ -464,6 +464,30 @@ def test_record_apply_attempt_clears_stale_session_prepared_flag(tmp_path):
     assert "session_prepared_at" not in _json.loads(row["extra_json"])
 
 
+def test_clear_session_block_stamps_even_without_prior_status(tmp_path):
+    """Codex #57 P2: a newly-approved USAJobs job is classified needs-session with
+    no apply_last_status yet, so clear_session_block() must stamp the marker even
+    when no prior attempt was recorded — otherwise prepare-sessions can't make it
+    retryable without a wasted apply cycle first."""
+    import json as _json
+    from src.state_manager import StateManager
+
+    sm = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "u1", "source": "usajobs", "title": "T", "company": "C",
+        "location": "", "salary_raw": "", "remote_type": "",
+        "url": "https://www.usajobs.gov/job/1", "description": "",
+    }
+    sm.upsert_job(job)  # never attempted — no apply_last_status
+
+    sm.clear_session_block("u1")
+
+    row = sm._connect().execute(
+        "SELECT extra_json FROM jobs WHERE job_id = ?", ("u1",)
+    ).fetchone()
+    assert _json.loads(row["extra_json"] or "{}")["session_prepared_at"]
+
+
 @pytest.mark.asyncio
 async def test_base_router_records():
     r = ReauthRouter()
@@ -497,7 +521,7 @@ async def test_session_routes_auth_outcome(tmp_path, monkeypatch):
                                 run_log=RunLog(agent="t", runs_dir=tmp_path / "runs"),
                                 reauth_router=router)
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         return _FakePage()
 
     monkeypatch.setattr(sess, "_start_browser", _start)
@@ -534,7 +558,7 @@ async def test_session_preserves_reauth_refresh_signal(tmp_path, monkeypatch):
                                 run_log=RunLog(agent="t", runs_dir=tmp_path / "runs"),
                                 reauth_router=router)
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         return _FakePage()
 
     monkeypatch.setattr(sess, "_start_browser", _start)
@@ -573,7 +597,7 @@ async def test_session_no_routing_on_normal_outcome(tmp_path, monkeypatch):
                                 run_log=RunLog(agent="t", runs_dir=tmp_path / "runs"),
                                 reauth_router=router)
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         return _FakePage()
 
     monkeypatch.setattr(sess, "_start_browser", _start)

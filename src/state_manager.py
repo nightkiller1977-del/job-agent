@@ -328,25 +328,28 @@ class StateManager:
         get_apply_funnel() skips any job whose apply_last_status is empty, so erasing
         it would silently drop the job from attempt/failure/per-source funnel stats
         until another apply attempt ran. _classify_apply_readiness treats a truthy
-        session_prepared_at as "ready to retry" for the two readiness classes
-        prepare_sessions() actually acts on (needs-session, needs-review), while
-        leaving apply_last_status intact for telemetry. record_apply_attempt() clears
-        the flag again on the next recorded attempt so a stale flag can't mask a
-        fresh block.
+        session_prepared_at as "ready to retry", while leaving apply_last_status
+        intact for telemetry. record_apply_attempt() clears the flag again on the
+        next recorded attempt so a stale flag can't mask a fresh block.
+
+        The marker is stamped even when there is no prior apply_last_status: a
+        newly-approved USAJobs job is classified needs-session with no attempt yet,
+        so requiring a prior status would leave it blocked until the user burned a
+        wasted apply cycle first (Codex #57).
         """
         now = datetime.utcnow().isoformat()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
+            if row is None:
+                return
             extra: dict = {}
-            if row and row["extra_json"]:
+            if row["extra_json"]:
                 try:
                     extra = json.loads(row["extra_json"])
                 except Exception:
                     pass
-            if not extra.get("apply_last_status"):
-                return
             extra["session_prepared_at"] = now
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",

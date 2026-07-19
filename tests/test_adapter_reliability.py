@@ -63,7 +63,7 @@ def _make_session(tmp_path, adapter, monkeypatch, page=None, ledger=None):
     fake_page = page or _FakePage()
     sess._closed = False
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         return fake_page
 
     async def _close(save_session=True):

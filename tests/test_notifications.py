@@ -108,7 +108,7 @@ async def test_session_dispatches_on_outcome(tmp_path, monkeypatch):
                                 run_log=RunLog(agent="t", runs_dir=tmp_path / "runs"),
                                 dispatcher=disp)
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         return _FakePage()
 
     monkeypatch.setattr(sess, "_start_browser", _start)
