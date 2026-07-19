@@ -437,8 +437,11 @@ class IndeedScraper(BaseScraper):
         (populated by load_credentials_from_dashboard() at run start).
         Falls back to a manual login prompt in interactive mode.
 
-        Returns True once the Indeed session surface was reached (so the caller
-        may clear the job's session block).
+        Returns True when the session is confirmed ready to clear: credential
+        auto-login succeeded, or the session was already fresh (both verified
+        without human input — safe even under launchd), or an interactive human
+        completed the login. Returns False when a non-interactive run hits a login
+        wall that auto-login could not clear.
         """
         console.print("\n[blue]Indeed Session Prep:[/blue] Opening Indeed…")
         page = await self._start_browser()
@@ -459,7 +462,7 @@ class IndeedScraper(BaseScraper):
                     if success:
                         console.print("[green]Indeed Session Prep:[/green] Auto-login succeeded — session saved.")
                         await self._delay(2, 3)
-                        return True
+                        return True  # verified without human input
                     console.print(
                         "[yellow]Indeed Session Prep:[/yellow] Auto-login failed "
                         "(2FA challenge or CAPTCHA). Falling back to manual login."
@@ -477,10 +480,11 @@ class IndeedScraper(BaseScraper):
                         "  Tip: save credentials in the dashboard to skip this step next time.\n"
                     )
                     input("  Press Enter once logged in > ")
-                else:
-                    console.print("[yellow]Non-interactive — skipping manual login prompt.[/yellow]")
-            else:
-                console.print("[green]Indeed Session Prep:[/green] Already logged in. Session is fresh.")
+                    return True  # human completed the login
+                console.print("[yellow]Non-interactive — skipping manual login prompt.[/yellow]")
+                return False  # login wall unresolved
+            # Already logged in — verified, no interaction needed.
+            console.print("[green]Indeed Session Prep:[/green] Already logged in. Session is fresh.")
             return True
         finally:
             await self._close_browser()

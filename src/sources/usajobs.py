@@ -826,8 +826,10 @@ class USAJobsScraper(BaseScraper):
     async def prepare_session(self, job: Optional[dict] = None) -> bool:
         """Open USAJobs in the persistent profile so the user can refresh login/session state.
 
-        Returns True once the USAJobs session surface was reached (so the caller
-        may clear the job's session block).
+        Returns True when the session is confirmed ready to clear: it is already
+        authenticated (verified without human input — safe even under launchd) or
+        an interactive human completed the login. Returns False when a
+        non-interactive run finds the session not authenticated.
         """
         console.print("\n[cyan]USAJobs Session Prep:[/cyan] Opening USAJobs session")
         page = await self._start_browser()
@@ -835,15 +837,16 @@ class USAJobsScraper(BaseScraper):
             target = (job or {}).get("url") or USAJOBS_BASE
             await page.goto(target, wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
-            if await self._is_logged_in(page):
+            logged_in = await self._is_logged_in(page)
+            if logged_in:
                 console.print("[green]USAJobs session appears authenticated.[/green]")
             else:
                 console.print("[yellow]USAJobs needs login in this browser window.[/yellow]")
             if sys.stdin and sys.stdin.isatty():
                 input("Press Enter after USAJobs session is ready > ")
-            else:
-                console.print("[yellow]Non-interactive run: rerun from Terminal to pause while signing in.[/yellow]")
-            return True
+                return True  # human confirmed the session
+            console.print("[yellow]Non-interactive run: rerun from Terminal to pause while signing in.[/yellow]")
+            return bool(logged_in)  # only clear non-interactively if verified authenticated
         finally:
             await self._close_browser()
 
