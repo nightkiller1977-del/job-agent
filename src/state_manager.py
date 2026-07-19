@@ -311,6 +311,37 @@ class StateManager:
                 (json.dumps(extra), job_id),
             )
 
+    def clear_session_block(self, job_id: str) -> None:
+        """Clear a recorded auth/session blocker after prepare_sessions() opens the
+        job's portal for a human sign-in.
+
+        record_apply_attempt() is the only writer of apply_last_status, and
+        prepare_sessions() never calls it — so without this, _classify_apply_readiness
+        keeps reading the stale auth-wall status from the job's last apply attempt
+        and marks the job blocked forever, even after the human signs in.
+        should_attempt() treats an empty last_status as "never tried — always
+        attempt", so clearing it (rather than needing a new status value) is enough
+        to make the next apply run retry the job.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            extra: dict = {}
+            if row and row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    pass
+            if not extra.get("apply_last_status"):
+                return
+            extra["apply_last_status"] = ""
+            extra["apply_last_detail"] = ""
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
     def flag_circuit_break(self, job_id: str, blocker_class: str, reason: str) -> None:
         """P2: record that the circuit breaker skipped this job, WITHOUT touching
         apply_last_status / apply_attempt_count (so the real blocker and count are

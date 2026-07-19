@@ -602,6 +602,11 @@ class Orchestrator:
                 continue
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
             await prepare(job)
+            # Clear the stale auth-wall status now that the human has had a chance
+            # to sign in — otherwise apply_approved() keeps classifying this job as
+            # needs-session/needs-portal-login/needs-review forever (Codex #56 P1).
+            if job.get("job_id"):
+                self.state.clear_session_block(job["job_id"])
 
     async def apply_approved(
         self,

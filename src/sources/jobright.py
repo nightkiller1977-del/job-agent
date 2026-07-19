@@ -1929,13 +1929,17 @@ class JobrightScraper(BaseScraper):
         )
         # Reset recovery flag so the interactive prompt fires if needed
         self._workday_recovery_attempted = False
-        page = await self._start_browser(load_extensions=True)
+        # Jobs routed here from other discovery sources (LinkedIn/Indeed) carry
+        # a recorded external portal URL instead of a Jobright listing — open
+        # the portal directly, there is no Jobright page to extract from.
+        from .adapters.auth_routing import external_ats_url
+        known_ext_url = external_ats_url(job)
+        # Match apply_external_ats_job()'s extension policy: the Jobright extension's
+        # content scripts can crash the Teamtailor renderer tab, so don't load it
+        # when we already know the portal is Teamtailor.
+        _is_teamtailor = "teamtailor.com" in known_ext_url.lower()
+        page = await self._start_browser(load_extensions=not _is_teamtailor)
         try:
-            # Jobs routed here from other discovery sources (LinkedIn/Indeed) carry
-            # a recorded external portal URL instead of a Jobright listing — open
-            # the portal directly, there is no Jobright page to extract from.
-            from .adapters.auth_routing import external_ats_url
-            known_ext_url = external_ats_url(job)
             if known_ext_url:
                 console.print(f"[cyan]Opening recorded ATS portal:[/cyan] {known_ext_url[:100]}")
                 company_page = page
