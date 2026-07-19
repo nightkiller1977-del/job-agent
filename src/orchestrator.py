@@ -728,21 +728,36 @@ class Orchestrator:
                 _extra = {}
             _last = _extra.get("apply_last_status")
             _attempts = int(_extra.get("apply_attempt_count", 0) or 0)
+            # clear_session_block() stamped this after a human signed in to the job's
+            # portal via prepare-sessions. It's a one-shot bypass of the downstream
+            # auth gates below (Codex #57 P1): record_apply_attempt() drops the flag
+            # on the very next attempt, so a still-broken session falls straight back
+            # under normal gating and can't loop. apply_last_status/count are left
+            # intact for telemetry, which is exactly why these gates can't see the
+            # prep on their own.
+            _session_prepared = bool(_extra.get("session_prepared_at"))
             _ok, _skip_reason = should_attempt(_last, _attempts)
-            if not _ok:
+            if not _ok and not _session_prepared:
                 _cls = classify(_last).value
                 console.print(f"[dim]⛔ Circuit breaker: skipping — {_skip_reason}[/dim]")
                 self.state.flag_circuit_break(job["job_id"], _cls, _skip_reason)
                 skipped_count += 1
                 outcomes.append({"job": job, "status": "circuit_open", "reason": _skip_reason})
                 continue
+            if not _ok and _session_prepared:
+                console.print(
+                    "[cyan]Retrying past the circuit breaker — session prepared via prepare-sessions.[/cyan]"
+                )
 
             src = job.get("source", "")
 
             # P3 session/auth preflight: if this job last failed on an auth blocker,
             # refresh the source session BEFORE attempting (once per source per run),
             # so we don't burn another attempt hitting the same expired session.
-            if src in SOURCE_MAP and needs_preflight_reauth(_last, src, reauthed_this_run):
+            # Skip when the session was just prepared: the human already refreshed the
+            # (possibly external ATS) session, and reauthing the discovery source here
+            # could clobber it / record credentials_missing without running the scraper.
+            if src in SOURCE_MAP and not _session_prepared and needs_preflight_reauth(_last, src, reauthed_this_run):
                 reauthed_this_run.add(src)
                 # Guard: don't trigger a doomed reauth (human-login sources block on a
                 # timeout; automated sources with missing creds just error). Skip cleanly
