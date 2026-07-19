@@ -382,6 +382,26 @@ def test_clear_session_block_resets_status_so_readiness_becomes_ready(tmp_path):
     assert readiness == "ready"
 
 
+def test_usajobs_prepared_session_becomes_ready(tmp_path):
+    """Codex #57 P1: USAJobs returns needs-session at a source-specific early return
+    before any status logic. The session-prepared marker must be honored ahead of
+    that return, or a prepared USAJobs job can never be made retryable (its blocked
+    path would then drop the marker, locking it forever)."""
+    from src.orchestrator import Orchestrator
+
+    o = Orchestrator.__new__(Orchestrator)
+
+    base = {"job_id": "u1", "source": "usajobs", "title": "T", "company": "C",
+            "url": "https://www.usajobs.gov/job/1"}
+    # Unprepared: blocked as needs-session.
+    readiness, _ = o._classify_apply_readiness(base)
+    assert readiness == "needs-session"
+    # After prepare-sessions stamps the marker: ready to retry.
+    prepared = {**base, "extra_json": '{"session_prepared_at": "2026-07-19T00:00:00"}'}
+    readiness, _ = o._classify_apply_readiness(prepared)
+    assert readiness == "ready"
+
+
 def test_clear_session_block_preserves_apply_last_status_for_funnel(tmp_path):
     """Codex #57 P2: clear_session_block() must NOT blank apply_last_status —
     get_apply_funnel() skips any job whose apply_last_status is empty, so doing

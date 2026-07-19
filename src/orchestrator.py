@@ -391,15 +391,28 @@ class Orchestrator:
         source = (job.get("source") or "").lower()
         company = (job.get("company") or "").lower()
         url = (job.get("url") or "").lower()
-        # Also check any previously-extracted ATS URL stored in extra_json
+        # Also check any previously-extracted ATS URL stored in extra_json, plus the
+        # one-shot session-prepared marker that prepare_sessions() stamps (see
+        # clear_session_block).
+        session_prepared_at = ""
         try:
             extra = job.get("extra_json") or {}
             if isinstance(extra, str):
                 extra = _json.loads(extra)
             ats_url = (extra.get("ats_url") or "").lower()
+            session_prepared_at = str(extra.get("session_prepared_at") or "")
         except Exception:
             ats_url = ""
         all_urls = url + " " + ats_url
+
+        # Honor the session-prepared marker before ANY source-specific block below —
+        # including USAJobs, which otherwise returns needs-session unconditionally and
+        # could never be made retryable by prepare-sessions (Codex #57). Preparation
+        # confirmed the portal session; retry without touching apply_last_status/detail
+        # (get_apply_funnel() needs them intact). One-shot: record_apply_attempt() drops
+        # the marker on the next attempt, so a still-broken session re-blocks normally.
+        if session_prepared_at:
+            return ("ready", "Session prepared via prepare-sessions; retrying.")
 
         if source == "usajobs":
             return ("needs-session", "USAJobs requires a signed-in USAJobs/Login.gov browser session and a saved resume.")
@@ -408,14 +421,12 @@ class Orchestrator:
 
         last_status = ""
         last_detail = ""
-        session_prepared_at = ""
         try:
             extra = job.get("extra_json") or {}
             if isinstance(extra, str):
                 extra = _json.loads(extra)
             last_status = str(extra.get("apply_last_status") or "")
             last_detail = str(extra.get("apply_last_detail") or "")
-            session_prepared_at = str(extra.get("session_prepared_at") or "")
         except Exception:
             pass
 
@@ -433,6 +444,8 @@ class Orchestrator:
             "linkedin_authwall",
             "linkedin_login_required",
         }
+        if last_status in session_statuses:
+            return ("needs-session", last_detail or "Portal session or credentials must be refreshed before applying.")
         # "needs-review" was also set by old preflight code; "workday_form_not_detected"
         # means the portal page loaded but looked like a job listing — worth retrying.
         # Only block on "form_not_reached" outcomes that indicate a hard wall.
@@ -440,14 +453,7 @@ class Orchestrator:
             "workday_account_required",
             "brassring_registration_required",
         }
-        if last_status in (session_statuses | hard_blocks):
-            # prepare_sessions() stamped session_prepared_at after a human signed in
-            # to this job's portal — retry it instead of blocking again, without
-            # touching apply_last_status/detail (get_apply_funnel() needs them intact).
-            if session_prepared_at:
-                return ("ready", "Session prepared via prepare-sessions; retrying.")
-            if last_status in session_statuses:
-                return ("needs-session", last_detail or "Portal session or credentials must be refreshed before applying.")
+        if last_status in hard_blocks:
             return ("needs-review", last_detail or "This application requires manual account setup before auto-submit.")
         if last_status in {"linkedin_stuck_on_required_field", "required_field_unanswered"}:
             return ("needs-answer", last_detail or "The apply form has a required field the agent cannot answer yet.")
