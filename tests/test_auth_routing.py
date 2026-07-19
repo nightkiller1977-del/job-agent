@@ -168,60 +168,64 @@ async def test_prepare_sessions_dispatches_portal_blocked_jobs_to_external_prep(
 
 
 @pytest.mark.asyncio
-async def test_prepare_sessions_does_not_clear_block_when_non_interactive(monkeypatch):
-    """Codex #57 P1: a non-interactive run is diagnostic-only — every
-    prepare_session() implementation skips the login prompt outright when
-    sys.stdin isn't a TTY, so there is no signal the auth wall was actually
-    cleared. Must not mark the job retryable in that case."""
-    import json as _json
-    from src import orchestrator as orch_mod
+async def test_linkedin_prepare_session_returns_true_when_already_authenticated_non_tty(monkeypatch):
+    """Codex #57 P2b: an already-authenticated session is verified WITHOUT human
+    input, so prepare_session must report success even under launchd (no TTY) —
+    otherwise the block never clears on scheduled runs."""
+    from unittest.mock import AsyncMock as _AM
+    from src.sources.linkedin import LinkedInScraper
 
-    def make_scraper(name):
-        class _Scraper:
-            def __init__(self, config):
-                pass
-
-            async def prepare_session(self, job):
-                return True  # reached portal, but the run is non-interactive
-        return _Scraper
-
-    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {
-        "jobright": make_scraper("jobright"),
-        "linkedin": make_scraper("linkedin"),
-    })
-
-    jobs = [
-        {"job_id": "authwall", "source": "linkedin", "title": "T", "company": "C",
-         "url": "https://www.linkedin.com/jobs/view/1",
-         "extra_json": _json.dumps({"apply_last_status": "linkedin_authwall"})},
-    ]
-
-    class _State:
-        def __init__(self):
-            self.cleared = []
-
-        def get_approved_unapplied(self):
-            return jobs
-
-        def clear_session_block(self, job_id):
-            self.cleared.append(job_id)
-
-        def get_job(self, job_id):
-            return None
-
-    async def _noop(*args, **kwargs):
-        return None
-
-    o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
-    o.config = {}
-    o.state = _State()
-    o.load_credentials_from_dashboard = _noop
-    o._pull_approved_from_cloud = _noop
+    scraper = LinkedInScraper({})
+    monkeypatch.setattr(scraper, "_start_browser", _AM(return_value=_AM()))
+    monkeypatch.setattr(scraper, "_close_browser", _AM())
+    monkeypatch.setattr(scraper, "_delay", _AM())
+    monkeypatch.setattr(scraper, "_needs_login", _AM(return_value=False))  # already good
 
     with patch("sys.stdin") as mock_stdin:
-        mock_stdin.isatty.return_value = False  # non-interactive: diagnostic prep only
-        await o.prepare_sessions()
-    assert o.state.cleared == []
+        mock_stdin.isatty.return_value = False
+        result = await scraper.prepare_session({"url": "https://www.linkedin.com/jobs/view/1"})
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_linkedin_prepare_session_returns_false_on_login_wall_non_tty(monkeypatch):
+    """A login wall that needs a human is unresolved in a non-TTY run, so
+    prepare_session must NOT report success (Codex #57 P1)."""
+    from unittest.mock import AsyncMock as _AM
+    from src.sources.linkedin import LinkedInScraper
+
+    scraper = LinkedInScraper({})
+    monkeypatch.setattr(scraper, "_start_browser", _AM(return_value=_AM()))
+    monkeypatch.setattr(scraper, "_close_browser", _AM())
+    monkeypatch.setattr(scraper, "_delay", _AM())
+    monkeypatch.setattr(scraper, "_needs_login", _AM(return_value=True))  # needs manual login
+
+    with patch("sys.stdin") as mock_stdin:
+        mock_stdin.isatty.return_value = False
+        result = await scraper.prepare_session({"url": "https://www.linkedin.com/jobs/view/1"})
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_indeed_prepare_session_returns_true_on_autologin_non_tty(monkeypatch):
+    """Codex #57 P2b: credential auto-login is a verified success without human
+    input, so prepare_session must report success even under launchd (no TTY)."""
+    from unittest.mock import AsyncMock as _AM
+    from src.sources.indeed import IndeedScraper
+
+    scraper = IndeedScraper({})
+    monkeypatch.setattr(scraper, "_start_browser", _AM(return_value=_AM()))
+    monkeypatch.setattr(scraper, "_close_browser", _AM())
+    monkeypatch.setattr(scraper, "_delay", _AM())
+    monkeypatch.setattr(scraper, "_on_login_page", lambda page: True)  # login wall present
+    monkeypatch.setattr(scraper, "_auto_login", _AM(return_value=True))  # creds work
+    monkeypatch.setenv("INDEED_EMAIL", "a@b.co")
+    monkeypatch.setenv("INDEED_PASSWORD", "secret")
+
+    with patch("sys.stdin") as mock_stdin:
+        mock_stdin.isatty.return_value = False
+        result = await scraper.prepare_session({})
+    assert result is True
 
 
 @pytest.mark.asyncio
@@ -287,17 +291,19 @@ async def test_prepare_sessions_does_not_clear_when_prep_bails_early(monkeypatch
 
 @pytest.mark.asyncio
 async def test_prepare_session_disables_extensions_for_known_teamtailor_portal(monkeypatch):
-    """Codex #56 P2 regression: prepare_session's extension policy must match
-    apply_external_ats_job's — the Jobright extension's content scripts can crash
-    the Teamtailor renderer tab, so don't load them when the job's recorded
-    portal URL is already known to be Teamtailor."""
+    """Codex #56 P2 / #57 P2: for a known Teamtailor portal, prepare_session must
+    launch with extensions genuinely disabled — the Jobright extension's content
+    scripts can crash the Teamtailor renderer. load_extensions=False alone is not
+    enough (a Web-Store copy in the profile still loads), so disable_extensions
+    must be set too."""
     from src.sources.jobright import JobrightScraper
 
     scraper = JobrightScraper({})
     captured = {}
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         captured["load_extensions"] = load_extensions
+        captured["disable_extensions"] = disable_extensions
         raise RuntimeError("stop before touching a real page")
 
     monkeypatch.setattr(scraper, "_start_browser", _start)
@@ -309,20 +315,23 @@ async def test_prepare_session_disables_extensions_for_known_teamtailor_portal(m
     with pytest.raises(RuntimeError):
         await scraper.prepare_session(job)
     assert captured["load_extensions"] is False
+    assert captured["disable_extensions"] is True
 
 
 @pytest.mark.asyncio
 async def test_prepare_session_keeps_extensions_for_non_teamtailor_portal(monkeypatch):
     """Non-Teamtailor portals (or no recorded portal at all) keep the existing
     behavior — the extension is needed to dismiss Jobright's own popups when
-    extracting the external URL from a native Jobright listing."""
+    extracting the external URL from a native Jobright listing, and extensions
+    are not force-disabled."""
     from src.sources.jobright import JobrightScraper
 
     scraper = JobrightScraper({})
     captured = {}
 
-    async def _start(load_extensions=False):
+    async def _start(load_extensions=False, disable_extensions=False):
         captured["load_extensions"] = load_extensions
+        captured["disable_extensions"] = disable_extensions
         raise RuntimeError("stop before touching a real page")
 
     monkeypatch.setattr(scraper, "_start_browser", _start)
@@ -334,6 +343,7 @@ async def test_prepare_session_keeps_extensions_for_non_teamtailor_portal(monkey
     with pytest.raises(RuntimeError):
         await scraper.prepare_session(job)
     assert captured["load_extensions"] is True
+    assert captured["disable_extensions"] is False
 
 
 def test_clear_session_block_resets_status_so_readiness_becomes_ready(tmp_path):

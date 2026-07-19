@@ -610,14 +610,15 @@ class Orchestrator:
                 continue
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
             prepared = await prepare(job)
-            # Mark the job retryable now that the human has had a chance to sign
-            # in — otherwise apply_approved() keeps classifying it as needs-session/
-            # needs-portal-login/needs-review forever (Codex #56 P1). Guard on both:
-            #  - prepared is truthy: prepare_session() reached a usable portal rather
-            #    than bailing early (e.g. no ATS URL found) (Codex #57 P2); and
-            #  - interactive: a non-TTY run is diagnostic-only and skips the login
-            #    prompt, so the wall was never actually cleared (Codex #57 P1).
-            if job.get("job_id") and prepared and sys.stdin and sys.stdin.isatty():
+            # Mark the job retryable — otherwise apply_approved() keeps classifying
+            # it as needs-session/needs-portal-login/needs-review forever (Codex #56
+            # P1). prepare_session() returns True only when the session is confirmed
+            # ready to clear: verified without human input (auto-login / already
+            # authenticated — safe even under launchd, Codex #57 P2b) or an
+            # interactive human completed the login. It returns False when it bailed
+            # early (no ATS URL, Codex #57 P2a) or a non-TTY run left a login wall
+            # unresolved (Codex #57 P1) — so this single check covers all of them.
+            if job.get("job_id") and prepared:
                 self.state.clear_session_block(job["job_id"])
                 await self._push_apply_attempt_to_cloud(job["job_id"])
 

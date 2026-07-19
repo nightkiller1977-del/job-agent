@@ -1924,9 +1924,11 @@ class JobrightScraper(BaseScraper):
         The persistent profile saves the new cookies automatically so future apply
         runs skip this step entirely.
 
-        Returns True if a usable portal was reached (so the caller may clear the
-        job's session block), False if preparation bailed early — e.g. no external
-        ATS URL could be found for a native Jobright listing.
+        Returns True only when the portal session is confirmed ready to clear —
+        i.e. the run is interactive and the human was prompted to sign in. Returns
+        False when preparation bailed early (no external ATS URL for a native
+        Jobright listing) or when a non-interactive run merely did diagnostic prep
+        without a human completing the login.
         """
         console.print(
             f"\n[magenta]Jobright Session Prep:[/magenta] {job.get('title')} @ {job.get('company')}"
@@ -1939,10 +1941,13 @@ class JobrightScraper(BaseScraper):
         from .adapters.auth_routing import external_ats_url
         known_ext_url = external_ats_url(job)
         # Match apply_external_ats_job()'s extension policy: the Jobright extension's
-        # content scripts can crash the Teamtailor renderer tab, so don't load it
-        # when we already know the portal is Teamtailor.
+        # content scripts can crash the Teamtailor renderer tab, so open Teamtailor
+        # with extensions fully disabled (disable_extensions, not just
+        # load_extensions=False, which would leave a Web-Store copy loading).
         _is_teamtailor = "teamtailor.com" in known_ext_url.lower()
-        page = await self._start_browser(load_extensions=not _is_teamtailor)
+        page = await self._start_browser(
+            load_extensions=not _is_teamtailor, disable_extensions=_is_teamtailor
+        )
         try:
             if known_ext_url:
                 console.print(f"[cyan]Opening recorded ATS portal:[/cyan] {known_ext_url[:100]}")
@@ -2009,12 +2014,12 @@ class JobrightScraper(BaseScraper):
                     "Sign in, refresh your portal account, or click through to the application form."
                 )
                 input("  Press Enter when this portal session is ready > ")
-            else:
-                console.print(
-                    "[yellow]Non-interactive run: diagnostic prep only. "
-                    "Run from Terminal to pause while you sign in.[/yellow]"
-                )
-            return True
+                return True  # human confirmed the portal session
+            console.print(
+                "[yellow]Non-interactive run: diagnostic prep only. "
+                "Run from Terminal to pause while you sign in.[/yellow]"
+            )
+            return False  # no human signed in — not safe to clear the block
         finally:
             await self._close_browser()
 
