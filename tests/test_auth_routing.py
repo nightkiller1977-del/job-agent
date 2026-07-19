@@ -114,6 +114,7 @@ async def test_prepare_sessions_dispatches_portal_blocked_jobs_to_external_prep(
 
             async def prepare_session(self, job):
                 calls.append((name, job.get("job_id")))
+                return True  # reached a usable portal
         return _Scraper
 
     monkeypatch.setattr(orch_mod, "SOURCE_MAP", {
@@ -181,7 +182,7 @@ async def test_prepare_sessions_does_not_clear_block_when_non_interactive(monkey
                 pass
 
             async def prepare_session(self, job):
-                pass
+                return True  # reached portal, but the run is non-interactive
         return _Scraper
 
     monkeypatch.setattr(orch_mod, "SOURCE_MAP", {
@@ -221,6 +222,67 @@ async def test_prepare_sessions_does_not_clear_block_when_non_interactive(monkey
         mock_stdin.isatty.return_value = False  # non-interactive: diagnostic prep only
         await o.prepare_sessions()
     assert o.state.cleared == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_sessions_does_not_clear_when_prep_bails_early(monkeypatch):
+    """Codex #57 P2: prepare_session() returns False when it can't reach a usable
+    portal (e.g. no ATS URL found). Even in an interactive run, the block must NOT
+    be cleared then — otherwise the next apply run bypasses the gates and burns an
+    attempt on a portal that was never opened."""
+    import json as _json
+    from src import orchestrator as orch_mod
+
+    def make_scraper(reached):
+        class _Scraper:
+            def __init__(self, config):
+                pass
+
+            async def prepare_session(self, job):
+                return reached
+        return _Scraper
+
+    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {
+        "jobright": make_scraper(False),   # bailed — no usable portal
+        "linkedin": make_scraper(True),    # reached the LinkedIn session surface
+    })
+
+    jobs = [
+        {"job_id": "bailed", "source": "jobright", "title": "T", "company": "C",
+         "url": "https://jobright.ai/jobs/info/1",
+         "extra_json": _json.dumps({"apply_last_status": "workday_session_expired"})},
+        {"job_id": "reached", "source": "linkedin", "title": "T2", "company": "C2",
+         "url": "https://www.linkedin.com/jobs/view/2",
+         "extra_json": _json.dumps({"apply_last_status": "linkedin_authwall"})},
+    ]
+
+    class _State:
+        def __init__(self):
+            self.cleared = []
+
+        def get_approved_unapplied(self):
+            return jobs
+
+        def clear_session_block(self, job_id):
+            self.cleared.append(job_id)
+
+        def get_job(self, job_id):
+            return None
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
+    o.config = {}
+    o.state = _State()
+    o.load_credentials_from_dashboard = _noop
+    o._pull_approved_from_cloud = _noop
+
+    with patch("sys.stdin") as mock_stdin:
+        mock_stdin.isatty.return_value = True  # interactive
+        await o.prepare_sessions()
+    # Only the job that reached a usable portal is cleared; the bailed one is not.
+    assert o.state.cleared == ["reached"]
 
 
 @pytest.mark.asyncio

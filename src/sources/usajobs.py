@@ -823,8 +823,12 @@ class USAJobsScraper(BaseScraper):
             )
         return submitted
 
-    async def prepare_session(self, job: Optional[dict] = None) -> None:
-        """Open USAJobs in the persistent profile so the user can refresh login/session state."""
+    async def prepare_session(self, job: Optional[dict] = None) -> bool:
+        """Open USAJobs in the persistent profile so the user can refresh login/session state.
+
+        Returns True once the USAJobs session surface was reached (so the caller
+        may clear the job's session block).
+        """
         console.print("\n[cyan]USAJobs Session Prep:[/cyan] Opening USAJobs session")
         page = await self._start_browser()
         try:
@@ -839,6 +843,7 @@ class USAJobsScraper(BaseScraper):
                 input("Press Enter after USAJobs session is ready > ")
             else:
                 console.print("[yellow]Non-interactive run: rerun from Terminal to pause while signing in.[/yellow]")
+            return True
         finally:
             await self._close_browser()
 
