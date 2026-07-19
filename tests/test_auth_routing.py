@@ -133,8 +133,14 @@ async def test_prepare_sessions_dispatches_portal_blocked_jobs_to_external_prep(
     ]
 
     class _State:
+        def __init__(self):
+            self.cleared = []
+
         def get_approved_unapplied(self):
             return jobs
+
+        def clear_session_block(self, job_id):
+            self.cleared.append(job_id)
 
     async def _noop(*args, **kwargs):
         return None
@@ -148,6 +154,97 @@ async def test_prepare_sessions_dispatches_portal_blocked_jobs_to_external_prep(
     await o.prepare_sessions()
     assert ("jobright", "portal") in calls    # external ATS wall -> portal prep flow
     assert ("linkedin", "authwall") in calls  # source-session block -> source prep
+    # Codex #56 P1: both jobs must have their stale auth-wall status cleared after
+    # prepare_session() runs, or apply_approved() would classify them as blocked
+    # forever even after the human signs in.
+    assert set(o.state.cleared) == {"portal", "authwall"}
+
+
+@pytest.mark.asyncio
+async def test_prepare_session_disables_extensions_for_known_teamtailor_portal(monkeypatch):
+    """Codex #56 P2 regression: prepare_session's extension policy must match
+    apply_external_ats_job's — the Jobright extension's content scripts can crash
+    the Teamtailor renderer tab, so don't load them when the job's recorded
+    portal URL is already known to be Teamtailor."""
+    from src.sources.jobright import JobrightScraper
+
+    scraper = JobrightScraper({})
+    captured = {}
+
+    async def _start(load_extensions=False):
+        captured["load_extensions"] = load_extensions
+        raise RuntimeError("stop before touching a real page")
+
+    monkeypatch.setattr(scraper, "_start_browser", _start)
+
+    job = {
+        "job_id": "j1", "title": "T", "company": "C", "url": "https://example.com",
+        "extra_json": {"ats_url": "https://acme.teamtailor.com/jobs/1/applications/new"},
+    }
+    with pytest.raises(RuntimeError):
+        await scraper.prepare_session(job)
+    assert captured["load_extensions"] is False
+
+
+@pytest.mark.asyncio
+async def test_prepare_session_keeps_extensions_for_non_teamtailor_portal(monkeypatch):
+    """Non-Teamtailor portals (or no recorded portal at all) keep the existing
+    behavior — the extension is needed to dismiss Jobright's own popups when
+    extracting the external URL from a native Jobright listing."""
+    from src.sources.jobright import JobrightScraper
+
+    scraper = JobrightScraper({})
+    captured = {}
+
+    async def _start(load_extensions=False):
+        captured["load_extensions"] = load_extensions
+        raise RuntimeError("stop before touching a real page")
+
+    monkeypatch.setattr(scraper, "_start_browser", _start)
+
+    job = {
+        "job_id": "j2", "title": "T", "company": "C", "url": "https://example.com",
+        "extra_json": {"ats_url": "https://acme.wd1.myworkdayjobs.com/job/1"},
+    }
+    with pytest.raises(RuntimeError):
+        await scraper.prepare_session(job)
+    assert captured["load_extensions"] is True
+
+
+def test_clear_session_block_resets_status_so_readiness_becomes_ready(tmp_path):
+    """Codex #56 P1 (state layer): without clear_session_block(), apply_last_status
+    stays a session-blocking status forever (record_apply_attempt is the only
+    writer, and prepare_sessions never called it), so _classify_apply_readiness
+    — and therefore apply_approved()'s preflight, which skips needs-session/
+    needs-portal-login/needs-review jobs outright — keeps the job blocked even
+    after the human signs in via prepare_sessions."""
+    from src.state_manager import StateManager
+    from src.orchestrator import Orchestrator
+
+    sm = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "jid1", "source": "linkedin", "title": "T", "company": "C",
+        "location": "", "salary_raw": "", "remote_type": "", "url": "https://x",
+        "description": "",
+    }
+    sm.upsert_job(job)
+    sm.record_apply_attempt("jid1", "workday_session_expired", "auth wall")
+
+    o = Orchestrator.__new__(Orchestrator)
+
+    def _job_with_current_extra():
+        row = sm._connect().execute(
+            "SELECT extra_json FROM jobs WHERE job_id = ?", ("jid1",)
+        ).fetchone()
+        return {**job, "extra_json": row["extra_json"]}
+
+    readiness, _ = o._classify_apply_readiness(_job_with_current_extra())
+    assert readiness == "needs-session"
+
+    sm.clear_session_block("jid1")
+
+    readiness, _ = o._classify_apply_readiness(_job_with_current_extra())
+    assert readiness == "ready"
 
 
 @pytest.mark.asyncio
