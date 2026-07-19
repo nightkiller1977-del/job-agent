@@ -405,19 +405,26 @@ class Orchestrator:
             ats_url = ""
         all_urls = url + " " + ats_url
 
-        # Honor the session-prepared marker before ANY source-specific block below —
-        # including USAJobs, which otherwise returns needs-session unconditionally and
-        # could never be made retryable by prepare-sessions (Codex #57). Preparation
-        # confirmed the portal session; retry without touching apply_last_status/detail
-        # (get_apply_funnel() needs them intact). One-shot: record_apply_attempt() drops
-        # the marker on the next attempt, so a still-broken session re-blocks normally.
+        # A missing/malformed job URL is a precondition no session prep can fix, so
+        # check it before the session-prepared marker and the source blocks — a
+        # prepared job with a broken URL must still route to hydration rather than
+        # launch the scraper against an invalid URL (Codex #57). The marker overrides
+        # only the session/portal blocks, not URL validity.
+        if "https://www./" in all_urls or url in {"", "https://", "http://"}:
+            return ("needs-hydration", "Job URL is missing or invalid; hydrate/refresh the job before applying.")
+
+        # Honor the session-prepared marker before the source-specific session blocks
+        # below — including USAJobs, which otherwise returns needs-session
+        # unconditionally and could never be made retryable by prepare-sessions
+        # (Codex #57). Preparation confirmed the portal session; retry without
+        # touching apply_last_status/detail (get_apply_funnel() needs them intact).
+        # One-shot: record_apply_attempt() drops the marker on the next attempt, so a
+        # still-broken session re-blocks normally.
         if session_prepared_at:
             return ("ready", "Session prepared via prepare-sessions; retrying.")
 
         if source == "usajobs":
             return ("needs-session", "USAJobs requires a signed-in USAJobs/Login.gov browser session and a saved resume.")
-        if "https://www./" in all_urls or url in {"", "https://", "http://"}:
-            return ("needs-hydration", "Job URL is missing or invalid; hydrate/refresh the job before applying.")
 
         last_status = ""
         last_detail = ""

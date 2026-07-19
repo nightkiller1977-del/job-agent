@@ -400,6 +400,14 @@ def test_usajobs_prepared_session_becomes_ready(tmp_path):
     prepared = {**base, "extra_json": '{"session_prepared_at": "2026-07-19T00:00:00"}'}
     readiness, _ = o._classify_apply_readiness(prepared)
     assert readiness == "ready"
+    # Codex #57: the marker overrides the session block but NOT URL validity — a
+    # prepared job with a malformed URL must still route to hydration, never launch
+    # the scraper against a bad URL.
+    bad_url = {"job_id": "u1", "source": "usajobs", "title": "T", "company": "C",
+               "url": "https://www./",
+               "extra_json": '{"session_prepared_at": "2026-07-19T00:00:00"}'}
+    readiness, _ = o._classify_apply_readiness(bad_url)
+    assert readiness == "needs-hydration"
 
 
 def test_clear_session_block_preserves_apply_last_status_for_funnel(tmp_path):
