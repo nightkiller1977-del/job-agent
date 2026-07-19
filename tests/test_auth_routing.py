@@ -497,6 +497,62 @@ def test_clear_session_block_stamps_even_without_prior_status(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_preflight_block_keeps_portal_status_for_prepare_sessions(tmp_path, monkeypatch):
+    """A scheduled preflight must not erase the portal status that selects prep."""
+    from src import orchestrator as orch_mod
+    from src.state_manager import StateManager
+
+    sm = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "job1", "source": "jobright", "title": "T", "company": "C",
+        "location": "", "salary_raw": "", "remote_type": "",
+        "url": "https://jobright.ai/jobs/info/1", "description": "",
+    }
+    sm.upsert_job(job)
+    sm.set_status("job1", "approved")
+    sm.record_apply_attempt("job1", "workday_session_expired", "Workday sign-in required")
+
+    prepared = []
+
+    class _Jobright:
+        def __init__(self, config):
+            pass
+
+        async def prepare_session(self, prepared_job):
+            prepared.append(prepared_job["job_id"])
+            return True
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {"jobright": _Jobright})
+    monkeypatch.setattr(orch_mod, "preflight_session_check", lambda sources: None)
+
+    o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
+    o.config = {}
+    o.state = sm
+    o.load_credentials_from_dashboard = _noop
+    o._pull_approved_from_cloud = _noop
+    o._push_apply_attempt_to_cloud = _noop
+    o._log_credential_presence = lambda: None
+
+    # First, a scheduled apply run detects the block. This must not overwrite
+    # workday_session_expired with the generic needs-session readiness label.
+    await o.apply_approved(auto_submit=True)
+    extra = _json.loads(sm.get_job("job1")["extra_json"])
+    assert extra["apply_last_status"] == "workday_session_expired"
+    assert extra["apply_attempt_count"] == 1
+
+    # Then session preparation must still select the job and stamp the one-shot
+    # retry marker without losing the concrete outcome telemetry.
+    await o.prepare_sessions()
+    extra = _json.loads(sm.get_job("job1")["extra_json"])
+    assert prepared == ["job1"]
+    assert extra["apply_last_status"] == "workday_session_expired"
+    assert extra["session_prepared_at"]
+
+
+@pytest.mark.asyncio
 async def test_base_router_records():
     r = ReauthRouter()
     d = directive_for("microsoft_login_required", {})
