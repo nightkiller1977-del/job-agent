@@ -307,6 +307,89 @@ class TestApplyReauth:
 
         assert orchestrator.state.get_job("job1") is None  # expired → deleted
 
+    @pytest.mark.asyncio
+    async def test_prepared_session_bypasses_circuit_breaker_and_preflight(self, orchestrator, tmp_status):
+        """Codex #57 P1: a job whose portal session was just prepared via
+        prepare-sessions must actually be retried — past the circuit breaker's
+        attempt cap AND without the preflight reauth clobbering the prepared
+        session — even though apply_last_status / apply_attempt_count are kept
+        intact for telemetry. Returning 'ready' from _classify_apply_readiness
+        alone is not enough; those two downstream gates re-read the raw fields."""
+        job = {
+            "job_id": "job1", "source": "jobright", "title": "T", "company": "Acme",
+            "url": "https://jobright.ai/jobs/info/abc", "status": "approved", "score": 90,
+            # workday_session_expired classifies AUTH_REQUIRED (cap 5); at the cap
+            # should_attempt() would normally skip, and the prior status would drive
+            # needs_preflight_reauth() to refresh jobright before attempting.
+            "apply_last_status": "workday_session_expired",
+            "apply_last_detail": "auth wall",
+            "apply_attempt_count": 5,
+            "session_prepared_at": "2026-07-19T00:00:00",
+        }
+        orchestrator.state.upsert_job(job)
+        orchestrator.state.set_status("job1", "approved")
+
+        scraper = AsyncMock()
+        scraper.apply = AsyncMock(return_value=True)
+        scraper._apply_analytics = None
+        scraper._apply_validation_metrics = {}
+        scraper.last_apply_ats_url = ""
+        scraper_cls = MagicMock(return_value=scraper)
+        mock_reauth = AsyncMock(return_value=True)
+
+        with patch.dict("src.orchestrator.SOURCE_MAP", {"jobright": scraper_cls}), \
+             patch("src.orchestrator.ReauthManager") as MockReauthMgr, \
+             patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+            MockReauthMgr.return_value.handle = mock_reauth
+            await orchestrator.apply_approved(auto_submit=True)
+
+        # Circuit breaker did NOT skip despite attempt_count == cap.
+        assert scraper.apply.call_count == 1
+        # Preflight reauth was bypassed — the prepared (possibly external ATS)
+        # session must not be clobbered by reauthing the discovery source.
+        mock_reauth.assert_not_called()
+        db_job = orchestrator.state.get_job("job1")
+        assert db_job["status"] == "applied"
+        # One-shot: the recorded attempt cleared the prepared flag, so a
+        # still-broken session falls back under normal gating next run.
+        extra = json.loads(db_job.get("extra_json") or "{}")
+        assert "session_prepared_at" not in extra
+
+    @pytest.mark.asyncio
+    async def test_capped_job_without_prepared_flag_is_still_skipped(self, orchestrator, tmp_status):
+        """The bypass is scoped to freshly-prepared sessions: an at-cap auth job
+        with no session_prepared_at flag stays blocked (classified needs-session,
+        never reaching the scraper)."""
+        job = {
+            "job_id": "job1", "source": "jobright", "title": "T", "company": "Acme",
+            "url": "https://jobright.ai/jobs/info/abc", "status": "approved", "score": 90,
+            "apply_last_status": "workday_session_expired",
+            "apply_last_detail": "auth wall",
+            "apply_attempt_count": 5,
+        }
+        orchestrator.state.upsert_job(job)
+        orchestrator.state.set_status("job1", "approved")
+
+        scraper = AsyncMock()
+        scraper.apply = AsyncMock(return_value=True)
+        scraper_cls = MagicMock(return_value=scraper)
+
+        with patch.dict("src.orchestrator.SOURCE_MAP", {"jobright": scraper_cls}), \
+             patch("src.orchestrator.ReauthManager") as MockReauthMgr, \
+             patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+            await orchestrator.apply_approved(auto_submit=True)
+
+        scraper.apply.assert_not_called()
+        assert orchestrator.state.get_job("job1")["status"] == "approved"
+
 
 # ── _safe_evaluate integration ────────────────────────────────────────────────
 

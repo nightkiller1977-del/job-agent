@@ -390,20 +390,40 @@ class Orchestrator:
         source = (job.get("source") or "").lower()
         company = (job.get("company") or "").lower()
         url = (job.get("url") or "").lower()
-        # Also check any previously-extracted ATS URL stored in extra_json
+        # Also check any previously-extracted ATS URL stored in extra_json, plus the
+        # one-shot session-prepared marker that prepare_sessions() stamps (see
+        # clear_session_block).
+        session_prepared_at = ""
         try:
             extra = job.get("extra_json") or {}
             if isinstance(extra, str):
                 extra = _json.loads(extra)
             ats_url = (extra.get("ats_url") or "").lower()
+            session_prepared_at = str(extra.get("session_prepared_at") or "")
         except Exception:
             ats_url = ""
         all_urls = url + " " + ats_url
 
-        if source == "usajobs":
-            return ("needs-session", "USAJobs requires a signed-in USAJobs/Login.gov browser session and a saved resume.")
+        # A missing/malformed job URL is a precondition no session prep can fix, so
+        # check it before the session-prepared marker and the source blocks — a
+        # prepared job with a broken URL must still route to hydration rather than
+        # launch the scraper against an invalid URL (Codex #57). The marker overrides
+        # only the session/portal blocks, not URL validity.
         if "https://www./" in all_urls or url in {"", "https://", "http://"}:
             return ("needs-hydration", "Job URL is missing or invalid; hydrate/refresh the job before applying.")
+
+        # Honor the session-prepared marker before the source-specific session blocks
+        # below — including USAJobs, which otherwise returns needs-session
+        # unconditionally and could never be made retryable by prepare-sessions
+        # (Codex #57). Preparation confirmed the portal session; retry without
+        # touching apply_last_status/detail (get_apply_funnel() needs them intact).
+        # One-shot: record_apply_attempt() drops the marker on the next attempt, so a
+        # still-broken session re-blocks normally.
+        if session_prepared_at:
+            return ("ready", "Session prepared via prepare-sessions; retrying.")
+
+        if source == "usajobs":
+            return ("needs-session", "USAJobs requires a signed-in USAJobs/Login.gov browser session and a saved resume.")
 
         last_status = ""
         last_detail = ""
@@ -601,7 +621,18 @@ class Orchestrator:
                 console.print(f"[yellow]{job.get('source')} does not support session preparation.[/yellow]")
                 continue
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
-            await prepare(job)
+            prepared = await prepare(job)
+            # Mark the job retryable — otherwise apply_approved() keeps classifying
+            # it as needs-session/needs-portal-login/needs-review forever (Codex #56
+            # P1). prepare_session() returns True only when the session is confirmed
+            # ready to clear: verified without human input (auto-login / already
+            # authenticated — safe even under launchd, Codex #57 P2b) or an
+            # interactive human completed the login. It returns False when it bailed
+            # early (no ATS URL, Codex #57 P2a) or a non-TTY run left a login wall
+            # unresolved (Codex #57 P1) — so this single check covers all of them.
+            if job.get("job_id") and prepared:
+                self.state.clear_session_block(job["job_id"])
+                await self._push_apply_attempt_to_cloud(job["job_id"])
 
     async def apply_approved(
         self,
@@ -669,8 +700,15 @@ class Orchestrator:
                 )
                 console.print(f"    [dim]{reason}[/dim]")
                 blocked_sources.add(bj.get("source", ""))
-                # Persist so dashboard and future runs can surface the reason
-                self.state.record_apply_attempt(bj["job_id"], readiness, reason)
+                # A preflight block is not an application attempt. Preserve any
+                # concrete portal status (for example workday_session_expired) so
+                # prepare-sessions can still select and route this job on the next
+                # run; replacing it with the generic readiness label strands the
+                # recovery flow before a browser is opened.
+                if readiness in {"needs-session", "needs-portal-login", "needs-review"}:
+                    self.state.record_preflight_block(bj["job_id"], readiness, reason)
+                else:
+                    self.state.record_apply_attempt(bj["job_id"], readiness, reason)
                 await self._push_apply_attempt_to_cloud(bj["job_id"])
             # Emit deep-link notifications for each blocked source
             if not is_interactive and blocked_sources:
@@ -711,21 +749,36 @@ class Orchestrator:
                 _extra = {}
             _last = _extra.get("apply_last_status")
             _attempts = int(_extra.get("apply_attempt_count", 0) or 0)
+            # clear_session_block() stamped this after a human signed in to the job's
+            # portal via prepare-sessions. It's a one-shot bypass of the downstream
+            # auth gates below (Codex #57 P1): record_apply_attempt() drops the flag
+            # on the very next attempt, so a still-broken session falls straight back
+            # under normal gating and can't loop. apply_last_status/count are left
+            # intact for telemetry, which is exactly why these gates can't see the
+            # prep on their own.
+            _session_prepared = bool(_extra.get("session_prepared_at"))
             _ok, _skip_reason = should_attempt(_last, _attempts)
-            if not _ok:
+            if not _ok and not _session_prepared:
                 _cls = classify(_last).value
                 console.print(f"[dim]⛔ Circuit breaker: skipping — {_skip_reason}[/dim]")
                 self.state.flag_circuit_break(job["job_id"], _cls, _skip_reason)
                 skipped_count += 1
                 outcomes.append({"job": job, "status": "circuit_open", "reason": _skip_reason})
                 continue
+            if not _ok and _session_prepared:
+                console.print(
+                    "[cyan]Retrying past the circuit breaker — session prepared via prepare-sessions.[/cyan]"
+                )
 
             src = job.get("source", "")
 
             # P3 session/auth preflight: if this job last failed on an auth blocker,
             # refresh the source session BEFORE attempting (once per source per run),
             # so we don't burn another attempt hitting the same expired session.
-            if src in SOURCE_MAP and needs_preflight_reauth(_last, src, reauthed_this_run):
+            # Skip when the session was just prepared: the human already refreshed the
+            # (possibly external ATS) session, and reauthing the discovery source here
+            # could clobber it / record credentials_missing without running the scraper.
+            if src in SOURCE_MAP and not _session_prepared and needs_preflight_reauth(_last, src, reauthed_this_run):
                 reauthed_this_run.add(src)
                 # Guard: don't trigger a doomed reauth (human-login sources block on a
                 # timeout; automated sources with missing creds just error). Skip cleanly

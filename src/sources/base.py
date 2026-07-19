@@ -168,7 +168,9 @@ class BaseScraper(ABC):
                 except Exception:
                     pass
 
-    async def _start_browser(self, load_extensions: bool = False) -> Page:
+    async def _start_browser(
+        self, load_extensions: bool = False, disable_extensions: bool = False
+    ) -> Page:
         """
         Launch a persistent Chromium context backed by a per-source profile dir.
         On first run the browser opens to the site and the user logs in once.
@@ -177,6 +179,13 @@ class BaseScraper(ABC):
 
         load_extensions=True: also loads the Jobright Autofill extension from
         state/extensions/jobright-autofill so it can fill company ATS forms.
+
+        disable_extensions=True: pass Chrome's --disable-extensions so NOTHING
+        loads — not the unpacked extension and not a Web-Store copy already
+        installed in the profile. Needed for portals (Teamtailor) whose renderer
+        the Jobright content scripts can crash; load_extensions=False alone does
+        not achieve this (it only omits --load-extension). Mutually exclusive with
+        load_extensions.
         """
         use_chromium_fallback = self._should_use_chromium_fallback()
 
@@ -197,7 +206,9 @@ class BaseScraper(ABC):
             ).acquire_async()
 
         try:
-            return await self._launch_browser(load_extensions, use_chromium_fallback)
+            return await self._launch_browser(
+                load_extensions, use_chromium_fallback, disable_extensions
+            )
         except BaseException:
             # Startup failed after acquisition. Close any PARTIALLY-launched browser
             # BEFORE the lock goes away — releasing first would let the next owner
@@ -238,7 +249,9 @@ class BaseScraper(ABC):
             self._session_export_path.unlink(missing_ok=True)
             return False
 
-    async def _launch_browser(self, load_extensions: bool, use_chromium_fallback: bool) -> Page:
+    async def _launch_browser(
+        self, load_extensions: bool, use_chromium_fallback: bool, disable_extensions: bool = False
+    ) -> Page:
         if not use_chromium_fallback:
             # Remove stale lock files so Playwright can acquire the profile — safe:
             # holding the applylock means any Chrome still on this profile is stale.
@@ -263,6 +276,13 @@ class BaseScraper(ABC):
                 # so extensions installed via Chrome Web Store in the profile also load.
                 args.append(f"--load-extension={str(ext_path)}")
             # Extensions already installed in the Chrome profile load automatically.
+        elif disable_extensions:
+            # Turn OFF every extension, including any Web-Store copy already installed
+            # in this persistent profile. load_extensions=False only drops the unpacked
+            # --load-extension arg; the profile's installed extensions would still load
+            # and can crash a Teamtailor renderer. The profile's saved cookies are
+            # unaffected, so the portal session still persists.
+            args.append("--disable-extensions")
 
         # The bundled-Chromium vs persistent-Chrome decision was made in
         # _should_use_chromium_fallback() (before the profile lock); the flag arrives

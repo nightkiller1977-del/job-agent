@@ -296,6 +296,10 @@ class StateManager:
             extra["apply_last_status"]  = status
             extra["apply_last_detail"]  = (detail or "")[:500]
             extra["apply_attempt_count"] = extra.get("apply_attempt_count", 0) + 1
+            # A fresh attempt supersedes any earlier clear_session_block() flag —
+            # otherwise a stale flag from a prior sign-in could mask a brand-new
+            # block recorded by this attempt.
+            extra.pop("session_prepared_at", None)
             # P1 instrumentation: a durable success flag on EVERY attempt (success or
             # failure) so success-rate is computable. Previously only rich analytics
             # were recorded, and only on success — leaving `submitted` null everywhere.
@@ -306,6 +310,77 @@ class StateManager:
             extra["blocker_class"] = classify(status).value
             if metadata:
                 extra.update(metadata)
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
+    def clear_session_block(self, job_id: str) -> None:
+        """Mark a session/portal-blocked job retryable after prepare_sessions() opens
+        its portal for a human sign-in.
+
+        record_apply_attempt() is the only writer of apply_last_status, and
+        prepare_sessions() never calls it — so without this, _classify_apply_readiness
+        keeps reading the stale auth-wall status from the job's last apply attempt
+        and marks the job blocked forever, even after the human signs in.
+
+        Stamps `session_prepared_at` rather than blanking apply_last_status/detail:
+        get_apply_funnel() skips any job whose apply_last_status is empty, so erasing
+        it would silently drop the job from attempt/failure/per-source funnel stats
+        until another apply attempt ran. _classify_apply_readiness treats a truthy
+        session_prepared_at as "ready to retry", while leaving apply_last_status
+        intact for telemetry. record_apply_attempt() clears the flag again on the
+        next recorded attempt so a stale flag can't mask a fresh block.
+
+        The marker is stamped even when there is no prior apply_last_status: a
+        newly-approved USAJobs job is classified needs-session with no attempt yet,
+        so requiring a prior status would leave it blocked until the user burned a
+        wasted apply cycle first (Codex #57).
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return
+            extra: dict = {}
+            if row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    pass
+            extra["session_prepared_at"] = now
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
+    def record_preflight_block(self, job_id: str, readiness: str, reason: str) -> None:
+        """Persist a preflight-only block without replacing the real apply outcome.
+
+        A preflight classification happens before a browser or form interaction, so
+        it must not increment apply_attempt_count or overwrite apply_last_status.
+        In particular, retaining a concrete portal outcome such as
+        workday_session_expired lets prepare_sessions() route the job to the right
+        authenticated portal on the following run.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return
+            extra: dict = {}
+            if row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    pass
+            extra["preflight_readiness"] = readiness
+            extra["preflight_block_reason"] = (reason or "")[:500]
+            extra["preflight_blocked_at"] = now
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
                 (json.dumps(extra), job_id),
