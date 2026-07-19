@@ -774,3 +774,676 @@ class Orchestrator:
 
             # P3 session/auth preflight: if this job last failed on an auth blocker,
             # refresh the source session BEFORE attempting (once per source per run),
+            # so we don't burn another attempt hitting the same expired session.
+            # Skip when the session was just prepared: the human already refreshed the
+            # (possibly external ATS) session, and reauthing the discovery source here
+            # could clobber it / record credentials_missing without running the scraper.
+            if src in SOURCE_MAP and not _session_prepared and needs_preflight_reauth(_last, src, reauthed_this_run):
+                reauthed_this_run.add(src)
+                # Guard: don't trigger a doomed reauth (human-login sources block on a
+                # timeout; automated sources with missing creds just error). Skip cleanly
+                # with an actionable status instead of a 10-min block / scary notification.
+                _viable, _why = preflight_reauth_viable(src)
+                if not _viable:
+                    console.print(
+                        f"[yellow]P3 preflight: skipping {src} — {_why} "
+                        f"({'run prepare-sessions' if _why == 'needs_session_prep' else 'add credentials to .env'}).[/yellow]"
+                    )
+                    self.state.record_apply_attempt(job["job_id"], _why, f"P3 preflight: {_why}")
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    skipped_count += 1
+                    outcomes.append({"job": job, "status": _why, "reason": f"P3 preflight: {_why}"})
+                    continue
+
+                console.print(f"[cyan]P3 preflight:[/cyan] prior auth blocker ({_last}) — refreshing {src} session…")
+                try:
+                    _refreshed = await apply_reauth_mgr.handle(src, _last or "", context="apply")
+                except Exception as _re:
+                    _refreshed = False
+                    console.print(f"[yellow]P3 preflight reauth error for {src}:[/yellow] {_re}")
+                if not _refreshed:
+                    console.print(f"[yellow]P3 preflight: {src} session not refreshed — skipping this job.[/yellow]")
+                    self.state.record_apply_attempt(job["job_id"], "reauth_failed", "P3 preflight reauth failed")
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    skipped_count += 1
+                    outcomes.append({"job": job, "status": "reauth_failed", "reason": "preflight reauth failed"})
+                    continue
+
+            if src not in SOURCE_MAP:
+                console.print(f"[red]Unknown source '{src}' — skipping.[/red]")
+                skipped_count += 1
+                outcomes.append({"job": job, "status": "skipped", "reason": f"unknown source {src}"})
+                self.state.record_apply_attempt(job["job_id"], "unknown_source", f"source '{src}' not in SOURCE_MAP")
+                await self._push_apply_attempt_to_cloud(job["job_id"])
+                continue
+
+            scraper = SOURCE_MAP[src](self.config)
+            try:
+                # One-shot same-run retry: when the adapter path reports it refreshed a
+                # session mid-attempt (analytics["reauth_refreshed"], set by
+                # ExternalApplySession._route_auth), the blocked attempt is retried
+                # immediately instead of dead-ending until the next scheduled run.
+                for _reauth_pass in range(2):
+                    result = await scraper.apply(job, auto_submit=auto_submit)
+                    if result:
+                        break
+                    _an = getattr(scraper, "_apply_analytics", None) or {}
+                    if _reauth_pass == 0 and _an.get("reauth_refreshed"):
+                        console.print(
+                            "[cyan]Session refreshed by re-auth — retrying this job in the same run.[/cyan]"
+                        )
+                        continue
+                    break
+                if result:
+                    self.state.set_status(job["job_id"], "applied")
+                    self.state.record_apply_attempt(
+                        job["job_id"],
+                        "applied",
+                        "Application submitted successfully.",
+                        metadata=self._apply_validation_metadata(scraper),
+                    )
+                    # Persist any analytics the scraper collected (atsScore, resumeVersion, etc.)
+                    _analytics = getattr(scraper, "_apply_analytics", None)
+                    if _analytics:
+                        self.state.record_application_analytics(job["job_id"], _analytics)
+                    applied_count += 1
+                    outcomes.append({"job": job, "status": "applied", "reason": "submitted"})
+                    console.print("[green]Applied! Status updated.[/green]")
+                    await self._push_status_to_cloud(job["job_id"], "applied")
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                else:
+                    reason = getattr(scraper, "last_apply_detail", "") or "not submitted"
+                    code   = getattr(scraper, "last_apply_status",  "") or "blocked"
+                    console.print(f"[yellow]Application not submitted ({code}) — status unchanged.[/yellow]")
+                    if reason:
+                        console.print(f"[dim]{reason}[/dim]")
+                    # Persist the specific block reason
+                    self.state.record_apply_attempt(
+                        job["job_id"],
+                        code,
+                        reason,
+                        metadata=self._apply_validation_metadata(scraper),
+                    )
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    skipped_count += 1
+                    outcomes.append({"job": job, "status": code, "reason": reason})
+            except AuthFailedError as auth_exc:
+                console.print(f"[yellow]{src} apply: session expired — attempting reauth…[/yellow]")
+                if src in reauthed_this_run:
+                    console.print(
+                        f"[yellow]{src} reauth already attempted this run — skipping duplicate notification.[/yellow]"
+                    )
+                    self.state.record_apply_attempt(
+                        job["job_id"],
+                        "reauth_failed",
+                        f"Reauth already attempted for {src} this run; skipping duplicate notification.",
+                    )
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    skipped_count += 1
+                    outcomes.append({
+                        "job": job,
+                        "status": "reauth_failed",
+                        "reason": f"reauth already attempted for {src} this run",
+                    })
+                    continue
+                reauthed_this_run.add(src)
+                refreshed = await apply_reauth_mgr.handle(src, auth_exc.detail, context="apply")
+                if refreshed:
+                    try:
+                        scraper2 = SOURCE_MAP[src](self.config)
+                        result = await scraper2.apply(job, auto_submit=auto_submit)
+                        if result:
+                            self.state.set_status(job["job_id"], "applied")
+                            self.state.record_apply_attempt(
+                                job["job_id"],
+                                "applied",
+                                "Submitted after reauth.",
+                                metadata=self._apply_validation_metadata(scraper2),
+                            )
+                            applied_count += 1
+                            outcomes.append({"job": job, "status": "applied", "reason": "submitted after reauth"})
+                            console.print("[green]Applied after reauth! Status updated.[/green]")
+                            await self._push_status_to_cloud(job["job_id"], "applied")
+                            await self._push_apply_attempt_to_cloud(job["job_id"])
+                        else:
+                            reason = getattr(scraper2, "last_apply_detail", "") or "not submitted"
+                            code   = getattr(scraper2, "last_apply_status",  "") or "blocked"
+                            self.state.record_apply_attempt(
+                                job["job_id"],
+                                code,
+                                reason,
+                                metadata=self._apply_validation_metadata(scraper2),
+                            )
+                            await self._push_apply_attempt_to_cloud(job["job_id"])
+                            skipped_count += 1
+                            outcomes.append({"job": job, "status": code, "reason": reason})
+                    except Exception as retry_exc:
+                        console.print(f"[red]{src} apply failed after reauth:[/red] {retry_exc}")
+                        self.state.record_apply_attempt(job["job_id"], "reauth_retry_error", str(retry_exc)[:400])
+                        await self._push_apply_attempt_to_cloud(job["job_id"])
+                        failed_count += 1
+                        outcomes.append({"job": job, "status": "reauth_retry_error", "reason": str(retry_exc)})
+                else:
+                    self.state.record_apply_attempt(job["job_id"], "reauth_failed", auth_exc.detail[:400])
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    skipped_count += 1
+                    outcomes.append({"job": job, "status": "reauth_failed", "reason": auth_exc.detail})
+            except JobExpiredError as exc:
+                self.state.set_status(job["job_id"], "expired")
+                console.print("[red]Job no longer active (expired). Removed from database.[/red]")
+                outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
+                await self._push_status_to_cloud(job["job_id"], "expired")
+            except ATSReadabilityError as exc:
+                _is_unreadable = isinstance(exc, PDFTextLayerError) or "no extractable text layer" in str(exc).lower() or "failed to parse" in str(exc).lower()
+                status = "keyword_coverage_failed" if isinstance(exc, KeywordCoverageError) else "pdf_text_layer_failed" if isinstance(exc, PDFTextLayerError) else "ats_failure"
+                console.print(f"[red]ATS Readability Failure for {job.get('title')} ({status}):[/red] {exc}")
+                self.state.record_apply_attempt(
+                    job["job_id"],
+                    status,
+                    str(exc)[:400],
+                    metadata=self._apply_validation_metadata(scraper, exc),
+                )
+                await self._push_apply_attempt_to_cloud(job["job_id"])
+                notify_error("ATS Readability Failure", f"Job ID {job.get('job_id')} failed ATS check ({status}): {exc}")
+                failed_count += 1
+                outcomes.append({"job": job, "status": status, "reason": str(exc)})
+                if _is_unreadable:
+                    # Unreadable PDF (image-only or corrupt) — pause the whole loop; self-healing required.
+                    console.print("[bold yellow]Pausing application loop: PDF is unreadable. Self-healing/repair required.[/bold yellow]")
+                    break
+                # Keyword mismatch — skip this job only; continue applying to others.
+                console.print("[yellow]Skipping this job due to keyword ATS failure; continuing with remaining jobs.[/yellow]")
+                continue
+            except Exception as exc:
+                console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")
+                self.state.record_apply_attempt(job["job_id"], "error", str(exc)[:400])
+                await self._push_apply_attempt_to_cloud(job["job_id"])
+                failed_count += 1
+                outcomes.append({"job": job, "status": "error", "reason": str(exc)})
+
+        record_run_stats(applied_count, failed_count, skipped_count)
+        _log.info(
+            "apply.complete applied=%d failed=%d skipped=%d session_blocked=%d",
+            applied_count, failed_count, skipped_count, len(blocked),
+        )
+        console.print(
+            f"\n[bold]Apply run complete:[/bold] "
+            f"{applied_count} applied, {failed_count} failed, "
+            f"{skipped_count} blocked/not submitted, "
+            f"{len(blocked)} session-blocked (skipped pre-flight)"
+        )
+        if outcomes:
+            console.print("\n[bold]Outcome details[/bold]")
+            for item in outcomes:
+                j = item["job"]
+                console.print(f"  • {item['status']}: {j.get('title')} @ {j.get('company')}")
+                if item.get("reason"):
+                    console.print(f"    [dim]{item['reason']}[/dim]")
+        if applied_count == 0 and (skipped_count or blocked):
+            notify_warning(
+                "Apply run: nothing submitted",
+                f"0 submitted, {skipped_count} blocked, {len(blocked)} need session prep. "
+                f"Run: python src/main.py prepare-sessions",
+            )
+
+    def prune_stale_jobs(self, max_age_days: int = 30, dry_run: bool = False) -> dict:
+        """Archive jobs that have been sitting in discovered/approved status
+        for longer than max_age_days without ever being applied to.
+
+        Most job listings close within 30 days, so age is a reliable proxy for
+        unavailability without requiring an expensive browser visit per job.
+
+        Returns a summary dict: { "pruned": [...], "total": N }
+        """
+        stale = self.state.get_stale_jobs(max_age_days=max_age_days)
+        if not stale:
+            console.print(
+                f"[green]No stale jobs found (none older than {max_age_days} days in discovered/approved).[/green]"
+            )
+            return {"pruned": [], "total": 0}
+
+        console.print(
+            f"\n[bold]Stale job cleanup:[/bold] {len(stale)} job(s) older than {max_age_days} days"
+        )
+        if dry_run:
+            console.print("[yellow]Dry-run — no changes will be made.[/yellow]")
+
+        pruned = []
+        for job in stale:
+            age_days = 0
+            try:
+                disc = datetime.fromisoformat(job["discovered_at"].rstrip("Z"))
+                age_days = (datetime.utcnow() - disc).days
+            except Exception:
+                pass
+            console.print(
+                f"  {'[dim]would archive[/dim]' if dry_run else '[red]archiving[/red]'}: "
+                f"{job.get('title')} @ {job.get('company')} "
+                f"({job.get('source')}, {age_days}d old, status={job.get('status')})"
+            )
+            if not dry_run:
+                self.state.archive_job(job["job_id"], reason=f"stale>{max_age_days}d")
+            pruned.append(job)
+
+        if not dry_run:
+            console.print(f"[green]Archived {len(pruned)} stale job(s).[/green]")
+        else:
+            console.print(f"[yellow]Would archive {len(pruned)} job(s). Run without --dry-run to apply.[/yellow]")
+
+        return {"pruned": pruned, "total": len(pruned)}
+
+    def reset_failures(self, reason: str, dry_run: bool = False) -> None:
+        """Reset selected failed approved jobs so the apply circuit can retry them."""
+        if reason != "keyword-validation":
+            console.print(f"[red]Unsupported reset reason:[/red] {reason}")
+            return
+        stats = self.state.reset_failed_keyword_jobs(dry_run=dry_run)
+        mode = "would reset" if dry_run else "reset"
+        console.print(
+            f"[green]Failure reset complete:[/green] matched={stats['matched']} "
+            f"{mode}={stats['reset'] if not dry_run else stats['matched']} "
+            f"unmatched={stats['unmatched']}"
+        )
+
+    async def _pull_approved_from_cloud(self) -> None:
+        """Fetch jobs marked 'approved' on the cloud dashboard and upsert them
+        into the local SQLite DB so the apply command can act on them."""
+        dashboard_url = os.environ.get("DASHBOARD_URL", "")
+        sync_secret = os.environ.get("SYNC_SECRET", "")
+        if not dashboard_url:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(
+                    f"{dashboard_url}/api/jobs/approved",
+                    headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
+                )
+                if r.status_code != 200:
+                    console.print(f"[yellow]Cloud pull returned {r.status_code} — skipping.[/yellow]")
+                    return
+                jobs = r.json()
+                if not jobs:
+                    return
+                pulled = 0
+                for job in jobs:
+                    # Insert if new, then always force status to "approved"
+                    # (upsert_job skips existing rows, so set_status does the update)
+                    job["status"] = "approved"
+                    self.state.upsert_job(job)
+                    self.state.set_status(job["job_id"], "approved")
+                    pulled += 1
+                console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")
+        except Exception as e:
+            console.print(f"[dim]Cloud pull failed (non-fatal): {e}[/dim]")
+            _log.warning("cloud_sync.pull_failed error=%s", e)
+            notify_error("Cloud sync failed: _pull_approved_from_cloud", str(e)[:200])
+
+    async def _push_status_to_cloud(self, job_id: str, status: str) -> None:
+        """POST a status update back to the cloud dashboard (non-fatal)."""
+        dashboard_url = os.environ.get("DASHBOARD_URL", "")
+        sync_secret = os.environ.get("SYNC_SECRET", "")
+        if not dashboard_url:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{dashboard_url}/api/action",
+                    json={"job_id": job_id, "action": status},
+                    headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
+                )
+                if r.status_code != 200:
+                    console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
+        except Exception as e:
+            console.print(f"[dim]Cloud status push failed (non-fatal): {e}[/dim]")
+            _log.warning("cloud_sync.push_status_failed error=%s", e)
+            notify_error("Cloud sync failed: _push_status_to_cloud", str(e)[:200])
+
+    async def _push_apply_attempt_to_cloud(self, job_id: str) -> None:
+        """Sync the latest local apply attempt fields to the dashboard.
+
+        /api/action only changes the job status. The dashboard's approved queue
+        displays apply_last_* fields from extra_json, so blocked and failed
+        attempts need a normal sync after record_apply_attempt().
+        """
+        job = self.state.get_job(job_id)
+        if not job:
+            return
+        await self._sync_to_cloud([job])
+
+    # ------------------------------------------------------------------
+    # status command
+    # ------------------------------------------------------------------
+
+    async def _sync_to_cloud(self, jobs: list[dict]) -> None:
+        """POST discovered jobs to the Render dashboard. Non-fatal on any error."""
+        dashboard_url = os.environ.get("DASHBOARD_URL", "")
+        sync_secret = os.environ.get("SYNC_SECRET", "")
+        if not dashboard_url or not jobs:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    f"{dashboard_url}/api/sync",
+                    json=jobs,
+                    headers={"X-Sync-Secret": sync_secret},
+                )
+                if r.status_code == 200:
+                    console.print(f"[green]☁ Synced {len(jobs)} jobs to dashboard.[/green]")
+                else:
+                    console.print(f"[yellow]Dashboard sync returned {r.status_code}[/yellow]")
+        except Exception as e:
+            console.print(f"[dim]Dashboard sync failed (non-fatal): {e}[/dim]")
+
+    def show_status(self) -> None:
+        """Display stats table."""
+        stats = self.state.get_stats()
+        show_summary_table(stats)
+
+        # Also show today's bookmarks
+        bookmarked = self.state.get_jobs_by_status("bookmarked")
+        if bookmarked:
+            console.print(f"\n[cyan]Bookmarked jobs ({len(bookmarked)}):[/cyan]")
+            for j in bookmarked[:10]:
+                console.print(f"  • {j['title']} @ {j['company']} — {j['url']}")
+
+    def show_apply_stats(self) -> dict:
+        """P1: print the apply funnel + success rate from persisted data.
+
+        Works on existing data — no new run required. Returns the funnel dict
+        so callers (tests, cloud push) can consume it too.
+        """
+        from rich.table import Table
+
+        f = self.state.get_apply_funnel()
+        rate_pct = f["attempt_success_rate"] * 100
+
+        console.rule("[bold]Apply Success Report[/bold]")
+        console.print(
+            f"Discovered: [bold]{f['total_jobs']}[/bold]   "
+            f"Attempts: [bold]{f['attempts']}[/bold]   "
+            f"Submitted: [bold]{f['submitted']}[/bold]   "
+            f"Success rate: [bold]{rate_pct:.1f}%[/bold]   "
+            f"Wasted retries: [bold]{f['wasted_retries']}[/bold]"
+        )
+
+        sc = f["status_counts"]
+        if sc:
+            console.print(
+                "[dim]Funnel: "
+                + " → ".join(
+                    f"{k}={v}"
+                    for k, v in sorted(sc.items(), key=lambda x: -x[1])
+                )
+                + "[/dim]"
+            )
+
+        if f["failure_clusters"]:
+            ct = Table(title="Failure clusters", show_edge=False)
+            ct.add_column("cluster")
+            ct.add_column("count", justify="right")
+            for k, v in f["failure_clusters"].items():
+                ct.add_row(k, str(v))
+            console.print(ct)
+
+        if f["failure_histogram"]:
+            ft = Table(title="Failure detail", show_edge=False)
+            ft.add_column("status")
+            ft.add_column("count", justify="right")
+            for k, v in f["failure_histogram"].items():
+                ft.add_row(k, str(v))
+            console.print(ft)
+
+        if f["per_source"]:
+            st = Table(title="Per source", show_edge=False)
+            st.add_column("source")
+            st.add_column("attempts", justify="right")
+            st.add_column("submitted", justify="right")
+            st.add_column("rate", justify="right")
+            for src, d in sorted(f["per_source"].items(), key=lambda x: -x[1]["attempts"]):
+                st.add_row(src, str(d["attempts"]), str(d["submitted"]), f"{d['rate']*100:.0f}%")
+            console.print(st)
+
+        return f
+
+    def _log_credential_presence(self) -> None:
+        """BAND-AID / TODO(secrets): log which source credentials are present in
+        os.environ (names + SET/MISSING, never values) at the start of a run. Turns
+        'is JOBRIGHT_EMAIL actually loaded in the scheduled process?' from a guess into
+        a fact in the log. Remove once the single-source secrets store lands (roadmap).
+        """
+        pairs = {
+            "jobright": ("JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD"),
+            "linkedin": ("LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"),
+            "indeed":   ("INDEED_EMAIL", "INDEED_PASSWORD"),
+            "usajobs":  ("USAJOBS_EMAIL", "USAJOBS_PASSWORD"),
+            "anthropic": ("ANTHROPIC_API_KEY", None),
+        }
+        parts = []
+        for name, (ek, pk) in pairs.items():
+            ok = bool(os.environ.get(ek)) and (pk is None or bool(os.environ.get(pk)))
+            parts.append(f"{name}={'SET' if ok else 'MISSING'}")
+        console.print(f"[dim]🔑 Credential presence: {'  '.join(parts)}[/dim]")
+
+    async def load_credentials_from_dashboard(self) -> None:
+        """Fetch credentials from the cloud dashboard and populate os.environ.
+        Falls back to local env variables if not found or on error.
+        """
+        dashboard_url = os.environ.get("DASHBOARD_URL", "")
+        sync_secret = os.environ.get("SYNC_SECRET", "")
+        if not dashboard_url:
+            return
+
+        console.print("[cyan]☁ Fetching platform credentials from cloud...[/cyan]")
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    f"{dashboard_url}/api/credentials",
+                    headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
+                )
+                if r.status_code == 200:
+                    creds = r.json()
+                    loaded = []
+                    kept_local = []
+                    # BAND-AID / TODO(secrets): .env is the authoritative source. The cloud
+                    # dashboard may only FILL MISSING creds — never overwrite a value already
+                    # present locally. A stale/empty cloud value previously clobbered good
+                    # .env creds and broke reauth (jobright/usajobs). Replace this whole
+                    # multi-source scheme with the single-source secrets store
+                    # (SOPS + age + Azure Key Vault) — see roadmap.
+                    _platform_keys = {
+                        "indeed":        ("INDEED_EMAIL",   "INDEED_PASSWORD",   "Indeed"),
+                        "linkedin":      ("LINKEDIN_EMAIL", "LINKEDIN_PASSWORD", "LinkedIn"),
+                        "jobright":      ("JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD", "Jobright"),
+                        "company_portal":("COMPANY_EMAIL",  "COMPANY_PASSWORD",  "Company ATS"),
+                    }
+                    for item in creds:
+                        email = item.get("email")
+                        password = item.get("password")
+                        keys = _platform_keys.get(item.get("platform"))
+                        if not email or not password or not keys:
+                            continue
+                        email_key, pw_key, label = keys
+                        # .env wins: only fill when BOTH local values are empty/absent
+                        if os.environ.get(email_key) or os.environ.get(pw_key):
+                            kept_local.append(label)
+                            continue
+                        os.environ[email_key] = email
+                        os.environ[pw_key] = password
+                        loaded.append(label)
+                    if loaded:
+                        console.print(f"[green]☁ Cloud filled missing credentials: {', '.join(loaded)}[/green]")
+                    if kept_local:
+                        console.print(f"[dim]☁ Kept local .env credentials (cloud not applied): {', '.join(kept_local)}[/dim]")
+                    if not loaded and not kept_local:
+                        console.print("[yellow]☁ No platform credentials configured on cloud.[/yellow]")
+                else:
+                    console.print(f"[yellow]☁ Cloud credentials pull returned {r.status_code} — using local env fallbacks.[/yellow]")
+        except Exception as e:
+            console.print(f"[dim]Failed to load credentials from cloud (non-fatal): {e}[/dim]")
+
+    async def hydrate_external_jobs(self) -> None:
+        """Fetch unhydrated placeholders from the cloud dashboard, scrape them locally,
+        score them with Claude, and sync the results back to the dashboard."""
+        await self.load_credentials_from_dashboard()
+        dashboard_url = os.environ.get("DASHBOARD_URL", "")
+        sync_secret = os.environ.get("SYNC_SECRET", "")
+        if not dashboard_url:
+            return
+
+        console.print("[cyan]☁ Checking for unhydrated external jobs from cloud...[/cyan]")
+        import httpx
+        unhydrated = []
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(
+                    f"{dashboard_url}/api/jobs/unhydrated",
+                    headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
+                )
+                if r.status_code == 200:
+                    unhydrated = r.json()
+        except Exception as e:
+            console.print(f"[dim]Failed to pull unhydrated jobs: {e}[/dim]")
+            return
+
+        if not unhydrated:
+            console.print("[cyan]No unhydrated jobs found.[/cyan]")
+            return
+
+        console.print(f"[cyan]Found {len(unhydrated)} unhydrated job(s). Starting local scraper...[/cyan]")
+
+        from .sources.linkedin import LinkedInScraper, _infer_remote_type  # noqa: F401
+        from .sources.jobright import JobrightScraper
+        from .sources.indeed import IndeedScraper
+
+        jobright_scraper = JobrightScraper(self.config)
+        linkedin_scraper = LinkedInScraper(self.config)
+        indeed_scraper   = IndeedScraper(self.config)
+
+        hydrated_jobs = []
+
+        try:
+            for placeholder in unhydrated:
+                job_id = placeholder["job_id"]
+                url = placeholder["url"]
+                source = placeholder["source"]
+
+                console.print(f"\n[bold cyan]Hydrating {source} job: {url}[/bold cyan]")
+                job = {
+                    "job_id": job_id,
+                    "url": url,
+                    "source": source,
+                }
+
+                # Route to the right scraper + browser flags per source
+                if source == "linkedin":
+                    scraper_for_page = linkedin_scraper
+                    load_ext = False
+                elif source == "indeed":
+                    scraper_for_page = indeed_scraper
+                    load_ext = False
+                else:
+                    scraper_for_page = jobright_scraper
+                    load_ext = (source != "linkedin")
+
+                page = None
+                try:
+                    page = await scraper_for_page._start_browser(load_extensions=load_ext)
+                    if source == "linkedin":
+                        await linkedin_scraper._hydrate_job_detail(page, job)
+                    elif source == "indeed":
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        await indeed_scraper._delay(2, 3)
+                        await indeed_scraper._hydrate_job_detail(page, job)
+                    elif source == "jobright":
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        await jobright_scraper._delay(2, 3)
+                        title = await page.title()
+                        if " | Jobright" in title:
+                            title = title.replace(" | Jobright", "")
+                        job["title"] = title
+
+                        extracted = await page.evaluate("""
+                        () => {
+                            try {
+                                const nd = JSON.parse(document.getElementById('__NEXT_DATA__')?.textContent || '{}');
+                                const job = nd?.props?.pageProps?.job || nd?.props?.pageProps?.jobDetail || {};
+                                return {
+                                    title: job.title || '',
+                                    company: job.companyName || job.company || '',
+                                    location: job.location || '',
+                                    salary: job.salary || '',
+                                    description: job.description || ''
+                                };
+                            } catch(e) { return null; }
+                        }
+                        """)
+                        if extracted and extracted.get("title"):
+                            job["title"] = extracted["title"]
+                            job["company"] = extracted["company"]
+                            job["location"] = extracted["location"]
+                            job["salary_raw"] = extracted["salary"]
+                            job["description"] = extracted["description"]
+                        else:
+                            comp_elem = await page.query_selector("[class*='company'], [class*='employer']")
+                            if comp_elem:
+                                job["company"] = (await comp_elem.inner_text()).strip()
+                            desc_elem = await page.query_selector("[class*='description'], [class*='job-detail']")
+                            if desc_elem:
+                                job["description"] = (await desc_elem.inner_text()).strip()
+                    else:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        await jobright_scraper._delay(2, 3)
+                        job["title"] = await page.title()
+
+                        title_lower = job["title"].lower()
+                        for suffix in [" - indeed.com", " | indeed", " - jobs", " jobs at ", " careers at "]:
+                            if suffix in title_lower:
+                                idx = title_lower.index(suffix)
+                                job["title"] = job["title"][:idx].strip()
+                                break
+
+                        body_text = await page.evaluate("document.body.innerText")
+                        job["description"] = body_text[:3000]
+
+                    # Ensure essential fields
+                    if not job.get("title") or job["title"] == "Importing...":
+                        job["title"] = f"Job listing ({job_id})"
+                    if not job.get("company") or job["company"] == "Pending local agent sync":
+                        job["company"] = "Unknown Company"
+                    if not job.get("description"):
+                        job["description"] = "No description available."
+
+                    # Score via Ollama → Claude cascade
+                    console.print(f"Scoring job...")
+                    score, reason, flags, action = await self.scorer.score(job)
+                    job["score"] = score
+                    job["score_reason"] = reason
+                    job["flags"] = (flags or "").replace("needs_hydration", "").strip(",")
+                    job["recommended_action"] = action
+                    job["status"] = "discovered"
+
+                    # Save to local SQLite
+                    self.state.upsert_job(job)
+                    self.state.set_status(job_id, "discovered")
+                    self.state.update_score(job_id, score, reason, job["flags"])
+                    self.state.update_job_details(job_id, job)
+
+                    hydrated_jobs.append(job)
+                    console.print(f"[green]Successfully hydrated: {job['title']} @ {job['company']} (Score: {score})[/green]")
+
+                except Exception as inner_e:
+                    console.print(f"[red]Failed to hydrate job {job_id}: {inner_e}[/red]")
+                finally:
+                    if page:
+                        await scraper_for_page._close_browser()
+
+        finally:
+            pass
+
+        if hydrated_jobs:
+            console.print(f"[cyan]Syncing {len(hydrated_jobs)} hydrated job(s) back to cloud dashboard...[/cyan]")
+            await self._sync_to_cloud(hydrated_jobs)
