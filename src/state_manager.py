@@ -418,3 +418,238 @@ class StateManager:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            extra: dict = {}
+            if row and row["extra_json"]:
+                try:
+                    extra = json.loads(row["extra_json"])
+                except Exception:
+                    pass
+            extra.update(analytics)
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
+    # ------------------------------------------------------------------
+    # Read helpers
+    # ------------------------------------------------------------------
+
+    def get_job(self, job_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_jobs_by_status(self, status: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status = ? ORDER BY score DESC, discovered_at DESC",
+                (status,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_pending_review(self) -> list[dict]:
+        """Jobs that are discovered (scored) but not yet reviewed."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = 'discovered'
+                ORDER BY score DESC, discovered_at DESC
+                """,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_approved_unapplied(self) -> list[dict]:
+        """Jobs approved for application but not yet applied."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = 'approved'
+                ORDER BY score DESC, discovered_at DESC
+                """,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_stats(self) -> dict:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) as cnt FROM jobs GROUP BY status"
+            ).fetchall()
+            stats = {r["status"]: r["cnt"] for r in rows}
+            today_rows = conn.execute(
+                """
+                SELECT status, COUNT(*) as cnt FROM jobs
+                WHERE date(discovered_at) = date('now')
+                GROUP BY status
+                """,
+            ).fetchall()
+            stats["today"] = {r["status"]: r["cnt"] for r in today_rows}
+            return stats
+
+    # ------------------------------------------------------------------
+    # P1 instrumentation: apply funnel & success-rate
+    # ------------------------------------------------------------------
+
+    # Failure-status → cluster, so the report groups the noise the way the
+    # plan's measured baseline does. This is a *display* grouping only; the
+    # authoritative blocker classifier lands in P2 (src/blocker_classifier.py).
+    _FAILURE_CLUSTERS = {
+        "form_completion": {
+            "external_ats_error", "form_not_reached", "submit_not_found",
+            "linkedin_external_apply_not_found", "microsoft_apply_not_reached",
+            "ats_selector_failed", "resume_upload_failed",
+        },
+        "auth_session": {
+            "workday_session_expired", "brassring_login_required",
+            "reauth_failed", "reauth_retry_error",
+        },
+        "field_completion": {
+            "linkedin_stuck_on_required_field", "ats_failure",
+            "keyword_coverage_failed", "pdf_text_layer_failed",
+        },
+        "transient": {
+            "browser_timeout", "model_timeout", "unknown_external_ats_error",
+        },
+        "config_error": {"bad_ats_url", "unknown_source", "error"},
+    }
+
+    @classmethod
+    def _cluster_for(cls, status: str) -> str:
+        s = (status or "").strip()
+        for cluster, members in cls._FAILURE_CLUSTERS.items():
+            if s in members:
+                return cluster
+        return "other"
+
+    def get_apply_funnel(self) -> dict:
+        """Compute the apply funnel and success rate from persisted extra_json.
+
+        Reads what P1 records on every attempt (`apply_last_status`, `submitted`,
+        `apply_attempt_count`). Pure read; safe to call anytime. Returns a dict:
+        totals, funnel counts, attempt_success_rate, failure histogram + clusters,
+        per-source breakdown, and wasted-retry count.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT source, status, extra_json FROM jobs"
+            ).fetchall()
+
+        total = len(rows)
+        status_counts: dict = {}
+        attempts = 0
+        submitted = 0
+        wasted_retries = 0
+        failure_hist: dict = {}
+        cluster_hist: dict = {}
+        per_source: dict = {}
+
+        for r in rows:
+            status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+            try:
+                extra = json.loads(r["extra_json"]) if r["extra_json"] else {}
+            except Exception:
+                extra = {}
+            last = extra.get("apply_last_status")
+            if not last:
+                continue  # no apply attempt recorded for this job
+
+            attempts += 1
+            was_submitted = bool(extra.get("submitted")) or str(last).lower() == "applied"
+            src = r["source"] or "unknown"
+            ps = per_source.setdefault(src, {"attempts": 0, "submitted": 0})
+            ps["attempts"] += 1
+
+            if was_submitted:
+                submitted += 1
+                ps["submitted"] += 1
+            else:
+                failure_hist[last] = failure_hist.get(last, 0) + 1
+                cluster = self._cluster_for(last)
+                cluster_hist[cluster] = cluster_hist.get(cluster, 0) + 1
+                # Attempts beyond the first on a job that never succeeded = wasted effort.
+                wasted_retries += max(0, int(extra.get("apply_attempt_count", 1)) - 1)
+
+        for ps in per_source.values():
+            ps["rate"] = (ps["submitted"] / ps["attempts"]) if ps["attempts"] else 0.0
+
+        return {
+            "total_jobs": total,
+            "status_counts": status_counts,
+            "attempts": attempts,
+            "submitted": submitted,
+            "attempt_success_rate": (submitted / attempts) if attempts else 0.0,
+            "failure_histogram": dict(sorted(failure_hist.items(), key=lambda x: -x[1])),
+            "failure_clusters": dict(sorted(cluster_hist.items(), key=lambda x: -x[1])),
+            "per_source": per_source,
+            "wasted_retries": wasted_retries,
+        }
+
+    def reset_failed_keyword_jobs(self, dry_run: bool = False) -> dict:
+        """Reset approved jobs blocked by the old keyword-validation failure.
+
+        Matches both legacy failures recorded as an ATS failure detail and the
+        structured telemetry produced by the normalized keyword coverage check.
+        """
+        reset_keys = {
+            "apply_last_status",
+            "apply_attempt_count",
+            "submitted",
+            "blocker_class",
+            "circuit_broken",
+            "circuit_class",
+            "circuit_reason",
+            "circuit_broken_at",
+            "apply_last_attempt",
+            "apply_validation_metrics",
+        }
+        matched: list[tuple[str, dict]] = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, extra_json FROM jobs WHERE status = 'approved'"
+            ).fetchall()
+
+            for row in rows:
+                extra: dict = {}
+                if row["extra_json"]:
+                    try:
+                        extra = json.loads(row["extra_json"])
+                    except Exception:
+                        extra = {}
+                metrics = extra.get("apply_validation_metrics") or {}
+                detail = str(extra.get("apply_last_detail") or "")
+                status = str(extra.get("apply_last_status") or "")
+                legacy_keyword_detail = detail.startswith("ATS check failed") and "keyword" in detail.lower()
+                is_match = (
+                    metrics.get("failure_type") == "keyword_coverage"
+                    or status == "keyword_coverage_failed"
+                    or legacy_keyword_detail
+                )
+                if is_match:
+                    matched.append((row["job_id"], extra))
+
+            if not dry_run:
+                for job_id, extra in matched:
+                    for key in reset_keys:
+                        extra.pop(key, None)
+                    extra.pop("apply_last_detail", None)
+                    conn.execute(
+                        "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                        (json.dumps(extra) if extra else None, job_id),
+                    )
+
+        return {
+            "matched": len(matched),
+            "reset": 0 if dry_run else len(matched),
+            "unmatched": max(0, len(rows) - len(matched)),
+        }
+
+    def already_seen(self, job_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return row is not None
