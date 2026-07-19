@@ -499,6 +499,7 @@ def test_clear_session_block_stamps_even_without_prior_status(tmp_path):
 @pytest.mark.asyncio
 async def test_preflight_block_keeps_portal_status_for_prepare_sessions(tmp_path, monkeypatch):
     """A scheduled preflight must not erase the portal status that selects prep."""
+    import json as _json
     from src import orchestrator as orch_mod
     from src.state_manager import StateManager
 
