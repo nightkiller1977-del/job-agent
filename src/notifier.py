@@ -59,9 +59,11 @@ def _load_telegram_config() -> tuple[str, str]:
         return token, chat_id
 
     # 3. settings-v3.json legacy fallback (in case UI ever writes there)
-    settings_path = (
-        Path.home() / "Library" / "Application Support" / "ai-command-center" / "settings-v3.json"
-    )
+    try:
+        from .secret_store import _commander_dir
+        settings_path = _commander_dir() / "settings-v3.json"
+    except Exception:
+        settings_path = Path.home() / ".config" / "ai-command-center" / "settings-v3.json"
     if settings_path.exists():
         try:
             tg = json.loads(settings_path.read_text()).get("telegram", {})
@@ -90,27 +92,30 @@ def _send_telegram(message: str) -> None:
     except Exception:
         pass
 
-def _macos_notify(title: str, message: str, subtitle: str = "Job Agent") -> None:
-    """Fire a native macOS notification via osascript with rate limiting."""
+def _desktop_notify(title: str, message: str, subtitle: str = "Job Agent") -> None:
+    """Fire a native desktop notification with rate limiting (macOS and Linux)."""
+    import sys
     now = time.time()
     cache_key = f"{title}:{message}"
     last_time = _last_notification_times.get(cache_key, 0)
-    # Rate limit identical macOS notifications to once every 15 minutes (900 seconds)
     if now - last_time < 900:
         return
     _last_notification_times[cache_key] = now
 
     try:
-        script = (
-            f'display notification "{message}" '
-            f'with title "{title}" '
-            f'subtitle "{subtitle}"'
-        )
-        subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            timeout=5,
-        )
+        if sys.platform == "darwin":
+            script = (
+                f'display notification "{message}" '
+                f'with title "{title}" '
+                f'subtitle "{subtitle}"'
+            )
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+        else:
+            subprocess.run(
+                ["notify-send", f"{subtitle}: {title}", message],
+                capture_output=True,
+                timeout=5,
+            )
     except Exception:
         pass  # Never let notification failures crash the agent
 
@@ -144,7 +149,7 @@ def notify_error(title: str, detail: str = "") -> None:
         _last_notification_times[cache_key] = now
         _send_telegram(f"🚨 [Job Agent ERROR] {title}\nDetail: {detail}")
 
-    _macos_notify(f"🔴 {title}", detail or title, subtitle="Job Agent ERROR")
+    _desktop_notify(f"🔴 {title}", detail or title, subtitle="Job Agent ERROR")
 
 
 def notify_warning(title: str, detail: str = "") -> None:
@@ -159,14 +164,14 @@ def notify_warning(title: str, detail: str = "") -> None:
         _last_notification_times[cache_key] = now
         _send_telegram(f"⚠️ [Job Agent WARNING] {title}\nDetail: {detail}")
 
-    _macos_notify(f"🟡 {title}", detail or title, subtitle="Job Agent WARNING")
+    _desktop_notify(f"🟡 {title}", detail or title, subtitle="Job Agent WARNING")
 
 
 def notify_success(title: str, detail: str = "") -> None:
     """Signal a successful application submission."""
     _add_alert("success", title, detail)
     _send_telegram(f"✅ [Job Agent SUCCESS] {title}\nDetail: {detail}")
-    _macos_notify(f"✅ {title}", detail or title, subtitle="Job Agent")
+    _desktop_notify(f"✅ {title}", detail or title, subtitle="Job Agent")
 
 
 def notify_info(title: str, detail: str = "") -> None:
