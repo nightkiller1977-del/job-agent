@@ -34,12 +34,26 @@ _log = logging.getLogger("job-agent.secrets")
 
 # Directory that owns the central store. Overridable via AICC_SECRETS_DIR (used by
 # tests and by anyone who relocates the AI Commander userData dir).
-_DEFAULT_COMMANDER_DIR = Path.home() / "Library" / "Application Support" / "ai-command-center"
+# Default follows Electron's app.getPath('userData') per platform:
+#   macOS  → ~/Library/Application Support/ai-command-center
+#   Linux  → ~/.config/ai-command-center   (XDG_CONFIG_HOME)
+#   Windows→ %APPDATA%/ai-command-center
+def _default_commander_dir() -> Path:
+    import sys
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "ai-command-center"
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA") or str(home / "AppData" / "Roaming")
+        return Path(appdata) / "ai-command-center"
+    # Linux / other POSIX
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(home / ".config")
+    return Path(xdg) / "ai-command-center"
 
 
 def _commander_dir() -> Path:
     override = os.environ.get("AICC_SECRETS_DIR")
-    return Path(override) if override else _DEFAULT_COMMANDER_DIR
+    return Path(override).expanduser() if override else _default_commander_dir()
 
 
 # Every secret this repo may need. Used as the default set for fill_missing() and
@@ -93,9 +107,13 @@ def _read_store() -> dict[str, str]:
     enc = d / "secrets.enc.env"
     if enc.exists() and shutil.which("sops"):
         try:
+            sops_env = os.environ.copy()
+            if sops_env.get("SOPS_AGE_KEY_FILE"):
+                sops_env["SOPS_AGE_KEY_FILE"] = str(Path(sops_env["SOPS_AGE_KEY_FILE"]).expanduser())
             res = subprocess.run(
                 ["sops", "-d", str(enc)],
                 capture_output=True, text=True, timeout=15,
+                env=sops_env,
             )
             if res.returncode == 0:
                 return _parse_env_text(res.stdout)
