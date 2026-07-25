@@ -16,7 +16,15 @@ set -euo pipefail
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
-STORE_DIR="${AICC_SECRETS_DIR:-$HOME/Library/Application Support/ai-command-center}"
+if [[ -n "${AICC_SECRETS_DIR:-}" ]]; then
+  STORE_DIR="${AICC_SECRETS_DIR}"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  STORE_DIR="$HOME/Library/Application Support/ai-command-center"
+elif [[ -n "${APPDATA:-}" ]]; then
+  STORE_DIR="${APPDATA}/ai-command-center"
+else
+  STORE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ai-command-center"
+fi
 STORE="$STORE_DIR/.env"
 
 # Source .env files to pull keys from (add more here as needed).
