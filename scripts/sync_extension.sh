@@ -2,7 +2,11 @@
 # Syncs the latest Jobright Autofill extension from Chrome to the project.
 # Run manually after Chrome auto-updates the extension, or any time.
 
-CHROME_EXT="$HOME/Library/Application Support/Google/Chrome/Default/Extensions/odcnpipkhjegpefkfplmedhmkmmhmoko"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  CHROME_EXT="$HOME/Library/Application Support/Google/Chrome/Default/Extensions/odcnpipkhjegpefkfplmedhmkmmhmoko"
+else
+  CHROME_EXT="${XDG_CONFIG_HOME:-$HOME/.config}/google-chrome/Default/Extensions/odcnpipkhjegpefkfplmedhmkmmhmoko"
+fi
 PROJECT_EXT="./state/extensions/jobright-autofill"
 
 LATEST=$(ls -d "$CHROME_EXT"/*/ 2>/dev/null | sort -V | tail -1)
