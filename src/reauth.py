@@ -29,7 +29,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from .sources.base import SESSIONS_DIR
-from .notifier import notify_error, notify_info, notify_success, notify_warning, record_reauth_event, _macos_notify
+from .notifier import notify_error, notify_info, notify_success, notify_warning, record_reauth_event, _desktop_notify
 
 _log = logging.getLogger(__name__)
 
@@ -324,7 +324,7 @@ async def test_regression_{source}_{ts_slug}():
 
 def _send_imessage(phone: str, message: str) -> None:
     # Always fire a macOS notification as a fallback regardless of iMessage success
-    _macos_notify("Job Agent — Auth Required", message[:200], subtitle="Action Needed")
+    _desktop_notify("Job Agent — Auth Required", message[:200], subtitle="Action Needed")
 
     if not phone:
         notify_warning(
