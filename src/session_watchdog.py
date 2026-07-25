@@ -8,7 +8,8 @@ Three layers of protection:
      lifetime without a full login — run nightly via scheduler.
   3. Deep-link notification: delegates to notifier.py which reads Telegram
      credentials from AI Commander's settings-v3.json automatically.
-     (~Library/Application Support/ai-command-center/settings-v3.json)
+     (platform-specific: ~/Library/Application Support/ai-command-center on macOS,
+      ~/.config/ai-command-center on Linux — resolved via secret_store._commander_dir())
      No duplicate credential configuration needed — configure Telegram once
      in AI Commander and job-agent picks it up automatically.
 
