@@ -285,7 +285,7 @@ def _send_deep_link_notification(source: str, message: str) -> None:
     full_msg = f"{message}\n\n{deep_link}"
 
     try:
-        from .notifier import _send_telegram, _macos_notify, _last_notification_times
+        from .notifier import _send_telegram, _desktop_notify, _last_notification_times
         import time
         now = time.time()
         cache_key = f"tg:deep_link:{source}"
@@ -296,7 +296,7 @@ def _send_deep_link_notification(source: str, message: str) -> None:
         _last_notification_times[cache_key] = now
 
         _send_telegram(full_msg)
-        _macos_notify(f"{source} session needs refresh", message)
+        _desktop_notify(f"{source} session needs refresh", message)
     except Exception as exc:
         _log.warning("session_watchdog.notify_failed source=%s error=%s", source, exc)
         console.print(f"[yellow]Session alert ({source}):[/yellow] {message}\n{deep_link}")
