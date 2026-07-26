@@ -5,6 +5,7 @@ set -euo pipefail
 
 echo "==> pre-push: running Python test suite..."
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 if [ -x "$REPO_ROOT/.venv/bin/pytest" ]; then
   "$REPO_ROOT/.venv/bin/pytest"
 else
