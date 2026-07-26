@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Runs tests before every push. Exit non-zero to abort the push.
+
+set -euo pipefail
+
+echo "==> pre-push: running Python test suite..."
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+if [ -x "$REPO_ROOT/.venv/bin/pytest" ]; then
+  "$REPO_ROOT/.venv/bin/pytest"
+else
+  python3 -m pytest
+fi
+
+echo "==> pre-push: all checks passed."
