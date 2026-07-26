@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Runs tests before every push. Exit non-zero to abort the push.
+
+set -euo pipefail
+
+echo "==> pre-push: running Python test suite..."
+pytest
+
+echo "==> pre-push: all checks passed."
