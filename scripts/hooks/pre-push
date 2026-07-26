@@ -4,6 +4,6 @@
 set -euo pipefail
 
 echo "==> pre-push: running Python test suite..."
-pytest
+python3 -m pytest
 
 echo "==> pre-push: all checks passed."
