@@ -92,7 +92,8 @@
     .jgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(296px,1fr));gap:12px;margin-bottom:32px;}
 
     /* ── Job card ────────────────────────────────────── */
-    .jcard{background:#fff;border-radius:12px;border:1px solid #E5E7EB;display:flex;flex-direction:column;overflow:hidden;transition:box-shadow .2s,transform .2s,opacity .3s;}
+    .jcard{position:relative;background:#fff;border-radius:12px;border:1px solid #E5E7EB;display:flex;flex-direction:column;overflow:hidden;transition:box-shadow .2s,transform .2s,opacity .3s;}
+    .jcard.selected{border-color:#4F46E5;box-shadow:0 0 0 2px rgba(79,70,229,0.25);}
     .jcard:hover{box-shadow:0 6px 24px rgba(0,0,0,.09);transform:translateY(-2px);}
     .jcard.removing{opacity:0;transform:scale(0.96);pointer-events:none;}
     .jcard-acc{height:3px;width:100%;flex-shrink:0;}
@@ -305,6 +306,36 @@
         <p>No jobs pending review. Run the agent to discover new positions.</p>
       </div>
       {% else %}
+      <!-- Controls & Bulk Actions Bar -->
+      <div class="controls-bar" style="margin-bottom: 16px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; background: #F9FAFB; padding: 12px 16px; border-radius: 8px; border: 1px solid #E5E7EB;">
+        <!-- Filters -->
+        <input type="text" id="filter-search" placeholder="🔍 Search title, company, location..." style="padding: 7px 12px; border: 1px solid #D1D5DB; border-radius: 6px; font-size: 13px; flex: 1; min-width: 200px; outline: none; background: #fff;" oninput="applyFilters()">
+        <input type="text" id="filter-location-priority" placeholder="📍 Prioritize location (e.g. Remote, NY)..." style="padding: 7px 12px; border: 1px solid #D1D5DB; border-radius: 6px; font-size: 13px; width: 220px; outline: none; background: #fff;" oninput="applyFilters()">
+        
+        <select id="filter-min-score" style="padding: 7px 12px; border: 1px solid #D1D5DB; border-radius: 6px; font-size: 13px; outline: none; background: #fff; cursor: pointer;" onchange="applyFilters()">
+          <option value="">🎯 All Scores</option>
+          <option value="80">Score ≥ 80</option>
+          <option value="60">Score ≥ 60</option>
+          <option value="40">Score ≥ 40</option>
+        </select>
+
+        <select id="sort-by" style="padding: 7px 12px; border: 1px solid #D1D5DB; border-radius: 6px; font-size: 13px; outline: none; background: #fff; cursor: pointer;" onchange="applyFilters()">
+          <option value="score">Sort: Highest Score</option>
+          <option value="date">Sort: Newest First</option>
+          <option value="priority">Sort: Location Priority</option>
+        </select>
+
+        <!-- Bulk Selection controls -->
+        <div style="display: flex; gap: 8px; align-items: center; margin-left: auto;">
+          <button class="rf-btn" onclick="toggleSelectAll()" style="padding: 6px 12px; font-size: 13px; border-radius: 6px; border: 1px solid #D1D5DB; background: #fff; cursor: pointer; height: 32px;">Select All</button>
+          <button class="jbtn jb-green" onclick="doBulkAction('approved')" style="padding: 6px 12px; font-size: 13px; height: 32px; display: flex; align-items: center; justify-content: center;">Approve Selected</button>
+          <button class="jbtn jb-blue" onclick="doBulkAction('bookmarked')" style="padding: 6px 12px; font-size: 13px; height: 32px; display: flex; align-items: center; justify-content: center;">Save Selected</button>
+          <button class="jbtn jb-ghost" onclick="doBulkAction('skipped')" style="padding: 6px 12px; font-size: 13px; height: 32px; border: 1px solid #D1D5DB; display: flex; align-items: center; justify-content: center;" title="Skip Selected">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      </div>
+
       <div class="jgrid" id="pending-list">
         {% for job in pending %}
           {% set src = (job.source or 'other').lower() %}
@@ -315,10 +346,13 @@
             {% elif job.score >= 40 %}{% set sc = 'sb-me' %}
             {% else %}{% set sc = 'sb-lo' %}{% endif %}
           {% else %}{% set sc = 'sb-no' %}{% endif %}
-          <div id="card-{{ job.job_id }}" class="jcard">
+          <div id="card-{{ job.job_id }}" class="jcard" data-title="{{ (job.title or '')|lower }}" data-company="{{ (job.company or '')|lower }}" data-location="{{ (job.location or '')|lower }}" data-score="{{ job.score or 0 }}" data-date="{{ job.discovered_at or '' }}">
             <div class="jcard-acc acc-{{ src_c }}"></div>
             <div class="jcard-body">
               <div class="jcard-top">
+                <div style="margin-right: 8px; margin-top: 4px; flex-shrink: 0; display: flex; align-items: center;">
+                  <input type="checkbox" class="job-checkbox" value="{{ job.job_id }}" onchange="this.closest('.jcard').classList.toggle('selected', this.checked)" style="width: 17px; height: 17px; cursor: pointer; accent-color: #4F46E5;">
+                </div>
                 <div class="jcard-info">
                   <div class="jcard-title"><a href="{{ job.url or '#' }}" target="_blank" rel="noopener" title="{{ job.title }}">{{ job.title or 'Untitled' }}</a></div>
                   <div class="jcard-co">{{ job.company or '—' }}</div>
@@ -744,6 +778,136 @@
     var hash = location.hash.replace('#', '');
     if (hash && document.getElementById('tab-' + hash)) showTab(hash);
   })();
+
+  // ── Filters & Sorting ───────────────────────────────────────
+  function applyFilters() {
+    var searchVal = document.getElementById('filter-search').value.toLowerCase().trim();
+    var locVal = document.getElementById('filter-location-priority').value.toLowerCase().trim();
+    var minScoreVal = document.getElementById('filter-min-score').value;
+    var sortBy = document.getElementById('sort-by').value;
+
+    var minScore = minScoreVal ? parseInt(minScoreVal, 10) : -1;
+    var list = document.getElementById('pending-list');
+    if (!list) return;
+
+    var cards = Array.from(list.querySelectorAll('.jcard'));
+
+    cards.forEach(card => {
+      var title = card.getAttribute('data-title') || '';
+      var company = card.getAttribute('data-company') || '';
+      var location = card.getAttribute('data-location') || '';
+      var score = parseInt(card.getAttribute('data-score') || '0', 10);
+
+      // Search match
+      var searchMatch = !searchVal || 
+                        title.includes(searchVal) || 
+                        company.includes(searchVal) || 
+                        location.includes(searchVal);
+
+      // Score match
+      var scoreMatch = score >= minScore;
+
+      if (searchMatch && scoreMatch) {
+        card.style.display = 'flex';
+      } else {
+        card.style.display = 'none';
+        // Uncheck if hidden
+        var cb = card.querySelector('.job-checkbox');
+        if (cb) {
+          cb.checked = false;
+          card.classList.remove('selected');
+        }
+      }
+    });
+
+    // Sort visible ones
+    cards.sort((a, b) => {
+      var scoreA = parseInt(a.getAttribute('data-score') || '0', 10);
+      var scoreB = parseInt(b.getAttribute('data-score') || '0', 10);
+      var dateA = a.getAttribute('data-date') || '';
+      var dateB = b.getAttribute('data-date') || '';
+
+      var locMatchA = locVal && (a.getAttribute('data-location') || '').includes(locVal) ? 1 : 0;
+      var locMatchB = locVal && (b.getAttribute('data-location') || '').includes(locVal) ? 1 : 0;
+
+      if (sortBy === 'priority') {
+        if (locMatchA !== locMatchB) return locMatchB - locMatchA; // Priority location first
+        if (scoreA !== scoreB) return scoreB - scoreA;             // Then highest score
+        return dateB.localeCompare(dateA);                         // Then newest date
+      } else if (sortBy === 'date') {
+        return dateB.localeCompare(dateA);                         // Newest date
+      } else { // sortBy === 'score'
+        if (locVal) {
+          if (scoreA !== scoreB) return scoreB - scoreA;
+          if (locMatchA !== locMatchB) return locMatchB - locMatchA;
+        }
+        if (scoreA !== scoreB) return scoreB - scoreA;
+        return dateB.localeCompare(dateA);
+      }
+    });
+
+    // Re-append in sorted order
+    cards.forEach(card => list.appendChild(card));
+  }
+
+  function toggleSelectAll() {
+    var checkboxes = document.querySelectorAll('#pending-list .jcard:not([style*="display: none"]):not(.removing) .job-checkbox');
+    if (checkboxes.length === 0) return;
+    
+    // Check if all visible ones are currently checked
+    var allChecked = true;
+    checkboxes.forEach(cb => { if (!cb.checked) allChecked = false; });
+    
+    // Toggle
+    checkboxes.forEach(cb => { 
+      cb.checked = !allChecked; 
+      cb.closest('.jcard').classList.toggle('selected', cb.checked);
+    });
+  }
+
+  async function doBulkAction(action) {
+    var checked = document.querySelectorAll('#pending-list .jcard:not([style*="display: none"]):not(.removing) .job-checkbox:checked');
+    if (checked.length === 0) {
+      showToast('No jobs selected.', '#6B7280');
+      return;
+    }
+
+    var jobIds = Array.from(checked).map(cb => cb.value);
+    var msgs = { approved: 'Approve', bookmarked: 'Save', skipped: 'Skip' };
+    showToast(`${msgs[action] || 'Processing'} ${jobIds.length} job(s)...`, '#2563EB');
+
+    var successCount = 0;
+    var failCount = 0;
+
+    for (var jobId of jobIds) {
+      var card = document.getElementById('card-' + jobId);
+      if (card) card.classList.add('removing');
+      
+      try {
+        var resp = await fetch('/api/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id: jobId, action: action })
+        });
+        if (resp.ok) {
+          successCount++;
+          if (card) card.remove();
+        } else {
+          failCount++;
+          if (card) card.classList.remove('removing');
+        }
+      } catch (err) {
+        failCount++;
+        if (card) card.classList.remove('removing');
+      }
+    }
+
+    var doneMsgs = { approved: 'approved', bookmarked: 'saved', skipped: 'skipped' };
+    var colors = { approved: '#059669', bookmarked: '#2563EB', skipped: '#6B7280' };
+    
+    showToast(`Successfully ${doneMsgs[action]} ${successCount} job(s).` + (failCount > 0 ? ` Failed: ${failCount}` : ''), colors[action] || '#374151');
+    updateBadges();
+  }
 
   // ── Job action ──────────────────────────────────────────────
   async function doAction(jobId, action) {
