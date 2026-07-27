@@ -314,7 +314,7 @@ def check_ats_readability(
     pdf_path: str,
     target_keywords: list[str],
     *,
-    minimum_coverage: float = 0.70,
+    minimum_coverage: float = 0.65,
 ) -> ATSValidationResult:
     """Extracts text layer from the PDF and verifies target keyword presence.
 

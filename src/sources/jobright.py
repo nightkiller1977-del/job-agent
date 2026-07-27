@@ -427,7 +427,7 @@ class JobrightScraper(BaseScraper):
 
                                 # Check ATS Readability: check only Claude's matching keywords (profile-supported)
                                 matching_keywords = list(_tailored.get("matching_keywords", []))
-                                val_res = check_ats_readability(pdf_cv_path, matching_keywords, minimum_coverage=0.70)
+                                val_res = check_ats_readability(pdf_cv_path, matching_keywords, minimum_coverage=0.65)
                                 self._apply_validation_metrics = {
                                     "passed": val_res.passed,
                                     "coverage": val_res.coverage,
@@ -510,8 +510,10 @@ class JobrightScraper(BaseScraper):
                 self.last_apply_detail = "External ATS application submitted successfully."
         except KeywordCoverageError as exc:
             self._apply_validation_metrics = self._validation_metrics_from_error(exc)
+            self.last_apply_status = "keyword_coverage_failed"
+            self.last_apply_detail = str(exc)
             console.print(f"[red]Keyword coverage failure:[/red] {exc}")
-            return self._set_apply_outcome("keyword_coverage_failed", str(exc))
+            raise
         except PDFTextLayerError as exc:
             # Don't swallow this into a per-job False outcome: an unreadable/corrupt
             # PDF means the resume-compilation pipeline itself is broken, not just

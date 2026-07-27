@@ -192,8 +192,8 @@ class USAJobsScraper(BaseScraper):
                 elif not (sys.stdin and sys.stdin.isatty()):
                     pass  # non-interactive — will fall through to AuthFailedError check below
                 else:
-                    console.print("[cyan]USAJobs:[/cyan] 2FA required — complete it in the browser window (waiting up to 90s)…")
-                    for _ in range(45):
+                    console.print("[cyan]USAJobs:[/cyan] 2FA required — complete it in the browser window (waiting up to 300s)…")
+                    for _ in range(150):
                         await asyncio.sleep(2)
                         if "login.gov" not in page.url:
                             break
