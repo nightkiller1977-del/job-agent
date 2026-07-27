@@ -1,6 +1,5 @@
 import asyncio
 import json
-import sys
 import os
 from datetime import datetime
 from rich.console import Console
@@ -15,7 +14,7 @@ class JobSpyScraper(BaseScraper):
         search = self.config.get("search_settings", {})
         keywords = search.get("keywords", "")
         location = search.get("location", "Remote")
-        
+
         if not keywords:
             console.print("[yellow]JobSpy: No keywords configured. Skipping.[/yellow]")
             return []
@@ -63,7 +62,7 @@ class JobSpyScraper(BaseScraper):
             url = item.get("url", "")
             if not url:
                 continue
-            
+
             # Map site name to standardized source names
             site = item.get("site", "google")
             if site == "zip_recruiter":

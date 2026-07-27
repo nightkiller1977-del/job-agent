@@ -22,7 +22,7 @@ def main():
             results_wanted=args.limit,
             hours_old=72, # last 3 days
         )
-        
+
         results = []
         if not jobs_df.empty:
             # fill nan with empty string
