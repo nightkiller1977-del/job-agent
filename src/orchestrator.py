@@ -21,6 +21,7 @@ from .sources.jobright import JobrightScraper
 from .sources.linkedin import LinkedInScraper
 from .sources.usajobs import USAJobsScraper
 from .sources.indeed import IndeedScraper
+from .sources.jobspy_scraper import JobSpyScraper
 
 import logging
 
@@ -41,13 +42,17 @@ SOURCE_MAP = {
     "usajobs": USAJobsScraper,
     "indeed":   IndeedScraper,
     "external": JobrightScraper,   # legacy fallback for manually-pasted non-source URLs
+    "jobspy":   JobSpyScraper,
+    "glassdoor": JobrightScraper,  # routes external apply
+    "ziprecruiter": JobrightScraper,
+    "google":   JobrightScraper,
 }
 
 # Sources fanned out by default discovery (no --source given). Deliberately
 # excludes "external", which resolves to JobrightScraper and is only meant for
 # explicitly hydrating manually-pasted non-source URLs — including it here would
 # scrape Jobright twice per run.
-DEFAULT_DISCOVERY_SOURCES = ["jobright", "linkedin", "usajobs", "indeed"]
+DEFAULT_DISCOVERY_SOURCES = ["jobright", "linkedin", "usajobs", "indeed", "jobspy"]
 
 # Path to the file written by the Claude-in-Chrome MCP scraper
 MCP_SCRAPED_FILE = Path(__file__).parent.parent / "state" / "mcp_scraped.json"
@@ -845,8 +850,25 @@ class Orchestrator:
                 outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
                 await self._push_status_to_cloud(job["job_id"], "expired")
             except ATSReadabilityError as exc:
+                if isinstance(exc, KeywordCoverageError):
+                    reason = f"Keyword coverage ({exc.result.coverage*100:.1f}%) is below 65% threshold. Doesn't meet criteria."
+                    self.state.set_status(job["job_id"], "skipped")
+                    self.state.update_score(job["job_id"], job.get("score", 0), reason, job.get("flags", ""))
+                    self.state.record_apply_attempt(
+                        job["job_id"],
+                        "skipped",
+                        reason[:400],
+                        metadata=self._apply_validation_metadata(scraper, exc),
+                    )
+                    await self._push_status_to_cloud(job["job_id"], "skipped")
+                    await self._push_apply_attempt_to_cloud(job["job_id"])
+                    console.print(f"[red]Job marked as skipped because keyword coverage is below 65% (Doesn't meet criteria):[/red] {job.get('title')}")
+                    skipped_count += 1
+                    outcomes.append({"job": job, "status": "skipped", "reason": reason})
+                    continue
+
                 _is_unreadable = isinstance(exc, PDFTextLayerError) or "no extractable text layer" in str(exc).lower() or "failed to parse" in str(exc).lower()
-                status = "keyword_coverage_failed" if isinstance(exc, KeywordCoverageError) else "pdf_text_layer_failed" if isinstance(exc, PDFTextLayerError) else "ats_failure"
+                status = "pdf_text_layer_failed" if isinstance(exc, PDFTextLayerError) else "ats_failure"
                 console.print(f"[red]ATS Readability Failure for {job.get('title')} ({status}):[/red] {exc}")
                 self.state.record_apply_attempt(
                     job["job_id"],
@@ -862,8 +884,8 @@ class Orchestrator:
                     # Unreadable PDF (image-only or corrupt) — pause the whole loop; self-healing required.
                     console.print("[bold yellow]Pausing application loop: PDF is unreadable. Self-healing/repair required.[/bold yellow]")
                     break
-                # Keyword mismatch — skip this job only; continue applying to others.
-                console.print("[yellow]Skipping this job due to keyword ATS failure; continuing with remaining jobs.[/yellow]")
+                # General ATS mismatch — skip this job only; continue applying to others.
+                console.print("[yellow]Skipping this job due to ATS failure; continuing with remaining jobs.[/yellow]")
                 continue
             except Exception as exc:
                 console.print(f"[red]Apply error for {job.get('title')}:[/red] {exc}")

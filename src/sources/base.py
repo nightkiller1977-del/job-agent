@@ -267,8 +267,9 @@ class BaseScraper(ABC):
         pages = self._context.pages
         self._page = pages[0] if pages else await self._context.new_page()
         try:
-            from playwright_stealth import stealth_async
-            await stealth_async(self._page)
+            from playwright_stealth import Stealth
+            stealth = Stealth()
+            await stealth.apply_stealth_async(self._page)
         except ImportError:
             _log.warning(
                 "playwright-stealth not installed — bot-detection mitigation is OFF. "

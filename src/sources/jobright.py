@@ -409,7 +409,7 @@ class JobrightScraper(BaseScraper):
 
                                 # Check ATS Readability: check only Claude's matching keywords (profile-supported)
                                 matching_keywords = list(_tailored.get("matching_keywords", []))
-                                val_res = check_ats_readability(pdf_cv_path, matching_keywords, minimum_coverage=0.70)
+                                val_res = check_ats_readability(pdf_cv_path, matching_keywords, minimum_coverage=0.65)
                                 self._apply_validation_metrics = {
                                     "passed": val_res.passed,
                                     "coverage": val_res.coverage,
