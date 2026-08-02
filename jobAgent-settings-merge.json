@@ -4,6 +4,12 @@
       "enabled": true,
       "maxSteps": 8,
       "stepTimeoutMs": 15000,
+      "postActionDelayMs": 1500,
+      "skillReplayDelayMs": 1000,
+      "maxInputElements": 20,
+      "maxFileInputElements": 10,
+      "maxButtonElements": 15,
+      "bodyTextSnippetLen": 800,
       "loopDetection": {
         "enabled": true,
         "maxRepeatedStates": 3,
@@ -15,7 +21,10 @@
         "trackDomChanges": true,
         "trackSelectorUsage": true,
         "trackActionSequence": true,
-        "minProgressThreshold": 0.3
+        "minProgressThreshold": 0.3,
+        "recentActionWindow": 5,
+        "topSelectorsCount": 3,
+        "stateChangeTargetRatio": 0.7
       },
       "successIndicators": [
         "thank you",

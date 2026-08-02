@@ -18,7 +18,6 @@ import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 
 _log = logging.getLogger(__name__)
 
@@ -71,11 +70,17 @@ class ProgressTracker:
         max_repeated_actions: int = 2,
         state_hash_window: int = 5,
         min_progress_threshold: float = 0.3,
+        recent_action_window: int = 5,
+        top_selectors_count: int = 3,
+        state_change_target_ratio: float = 0.7,
     ):
         self.max_repeated_states = max_repeated_states
         self.max_repeated_actions = max_repeated_actions
         self.state_hash_window = state_hash_window
         self.min_progress_threshold = min_progress_threshold
+        self.recent_action_window = recent_action_window
+        self.top_selectors_count = top_selectors_count
+        self.state_change_target_ratio = state_change_target_ratio
 
         self.dom_states: list[DomState] = []
         self.action_history: list[ActionRecord] = []
@@ -140,7 +145,7 @@ class ProgressTracker:
         # Check for repeated DOM states
         repeated_states = self._count_repeated_dom_states()
 
-        # Check for repeated action sequences
+        # Check for repeated action sequences (same action+selector pair)
         repeated_actions = self._count_repeated_actions()
 
         # Check for selector repetition (trying the same field multiple times)
@@ -166,7 +171,7 @@ class ProgressTracker:
 
         elif repeated_actions >= self.max_repeated_actions:
             is_looping = True
-            reason = f"action sequence repeated {repeated_actions} times"
+            reason = f"action+selector pair repeated {repeated_actions} times consecutively"
             confidence = min(0.90, 0.5 + (repeated_actions * 0.2))
 
         elif high_repetition_selectors:
@@ -204,7 +209,7 @@ class ProgressTracker:
         state_changes = self._count_state_changes(recent_states)
 
         # Identify most-used selectors
-        top_selectors = sorted(self.selector_usage.items(), key=lambda x: x[1], reverse=True)[:3]
+        top_selectors = sorted(self.selector_usage.items(), key=lambda x: x[1], reverse=True)[:self.top_selectors_count]
 
         return {
             "total_steps": total_steps,
@@ -219,53 +224,46 @@ class ProgressTracker:
                     "action": a.action,
                     "success": a.success,
                 }
-                for a in self.action_history[-5:]
+                for a in self.action_history[-self.recent_action_window:]
             ],
         }
 
     def _count_repeated_dom_states(self) -> int:
-        """Count consecutive repeated DOM states."""
+        """Count how many times the latest DOM state hash appears in the recent window."""
         if len(self.dom_states) < 2:
             return 0
 
-        # Look at the last state_hash_window states
         recent = self.dom_states[-self.state_hash_window :]
-        if not recent:
-            return 0
-
         latest_hash = recent[-1].body_text_hash
-        count = sum(1 for state in recent if state.body_text_hash == latest_hash)
-        return count
+        return sum(1 for state in recent if state.body_text_hash == latest_hash)
 
     def _count_repeated_actions(self) -> int:
-        """Count consecutive repeated action sequences."""
+        """
+        Count the longest consecutive run of identical (action, selector) pairs.
+        Using pairs instead of action type alone avoids false positives on forms
+        that legitimately require multiple fill/click actions on different fields.
+        """
         if len(self.action_history) < 2:
             return 0
 
-        # Look for patterns in recent actions: [X, X] or [X, Y, X, Y]
-        recent = self.action_history[-5:]
-        if not recent:
-            return 0
-
-        # Count same action type in sequence
-        action_sequence = [a.action for a in recent]
+        recent = self.action_history[-self.recent_action_window:]
+        action_pairs = [(a.action, a.selector) for a in recent]
         max_consecutive = 1
+        current_run = 1
 
-        for i in range(len(action_sequence) - 1):
-            if action_sequence[i] == action_sequence[i + 1]:
-                consecutive = 1
-                j = i
-                while j < len(action_sequence) - 1 and action_sequence[j] == action_sequence[j + 1]:
-                    consecutive += 1
-                    j += 1
-                max_consecutive = max(max_consecutive, consecutive)
+        for i in range(1, len(action_pairs)):
+            if action_pairs[i] == action_pairs[i - 1]:
+                current_run += 1
+                max_consecutive = max(max_consecutive, current_run)
+            else:
+                current_run = 1
 
         return max_consecutive
 
     def _calculate_progress_score(self) -> float:
         """
         Calculate overall progress score (0.0 to 1.0).
-        Considers: state changes, successful actions, form field completion.
+        Considers: state changes, successful actions, form field activity.
         """
         if not self.dom_states or not self.action_history:
             return 0.5
@@ -273,19 +271,21 @@ class ProgressTracker:
         # State change contribution (40%)
         state_changes = self._count_state_changes(self.dom_states)
         max_states = len(self.dom_states)
-        state_progress = min(1.0, state_changes / max(1, max_states * 0.7))
+        state_progress = min(1.0, state_changes / max(1, max_states * self.state_change_target_ratio))
 
         # Action success contribution (40%)
         successful = sum(1 for a in self.action_history if a.success)
         total = len(self.action_history)
         success_rate = successful / max(1, total)
 
-        # Form field progression (20%)
+        # Form field activity (20%) — any change in field count indicates progress.
+        # Multi-step forms frequently reduce visible fields after completing a section,
+        # so we use absolute change rather than requiring monotonic increase.
         if len(self.dom_states) >= 2:
             first_state = self.dom_states[0]
             last_state = self.dom_states[-1]
-            field_change = last_state.form_fields_count - first_state.form_fields_count
-            field_progress = min(1.0, max(0, field_change / max(1, first_state.form_fields_count)))
+            field_delta = abs(last_state.form_fields_count - first_state.form_fields_count)
+            field_progress = min(1.0, field_delta / max(1, first_state.form_fields_count))
         else:
             field_progress = 0.5
 

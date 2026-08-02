@@ -30,7 +30,8 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
     """Fallback LLM browser agent with integrated loop detection and progress tracking."""
 
     name = "browser_use_recovery_refactored"
-    SKILLS_FILE = Path("state/browseruse_skills.json")
+    # Path is resolved relative to the project root (4 levels up from this file).
+    SKILLS_FILE = Path(__file__).parent.parent.parent.parent / "state" / "browseruse_skills.json"
 
     def __init__(self):
         self.skills_dir = self.SKILLS_FILE.parent
@@ -48,11 +49,15 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
         domain = urllib.parse.urlparse(ctx.url).netloc.lower()
 
         # Initialize progress tracker with config
+        pm = self.browser_config.progress_metrics
         progress_tracker = ProgressTracker(
             max_repeated_states=self.browser_config.loop_detection.max_repeated_states,
             max_repeated_actions=self.browser_config.loop_detection.max_repeated_actions,
             state_hash_window=self.browser_config.loop_detection.state_hash_window,
-            min_progress_threshold=self.browser_config.progress_metrics.min_progress_threshold,
+            min_progress_threshold=pm.min_progress_threshold,
+            recent_action_window=pm.recent_action_window,
+            top_selectors_count=pm.top_selectors_count,
+            state_change_target_ratio=pm.state_change_target_ratio,
         )
 
         # 1. Attempt to replay existing domain skills if recorded
@@ -100,10 +105,8 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 logger.info("Success screen detected in visible body text.")
                 if steps_recorded:
                     self._save_skills(domain, steps_recorded)
-                # Record final state
-                self.config.telemetry.track_step_efficiency and logger.info(
-                    f"Loop completed successfully in {step} steps"
-                )
+                if self.config.telemetry.track_step_efficiency:
+                    logger.info(f"Loop completed successfully in {step} steps")
                 return AtsApplyResult.ok(detail="Application submitted successfully.")
 
             # Check for loops BEFORE exceeding max_steps
@@ -114,9 +117,10 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                         f"Loop detected at step {step}: {loop_result.reason} "
                         f"(confidence={loop_result.confidence:.2f})"
                     )
-                    self.config.telemetry.track_loop_events and logger.warning(
-                        f"loop_detected domain={domain} step={step} reason={loop_result.reason}"
-                    )
+                    if self.config.telemetry.track_loop_events:
+                        logger.warning(
+                            f"loop_detected domain={domain} step={step} reason={loop_result.reason}"
+                        )
                     return AtsApplyResult.blocked(
                         status="form_not_reached",
                         detail=f"Loop detected: {loop_result.reason}. Agent not making progress toward submission."
@@ -126,7 +130,7 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
             state_desc = {
                 "url": ctx.page.url,
                 "title": title,
-                "text_snippet": body_text[:800],
+                "text_snippet": body_text[:self.browser_config.body_text_snippet_len],
                 "interactive_elements": elements
             }
 
@@ -183,7 +187,7 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                     "selector": selector,
                     "value": val
                 })
-                await asyncio.sleep(1.5)  # Brief pause for DOM updates
+                await asyncio.sleep(self.browser_config.post_action_delay_ms / 1000)
             else:
                 logger.warning(f"Failed to execute action {action} on selector {selector}.")
 
@@ -192,10 +196,11 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
             f"Browser Use recovery loop exceeded step limit {self.browser_config.max_steps} "
             f"without reaching submission"
         )
-        self.config.telemetry.track_loop_events and logger.error(
-            f"loop_max_steps_exceeded domain={domain} max_steps={self.browser_config.max_steps} "
-            f"progress={progress_tracker.last_progress_score:.2f}"
-        )
+        if self.config.telemetry.track_loop_events:
+            logger.error(
+                f"loop_max_steps_exceeded domain={domain} max_steps={self.browser_config.max_steps} "
+                f"progress={progress_tracker.last_progress_score:.2f}"
+            )
 
         # Log summary for debugging
         summary = progress_tracker.get_summary()
@@ -264,7 +269,8 @@ Respond ONLY with valid JSON matching this structure:
 
         # Add progress visualization
         if recent_actions:
-            prompt_parts.append("Recent Actions (last 5 steps):")
+            window = self.browser_config.progress_metrics.recent_action_window
+            prompt_parts.append(f"Recent Actions (last {window} steps):")
             for action in recent_actions:
                 status = "✓" if action["success"] else "✗"
                 prompt_parts.append(f"  {status} Step {action['step']}: {action['action']}")
@@ -291,7 +297,7 @@ Respond ONLY with valid JSON matching this structure:
         return "\n".join(prompt_parts)
 
     def _clean_json_response(self, text: str) -> dict:
-        """Parse JSON response from LLM."""
+        """Parse JSON response from LLM. Raises json.JSONDecodeError on malformed output."""
         text_clean = text.strip()
         if text_clean.startswith("```json"):
             text_clean = text_clean[7:]
@@ -307,7 +313,7 @@ Respond ONLY with valid JSON matching this structure:
         try:
             # Inputs
             inputs = await page.query_selector_all('input:not([type="hidden"]):not([type="submit"]):not([type="file"])')
-            for el in inputs[:20]:
+            for el in inputs[:self.browser_config.max_input_elements]:
                 name = await el.get_attribute("name") or ""
                 id_val = await el.get_attribute("id") or ""
                 placeholder = await el.get_attribute("placeholder") or ""
@@ -332,7 +338,7 @@ Respond ONLY with valid JSON matching this structure:
 
             # File inputs
             file_inputs = await page.query_selector_all('input[type="file"]')
-            for el in file_inputs:
+            for el in file_inputs[:self.browser_config.max_file_input_elements]:
                 name = await el.get_attribute("name") or ""
                 id_val = await el.get_attribute("id") or ""
                 selector = "input[type='file']"
@@ -366,7 +372,7 @@ Respond ONLY with valid JSON matching this structure:
 
             # Buttons
             buttons = await page.query_selector_all('button, input[type="submit"], [role="button"]')
-            for el in buttons[:15]:
+            for el in buttons[:self.browser_config.max_button_elements]:
                 text = (await el.inner_text() or "").strip()
                 type_val = await el.get_attribute("type") or ""
                 id_val = await el.get_attribute("id") or ""
@@ -417,6 +423,9 @@ Respond ONLY with valid JSON matching this structure:
 
     async def _replay_skills(self, page: Page, skills: List[Dict[str, Any]], resume_path: Optional[str]) -> bool:
         """Replay recorded domain skills."""
+        delay_s = self.browser_config.skill_replay_delay_ms / 1000
+        timeout_ms = self.browser_config.step_timeout_ms
+
         for idx, step in enumerate(skills):
             action = step.get("action")
             selector = step.get("selector")
@@ -424,11 +433,11 @@ Respond ONLY with valid JSON matching this structure:
             logger.info(f"Replaying skill step {idx + 1}: {action} on {selector}")
 
             try:
-                await page.wait_for_selector(selector, timeout=8000)
+                await page.wait_for_selector(selector, timeout=timeout_ms)
                 success = await self._execute_action(page, action, selector, val, resume_path)
                 if not success:
                     return False
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(delay_s)
             except Exception as e:
                 logger.error(f"Skill replay failed at step {idx + 1}: {e}")
                 return False

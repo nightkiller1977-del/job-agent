@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,9 @@ class ProgressMetricsConfig:
     track_selector_usage: bool = True
     track_action_sequence: bool = True
     min_progress_threshold: float = 0.3
+    recent_action_window: int = 5
+    top_selectors_count: int = 3
+    state_change_target_ratio: float = 0.7
 
 
 @dataclass
@@ -45,6 +49,12 @@ class BrowserRecoveryConfig:
     enabled: bool = True
     max_steps: int = 8
     step_timeout_ms: int = 15_000
+    post_action_delay_ms: int = 1_500
+    skill_replay_delay_ms: int = 1_000
+    max_input_elements: int = 20
+    max_file_input_elements: int = 10
+    max_button_elements: int = 15
+    body_text_snippet_len: int = 800
     loop_detection: LoopDetectionConfig = None
     progress_metrics: ProgressMetricsConfig = None
     success_indicators: list[str] = None
@@ -104,6 +114,31 @@ class JobAgentConfig:
             self.telemetry = TelemetryConfig()
 
 
+# Ordered longest-first so partial prefix matches don't shadow longer ones.
+_ENV_SECTION_REGISTRY: list[list[str]] = [
+    ["browser_recovery", "loop_detection"],
+    ["browser_recovery", "progress_metrics"],
+    ["browser_recovery"],
+    ["llm_prompting"],
+    ["telemetry"],
+]
+
+
+def _camel_to_snake(name: str) -> str:
+    """Convert camelCase or PascalCase key to snake_case."""
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+
+
+def _normalize_keys(obj: object) -> object:
+    """Recursively convert all dict keys from camelCase to snake_case."""
+    if isinstance(obj, dict):
+        return {_camel_to_snake(k): _normalize_keys(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_keys(item) for item in obj]
+    return obj
+
+
 class ConfigLoader:
     """Loads job-agent configuration from centralized sources."""
 
@@ -149,7 +184,8 @@ class ConfigLoader:
             with open(config_path) as f:
                 file_config = json.load(f)
             if "jobAgent" in file_config:
-                return self._deep_merge(base, {"jobAgent": file_config["jobAgent"]})
+                overlay = _normalize_keys({"jobAgent": file_config["jobAgent"]})
+                return self._deep_merge(base, overlay)
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(f"Failed to load config.json: {e}")
@@ -172,7 +208,8 @@ class ConfigLoader:
             with open(settings_path) as f:
                 settings = json.load(f)
             if "jobAgent" in settings:
-                return self._deep_merge(base, {"jobAgent": settings["jobAgent"]})
+                overlay = _normalize_keys({"jobAgent": settings["jobAgent"]})
+                return self._deep_merge(base, overlay)
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(
@@ -184,6 +221,8 @@ class ConfigLoader:
         """
         Apply environment variable overrides.
         Format: JOBAGENT_<SECTION>_<KEY>=value
+        Supported sections: browser_recovery, browser_recovery_loop_detection,
+        browser_recovery_progress_metrics, llm_prompting, telemetry.
         Example: JOBAGENT_BROWSER_RECOVERY_MAX_STEPS=12
         """
         job_agent_config = base.get("jobAgent", {})
@@ -192,24 +231,36 @@ class ConfigLoader:
             if not key.startswith("JOBAGENT_"):
                 continue
 
-            # Parse JOBAGENT_SECTION_KEY -> path in config
-            parts = key[9:].lower().split("_")  # strip 'JOBAGENT_', lowercase
-            if len(parts) < 2:
+            raw = key[9:].lower()  # strip JOBAGENT_ prefix
+            parsed = self._parse_env_key(raw)
+            if parsed is None:
                 continue
 
-            # Navigate the config dict and set the value
+            section_path, final_key = parsed
             current = job_agent_config
-            for part in parts[:-1]:
+            for part in section_path:
                 if part not in current:
                     current[part] = {}
                 current = current[part]
 
-            # Try to coerce the value to the right type
-            final_key = parts[-1]
             current[final_key] = self._coerce_env_value(value)
 
         base["jobAgent"] = job_agent_config
         return base
+
+    @staticmethod
+    def _parse_env_key(raw: str) -> tuple[list[str], str] | None:
+        """
+        Match the lower-cased post-JOBAGENT_ portion against known section prefixes.
+        Returns (section_path, final_key) or None if no section matches.
+        """
+        for section_path in _ENV_SECTION_REGISTRY:
+            prefix = "_".join(section_path) + "_"
+            if raw.startswith(prefix):
+                final_key = raw[len(prefix):]
+                if final_key:
+                    return section_path, final_key
+        return None
 
     def _coerce_env_value(self, value: str) -> bool | int | float | str:
         """Coerce an environment variable string to the appropriate type."""
@@ -226,28 +277,44 @@ class ConfigLoader:
 
     @staticmethod
     def _deep_merge(base: dict, overlay: dict) -> dict:
-        """Recursively merge overlay into base, preserving base values."""
+        """Recursively merge overlay into base. Overlay values win on conflict."""
         result = base.copy()
         for key, value in overlay.items():
             if key in result and isinstance(result[key], dict) and isinstance(value, dict):
                 result[key] = ConfigLoader._deep_merge(result[key], value)
-            elif key not in result:
+            else:
                 result[key] = value
         return result
 
     @staticmethod
     def _dict_to_config(d: dict) -> JobAgentConfig:
-        """Convert a dict to typed JobAgentConfig."""
+        """Convert a merged dict to a typed JobAgentConfig."""
         job_agent_dict = d.get("jobAgent", {})
 
+        # Browser recovery — convert nested sub-config dicts to dataclass instances
+        br_dict = dict(job_agent_dict.get("browser_recovery", {}))
+        if isinstance(br_dict.get("loop_detection"), dict):
+            br_dict["loop_detection"] = LoopDetectionConfig(
+                **{k: v for k, v in br_dict["loop_detection"].items()
+                   if k in LoopDetectionConfig.__dataclass_fields__}
+            )
+        if isinstance(br_dict.get("progress_metrics"), dict):
+            br_dict["progress_metrics"] = ProgressMetricsConfig(
+                **{k: v for k, v in br_dict["progress_metrics"].items()
+                   if k in ProgressMetricsConfig.__dataclass_fields__}
+            )
         browser_recovery = BrowserRecoveryConfig(
-            **{k: v for k, v in job_agent_dict.get("browser_recovery", {}).items()}
+            **{k: v for k, v in br_dict.items()
+               if k in BrowserRecoveryConfig.__dataclass_fields__}
         )
+
         llm_prompting = LLMPromptingConfig(
-            **{k: v for k, v in job_agent_dict.get("llm_prompting", {}).items()}
+            **{k: v for k, v in job_agent_dict.get("llm_prompting", {}).items()
+               if k in LLMPromptingConfig.__dataclass_fields__}
         )
         telemetry = TelemetryConfig(
-            **{k: v for k, v in job_agent_dict.get("telemetry", {}).items()}
+            **{k: v for k, v in job_agent_dict.get("telemetry", {}).items()
+               if k in TelemetryConfig.__dataclass_fields__}
         )
 
         return JobAgentConfig(
