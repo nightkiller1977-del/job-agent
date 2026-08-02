@@ -84,7 +84,8 @@ class ProgressTracker:
 
         self.dom_states: list[DomState] = []
         self.action_history: list[ActionRecord] = []
-        self.selector_usage: dict[str, int] = {}
+        self.selector_usage: dict[str, int] = {}           # raw selector hit counts (for context report)
+        self._selector_value_usage: dict[str, int] = {}    # (selector+value) counts (for loop detection)
         self.last_progress_score: float = 0.5
 
     def record_state(
@@ -120,9 +121,13 @@ class ProgressTracker:
         )
         self.action_history.append(record)
 
-        # Track selector usage
+        # Track raw selector usage (for context report / most-used display)
         if selector:
             self.selector_usage[selector] = self.selector_usage.get(selector, 0) + 1
+            # Track (selector, value) pairs separately for loop detection — a correction
+            # that reuses the same selector with a different value must not be flagged.
+            sv_key = f"{selector}||{value or ''}"
+            self._selector_value_usage[sv_key] = self._selector_value_usage.get(sv_key, 0) + 1
 
         _log.debug(
             f"Action recorded: step={step} action={action} selector={selector} success={success}"
@@ -148,10 +153,12 @@ class ProgressTracker:
         # Check for repeated action sequences (same action+selector pair)
         repeated_actions = self._count_repeated_actions()
 
-        # Check for selector repetition (trying the same field multiple times)
+        # Check for selector+value repetition (same field filled with same value).
+        # Raw selector reuse is intentional when the value changes (e.g. validation retry).
+        # Display the selector only (strip the value suffix) for readability.
         high_repetition_selectors = {
-            sel: count
-            for sel, count in self.selector_usage.items()
+            sv_key.split("||")[0]: count
+            for sv_key, count in self._selector_value_usage.items()
             if count >= self.max_repeated_actions
         }
 
@@ -247,12 +254,14 @@ class ProgressTracker:
             return 0
 
         recent = self.action_history[-self.recent_action_window:]
-        action_pairs = [(a.action, a.selector) for a in recent]
+        # Include value so that filling the same field with a different value
+        # (e.g. correcting a validation error) is not flagged as a loop.
+        action_tuples = [(a.action, a.selector, a.value or "") for a in recent]
         max_consecutive = 1
         current_run = 1
 
-        for i in range(1, len(action_pairs)):
-            if action_pairs[i] == action_pairs[i - 1]:
+        for i in range(1, len(action_tuples)):
+            if action_tuples[i] == action_tuples[i - 1]:
                 current_run += 1
                 max_consecutive = max(max_consecutive, current_run)
             else:

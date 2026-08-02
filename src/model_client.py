@@ -357,15 +357,18 @@ class ModelClient:
         system: str = "",
         task_type: str = "general",
         max_tokens: int = ANTHROPIC_MAX_TOKENS,
+        temperature: float | None = None,
     ) -> str:
-        """Return the model response text.  Cascade: Ollama → Claude → OpenAI."""
+        """Return the model response text.  Cascade: Ollama → Claude → OpenAI.
 
+        Pass temperature to override the default (0.2) for all backends.
+        """
         # Tier 1: Ollama with resource-aware model selection
         ollama_model = await self._pick_ollama_model(task_type)
         if ollama_model:
             try:
                 with _model_span("ollama", ollama_model):
-                    text = await self._call_ollama(ollama_model, messages, system, max_tokens)
+                    text = await self._call_ollama(ollama_model, messages, system, max_tokens, temperature=temperature)
                 if text and text.strip():
                     _log.info("ModelClient: Ollama model=%s task=%s", ollama_model, task_type)
                     return text
@@ -379,7 +382,7 @@ class ModelClient:
         if self._api_key:
             try:
                 with _model_span("anthropic", self._anthropic_model):
-                    text = await self._call_claude(messages, system, max_tokens)
+                    text = await self._call_claude(messages, system, max_tokens, temperature=temperature)
                 if text and text.strip():
                     _log.info("ModelClient: Claude model=%s task=%s", self._anthropic_model, task_type)
                     return text
@@ -395,7 +398,7 @@ class ModelClient:
         if openai_key:
             try:
                 with _model_span("openai", OPENAI_MODEL):
-                    text = await self._call_openai(messages, system, max_tokens)
+                    text = await self._call_openai(messages, system, max_tokens, temperature=temperature)
                 _log.info("ModelClient: OpenAI model=%s task=%s", OPENAI_MODEL, task_type)
                 return text
             except Exception as exc:
@@ -511,6 +514,7 @@ class ModelClient:
         messages: list[dict],
         system: str,
         max_tokens: int,
+        temperature: float | None = None,
     ) -> str:
         sem_key = self.ollama_base_url
 
@@ -538,7 +542,7 @@ class ModelClient:
             payload: dict[str, Any] = {
                 "model": model,
                 "messages": full_messages,
-                "options": {"temperature": 0.2, "num_ctx": num_ctx},
+                "options": {"temperature": temperature if temperature is not None else 0.2, "num_ctx": num_ctx},
                 "keep_alive": "10m",
                 "stream": False,
             }
@@ -568,16 +572,19 @@ class ModelClient:
     # Claude (Anthropic)
     # ------------------------------------------------------------------
 
-    async def _call_claude(self, messages: list[dict], system: str, max_tokens: int) -> str:
+    async def _call_claude(self, messages: list[dict], system: str, max_tokens: int, temperature: float | None = None) -> str:
         import anthropic as _anthropic
         client = _anthropic.Anthropic(api_key=self._api_key)
         non_system = [m for m in messages if m.get("role") != "system"]
-        response = client.messages.create(
+        kwargs: dict = dict(
             model=self._anthropic_model,
             max_tokens=max_tokens,
             system=system or "You are a helpful assistant.",
             messages=non_system,
         )
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        response = client.messages.create(**kwargs)
         for block in response.content:
             if block.type == "text":
                 return block.text
@@ -587,7 +594,7 @@ class ModelClient:
     # OpenAI
     # ------------------------------------------------------------------
 
-    async def _call_openai(self, messages: list[dict], system: str, max_tokens: int) -> str:
+    async def _call_openai(self, messages: list[dict], system: str, max_tokens: int, temperature: float | None = None) -> str:
         import openai as _openai
         openai_key = os.environ.get("OPENAI_API_KEY", "")
         client = _openai.OpenAI(api_key=openai_key)
@@ -598,6 +605,6 @@ class ModelClient:
             model=OPENAI_MODEL,
             messages=full_messages,
             max_tokens=max_tokens,
-            temperature=0.2,
+            temperature=temperature if temperature is not None else 0.2,
         )
         return response.choices[0].message.content or ""
