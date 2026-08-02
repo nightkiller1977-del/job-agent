@@ -1,0 +1,56 @@
+{
+  "jobAgent": {
+    "browserRecovery": {
+      "enabled": true,
+      "maxSteps": 8,
+      "stepTimeoutMs": 15000,
+      "loopDetection": {
+        "enabled": true,
+        "maxRepeatedStates": 3,
+        "maxRepeatedActions": 2,
+        "stateHashWindow": 5,
+        "progressCheckInterval": 2
+      },
+      "progressMetrics": {
+        "trackDomChanges": true,
+        "trackSelectorUsage": true,
+        "trackActionSequence": true,
+        "minProgressThreshold": 0.3
+      },
+      "successIndicators": [
+        "thank you",
+        "thanks",
+        "thank",
+        "received",
+        "submitted",
+        "success",
+        "application sent",
+        "application received",
+        "confirmation"
+      ],
+      "failureIndicators": [
+        "error",
+        "failed",
+        "cannot process",
+        "invalid input",
+        "required field",
+        "not supported",
+        "unsupported",
+        "connection failed"
+      ]
+    },
+    "llmPrompting": {
+      "modelTask": "reasoning",
+      "temperature": 0.3,
+      "contextMode": "detailed",
+      "progressVisualization": true,
+      "explicitLoopGuards": true
+    },
+    "telemetry": {
+      "trackLoopEvents": true,
+      "trackStepEfficiency": true,
+      "trackStateTransitions": true,
+      "minDomChangeThreshold": 100
+    }
+  }
+}
