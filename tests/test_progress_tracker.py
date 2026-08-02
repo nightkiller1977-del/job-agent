@@ -70,6 +70,15 @@ class TestLoopDetection:
         result = t.detect_loop()
         assert result.is_looping
 
+    def test_same_selector_different_value_does_not_loop(self):
+        """Correcting a validation error: same field, different value = not a loop."""
+        t = self._make_tracker(max_repeated_actions=2)
+        t.record_state("s1 invalid", "title", 3, 2, False)
+        t.record_action(1, "fill", "#email", "bad-email", False)
+        t.record_state("s2 error", "title", 3, 2, False)
+        t.record_action(2, "fill", "#email", "good@example.com", True)
+        assert not t.detect_loop().is_looping
+
     # -- selector repetition --
 
     def test_selector_used_multiple_times_triggers(self):

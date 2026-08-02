@@ -22,6 +22,7 @@ from src.agent_config import get_config
 from src.progress_tracker import ProgressTracker, LoopDetectionResult
 from .base import AtsAdapter
 from .context import AtsApplyContext, AtsApplyResult
+from .receipt import verify_receipt
 
 logger = logging.getLogger("job-agent.adapters.recovery_browseruse")
 
@@ -90,9 +91,9 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
             success = await self._replay_skills(ctx.page, skills, ctx.resume_path)
             if success:
                 logger.info(f"Domain skills replay succeeded for {domain}!")
-                body_text = await ctx.page.locator("body").inner_text()
-                if self._check_success_indicators(body_text):
-                    return AtsApplyResult.ok(detail="Application submitted via domain skills replay.")
+                verified, signal = await verify_receipt(ctx.page)
+                if verified:
+                    return AtsApplyResult.ok(detail=f"Application submitted via domain skills replay (receipt {signal}).")
                 return AtsApplyResult.blocked(
                     status="review_ready",
                     detail="Domain skills completed, form ready for review (not confirmed submitted).",
@@ -126,14 +127,17 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 has_submit=any(e["tag"] == "button" and "submit" in e.get("text", "").lower() for e in elements),
             )
 
-            # Check success indicators
-            if self._check_success_indicators(body_text):
-                logger.info("Success screen detected in visible body text.")
+            # Check for a verified receipt (URL-based or confirmation copy).
+            # verify_receipt() uses specific patterns that are resistant to false
+            # positives from form label text such as "Email confirmation".
+            verified, signal = await verify_receipt(ctx.page)
+            if verified:
+                logger.info(f"Receipt verified at step {step}: {signal}")
                 if steps_recorded:
                     self._save_skills(domain, steps_recorded)
                 if self.config.telemetry.track_step_efficiency:
                     logger.info(f"Loop completed successfully in {step} steps")
-                return AtsApplyResult.ok(detail="Application submitted successfully.")
+                return AtsApplyResult.ok(detail=f"Application submitted (receipt {signal}).")
 
             # Check for loops BEFORE exceeding max_steps
             if self.browser_config.loop_detection.enabled:
@@ -174,6 +178,7 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                     messages=messages,
                     system=system_prompt,
                     task_type=self.config.llm_prompting.model_task,
+                    temperature=self.config.llm_prompting.temperature,
                 )
                 action_data = self._clean_json_response(response)
                 logger.info(f"LLM Action decision: {json.dumps(action_data)}")
@@ -189,6 +194,9 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 logger.info("LLM declared form filling complete.")
                 if steps_recorded:
                     self._save_skills(domain, steps_recorded)
+                verified, signal = await verify_receipt(ctx.page)
+                if verified:
+                    return AtsApplyResult.ok(detail=f"Application submitted (receipt {signal}).")
                 return AtsApplyResult.blocked(
                     status="review_ready",
                     detail="Form filled by LLM agent, ready for manual review (not confirmed submitted).",
