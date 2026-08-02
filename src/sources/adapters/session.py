@@ -279,11 +279,11 @@ class ExternalApplySession(BaseScraper):
             # Recovery only on form-completion failure — NOT on 'submission_unverified'
             # (re-driving that risks a duplicate submit).
             if not res.submitted and res.status in ("submit_not_found", "form_not_reached", "blocked"):
-                from .recovery_browseruse import BrowserUseRecovery
+                from .recovery_browseruse_refactored import BrowserUseRecoveryRefactored
                 _event("recovery_triggered", AttemptPhase.FIELDS_FILLED, after=res.status)
                 console.print("[yellow]Triggering Browser Use self-healing recovery...[/yellow]")
                 recovery_res = self._enforce_authorization(
-                    await BrowserUseRecovery().apply(ctx), ctx, policy
+                    await BrowserUseRecoveryRefactored().apply(ctx), ctx, policy
                 )
                 if recovery_res.submitted:
                     res = recovery_res
