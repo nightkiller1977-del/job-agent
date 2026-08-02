@@ -184,7 +184,8 @@ class ConfigLoader:
             with open(config_path) as f:
                 file_config = json.load(f)
             if "jobAgent" in file_config:
-                overlay = _normalize_keys({"jobAgent": file_config["jobAgent"]})
+                # Normalize only the inner keys — the "jobAgent" namespace key itself stays.
+                overlay = {"jobAgent": _normalize_keys(file_config["jobAgent"])}
                 return self._deep_merge(base, overlay)
         except Exception as e:
             import logging
@@ -208,7 +209,7 @@ class ConfigLoader:
             with open(settings_path) as f:
                 settings = json.load(f)
             if "jobAgent" in settings:
-                overlay = _normalize_keys({"jobAgent": settings["jobAgent"]})
+                overlay = {"jobAgent": _normalize_keys(settings["jobAgent"])}
                 return self._deep_merge(base, overlay)
         except Exception as e:
             import logging

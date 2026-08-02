@@ -189,7 +189,7 @@ while step < config.browser_recovery.max_steps:  # From config!
 
 ### Minimal Setup
 
-Add this to `~/.config/ai-command-center/settings-v3.json`:
+Add this to `~/Library/Application Support/ai-command-center/settings-v3.json`:
 
 ```json
 {
