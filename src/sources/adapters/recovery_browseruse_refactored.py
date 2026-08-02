@@ -19,7 +19,7 @@ from playwright.async_api import Page
 
 from src.model_client import ModelClient
 from src.agent_config import get_config
-from src.progress_tracker import ProgressTracker, LoopDetectionResult
+from src.progress_tracker import ProgressTracker
 from .base import AtsAdapter
 from .context import AtsApplyContext, AtsApplyResult
 from .receipt import verify_receipt
