@@ -45,6 +45,29 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
         return 0.05
 
     async def apply(self, ctx: AtsApplyContext) -> AtsApplyResult:
+        # Honour the enabled flag — allow callers to disable recovery via config.
+        if not self.browser_config.enabled:
+            return AtsApplyResult.blocked(
+                status="form_not_reached",
+                detail="Browser Use recovery is disabled via configuration.",
+            )
+
+        # Policy gate: an LLM agent that can click submit MUST be authorized
+        # before it starts. No LLM path submits outside this check.
+        policy = getattr(ctx, "policy", None)
+        allow_submit = False
+        if policy is not None:
+            try:
+                allow_submit = bool(await policy.confirm_submit(ctx, {"via": "browser_use_recovery_refactored"}))
+            except Exception as e:
+                logger.warning(f"policy.confirm_submit raised, failing closed: {e}")
+        if not allow_submit:
+            logger.info("BrowserUse recovery withheld: submission not authorized by policy.")
+            return AtsApplyResult.blocked(
+                status="submit_denied_by_policy",
+                detail="BrowserUse recovery withheld: submission not authorized by policy.",
+            )
+
         logger.info(f"Initiating Browser Use recovery for job URL: {ctx.url}")
         domain = urllib.parse.urlparse(ctx.url).netloc.lower()
 
@@ -70,10 +93,9 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 body_text = await ctx.page.locator("body").inner_text()
                 if self._check_success_indicators(body_text):
                     return AtsApplyResult.ok(detail="Application submitted via domain skills replay.")
-                return AtsApplyResult(
-                    submitted=True,
+                return AtsApplyResult.blocked(
                     status="review_ready",
-                    detail="Domain skills completed, form ready for review."
+                    detail="Domain skills completed, form ready for review (not confirmed submitted).",
                 )
 
             logger.warning(f"Replay failed for {domain}, falling back to LLM agent loop.")
@@ -90,10 +112,14 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
             elements = await self._get_interactive_elements(ctx.page)
             body_text = await ctx.page.locator("body").inner_text()
             title = await ctx.page.title()
+            # Incorporate current input values into the snapshot so that
+            # filling a field (which doesn't change body text) still
+            # produces a new hash and is not classified as a repeated state.
+            page_snapshot = body_text + "|inputs:" + await self._get_input_values_snapshot(ctx.page)
 
             # Record state for progress tracking
             progress_tracker.record_state(
-                body_text=body_text,
+                body_text=page_snapshot,
                 title=title,
                 interactive_count=len(elements),
                 form_fields_count=sum(1 for e in elements if e["tag"] in ("input", "select", "file_input")),
@@ -163,7 +189,10 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 logger.info("LLM declared form filling complete.")
                 if steps_recorded:
                     self._save_skills(domain, steps_recorded)
-                return AtsApplyResult(submitted=True, status="review_ready", detail="Form filled, ready for manual review.")
+                return AtsApplyResult.blocked(
+                    status="review_ready",
+                    detail="Form filled by LLM agent, ready for manual review (not confirmed submitted).",
+                )
 
             elif action == "fail":
                 logger.warning(f"LLM declared failure: {action_data.get('explanation')}")
@@ -217,6 +246,28 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
         """Check if page contains success indicators from configuration."""
         lowered = body_text.lower()
         return any(indicator in lowered for indicator in self.browser_config.success_indicators)
+
+    async def _get_input_values_snapshot(self, page: Page) -> str:
+        """Return a string encoding current values of all visible form controls.
+        This is concatenated with body text before hashing so that filling a
+        field (which doesn't change visible body text) still produces a new
+        state hash and is not mis-classified as a repeated state.
+        """
+        try:
+            values = await page.evaluate(
+                """() => {
+                    const els = document.querySelectorAll(
+                        'input:not([type=hidden]):not([type=file]), textarea, select'
+                    );
+                    return Array.from(els)
+                        .map(el => (el.name || el.id || '') + ':' + (el.value || ''))
+                        .join('|');
+                }"""
+            )
+            return values or ""
+        except Exception as e:
+            logger.debug(f"Could not snapshot input values: {e}")
+            return ""
 
     def _build_system_prompt(self, progress_context: dict) -> str:
         """Build system prompt with progress guidance and loop warnings."""

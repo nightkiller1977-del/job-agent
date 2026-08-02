@@ -120,8 +120,8 @@ In the orchestrator's apply flow, use the refactored adapter:
 ```python
 # Example: In the apply method where adapters are selected
 if should_use_browser_recovery:
-    adapter = BrowserUseRecoveryRefactored(self.config)
-    result = await adapter.apply(job, ctx)
+    adapter = BrowserUseRecoveryRefactored()   # config loaded from get_config()
+    result = await adapter.apply(ctx)          # ctx is AtsApplyContext
 ```
 
 ### Step 2: Configuration in AI Commander
