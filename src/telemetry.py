@@ -45,6 +45,20 @@ def setup(agent: str = "job-agent", environment: str = "production") -> None:
 
 
 def _setup_loki_handler(agent: str, environment: str) -> None:
+    from urllib.parse import urlparse
+    import socket
+
+    # Quick TCP check to avoid spawning a Loki emitter thread when the server is offline
+    try:
+        parsed = urlparse(_LOKI_URL)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=0.5):
+            pass
+    except Exception:
+        print("[telemetry] Loki server offline — logging to console only")
+        return
+
     try:
         import logging_loki
         logging_loki.emitter.LokiEmitter.level_tag = "level"
