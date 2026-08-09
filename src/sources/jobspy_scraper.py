@@ -84,3 +84,8 @@ class JobSpyScraper(BaseScraper):
             })
 
         return jobs
+
+    async def apply(self, job: dict, auto_submit: bool = False) -> bool:
+        self.last_apply_status = "unsupported"
+        self.last_apply_detail = "JobSpy scraper does not support direct application."
+        return False
