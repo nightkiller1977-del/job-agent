@@ -198,14 +198,14 @@
       "title": "Land Browser Use AI recovery (P5)",
       "summary": "Wire the bounded LLM recovery fallback into the registry with submission gating; consider the real browser_use library.",
       "seededStatus": "partial",
-      "confidence": 0.7,
+      "confidence": 0.3,
       "dependsOn": [
         "ja.p3.adapter-registry-go-live"
       ],
       "evidence": [
         {
           "path": "src/sources/adapters/recovery_browseruse.py",
-          "note": "NOW WIRED: src/sources/adapters/session.py:282-286 imports BrowserUseRecoveryRefactored and applies it through the policy path. A refactored implementation with loop detection and progress tracking supersedes the module originally cited. The plan note \"not wired into default path\" is obsolete (verified 2026-08-13)."
+          "note": "Built + unit-tested, NOT wired into the default path. GUARD RAIL: session.py:282-286 does apply BrowserUseRecoveryRefactored, but that ExternalApplySession is reached only when USE_ADAPTER_REGISTRY is truthy, and jobright.py:283-290 documents that flag as default OFF (\"the proven path runs unless explicitly opted in\"). Wiring inside a feature-gated session is not wiring into the default path, so the original note stands and confidence stays at 0.3 (reviewed 2026-08-13)."
         }
       ],
       "jiraKey": "KAN-147"
