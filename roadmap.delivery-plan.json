@@ -23,9 +23,16 @@
         }
       ],
       "evidence": [
-        { "path": "src/blocker_classifier.py", "note": "P2 blocker classifier + circuit breaker" },
-        { "path": "ATS_ADAPTER_PLAN.md", "note": "P1-P3 marked done; baseline 528 discovered, ~11% success" }
-      ]
+        {
+          "path": "src/blocker_classifier.py",
+          "note": "P2 blocker classifier + circuit breaker"
+        },
+        {
+          "path": "ATS_ADAPTER_PLAN.md",
+          "note": "P1-P3 marked done; baseline 528 discovered, ~11% success"
+        }
+      ],
+      "jiraKey": "KAN-140"
     },
     {
       "id": "ja.p1.adapter-contract",
@@ -47,9 +54,16 @@
         }
       ],
       "evidence": [
-        { "path": "src/sources/adapters/base.py", "note": "abstract AtsAdapter contract" },
-        { "path": "src/discovery/ats_api.py", "note": "Greenhouse/Lever/Ashby discovery (PR #29)" }
-      ]
+        {
+          "path": "src/sources/adapters/base.py",
+          "note": "abstract AtsAdapter contract"
+        },
+        {
+          "path": "src/discovery/ats_api.py",
+          "note": "Greenhouse/Lever/Ashby discovery (PR #29)"
+        }
+      ],
+      "jiraKey": "KAN-141"
     },
     {
       "id": "ja.p2.browser-verify-form-completion",
@@ -60,11 +74,20 @@
       "summary": "Run the unit-tested submit/selector fixes against the real form-completion failure cluster on the Mac; measure via stats.",
       "seededStatus": "partial",
       "confidence": 0.5,
-      "dependsOn": ["ja.p1.adapter-contract"],
+      "dependsOn": [
+        "ja.p1.adapter-contract"
+      ],
       "evidence": [
-        { "path": "ATS_ADAPTER_PLAN.md", "note": "P4 done but unit-tested only, not browser-verified" },
-        { "path": "src/discovery/patchright_spike.py", "note": "patchright swap spike" }
-      ]
+        {
+          "path": "ATS_ADAPTER_PLAN.md",
+          "note": "P4 done but unit-tested only, not browser-verified"
+        },
+        {
+          "path": "src/discovery/patchright_spike.py",
+          "note": "patchright swap spike"
+        }
+      ],
+      "jiraKey": "KAN-142"
     },
     {
       "id": "ja.p3.adapter-registry-go-live",
@@ -75,11 +98,20 @@
       "summary": "Flip USE_ADAPTER_REGISTRY on after browser-verifying the generic + vendor apply path; retire the legacy monolith path.",
       "seededStatus": "partial",
       "confidence": 0.4,
-      "dependsOn": ["ja.p2.browser-verify-form-completion"],
+      "dependsOn": [
+        "ja.p2.browser-verify-form-completion"
+      ],
       "evidence": [
-        { "path": "src/sources/jobright.py", "note": "USE_ADAPTER_REGISTRY gate defaults OFF (~line 257)" },
-        { "path": "src/sources/adapters/session.py", "note": "registry wired but dormant" }
-      ]
+        {
+          "path": "src/sources/jobright.py",
+          "note": "USE_ADAPTER_REGISTRY gate defaults OFF (~line 257)"
+        },
+        {
+          "path": "src/sources/adapters/session.py",
+          "note": "registry wired but dormant"
+        }
+      ],
+      "jiraKey": "KAN-143"
     },
     {
       "id": "ja.p4.reauth-reliability",
@@ -101,9 +133,16 @@
         }
       ],
       "evidence": [
-        { "path": "src/reauth.py", "note": "no retry cap; documented false-positive" },
-        { "path": "docs/DIAGNOSTICS_2026-07-10.md", "note": "100 consecutive reauth-failed events" }
-      ]
+        {
+          "path": "src/reauth.py",
+          "note": "no retry cap; documented false-positive"
+        },
+        {
+          "path": "docs/DIAGNOSTICS_2026-07-10.md",
+          "note": "100 consecutive reauth-failed events"
+        }
+      ],
+      "jiraKey": "KAN-144"
     },
     {
       "id": "ja.p5.browser-launch-robustness",
@@ -112,13 +151,28 @@
       "owner": "claude",
       "title": "Browser-launch robustness",
       "summary": "Serial-launch guard + retry-with-backoff on 180s persistent-context timeouts and concurrent-Chrome collisions.",
-      "seededStatus": "not_started",
-      "confidence": 0.3,
+      "seededStatus": "partial",
+      "confidence": 0.5,
       "dependsOn": [],
       "evidence": [
-        { "path": "docs/DIAGNOSTICS_2026-07-10.md", "note": "launch_persistent_context Timeout 180000ms; browser-closed errors" },
-        { "path": "CLAUDE.md", "note": "Chrome profile-isolation constraints" }
-      ]
+        {
+          "path": "docs/DIAGNOSTICS_2026-07-10.md",
+          "note": "launch_persistent_context Timeout 180000ms; browser-closed errors"
+        },
+        {
+          "path": "CLAUDE.md",
+          "note": "Chrome profile-isolation constraints"
+        },
+        {
+          "path": "src/sources/base.py",
+          "note": "SERIAL-LAUNCH GUARD DELIVERED: lines 192-206 acquire an all-owners ProfileLock for every persistent-profile launch (scrape, apply, hydration, prepare-sessions, ExternalApplySession all funnel through it), reentrant within a process, with timeout-based contention wait via acquire_async. Verified by tests/test_profile_lock_all_owners.py, which covers acquisition and concurrent-owner refusal. Only the retry-with-backoff half of this item remains (verified 2026-08-13)."
+        },
+        {
+          "path": "tests/test_profile_lock_all_owners.py",
+          "note": "Covers ProfileLock acquisition and concurrent-owner refusal \u2014 the guard is tested, not just present (verified 2026-08-13)."
+        }
+      ],
+      "jiraKey": "KAN-145"
     },
     {
       "id": "ja.p6.vendor-apply-adapters",
@@ -129,11 +183,20 @@
       "summary": "Flesh out greenhouse/lever/ashby beyond can_handle() delegation with vendor-specific form handling.",
       "seededStatus": "partial",
       "confidence": 0.3,
-      "dependsOn": ["ja.p3.adapter-registry-go-live"],
+      "dependsOn": [
+        "ja.p3.adapter-registry-go-live"
+      ],
       "evidence": [
-        { "path": "src/sources/adapters/greenhouse.py", "note": "10-line stub delegating to generic" },
-        { "path": "src/sources/adapters/generic.py", "note": "real generic fill/submit (dormant behind flag)" }
-      ]
+        {
+          "path": "src/sources/adapters/greenhouse.py",
+          "note": "10-line stub delegating to generic"
+        },
+        {
+          "path": "src/sources/adapters/generic.py",
+          "note": "real generic fill/submit (dormant behind flag)"
+        }
+      ],
+      "jiraKey": "KAN-146"
     },
     {
       "id": "ja.p7.browseruse-recovery",
@@ -144,10 +207,16 @@
       "summary": "Wire the bounded LLM recovery fallback into the registry with submission gating; consider the real browser_use library.",
       "seededStatus": "partial",
       "confidence": 0.3,
-      "dependsOn": ["ja.p3.adapter-registry-go-live"],
+      "dependsOn": [
+        "ja.p3.adapter-registry-go-live"
+      ],
       "evidence": [
-        { "path": "src/sources/adapters/recovery_browseruse.py", "note": "built + unit-tested, not wired into default path" }
-      ]
+        {
+          "path": "src/sources/adapters/recovery_browseruse.py",
+          "note": "TWO IMPLEMENTATIONS, DO NOT CONFLATE. (a) BrowserUseRecovery in this module is unit-tested by tests/test_recovery_browseruse.py but is NOT the class the session invokes. (b) BrowserUseRecoveryRefactored in recovery_browseruse_refactored.py IS what session.py:282-286 applies, and NO test references it. (c) That session is itself reached only when USE_ADAPTER_REGISTRY is truthy, documented default OFF at jobright.py:283-290. So the tested implementation is unwired and the wired implementation is untested \u2014 neither is production-ready. Confidence stays 0.3 (verified 2026-08-13)."
+        }
+      ],
+      "jiraKey": "KAN-147"
     },
     {
       "id": "ja.p8.secrets-phases-2-4",
@@ -169,9 +238,16 @@
         }
       ],
       "evidence": [
-        { "path": "SECRETS.md", "note": "Phase 0-1 done; 2-4 pending" },
-        { "path": "src/orchestrator.py", "note": "TODO(secrets) band-aids (~lines 1065, 1104)" }
-      ]
+        {
+          "path": "SECRETS.md",
+          "note": "Phase 0-1 done; 2-4 pending"
+        },
+        {
+          "path": "src/orchestrator.py",
+          "note": "TODO(secrets) band-aids (~lines 1065, 1104)"
+        }
+      ],
+      "jiraKey": "KAN-148"
     },
     {
       "id": "ja.p9.deployment-and-refactor",
@@ -179,14 +255,26 @@
       "priority": "P3",
       "owner": "claude",
       "title": "Render/hybrid deployment & monolith refactor",
-      "summary": "24/7 residential-proxy egress + persistent disk deploy, and extract adapters from the 3,790-line jobright.py behind characterization tests.",
+      "summary": "24/7 residential-proxy egress + persistent disk deploy, and extract adapters from the 3,908-line jobright.py behind characterization tests.",
       "seededStatus": "not_started",
       "confidence": 0.2,
-      "dependsOn": ["ja.p3.adapter-registry-go-live"],
+      "dependsOn": [
+        "ja.p3.adapter-registry-go-live"
+      ],
       "evidence": [
-        { "path": "src/sources/jobright.py", "note": "3,790-line monolith (P7 extraction target)" },
-        { "path": "render.yaml", "note": "deployment target; residential-IP anti-bot advantage" }
-      ]
+        {
+          "path": "src/sources/jobright.py",
+          "note": "SCOPE GREW: now 3,908 lines, up from the 3,790 recorded here. not_started remains accurate but the extraction target is drifting away, so earlier estimates are optimistic. Consider a characterization-test harness first to stop further growth (verified 2026-08-13)."
+        },
+        {
+          "path": "render.yaml",
+          "note": "deployment target; residential-IP anti-bot advantage"
+        }
+      ],
+      "jiraKey": "KAN-149"
     }
-  ]
+  ],
+  "jiraProject": "KAN",
+  "lastReconciledAt": "2026-08-13",
+  "reconciliationNote": "Statuses in this file are SEEDED INTENT (provenance rank 0) and never override an audit or merge-verified result. Reconciled against the repository and Jira project KAN on 2026-08-13 after the AI Commander delivery plan had drifted 320 commits. Items are mirrored as Jira issues (see jiraKey); KAN-102 will make Jira the intake source and retire this file to bootstrap-only."
 }
