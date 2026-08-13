@@ -41,17 +41,20 @@ After that, the extension loads automatically from the profile on every run.
 
 ## Credential and Login Flow
 
-Credentials live in `.env` — all set and working as of June 2026:
+Credentials live in `.env` (see `.env.example` for the full template):
 
 | Variable | Used by | Method |
 |---|---|---|
 | `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` | `linkedin.py` | `_auto_login()` — fills form programmatically |
 | `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | `jobright.py` | `_auto_login()` — fills form programmatically |
-| `INDEED_EMAIL` / `INDEED_PASSWORD` | `indeed.py` | `_auto_login()` — fills form programmatically (`shoalinwu@gmail.com`) |
+| `INDEED_EMAIL` / `INDEED_PASSWORD` | `indeed.py` | `_auto_login()` — fills form programmatically |
 | `USAJOBS_EMAIL` / `USAJOBS_PASSWORD` | `usajobs.py` | `_auto_login()` via login.gov; pauses for 2FA if triggered |
-| `COMPANY_EMAIL` / `COMPANY_PASSWORD` | `jobright.py` `_company_portal_login()` | Primary ATS portal auto-login — set to your portal email (Motorola, Booz Allen, Greenhouse, SAIC, PNC, Capital One, ManTech) |
-| `COMPANY_EMAIL_ALT` / `COMPANY_PASSWORD_ALT` | `jobright.py` `_company_portal_login()` | Fallback ATS portal login — `anthonyclarkins@icloud.com` (GDIT, government portals); tried automatically if primary login fails |
+| `COMPANY_EMAIL` / `COMPANY_PASSWORD` | `jobright.py` `_company_portal_login()` | Primary ATS portal auto-login (Workday, Greenhouse, BrassRing, Lever, etc.) |
+| `COMPANY_EMAIL_ALT` / `COMPANY_PASSWORD_ALT` | `jobright.py` `_company_portal_login()` | Fallback ATS portal login for government/contractor portals; tried automatically if primary fails |
 | `ANTHROPIC_API_KEY` | `scorer.py`, `jobright.py` | Claude scoring + ATS analysis |
+| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM_NUMBER` | `notifier.py` | SMS approval alerts (optional; leave blank to disable) |
+| `APPROVAL_NOTIFY_EMAIL` / `APPROVAL_SEND_EMAIL` / `APPROVAL_SEND_PASSWORD` / `IMAP_PASSWORD` | `notifier.py` | Email-based job approval flow (optional; leave blank to disable) |
+| `NOTIFY_PHONE` | `reauth.py` | iMessage target for self-heal alerts (macOS only) |
 | `DASHBOARD_URL` / `SYNC_SECRET` | `orchestrator.py` | Cloud dashboard sync |
 
 Each scraper checks on startup whether it is logged in. If not, `_auto_login()` fills the login form using `.env` credentials automatically. No manual interaction needed for scheduled runs.

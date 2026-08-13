@@ -290,7 +290,7 @@ Two agents in the **same working directory will clobber each other** — branch 
 
 **Setup (run once):**
 ```bash
-cd /Users/alarkins/Dev/Projects/job-agent
+cd /path/to/job-agent
 git checkout main && git pull
 git checkout -b feat/success-rate           # integration branch
 git push -u origin feat/success-rate

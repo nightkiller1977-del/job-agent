@@ -36,7 +36,7 @@ behavior (form reached, submit withheld) — tune selectors from what you observ
 ## Stage 0 — Preflight (5 min, no browser)
 
 ```bash
-cd /Users/alarkins/Dev/Projects/job-agent
+cd /path/to/job-agent
 git checkout main && git pull
 source .venv/bin/activate
 python -m pytest -q --continue-on-collection-errors   # expect ~480+ passed

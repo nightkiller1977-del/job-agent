@@ -1,26 +1,8 @@
 # Security Policy
 
-## 🚨 CRITICAL: Credential Exposure and Rotation Required
+## Notice: Git History Cleanup (August 2026)
 
-**As of August 13, 2026, the `.env` file containing REAL CREDENTIALS was exposed in the public GitHub repository.**
-
-### Immediate Actions Required:
-
-**ROTATE ALL CREDENTIALS IMMEDIATELY:**
-
-1. **Anthropic API Key** - Revoke the exposed key (sk-ant-api03-WZ1tFuAr7S4QWqt-...), generate a new one
-2. **Job Site Credentials** - Change passwords for:
-   - JobRight
-   - LinkedIn
-   - Indeed
-   - USAJobs
-   - All company portal accounts
-3. **Twilio Credentials** - Revoke API credentials, generate new Account SID and Auth Token
-4. **Encryption Keys** - Regenerate:
-   - Credential encryption key (Fernet)
-   - Sync secret
-5. **Email Accounts** - Verify no unauthorized access, consider password reset for any connected accounts
-6. **Notify relevant services** - Inform Anthropic, job sites, and Twilio of potential credential compromise
+A `.env` file was previously committed to git history in this private repository. It was removed using `git filter-repo` before the repository was made public. If you forked or cloned the repo before August 13, 2026, rotate any credentials that were in your `.env` file.
 
 ---
 
@@ -61,7 +43,7 @@ If you discover a security vulnerability in job-agent, please email security det
 
 ### Testing
 - Test credentials should never be hardcoded in source files.
-- Use `AICC_SECRETS_DIR` override or fixtures for test-specific credentials.
+- Use environment variable overrides or pytest fixtures for test-specific credentials.
 - Never document real or example credentials in README or reports.
 
 ### Deployment Security
@@ -137,13 +119,10 @@ For security-related questions or clarifications, please reach out to the mainta
 
 ---
 
-## Git History Cleanup
+## Dependency Vulnerabilities and Python Version
 
-**August 13, 2026:** Removed `.env` file from entire git history using `git filter-repo` due to credential exposure. All credentials must be rotated.
+Several transitive dependencies (click, filelock, msgpack, starlette, urllib3, requests, pytest) have CVEs whose fix versions require **Python 3.10+**. If you are running Python 3.9, these cannot be patched without upgrading the interpreter.
 
-```
-git filter-repo --invert-paths --path .env
-git push origin --force-with-lease main
-```
+**Recommended**: Use Python 3.10 or newer for new installations to pick up all available security patches.
 
-This removes `.env` from all commits in the public repository but does NOT affect your local `.env` file.
+Run `pip-audit` after install to confirm the current vulnerability state for your Python version.

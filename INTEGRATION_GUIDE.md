@@ -266,7 +266,7 @@ async def test_browser_recovery_detects_loop():
 Run a real job application with the new system:
 
 ```bash
-cd /Users/alarkins/Dev/Projects/job-agent
+cd /path/to/job-agent
 
 # Test with default configuration
 python src/main.py apply --limit 1

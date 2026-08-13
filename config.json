@@ -1,54 +1,38 @@
 {
   "user_profile": {
-    "current_title": "Director of Software Engineering",
-    "years_experience": 18,
-    "clearance": "Top Secret",
-    "location": "Miami, Florida",
-    "open_to_relocation": ["remote", "miami", "dc_area"],
+    "current_title": "Your Current Title",
+    "years_experience": 10,
+    "clearance": "None",
+    "location": "Your City, State",
+    "open_to_relocation": ["remote"],
     "us_citizen": true,
-    "specialized_experience_gs14_equivalent": true
+    "specialized_experience_gs14_equivalent": false
   },
   "target_roles": [
-    "Director of Software Engineering",
-    "Director of IT",
-    "VP of IT",
-    "VP of Software Engineering",
-    "AVP of Software Engineering",
-    "CTO",
-    "CIO",
+    "Director of Engineering",
+    "VP of Engineering",
     "Engineering Manager",
-    "Program Manager",
-    "GS-15",
-    "SES",
-    "Senior Executive Service",
-    "SL",
-    "Senior Level"
+    "Senior Software Engineer",
+    "Staff Engineer"
   ],
   "reject_roles": [
-    "Software Engineer",
-    "Software Developer",
-    "Staff Engineer",
-    "Principal Engineer",
-    "Data Engineer",
-    "DevOps Engineer",
-    "Individual Contributor",
-    "IC"
+    "Intern",
+    "Junior",
+    "Entry Level"
   ],
   "compensation_thresholds": {
-    "remote": { "min_comp": 180000 },
-    "miami_onsite": { "min_comp": 230000 },
-    "dc_onsite": { "min_comp": 260000, "max_comp": 320000 },
-    "other_onsite": { "action": "skip" },
-    "cleared_dod_remote": { "min_comp": 170000 },
-    "cleared_dod_hybrid": { "min_comp": 230000 },
-    "federal_gs15": { "action": "always_apply" },
-    "federal_ses": { "action": "always_apply" },
-    "federal_sl": { "action": "always_apply" },
-    "contract_remote": { "min_comp": 170000 },
-    "contract_hybrid": { "action": "flag_for_review" }
+    "remote":            { "min_comp": 120000 },
+    "onsite":            { "min_comp": 140000 },
+    "hybrid":            { "min_comp": 130000 },
+    "cleared_remote":    { "min_comp": 130000 },
+    "cleared_hybrid":    { "min_comp": 140000 },
+    "federal_gs15":      { "action": "always_apply" },
+    "federal_ses":       { "action": "always_apply" },
+    "contract_remote":   { "min_comp": 120000 },
+    "contract_hybrid":   { "action": "flag_for_review" }
   },
   "search_settings": {
-    "keywords": "Director VP Engineering CTO CIO Software",
+    "keywords": "Engineering Manager Director VP Software",
     "location": "Remote",
     "days_posted": 7,
     "max_jobs_per_source": 50,

@@ -2463,9 +2463,9 @@ class JobrightScraper(BaseScraper):
         Falls back to COMPANY_EMAIL_ALT / COMPANY_PASSWORD_ALT if the primary fails.
 
         Two credential sets are configured:
-          COMPANY_EMAIL       — your portal email (most portals: Motorola, Booz Allen,
-                                Greenhouse, SAIC, PNC, Capital One, ManTech, etc.)
-          COMPANY_EMAIL_ALT   — anthonyclarkins@icloud.com (government/contractor: GDIT, etc.)
+          COMPANY_EMAIL       — your portal email (most portals: Workday, Greenhouse,
+                                BrassRing, Lever, etc.)
+          COMPANY_EMAIL_ALT   — your alternate portal email (government/contractor portals, etc.)
 
         Uses page.type() (real keystroke simulation) instead of fill() to avoid
         bot-detection triggers on Workday and similar ATS portals.
