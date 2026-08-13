@@ -1,5 +1,19 @@
 # ── Secrets — NEVER commit these ──────────────────────────────────────────────
 .env
+.env.local
+.env.*.local
+.env.production.local
+secrets.enc.env
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.yaml
+secrets.yml
+credentials.json
+aws_credentials
+.aws/
+.kube/
 
 # ── Python ────────────────────────────────────────────────────────────────────
 .venv/
