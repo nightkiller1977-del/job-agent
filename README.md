@@ -64,8 +64,8 @@ job-agent/
 │   ├── tailored_resumes/    # Claude-generated and Orion-generated PDFs (gitignored)
 │   └── agent_status.json    # Live alerts + reauth event log
 ├── config.json              # Scoring config, resume path, search settings
-├── .env                     # Credentials and API keys (never committed)
 ├── .env.example             # Template with all required and optional keys
+├── SECURITY.md              # Vulnerability disclosure and credential management policy
 ├── CLAUDE.md                # Critical constraints for Claude Code (Chrome profile isolation)
 ├── DEVELOPER_ONBOARDING.md  # Engineering internals and apply-workflow architecture
 └── requirements.txt
@@ -132,7 +132,6 @@ Each source scraper uses an **isolated Chromium profile** under `state/sessions/
 ### 1. Install dependencies
 
 ```bash
-cd ~/Dev/Projects/job-agent
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -168,10 +167,10 @@ SYNC_SECRET=...
 Set your resume path in `config.json`:
 
 ```json
-{ "local_resume_path": "/Users/yourname/resume.pdf" }
+{ "local_resume_path": "/path/to/your/resume.pdf" }
 ```
 
-Fill in `state/profile.json` with your real work history, skills, and contact information — this feeds LinkedIn Easy Apply autofill and Claude resume tailoring.
+Fill in `state/profile.json` with your work history, skills, and contact information — this feeds LinkedIn Easy Apply autofill and Claude resume tailoring.
 
 ### 3. One-time setup
 
@@ -253,7 +252,7 @@ python src/main.py ops-check
 2. Jobright Orion AI tailored resume (if Orion download succeeded)
 3. `local_resume_path` in `config.json`
 4. `LOCAL_RESUME_PATH` / `RESUME_PATH` env vars
-5. Common locations: `state/resumes/`, `~/Documents/Job App/`, `~/Downloads/`, `~/Desktop/`
+5. Common locations: `state/resumes/`, `~/Documents/`, `~/Downloads/`, `~/Desktop/`
 
 ### Claude ATS Scoring
 
@@ -286,37 +285,17 @@ If the ATS score is below 85 and `--auto-submit` is set, a warning is printed bu
 
 ---
 
-## Scoring Criteria
+## Scoring Configuration
 
-### Target Roles
+Scoring criteria are configured in `config.json`. The agent evaluates each job listing against your defined:
 
-- Director of Software Engineering / Director of IT
-- VP of IT / VP of Software Engineering / AVP of Software Engineering
-- CTO / CIO / Engineering Manager
-- Program Manager (government/DoD)
-- GS-15 / SES / SL — federal (always apply)
-- DoD/cleared positions at matching seniority
+- **Target roles** — job titles and seniority levels you want to apply to
+- **Rejected roles** — individual contributor or out-of-scope titles to skip
+- **Compensation thresholds** — minimum salary by work type (remote, on-site, hybrid, cleared, federal)
 
-### Rejected Roles
+Claude uses these to score each listing 0–100 and assign a recommendation. You review borderline scores in the terminal queue before any application is submitted.
 
-- Software Engineer / Developer (IC)
-- Staff / Principal Engineer (IC)
-- Data Engineer / DevOps Engineer (unless Manager/Director of)
-
-### Compensation Thresholds
-
-| Work type | Min |
-|---|---|
-| Remote | $180k |
-| Miami on-site | $230k |
-| DC area on-site | $260k–$320k |
-| Other on-site | Skip |
-| Cleared/DoD remote | $170k |
-| Cleared/DoD hybrid | $250k |
-| Federal GS-15/SES/SL | Always apply |
-| Contract remote | $180k |
-
-Missing salary: always flag for review.
+See `.env.example` and `config.json` for all configurable fields.
 
 ---
 
@@ -394,3 +373,17 @@ Status: Session refreshed — source will be retried
 ```
 
 Chrome opens and closes automatically — no user presence required. If a session expires mid-run, `ReauthManager` recovers it and retries the source without interrupting the rest of the queue.
+
+---
+
+## Security
+
+All credentials are managed via environment variables. See [`.env.example`](./.env.example) for the full list of required and optional keys, and [`SECURITY.md`](./SECURITY.md) for the credential management policy and secrets resolution architecture.
+
+**Never commit `.env` to the repository.** The secrets resolver (`src/secret_store.py`) supports a phased credential architecture — local `.env`, encrypted store (Phase 2), and a dedicated CLI (Phase 3).
+
+---
+
+## License
+
+TBD
