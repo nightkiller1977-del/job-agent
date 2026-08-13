@@ -1,0 +1,19 @@
+# Security-sensitive files require review
+
+# All security and configuration files
+SECURITY.md @nightkiller1977-del
+SECRETS.md @nightkiller1977-del
+.env.example @nightkiller1977-del
+.gitignore @nightkiller1977-del
+
+# Secrets management and configuration
+src/secret_store.py @nightkiller1977-del
+src/config/ @nightkiller1977-del
+
+# Docker and deployment
+docker/ @nightkiller1977-del
+render.yaml @nightkiller1977-del
+Dockerfile* @nightkiller1977-del
+
+# Documentation
+*.md @nightkiller1977-del
