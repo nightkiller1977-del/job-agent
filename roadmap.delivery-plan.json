@@ -151,8 +151,8 @@
       "owner": "claude",
       "title": "Browser-launch robustness",
       "summary": "Serial-launch guard + retry-with-backoff on 180s persistent-context timeouts and concurrent-Chrome collisions.",
-      "seededStatus": "not_started",
-      "confidence": 0.3,
+      "seededStatus": "partial",
+      "confidence": 0.5,
       "dependsOn": [],
       "evidence": [
         {
@@ -162,6 +162,14 @@
         {
           "path": "CLAUDE.md",
           "note": "Chrome profile-isolation constraints"
+        },
+        {
+          "path": "src/sources/base.py",
+          "note": "SERIAL-LAUNCH GUARD DELIVERED: lines 192-206 acquire an all-owners ProfileLock for every persistent-profile launch (scrape, apply, hydration, prepare-sessions, ExternalApplySession all funnel through it), reentrant within a process, with timeout-based contention wait via acquire_async. Verified by tests/test_profile_lock_all_owners.py, which covers acquisition and concurrent-owner refusal. Only the retry-with-backoff half of this item remains (verified 2026-08-13)."
+        },
+        {
+          "path": "tests/test_profile_lock_all_owners.py",
+          "note": "Covers ProfileLock acquisition and concurrent-owner refusal \u2014 the guard is tested, not just present (verified 2026-08-13)."
         }
       ],
       "jiraKey": "KAN-145"
@@ -205,7 +213,7 @@
       "evidence": [
         {
           "path": "src/sources/adapters/recovery_browseruse.py",
-          "note": "Built + unit-tested, NOT wired into the default path. GUARD RAIL: session.py:282-286 does apply BrowserUseRecoveryRefactored, but that ExternalApplySession is reached only when USE_ADAPTER_REGISTRY is truthy, and jobright.py:283-290 documents that flag as default OFF (\"the proven path runs unless explicitly opted in\"). Wiring inside a feature-gated session is not wiring into the default path, so the original note stands and confidence stays at 0.3 (reviewed 2026-08-13)."
+          "note": "TWO IMPLEMENTATIONS, DO NOT CONFLATE. (a) BrowserUseRecovery in this module is unit-tested by tests/test_recovery_browseruse.py but is NOT the class the session invokes. (b) BrowserUseRecoveryRefactored in recovery_browseruse_refactored.py IS what session.py:282-286 applies, and NO test references it. (c) That session is itself reached only when USE_ADAPTER_REGISTRY is truthy, documented default OFF at jobright.py:283-290. So the tested implementation is unwired and the wired implementation is untested \u2014 neither is production-ready. Confidence stays 0.3 (verified 2026-08-13)."
         }
       ],
       "jiraKey": "KAN-147"
@@ -247,7 +255,7 @@
       "priority": "P3",
       "owner": "claude",
       "title": "Render/hybrid deployment & monolith refactor",
-      "summary": "24/7 residential-proxy egress + persistent disk deploy, and extract adapters from the 3,790-line jobright.py behind characterization tests.",
+      "summary": "24/7 residential-proxy egress + persistent disk deploy, and extract adapters from the 3,908-line jobright.py behind characterization tests.",
       "seededStatus": "not_started",
       "confidence": 0.2,
       "dependsOn": [
