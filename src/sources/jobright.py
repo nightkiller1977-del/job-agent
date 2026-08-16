@@ -12,6 +12,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 from rich.console import Console
@@ -1923,7 +1924,7 @@ class JobrightScraper(BaseScraper):
 
         return submitted
 
-    async def prepare_session(self, job: dict) -> bool:
+    async def prepare_session(self, job: Optional[dict] = None) -> bool:
         """Open the external ATS portal in the persistent profile for login/session refresh.
 
         For Workday specifically: navigates to the /apply/autofillWithResume URL and
@@ -1936,7 +1937,29 @@ class JobrightScraper(BaseScraper):
         False when preparation bailed early (no external ATS URL for a native
         Jobright listing) or when a non-interactive run merely did diagnostic prep
         without a human completing the login.
+
+        job=None means there is no specific job to route through (called from the
+        "no approved jobs need session prep" fallback) — just refresh the base
+        Jobright site session instead of routing through ATS-portal detection.
         """
+        if job is None:
+            console.print("\n[magenta]Jobright Session Prep:[/magenta] Opening Jobright session")
+            page = await self._start_browser()
+            try:
+                await page.goto(JOBRIGHT_BASE, wait_until="domcontentloaded", timeout=30000)
+                await self._delay(2, 3)
+                if await self._looks_like_login_wall(page):
+                    console.print("[yellow]Jobright needs login in this browser window.[/yellow]")
+                    if sys.stdin and sys.stdin.isatty():
+                        input("Press Enter after Jobright session is ready > ")
+                        return True
+                    console.print("[yellow]Non-interactive run: rerun from Terminal to sign in once.[/yellow]")
+                    return False
+                console.print("[green]Jobright session is authenticated — no action needed.[/green]")
+                return True
+            finally:
+                await self._close_browser()
+
         console.print(
             f"\n[magenta]Jobright Session Prep:[/magenta] {job.get('title')} @ {job.get('company')}"
         )
