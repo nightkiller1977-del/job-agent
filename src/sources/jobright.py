@@ -12,6 +12,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 from rich.console import Console
@@ -1923,7 +1924,7 @@ class JobrightScraper(BaseScraper):
 
         return submitted
 
-    async def prepare_session(self, job: dict) -> bool:
+    async def prepare_session(self, job: Optional[dict] = None) -> bool:
         """Open the external ATS portal in the persistent profile for login/session refresh.
 
         For Workday specifically: navigates to the /apply/autofillWithResume URL and
@@ -1936,7 +1937,41 @@ class JobrightScraper(BaseScraper):
         False when preparation bailed early (no external ATS URL for a native
         Jobright listing) or when a non-interactive run merely did diagnostic prep
         without a human completing the login.
+
+        job=None means there is no specific job to route through (called from the
+        "no approved jobs need session prep" fallback) — just refresh the base
+        Jobright site session instead of routing through ATS-portal detection.
         """
+        if job is None:
+            console.print("\n[magenta]Jobright Session Prep:[/magenta] Opening Jobright session")
+            page = await self._start_browser()
+            try:
+                # Must navigate to a PROTECTED page, not JOBRIGHT_BASE — the public
+                # home page never shows a login form even when the session is
+                # expired, so _looks_like_login_wall() alone always says "fine"
+                # here and this closes without ever offering the login prompt.
+                # Same expired-session signal scrape() already relies on
+                # (line ~1196): a redirect back to bare jobright.ai without
+                # /jobs means the matched-jobs page bounced us for lacking auth.
+                await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=30000)
+                await self._delay(2, 3)
+                session_expired = (
+                    "jobright.ai" not in page.url
+                    or "jobright.ai/jobs" not in page.url
+                    or await self._looks_like_login_wall(page)
+                )
+                if session_expired:
+                    console.print("[yellow]Jobright needs login in this browser window.[/yellow]")
+                    if sys.stdin and sys.stdin.isatty():
+                        input("Press Enter after Jobright session is ready > ")
+                        return True
+                    console.print("[yellow]Non-interactive run: rerun from Terminal to sign in once.[/yellow]")
+                    return False
+                console.print("[green]Jobright session is authenticated — no action needed.[/green]")
+                return True
+            finally:
+                await self._close_browser()
+
         console.print(
             f"\n[magenta]Jobright Session Prep:[/magenta] {job.get('title')} @ {job.get('company')}"
         )
