@@ -78,7 +78,7 @@ resolve_ts_ip() {
     "tailscale"
   do
     [[ -z "\$bin" ]] && continue
-    if ip="\$(\"\$bin\" ip -4 2>/dev/null | head -1)" && [[ -n "\$ip" ]]; then
+    if ip="\$("\$bin" ip -4 2>/dev/null | head -1)" && [[ -n "\$ip" ]]; then
       echo "\$ip"
       return 0
     fi
