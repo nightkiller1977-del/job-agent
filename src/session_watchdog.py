@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -271,18 +273,92 @@ async def _heartbeat_source(source: str, config: dict) -> bool:
 # Deep-link notification
 # ---------------------------------------------------------------------------
 
+def _resolve_tailscale_ip() -> Optional[str]:
+    """Resolve this Mac's personal-tailnet IPv4 address for the noVNC bridge link.
+
+    Tries TAILSCALE_BIN (override), then the standard Tailscale.app CLI
+    location, then common Homebrew paths, then a bare `tailscale` on PATH.
+    Returns None — never a guessed/fallback address — if none resolve, so
+    callers skip the noVNC link rather than send a dead one.
+    """
+    candidates = [
+        os.environ.get("TAILSCALE_BIN", ""),
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        "/opt/homebrew/bin/tailscale",
+        "/usr/local/bin/tailscale",
+        "tailscale",
+    ]
+    for binary in candidates:
+        if not binary:
+            continue
+        try:
+            result = subprocess.run(
+                [binary, "ip", "-4"], capture_output=True, timeout=5, text=True,
+            )
+            ip = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+            if result.returncode == 0 and ip:
+                return ip
+        except Exception:
+            continue
+    return None
+
+
+def _novnc_link() -> Optional[str]:
+    """Build the tappable noVNC URL for remote reauth over the personal tailnet.
+
+    Returns None when Tailscale isn't resolvable so the caller can omit the
+    link entirely instead of sending one that won't connect. Port is
+    NOVNC_PORT (default 6080) — the websockify bridge set up alongside this,
+    bound explicitly to the Tailscale interface, never 0.0.0.0.
+    """
+    ip = _resolve_tailscale_ip()
+    if not ip:
+        return None
+    port = os.environ.get("NOVNC_PORT", "6080")
+    return f"http://{ip}:{port}/vnc.html?autoconnect=true&resize=scale"
+
+
+def _stage_prepare_sessions(source: str) -> None:
+    """Open a Terminal window on the Mac and start `prepare-sessions` for
+    *source* so the login browser window is already up by the time a human
+    opens either the jobagent:// deep link or the noVNC link. Safe to invoke
+    repeatedly — prepare_session() no-ops cleanly when already authenticated,
+    and blocks on a plain `input()` when a human login is actually needed."""
+    project_dir = Path(__file__).parent.parent
+    cmd = (
+        f"cd {project_dir} && source .venv/bin/activate && "
+        f"python src/main.py prepare-sessions --source {source}"
+    )
+    script = f'tell application "Terminal" to do script "{cmd}"'
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+    except Exception as exc:
+        _log.warning("session_watchdog.stage_terminal_failed source=%s error=%s", source, exc)
+
+
 def _send_deep_link_notification(source: str, message: str) -> None:
-    """Send a Telegram message with a one-tap repair deep-link.
+    """Send a Telegram message with two ways to complete reauth.
 
-    Delegates entirely to notifier._send_telegram() which reads credentials
-    from AI Commander's settings-v3.json — no duplicate config needed.
-    Configure Telegram once in AI Commander; job-agent picks it up here.
+    - jobagent:// deep link — one-tap fix, but only works when read on the
+      Mac itself (macOS-only URL scheme, see scripts/install-jobagent-url-handler.sh).
+    - noVNC link over your personal Tailscale tailnet — works from a phone
+      away from the Mac; opens a live, controllable view of this Mac's real
+      screen (the same browser window prepare-sessions already opens).
 
-    Deep-link format: jobagent://prepare-sessions?source=<source>
-    Handled by scripts/install-jobagent-url-handler.sh (register once).
+    Also stages the exact `prepare-sessions` command in a new Terminal window
+    on the Mac (see _stage_prepare_sessions) so there's something to see and
+    log into by the time either link is opened.
+
+    Delegates message delivery entirely to notifier._send_telegram(), which
+    reads credentials from the same centralized store telegramApprovalProvider.js
+    uses — no duplicate config needed.
     """
     deep_link = f"jobagent://prepare-sessions?source={source}"
-    full_msg = f"{message}\n\n{deep_link}"
+    novnc_link = _novnc_link()
+    link_lines = [deep_link]
+    if novnc_link:
+        link_lines.append(f"From your phone (personal Tailscale): {novnc_link}")
+    full_msg = f"{message}\n\n" + "\n".join(link_lines)
 
     try:
         from .notifier import _send_telegram, _desktop_notify, _last_notification_times
@@ -297,9 +373,10 @@ def _send_deep_link_notification(source: str, message: str) -> None:
 
         _send_telegram(full_msg)
         _desktop_notify(f"{source} session needs refresh", message)
+        _stage_prepare_sessions(source)
     except Exception as exc:
         _log.warning("session_watchdog.notify_failed source=%s error=%s", source, exc)
-        console.print(f"[yellow]Session alert ({source}):[/yellow] {message}\n{deep_link}")
+        console.print(f"[yellow]Session alert ({source}):[/yellow] {message}\n{full_msg}")
 
 
 # ---------------------------------------------------------------------------
