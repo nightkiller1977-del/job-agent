@@ -1946,9 +1946,21 @@ class JobrightScraper(BaseScraper):
             console.print("\n[magenta]Jobright Session Prep:[/magenta] Opening Jobright session")
             page = await self._start_browser()
             try:
-                await page.goto(JOBRIGHT_BASE, wait_until="domcontentloaded", timeout=30000)
+                # Must navigate to a PROTECTED page, not JOBRIGHT_BASE — the public
+                # home page never shows a login form even when the session is
+                # expired, so _looks_like_login_wall() alone always says "fine"
+                # here and this closes without ever offering the login prompt.
+                # Same expired-session signal scrape() already relies on
+                # (line ~1196): a redirect back to bare jobright.ai without
+                # /jobs means the matched-jobs page bounced us for lacking auth.
+                await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=30000)
                 await self._delay(2, 3)
-                if await self._looks_like_login_wall(page):
+                session_expired = (
+                    "jobright.ai" not in page.url
+                    or "jobright.ai/jobs" not in page.url
+                    or await self._looks_like_login_wall(page)
+                )
+                if session_expired:
                     console.print("[yellow]Jobright needs login in this browser window.[/yellow]")
                     if sys.stdin and sys.stdin.isatty():
                         input("Press Enter after Jobright session is ready > ")
