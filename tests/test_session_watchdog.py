@@ -12,6 +12,9 @@ from src.session_watchdog import (
     _resolve_tailscale_ip,
     _novnc_link,
     _send_deep_link_notification,
+    _prepare_sessions_source,
+    _prepare_sessions_command,
+    _stage_prepare_sessions,
 )
 
 def test_parse_linkedin_expiry_expired():
@@ -88,10 +91,11 @@ def test_check_session_health_stale_cookie():
             assert health.status == "stale"
             assert "expire in" in health.detail
 
-def _fake_run(returncode=0, stdout=""):
+def _fake_run(returncode=0, stdout="", stderr=""):
     result = MagicMock()
     result.returncode = returncode
     result.stdout = stdout
+    result.stderr = stderr
     return result
 
 
@@ -137,6 +141,45 @@ def test_novnc_link_respects_port_override(monkeypatch):
         assert link.startswith("http://100.64.1.2:7777/")
 
 
+def test_prepare_sessions_source_maps_unsupported_sources():
+    assert _prepare_sessions_source("linkedin") == "linkedin"
+    assert _prepare_sessions_source("usajobs") == "usajobs"
+    assert _prepare_sessions_source("indeed") == "indeed"
+    assert _prepare_sessions_source("jobright") == "jobright"
+    assert _prepare_sessions_source("external") == "jobright"
+    assert _prepare_sessions_source("glassdoor") == "jobright"
+    assert _prepare_sessions_source("ziprecruiter") == "jobright"
+    assert _prepare_sessions_source("google") == "jobright"
+    assert _prepare_sessions_source("jobspy") == "jobright"
+    assert _prepare_sessions_source("linkedin-saved") == "linkedin"
+    assert _prepare_sessions_source(None) is None
+
+
+def test_prepare_sessions_command_omits_unknown_source():
+    cmd, mapped_source = _prepare_sessions_command("unknown-provider")
+
+    assert mapped_source is None
+    assert cmd.endswith("prepare-sessions")
+    assert "--source" not in cmd
+
+
+def test_stage_prepare_sessions_maps_source_before_terminal():
+    with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
+        assert _stage_prepare_sessions("glassdoor") is True
+
+    script = mock_run.call_args[0][1]
+    assert "prepare-sessions --source jobright" in script
+    assert "--source glassdoor" not in script
+
+
+def test_stage_prepare_sessions_returns_false_on_osascript_failure():
+    with patch(
+        "src.session_watchdog.subprocess.run",
+        return_value=_fake_run(1, stderr="not authorized"),
+    ):
+        assert _stage_prepare_sessions("linkedin") is False
+
+
 def test_send_deep_link_notification_includes_novnc_link_when_available():
     with patch("src.session_watchdog._novnc_link", return_value="http://100.64.1.2:6080/vnc.html?autoconnect=true"), \
          patch("src.session_watchdog._stage_prepare_sessions") as mock_stage, \
@@ -151,6 +194,19 @@ def test_send_deep_link_notification_includes_novnc_link_when_available():
         assert "http://100.64.1.2:6080/vnc.html?autoconnect=true" in sent_text
         assert "From your phone" in sent_text
         mock_stage.assert_called_once_with("linkedin")
+
+
+def test_send_deep_link_notification_maps_deep_link_source():
+    with patch("src.session_watchdog._novnc_link", return_value=None), \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=True), \
+         patch("src.notifier._send_telegram") as mock_send, \
+         patch("src.notifier._desktop_notify"), \
+         patch("src.notifier._last_notification_times", {}):
+        _send_deep_link_notification("glassdoor", "Glassdoor session expired.")
+
+        sent_text = mock_send.call_args[0][0]
+        assert "jobagent://prepare-sessions?source=jobright" in sent_text
+        assert "source=glassdoor" not in sent_text
 
 
 def test_send_deep_link_notification_omits_novnc_link_when_unresolvable():
@@ -179,3 +235,18 @@ def test_send_deep_link_notification_respects_rate_limit():
 
         mock_send.assert_called_once()
         mock_stage.assert_called_once()
+
+
+def test_send_deep_link_notification_does_not_rate_limit_when_staging_fails():
+    cache = {}
+    with patch("src.session_watchdog._novnc_link", return_value=None), \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=False) as mock_stage, \
+         patch("src.notifier._send_telegram") as mock_send, \
+         patch("src.notifier._desktop_notify"), \
+         patch("src.notifier._last_notification_times", cache):
+        _send_deep_link_notification("linkedin", "first")
+        _send_deep_link_notification("linkedin", "second")
+
+        assert mock_send.call_count == 2
+        assert mock_stage.call_count == 2
+        assert "session_reauth_linkedin" not in cache
