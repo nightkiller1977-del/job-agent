@@ -53,17 +53,13 @@ _HEARTBEAT_SOURCES = {"linkedin", "indeed", "jobright"}
 # Sources that need a visible browser for the user to complete login
 _HUMAN_SOURCES = {"linkedin", "usajobs"}
 
-# CLI-supported prepare-sessions source choices. Queue/source labels such as
-# glassdoor and ziprecruiter are discovered through the Jobright-backed path,
-# so they must be mapped before staging Terminal commands or deep links.
+# CLI-supported prepare-sessions source choices. Queue/source labels from
+# JobSpy-backed providers such as glassdoor, google, and ziprecruiter must not
+# be rewritten to jobright because prepare_sessions filters stored jobs by exact
+# source. Unsupported labels intentionally omit the source filter.
 _PREPARE_SESSION_SOURCES = {"linkedin", "usajobs", "jobright", "indeed"}
 _PREPARE_SESSION_SOURCE_ALIASES = {
-    "external": "jobright",
-    "glassdoor": "jobright",
-    "google": "jobright",
-    "jobspy": "jobright",
     "linkedin-saved": "linkedin",
-    "ziprecruiter": "jobright",
 }
 
 
