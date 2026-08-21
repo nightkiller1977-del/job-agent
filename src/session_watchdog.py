@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass
@@ -51,6 +52,15 @@ _HEARTBEAT_SOURCES = {"linkedin", "indeed", "jobright"}
 
 # Sources that need a visible browser for the user to complete login
 _HUMAN_SOURCES = {"linkedin", "usajobs"}
+
+# CLI-supported prepare-sessions source choices. Queue/source labels from
+# JobSpy-backed providers such as glassdoor, google, and ziprecruiter must not
+# be rewritten to jobright because prepare_sessions filters stored jobs by exact
+# source. Unsupported labels intentionally omit the source filter.
+_PREPARE_SESSION_SOURCES = {"linkedin", "usajobs", "jobright", "indeed"}
+_PREPARE_SESSION_SOURCE_ALIASES = {
+    "linkedin-saved": "linkedin",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -318,22 +328,70 @@ def _novnc_link() -> Optional[str]:
     return f"http://{ip}:{port}/vnc.html?autoconnect=true&resize=scale"
 
 
-def _stage_prepare_sessions(source: str) -> None:
-    """Open a Terminal window on the Mac and start `prepare-sessions` for
-    *source* so the login browser window is already up by the time a human
-    opens either the jobagent:// deep link or the noVNC link. Safe to invoke
-    repeatedly — prepare_session() no-ops cleanly when already authenticated,
-    and blocks on a plain `input()` when a human login is actually needed."""
+def _prepare_sessions_source(source: str) -> Optional[str]:
+    """Return a CLI-supported prepare-sessions source for a queue source label."""
+    normalized = (source or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized in _PREPARE_SESSION_SOURCES:
+        return normalized
+    return _PREPARE_SESSION_SOURCE_ALIASES.get(normalized)
+
+
+def _prepare_sessions_command(source: str) -> tuple[str, Optional[str]]:
+    """Build a safe shell command for Terminal staging.
+
+    The second tuple item is the normalized prepare-sessions source, or None
+    when no safe source filter should be sent.
+    """
     project_dir = Path(__file__).parent.parent
-    cmd = (
-        f"cd {project_dir} && source .venv/bin/activate && "
-        f"python src/main.py prepare-sessions --source {source}"
-    )
-    script = f'tell application "Terminal" to do script "{cmd}"'
+    prepare_source = _prepare_sessions_source(source)
+    parts = [
+        "cd",
+        shlex.quote(str(project_dir)),
+        "&&",
+        "source",
+        ".venv/bin/activate",
+        "&&",
+        "python",
+        "src/main.py",
+        "prepare-sessions",
+    ]
+    if prepare_source:
+        parts.extend(["--source", shlex.quote(prepare_source)])
+    return " ".join(parts), prepare_source
+
+
+def _stage_prepare_sessions(source: str) -> bool:
+    """Open a Terminal window on the Mac and start `prepare-sessions`.
+
+    Returns True only when the osascript staging command succeeds. A failure is
+    logged and intentionally does not count as a successful notification cycle,
+    so the next watchdog pass may retry staging instead of waiting 12 hours.
+    """
+    cmd, prepare_source = _prepare_sessions_command(source)
+    if prepare_source != (source or "").strip().lower():
+        _log.info(
+            "session_watchdog.stage_source_mapped source=%s prepare_source=%s",
+            source,
+            prepare_source or "all",
+        )
+    script = f'tell application "Terminal" to do script {json.dumps(cmd)}'
     try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10, text=True)
     except Exception as exc:
         _log.warning("session_watchdog.stage_terminal_failed source=%s error=%s", source, exc)
+        return False
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        _log.warning(
+            "session_watchdog.stage_terminal_failed source=%s returncode=%s error=%s",
+            source,
+            result.returncode,
+            stderr,
+        )
+        return False
+    return True
 
 
 def _send_deep_link_notification(source: str, message: str) -> None:
@@ -353,7 +411,10 @@ def _send_deep_link_notification(source: str, message: str) -> None:
     reads credentials from the same centralized store telegramApprovalProvider.js
     uses — no duplicate config needed.
     """
-    deep_link = f"jobagent://prepare-sessions?source={source}"
+    prepare_source = _prepare_sessions_source(source)
+    deep_link = "jobagent://prepare-sessions"
+    if prepare_source:
+        deep_link += f"?source={prepare_source}"
     novnc_link = _novnc_link()
     link_lines = [deep_link]
     if novnc_link:
@@ -369,11 +430,12 @@ def _send_deep_link_notification(source: str, message: str) -> None:
         # Rate limit identical deep link Telegram alerts to once every 12 hours (43200 seconds)
         if now - last_time < 43200:
             return
-        _last_notification_times[cache_key] = now
 
         _send_telegram(full_msg)
         _desktop_notify(f"{source} session needs refresh", message)
-        _stage_prepare_sessions(source)
+        staged = _stage_prepare_sessions(source)
+        if staged:
+            _last_notification_times[cache_key] = now
     except Exception as exc:
         _log.warning("session_watchdog.notify_failed source=%s error=%s", source, exc)
         console.print(f"[yellow]Session alert ({source}):[/yellow] {message}\n{full_msg}")
