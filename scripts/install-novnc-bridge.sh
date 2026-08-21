@@ -48,15 +48,40 @@ fi
 # ── websockify ────────────────────────────────────────────────────────────
 if ! python3 -c "import websockify" >/dev/null 2>&1; then
   echo "Installing websockify ..."
-  pip3 install --user --quiet websockify
+  python3 -m pip install --user --quiet websockify
 fi
-WEBSOCKIFY_BIN="$(python3 -c "import shutil,sys; p=shutil.which('websockify'); print(p or '')")"
-if [[ -z "$WEBSOCKIFY_BIN" ]]; then
-  # pip --user installs land here on this machine's Python; not on PATH by default.
-  WEBSOCKIFY_BIN="$HOME/Library/Python/3.12/bin/websockify"
-fi
+WEBSOCKIFY_BIN="$(python3 - <<'PY'
+import os
+import shutil
+import site
+import sys
+import sysconfig
+
+found = shutil.which("websockify")
+if found:
+    print(found)
+    raise SystemExit
+
+version = f"{sys.version_info.major}.{sys.version_info.minor}"
+candidates = []
+for path in (
+    sysconfig.get_path("scripts"),
+    os.path.join(getattr(site, "USER_BASE", ""), "bin"),
+    os.path.expanduser(f"~/Library/Python/{version}/bin"),
+):
+    if path:
+        candidates.append(os.path.join(path, "websockify"))
+
+for candidate in candidates:
+    if os.path.exists(candidate):
+        print(candidate)
+        raise SystemExit
+print("")
+PY
+)"
 if [[ ! -x "$WEBSOCKIFY_BIN" ]]; then
   echo "Error: could not locate the websockify executable after install." >&2
+  echo "       Tried PATH, Python sysconfig scripts, user base bin, and macOS user script paths." >&2
   exit 1
 fi
 
