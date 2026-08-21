@@ -141,18 +141,21 @@ def test_novnc_link_respects_port_override(monkeypatch):
         assert link.startswith("http://100.64.1.2:7777/")
 
 
-def test_prepare_sessions_source_maps_unsupported_sources():
+def test_prepare_sessions_source_maps_supported_aliases_only():
     assert _prepare_sessions_source("linkedin") == "linkedin"
     assert _prepare_sessions_source("usajobs") == "usajobs"
     assert _prepare_sessions_source("indeed") == "indeed"
     assert _prepare_sessions_source("jobright") == "jobright"
-    assert _prepare_sessions_source("external") == "jobright"
-    assert _prepare_sessions_source("glassdoor") == "jobright"
-    assert _prepare_sessions_source("ziprecruiter") == "jobright"
-    assert _prepare_sessions_source("google") == "jobright"
-    assert _prepare_sessions_source("jobspy") == "jobright"
     assert _prepare_sessions_source("linkedin-saved") == "linkedin"
     assert _prepare_sessions_source(None) is None
+
+
+def test_prepare_sessions_source_omits_jobspy_backed_filters():
+    assert _prepare_sessions_source("external") is None
+    assert _prepare_sessions_source("glassdoor") is None
+    assert _prepare_sessions_source("ziprecruiter") is None
+    assert _prepare_sessions_source("google") is None
+    assert _prepare_sessions_source("jobspy") is None
 
 
 def test_prepare_sessions_command_omits_unknown_source():
@@ -163,13 +166,23 @@ def test_prepare_sessions_command_omits_unknown_source():
     assert "--source" not in cmd
 
 
-def test_stage_prepare_sessions_maps_source_before_terminal():
+def test_stage_prepare_sessions_omits_jobspy_backed_source_filter():
     with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
         assert _stage_prepare_sessions("glassdoor") is True
 
     script = mock_run.call_args[0][1]
-    assert "prepare-sessions --source jobright" in script
-    assert "--source glassdoor" not in script
+    assert "prepare-sessions" in script
+    assert "--source" not in script
+    assert "glassdoor" not in script
+    assert "jobright" not in script
+
+
+def test_stage_prepare_sessions_keeps_supported_source_filter():
+    with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
+        assert _stage_prepare_sessions("linkedin") is True
+
+    script = mock_run.call_args[0][1]
+    assert "prepare-sessions --source linkedin" in script
 
 
 def test_stage_prepare_sessions_returns_false_on_osascript_failure():
@@ -196,7 +209,7 @@ def test_send_deep_link_notification_includes_novnc_link_when_available():
         mock_stage.assert_called_once_with("linkedin")
 
 
-def test_send_deep_link_notification_maps_deep_link_source():
+def test_send_deep_link_notification_omits_jobspy_backed_deep_link_source():
     with patch("src.session_watchdog._novnc_link", return_value=None), \
          patch("src.session_watchdog._stage_prepare_sessions", return_value=True), \
          patch("src.notifier._send_telegram") as mock_send, \
@@ -205,8 +218,8 @@ def test_send_deep_link_notification_maps_deep_link_source():
         _send_deep_link_notification("glassdoor", "Glassdoor session expired.")
 
         sent_text = mock_send.call_args[0][0]
-        assert "jobagent://prepare-sessions?source=jobright" in sent_text
-        assert "source=glassdoor" not in sent_text
+        assert "jobagent://prepare-sessions\n" in sent_text
+        assert "source=" not in sent_text
 
 
 def test_send_deep_link_notification_omits_novnc_link_when_unresolvable():
