@@ -99,6 +99,12 @@ def _fake_run(returncode=0, stdout="", stderr=""):
     return result
 
 
+def _osascript_from_run(mock_run):
+    args = mock_run.call_args[0][0]
+    assert args[:2] == ["osascript", "-e"]
+    return args[2]
+
+
 def test_resolve_tailscale_ip_success_on_first_candidate():
     with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0, "100.64.1.2\n")):
         assert _resolve_tailscale_ip() == "100.64.1.2"
@@ -170,7 +176,7 @@ def test_stage_prepare_sessions_omits_jobspy_backed_source_filter():
     with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
         assert _stage_prepare_sessions("glassdoor") is True
 
-    script = mock_run.call_args[0][1]
+    script = _osascript_from_run(mock_run)
     assert "prepare-sessions" in script
     assert "--source" not in script
     assert "glassdoor" not in script
@@ -181,7 +187,7 @@ def test_stage_prepare_sessions_keeps_supported_source_filter():
     with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
         assert _stage_prepare_sessions("linkedin") is True
 
-    script = mock_run.call_args[0][1]
+    script = _osascript_from_run(mock_run)
     assert "prepare-sessions --source linkedin" in script
 
 
@@ -218,7 +224,7 @@ def test_send_deep_link_notification_omits_jobspy_backed_deep_link_source():
         _send_deep_link_notification("glassdoor", "Glassdoor session expired.")
 
         sent_text = mock_send.call_args[0][0]
-        assert "jobagent://prepare-sessions\n" in sent_text
+        assert sent_text.endswith("jobagent://prepare-sessions")
         assert "source=" not in sent_text
 
 
