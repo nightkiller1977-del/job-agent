@@ -401,3 +401,33 @@ class TestCloseBrowser:
         assert scraper._browser is None
         assert scraper._playwright is None
         assert scraper._page is None
+
+
+# ── ACES-74: Browser Launch Robustness ──────────────────────────────────────────
+
+class TestBrowserLaunchRobustness:
+    @pytest.mark.asyncio
+    async def test_launch_persistent_context_retry_and_backoff(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.sources.base.SESSIONS_DIR", tmp_path)
+        scraper = _Scraper(config={})
+
+        mock_ap_cm, mock_pw, mock_browser, mock_ctx, mock_page = _make_playwright_mock()
+
+        attempts = []
+        async def mock_launch(*args, **kwargs):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 3:
+                raise RuntimeError("Timeout 180000ms exceeded")
+            return mock_ctx
+
+        mock_pw.chromium.launch_persistent_context = mock_launch
+
+        sleep_calls = []
+        with patch("src.sources.base.async_playwright", return_value=mock_ap_cm), \
+             patch("asyncio.sleep", side_effect=lambda t: sleep_calls.append(t)), \
+             patch("src.sources.base.sys.stdin.isatty", return_value=True):
+
+             await scraper._start_browser()
+
+        assert len(attempts) == 3
+        assert sleep_calls == [5, 10]
