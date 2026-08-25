@@ -88,6 +88,40 @@ class ReauthManager:
     # ------------------------------------------------------------------
 
     async def _reauth_automated(self, source: str) -> bool:
+        # Cap retries and implement exponential backoff
+        from .notifier import get_status
+        status = get_status()
+        events = status.get("reauth_events", [])
+
+        consecutive_failures = 0
+        last_failure_ts = None
+        for event in reversed(events):
+            if event.get("source") == source:
+                if event.get("outcome") == "failed" and event.get("mode") == "automated":
+                    consecutive_failures += 1
+                    if not last_failure_ts:
+                        try:
+                            last_failure_ts = datetime.fromisoformat(event.get("ts").replace("Z", "+00:00"))
+                        except Exception:
+                            pass
+                elif event.get("outcome") == "success":
+                    break
+
+        if consecutive_failures >= 3:
+            _log.warning("reauth.skip_retry_cap source=%s consecutive_failures=%d", source, consecutive_failures)
+            return False
+
+        if consecutive_failures > 0 and last_failure_ts:
+            if last_failure_ts.tzinfo is not None:
+                last_failure_ts = last_failure_ts.replace(tzinfo=None)
+            now = datetime.utcnow()
+            backoff_seconds = (2 ** consecutive_failures) * 120
+            time_since_failure = (now - last_failure_ts).total_seconds()
+            if time_since_failure < backoff_seconds:
+                remaining = int(backoff_seconds - time_since_failure)
+                _log.info("reauth.backoff source=%s consecutive_failures=%d remaining=%ds", source, consecutive_failures, remaining)
+                return False
+
         source_map = _get_source_map()
         scraper_cls = source_map.get(source)
         if not scraper_cls:
@@ -111,6 +145,24 @@ class ReauthManager:
             page = await scraper._start_browser()
             success = await scraper._auto_login(page, email, password)
             if success:
+                # Post-login verification to eliminate false-positives
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    await asyncio.sleep(2)
+                    cur_url = page.url
+                except Exception as verify_exc:
+                    record_reauth_event(source, "automated", "failed", f"Failed post-login url verification: {verify_exc}")
+                    _log.error("reauth.verify_error source=%s error=%s", source, verify_exc)
+                    return False
+
+                if not _is_logged_in_url(source, cur_url):
+                    record_reauth_event(source, "automated", "failed", f"auto_login returned True but URL is {cur_url}")
+                    _log.warning("reauth.false_positive source=%s url=%s", source, cur_url)
+                    notify_warning(
+                        f"{source} automated reauth false-positive",
+                        f"Login returned True but was redirected to login page: {cur_url}",
+                    )
+                    return False
                 await scraper._export_session_json()
                 record_reauth_event(source, "automated", "success")
                 _log.info("reauth.success source=%s mode=automated", source)
@@ -346,3 +398,12 @@ def _send_imessage(phone: str, message: str) -> None:
         subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
     except Exception as exc:
         _log.warning("iMessage send failed: %s", exc)
+
+
+def _is_logged_in_url(source: str, url: str) -> bool:
+    """True if the URL doesn't look like a login/signin/challenge redirect."""
+    if not isinstance(url, str):
+        return True
+    url_lower = url.lower()
+    bad_patterns = ["/login", "/signin", "/signup", "challenge", "checkpoint", "accounts.google"]
+    return not any(p in url_lower for p in bad_patterns)
