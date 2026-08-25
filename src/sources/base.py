@@ -318,15 +318,48 @@ class BaseScraper(ABC):
             # Store extensions, saved logins, and Chrome's cookie encryption all
             # work correctly. The dedicated profile dir keeps sessions separate from
             # the main Chrome profile — no locking conflicts, no risk to personal data.
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self._profile_dir),
-                channel="chrome",
-                headless=False,
-                accept_downloads=True,
-                args=args,
-                slow_mo=80,
-                viewport={"width": 1400, "height": 900},
-            )
+            max_launch_attempts = 3
+            for attempt in range(1, max_launch_attempts + 1):
+                launch_lock = None
+                try:
+                    from .adapters.profile_lock import ProfileLock
+                    launch_lock = await ProfileLock(SESSIONS_DIR / "chrome_launch", timeout=180).acquire_async()
+
+                    self._context = await self._playwright.chromium.launch_persistent_context(
+                        user_data_dir=str(self._profile_dir),
+                        channel="chrome",
+                        headless=False,
+                        accept_downloads=True,
+                        args=args,
+                        slow_mo=80,
+                        viewport={"width": 1400, "height": 900},
+                    )
+                    break
+                except Exception as launch_exc:
+                    _log.warning(
+                        "%s: launch_persistent_context attempt %d failed: %s",
+                        self.name, attempt, launch_exc
+                    )
+                    if attempt == max_launch_attempts:
+                        raise
+
+                    if launch_lock:
+                        try:
+                            launch_lock.release()
+                        except Exception:
+                            pass
+                        launch_lock = None
+
+                    self._clear_profile_locks()
+                    backoff_delay = attempt * 5
+                    _log.info("%s: Retrying browser launch in %ds...", self.name, backoff_delay)
+                    await asyncio.sleep(backoff_delay)
+                finally:
+                    if launch_lock:
+                        try:
+                            launch_lock.release()
+                        except Exception:
+                            pass
 
         # Get or create a page
         pages = self._context.pages
