@@ -602,3 +602,45 @@ class TestSelfHealingNotifications:
         assert "USAJOBS" in title
         assert "human" in detail
         assert "Session refreshed" in detail
+
+
+# ── ACES-72: Retry Cap, Backoff, and URL Verification ───────────────────────────
+
+class TestReauthRemediation:
+    def test_is_logged_in_url(self):
+        from src.reauth import _is_logged_in_url
+        assert _is_logged_in_url("jobright", "https://jobright.ai/jobs") is True
+        assert _is_logged_in_url("linkedin", "https://www.linkedin.com/feed/") is True
+        assert _is_logged_in_url("jobright", "https://jobright.ai/login") is False
+        assert _is_logged_in_url("linkedin", "https://www.linkedin.com/checkpoint/challenge") is False
+        assert _is_logged_in_url("indeed", "https://secure.indeed.com/account/signin") is False
+
+    @pytest.mark.asyncio
+    async def test_retry_cap_limits_attempts(self, tmp_path, monkeypatch):
+        # Set up a mock status file with 3 consecutive failures
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src.notifier import record_reauth_event
+        record_reauth_event("jobright", "automated", "failed", "1")
+        record_reauth_event("jobright", "automated", "failed", "2")
+        record_reauth_event("jobright", "automated", "failed", "3")
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        result = await mgr._reauth_automated("jobright")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_backoff_delays_attempts(self, tmp_path, monkeypatch):
+        # Set up a mock status file with 1 failure
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src.notifier import record_reauth_event
+        record_reauth_event("jobright", "automated", "failed", "1")
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        # The backoff for 1 failure is 240 seconds, so it should bail out early (return False)
+        # without running _get_source_map
+        with patch("src.reauth._get_source_map") as mock_get_map:
+            result = await mgr._reauth_automated("jobright")
+            assert result is False
+            mock_get_map.assert_not_called()
