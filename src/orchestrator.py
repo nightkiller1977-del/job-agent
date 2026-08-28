@@ -22,6 +22,8 @@ from .sources.linkedin import LinkedInScraper
 from .sources.usajobs import USAJobsScraper
 from .sources.indeed import IndeedScraper
 from .sources.jobspy_scraper import JobSpyScraper
+from .sources.themuse import TheMuseScraper
+from .sources.builtin import BuiltInScraper
 
 import logging
 
@@ -46,13 +48,15 @@ SOURCE_MAP = {
     "glassdoor": JobrightScraper,  # routes external apply
     "ziprecruiter": JobrightScraper,
     "google":   JobrightScraper,
+    "themuse":  TheMuseScraper,
+    "builtin":  BuiltInScraper,
 }
 
 # Sources fanned out by default discovery (no --source given). Deliberately
 # excludes "external", which resolves to JobrightScraper and is only meant for
 # explicitly hydrating manually-pasted non-source URLs — including it here would
 # scrape Jobright twice per run.
-DEFAULT_DISCOVERY_SOURCES = ["jobright", "linkedin", "usajobs", "indeed", "jobspy"]
+DEFAULT_DISCOVERY_SOURCES = ["jobright", "linkedin", "usajobs", "indeed", "jobspy", "themuse", "builtin"]
 
 # Path to the file written by the Claude-in-Chrome MCP scraper
 MCP_SCRAPED_FILE = Path(__file__).parent.parent / "state" / "mcp_scraped.json"
