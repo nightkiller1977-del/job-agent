@@ -19,7 +19,7 @@ from datetime import datetime
 import httpx
 from rich.console import Console
 
-from .base import BaseScraper, AuthFailedError, JobExpiredError
+from .base import BaseScraper, JobExpiredError
 from src.resume_helper import PDFTextLayerError
 
 console = Console()
