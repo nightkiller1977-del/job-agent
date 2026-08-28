@@ -166,13 +166,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     discover_parser.add_argument(
         "--source",
-        choices=["linkedin", "linkedin-saved", "usajobs", "jobright", "indeed", "mcp"],
+        choices=["linkedin", "linkedin-saved", "usajobs", "jobright", "indeed", "themuse", "builtin", "mcp"],
         default=None,
         help=(
             "Scrape only a specific source. "
             "'linkedin-saved' imports jobs you saved in LinkedIn. "
+            "'themuse' pulls from TheMuse's public jobs API (no login required). "
+            "'builtin' pulls from builtin.com (no login required). "
             "'mcp' scores jobs already scraped via Claude-in-Chrome. "
-            "(default: all Playwright sources including Indeed)"
+            "(default: all Playwright sources including Indeed, plus JobSpy, TheMuse, and BuiltIn)"
         ),
     )
     discover_parser.add_argument(
@@ -211,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     apply_parser.add_argument(
         "--source",
-        choices=["linkedin", "usajobs", "jobright", "indeed"],
+        choices=["linkedin", "usajobs", "jobright", "indeed", "themuse", "builtin"],
         default=None,
         help="Only attempt approved jobs from one source",
     )
@@ -226,7 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
         "preflight",
         help="Pull cloud approvals and report which jobs are ready or likely blocked before applying",
     )
-    preflight_parser.add_argument("--source", choices=["linkedin", "usajobs", "jobright", "indeed"], default=None)
+    preflight_parser.add_argument("--source", choices=["linkedin", "usajobs", "jobright", "indeed", "themuse", "builtin"], default=None)
     preflight_parser.add_argument("--company", default=None)
 
     # prepare-sessions
@@ -266,7 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
         "ops-check",
         help="Run the safe operational readiness flow: queue preflight plus mock apply-path tests",
     )
-    ops_parser.add_argument("--source", choices=["linkedin", "usajobs", "jobright", "indeed"], default=None)
+    ops_parser.add_argument("--source", choices=["linkedin", "usajobs", "jobright", "indeed", "themuse", "builtin"], default=None)
     ops_parser.add_argument("--company", default=None)
     ops_parser.add_argument(
         "--skip-functional",
