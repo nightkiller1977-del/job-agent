@@ -674,8 +674,19 @@ class Orchestrator:
             company=company,
             limit=limit,
         )
+        min_apply_score = int(self.config.get("search_settings", {}).get("min_apply_score", 70))
+        valid_approved = []
+        for j in all_approved:
+            s = j.get("score")
+            if s is not None and s < min_apply_score:
+                console.print(f"[dim]Auto-skipping low-score job ({s} < {min_apply_score}): {j.get('title')} @ {j.get('company')}[/dim]")
+                self.state.set_status(j["job_id"], "skipped")
+            else:
+                valid_approved.append(j)
+        all_approved = valid_approved
+
         if not all_approved:
-            console.print("[yellow]No approved jobs pending application.[/yellow]")
+            console.print("[yellow]No approved jobs meeting minimum score pending application.[/yellow]")
             return
 
         # ── Pre-flight classification ──────────────────────────────────────────

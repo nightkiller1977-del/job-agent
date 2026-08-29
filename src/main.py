@@ -355,6 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Analyze skill gaps against approved/applied jobs and generate learning roadmap",
     )
 
+    # questions
+    subparsers.add_parser(
+        "questions",
+        help="Display all unanswered screening questions captured during application runs",
+    )
+
     # session-status
     subparsers.add_parser(
         "session-status",
@@ -375,6 +381,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    if args.command == "questions":
+        from src.answers.unanswered_tracker import tracker
+        tracker.display_table()
+        return 0
+
     from src.orchestrator import Orchestrator
 
     # Config path relative to project root
@@ -439,6 +450,11 @@ async def main_async(args: argparse.Namespace) -> int:
             reason=args.reason,
             dry_run=args.dry_run,
         )
+
+    elif args.command == "questions":
+        from src.answers.unanswered_tracker import tracker
+        tracker.display_table()
+        return 0
 
     elif args.command == "session-status":
         from src.session_watchdog import check_session_health, print_health_table
