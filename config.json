@@ -1,53 +1,39 @@
 {
   "user_profile": {
-    "current_title": "Director of Software Engineering",
-    "years_experience": 20,
-    "clearance": "Top Secret (TS)",
-    "location": "Miami, Florida",
-    "open_to_relocation": ["remote", "Miami on-site", "DC/DMV area"],
+    "current_title": "Software Engineering Executive",
+    "years_experience": 15,
+    "clearance": "None",
+    "location": "Remote",
+    "open_to_relocation": ["remote"],
     "us_citizen": true,
-    "specialized_experience_gs14_equivalent": true
+    "specialized_experience_gs14_equivalent": false
   },
   "target_roles": [
     "Director of Software Engineering",
     "Director of Engineering",
-    "Director of IT",
-    "VP of IT",
     "VP of Software Engineering",
-    "AVP of Software Engineering",
-    "CTO",
-    "CIO",
+    "VP of Engineering",
     "Engineering Manager",
-    "Program Manager",
     "GS-15",
-    "SES",
-    "SL"
+    "SES"
   ],
   "reject_roles": [
     "Software Engineer",
     "Software Developer",
-    "Staff Engineer",
-    "Principal Engineer",
-    "Data Engineer",
-    "DevOps Engineer",
     "Intern",
     "Junior",
     "Entry Level"
   ],
   "compensation_thresholds": {
     "remote":            { "min_comp": 180000 },
-    "miami_onsite":      { "min_comp": 230000 },
-    "dc_area_onsite":    { "min_comp": 260000, "max_comp": 320000 },
-    "other_onsite":      { "action": "skip" },
-    "cleared_dod_remote":{ "min_comp": 170000 },
-    "cleared_dod_hybrid":{ "min_comp": 230000 },
+    "onsite":            { "min_comp": 220000 },
+    "hybrid":            { "min_comp": 200000 },
     "federal_gs15":      { "action": "always_apply" },
     "federal_ses":       { "action": "always_apply" },
-    "federal_sl":        { "action": "always_apply" },
     "contract_remote":   { "min_comp": 180000 }
   },
   "search_settings": {
-    "keywords": "Director Software Engineering VP Engineering IT",
+    "keywords": "Director Software Engineering VP Engineering",
     "location": "Remote",
     "days_posted": 7,
     "max_jobs_per_source": 50,
