@@ -226,6 +226,17 @@ class AnswerBank:
             skill_name = skill_match.group(1).strip()
             return self._infer_years_of_experience(skill_name, field_type)
 
+        # 12. Open-Ended Text Questions (Grounded LLM Fallback)
+        if field_type == "text":
+            try:
+                from .llm_answer_generator import LLMAnswerGenerator
+                generator = LLMAnswerGenerator(self.profile)
+                llm_ans = generator.generate_answer(question_text, job=job)
+                if llm_ans:
+                    return llm_ans
+            except Exception:
+                pass
+
         # Record unanswered question to tracker
         try:
             from .unanswered_tracker import tracker
