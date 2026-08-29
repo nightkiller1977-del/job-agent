@@ -674,21 +674,21 @@ class Orchestrator:
             company=company,
             limit=limit,
         )
-        min_apply_score = int(self.config.get("search_settings", {}).get("min_apply_score", 70))
-        valid_approved = []
-        for j in all_approved:
-            s = j.get("score")
-            if s is None or not isinstance(s, (int, float)) or s < min_apply_score:
-                reason_str = "unscored" if s is None else f"{s} < {min_apply_score}"
-                console.print(f"[dim]Auto-skipping low-score/unscored job ({reason_str}): {j.get('title')} @ {j.get('company')}[/dim]")
-                self.state.set_status(j["job_id"], "skipped")
-                try:
-                    await self._push_status_to_cloud(j["job_id"], "skipped")
-                except Exception:
-                    pass
-            else:
-                valid_approved.append(j)
-        all_approved = valid_approved
+        min_apply_score = int(self.config.get("search_settings", {}).get("min_apply_score", 0))
+        if min_apply_score > 0:
+            valid_approved = []
+            for j in all_approved:
+                s = j.get("score")
+                if s is not None and isinstance(s, (int, float)) and s < min_apply_score:
+                    console.print(f"[dim]Auto-skipping low-score job ({s} < {min_apply_score}): {j.get('title')} @ {j.get('company')}[/dim]")
+                    self.state.set_status(j["job_id"], "skipped")
+                    try:
+                        await self._push_status_to_cloud(j["job_id"], "skipped")
+                    except Exception:
+                        pass
+                else:
+                    valid_approved.append(j)
+            all_approved = valid_approved
 
         if not all_approved:
             console.print("[yellow]No approved jobs meeting minimum score pending application.[/yellow]")
