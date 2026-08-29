@@ -62,7 +62,7 @@ class GenericAtsAdapter(AtsAdapter):
 
     # ---- small page helpers (overridable / fake-able in tests) ---------------
     async def _first_selector(self, page, selectors):
-        """Return the first selector (from a str or list) that matches an element."""
+        """Return the first selector (from a str or list) that matches an element on page or in any iframe."""
         if isinstance(selectors, str):
             selectors = [selectors]
         for sel in selectors:
@@ -72,6 +72,21 @@ class GenericAtsAdapter(AtsAdapter):
                     return sel, el
             except Exception:
                 continue
+
+        # Check all child frames/iframes
+        try:
+            frames = getattr(page, "frames", [])
+            for frame in frames:
+                for sel in selectors:
+                    try:
+                        el = await frame.query_selector(sel)
+                        if el:
+                            return sel, el
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
         return None, None
 
     async def _fill(self, page, selectors, value) -> bool:
