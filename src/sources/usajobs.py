@@ -399,9 +399,14 @@ class USAJobsScraper(BaseScraper):
         import os
         import asyncio
 
-        email_addr = os.environ.get("USAJOBS_EMAIL", "")
-        # Use an explicit IMAP password, or fall back to the main USAJOBS_PASSWORD
-        imap_password = os.environ.get("IMAP_PASSWORD", "") or os.environ.get("USAJOBS_PASSWORD", "")
+        email_addr = os.environ.get("USAJOBS_EMAIL", "") or os.environ.get("EMAIL_2FA_ADDRESS", "")
+        # Use an explicit IMAP password / iCloud App Password, or fall back to the main USAJOBS_PASSWORD
+        imap_password = (
+            os.environ.get("IMAP_PASSWORD", "")
+            or os.environ.get("ICLOUD_APP_PASSWORD_PERSONAL", "")
+            or os.environ.get("ICLOUD_APP_PASSWORD", "")
+            or os.environ.get("USAJOBS_PASSWORD", "")
+        )
 
         if not email_addr or not imap_password:
             return False
