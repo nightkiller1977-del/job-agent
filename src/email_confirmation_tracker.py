@@ -189,6 +189,27 @@ class EmailConfirmationTracker:
 
         return min(round(score, 2), 1.0), evidence
 
+    def _apply_confirmation_transition(self, job: dict, score: float, outcome: dict) -> None:
+        """Advance confirmation_status to confirmed_by_employer, but only when the row
+        already carries submission evidence (submitted/receipt_pending) stamped by the
+        orchestrator from a real apply-success event. An email match alone is signal,
+        not proof — it must never fabricate submitting/submitted history for a row that
+        has none (e.g. a legacy row that predates this column, or one the orchestrator
+        never got to stamp). Those cases are flagged for manual review instead."""
+        curr_conf = job.get("confirmation_status")
+        if curr_conf in ("submitted", "receipt_pending"):
+            try:
+                self.state_manager.transition_confirmation(job["job_id"], "confirmed_by_employer")
+                console.print(f"[green]✓ Application Confirmed by Employer:[/green] {job.get('title')} @ {job.get('company')} (Score: {score})")
+            except Exception as exc:
+                logger.warning("Could not transition confirmation for %s: %s", job["job_id"], exc)
+        else:
+            outcome["needs_manual_confirmation"] = True
+            console.print(
+                f"[yellow]⚠ Email matched but confirmation_status='{curr_conf}' has no submission evidence on file "
+                f"— flagged for manual review, state not advanced:[/yellow] {job.get('title')} @ {job.get('company')}"
+            )
+
     def scan_inbox_and_confirm(
         self,
         days: int = 7,
@@ -301,17 +322,7 @@ class EmailConfirmationTracker:
                     results.append(outcome)
 
                     if best_score >= 0.85 and not dry_run:
-                        # Transition confirmation_status to confirmed_by_employer
-                        try:
-                            # Advance through intermediate states if starting at None
-                            curr_conf = best_job.get("confirmation_status")
-                            if curr_conf is None:
-                                self.state_manager.transition_confirmation(best_job["job_id"], "submitting")
-                                self.state_manager.transition_confirmation(best_job["job_id"], "submitted")
-                            self.state_manager.transition_confirmation(best_job["job_id"], "confirmed_by_employer")
-                            console.print(f"[green]✓ Application Confirmed by Employer:[/green] {best_job.get('title')} @ {best_job.get('company')} (Score: {best_score})")
-                        except Exception as exc:
-                            logger.warning("Could not transition confirmation for %s: %s", best_job["job_id"], exc)
+                        self._apply_confirmation_transition(best_job, best_score, outcome)
 
                     if msg_id and not dry_run:
                         self._processed_ids.add(msg_id)

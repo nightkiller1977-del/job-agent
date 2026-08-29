@@ -1,7 +1,9 @@
 """Unit tests for Multi-Signal Email Confirmation Tracker."""
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
+import pytest
 from src.email_confirmation_tracker import EmailConfirmationTracker
+from src.state_manager import StateManager
 
 
 def test_workday_email_confirmation_scoring():
@@ -66,3 +68,56 @@ def test_unmatched_email_scoring():
 
     score, _ = tracker.calculate_match_score(sender, subject, body, msg_date, job)
     assert score < 0.50
+
+
+@pytest.fixture
+def state_mgr(tmp_path):
+    return StateManager(db_path=tmp_path / "test_jobs.db")
+
+
+def test_confirmation_transition_requires_submission_evidence(state_mgr):
+    """A high-scoring email match must never fabricate submitting/submitted history
+    for a row with no ledger-backed evidence (e.g. a legacy row, or one the
+    orchestrator never got to stamp) — it should flag for manual review instead."""
+    job = {
+        "job_id": "legacy_job_1",
+        "title": "Director of Engineering",
+        "company": "Tech Corp",
+        "source": "linkedin",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job)
+    fetched = state_mgr.get_job("legacy_job_1")
+    assert fetched.get("confirmation_status") is None
+
+    tracker = EmailConfirmationTracker(state_manager=state_mgr)
+    outcome = {"confirmed": True}
+    tracker._apply_confirmation_transition(fetched, 0.9, outcome)
+
+    assert state_mgr.get_job("legacy_job_1")["confirmation_status"] is None
+    assert outcome["needs_manual_confirmation"] is True
+
+
+def test_confirmation_transition_advances_with_submission_evidence(state_mgr):
+    """When the orchestrator already stamped submitted/receipt_pending from a real
+    apply-success event, a matching confirmation email should legitimately advance
+    the row to confirmed_by_employer."""
+    job = {
+        "job_id": "real_job_1",
+        "title": "VP Engineering",
+        "company": "Global Corp",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    state_mgr.transition_confirmation("real_job_1", "submitting")
+    state_mgr.transition_confirmation("real_job_1", "submitted")
+    state_mgr.set_status("real_job_1", "applied")
+
+    tracker = EmailConfirmationTracker(state_manager=state_mgr)
+    outcome = {"confirmed": True}
+    fetched = state_mgr.get_job("real_job_1")
+    tracker._apply_confirmation_transition(fetched, 0.9, outcome)
+
+    assert state_mgr.get_job("real_job_1")["confirmation_status"] == "confirmed_by_employer"
+    assert "needs_manual_confirmation" not in outcome

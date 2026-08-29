@@ -2,6 +2,7 @@
 import pytest
 from pathlib import Path
 from src.state_manager import StateManager, InvalidStateTransitionError
+from src.orchestrator import Orchestrator
 
 
 @pytest.fixture
@@ -72,3 +73,25 @@ def test_confirmed_by_employer_guard_requires_applied_status(state_mgr):
     # Should raise error because status is 'approved', not 'applied'
     with pytest.raises(InvalidStateTransitionError):
         state_mgr.transition_confirmation("test_job_3", "confirmed_by_employer")
+
+
+def test_orchestrator_stamps_confirmation_status_on_apply_success(state_mgr):
+    """Orchestrator._mark_confirmation_submitted must be the source of confirmation_status
+    evidence — called right at the point a real apply-success is observed, not inferred
+    later from an email (see EmailConfirmationTracker._apply_confirmation_transition)."""
+    job = {
+        "job_id": "test_job_4",
+        "title": "Staff Engineer",
+        "company": "Acme Corp",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+
+    orch = Orchestrator.__new__(Orchestrator)  # skip __init__ side effects
+    orch.config = {}
+    orch.state = state_mgr
+
+    orch._mark_confirmation_submitted("test_job_4")
+
+    assert state_mgr.get_job("test_job_4")["confirmation_status"] == "submitted"
