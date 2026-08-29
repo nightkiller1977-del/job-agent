@@ -400,15 +400,22 @@ class USAJobsScraper(BaseScraper):
         import asyncio
 
         email_addr = os.environ.get("USAJOBS_EMAIL", "") or os.environ.get("EMAIL_2FA_ADDRESS", "")
-        # Use an explicit IMAP password / iCloud App Password, or fall back to the main USAJOBS_PASSWORD
-        imap_password = (
-            os.environ.get("IMAP_PASSWORD", "")
-            or os.environ.get("ICLOUD_APP_PASSWORD_PERSONAL", "")
-            or os.environ.get("ICLOUD_APP_PASSWORD", "")
-            or os.environ.get("USAJOBS_PASSWORD", "")
-        )
+        if not email_addr:
+            return False
 
-        if not email_addr or not imap_password:
+        # Scope iCloud app password to iCloud domains; otherwise prefer explicit IMAP or USAJOBS password
+        is_icloud = any(dom in email_addr.lower() for dom in ("@icloud.com", "@me.com", "@mac.com"))
+        if is_icloud:
+            imap_password = (
+                os.environ.get("IMAP_PASSWORD", "")
+                or os.environ.get("ICLOUD_APP_PASSWORD_PERSONAL", "")
+                or os.environ.get("ICLOUD_APP_PASSWORD", "")
+                or os.environ.get("USAJOBS_PASSWORD", "")
+            )
+        else:
+            imap_password = os.environ.get("IMAP_PASSWORD", "") or os.environ.get("USAJOBS_PASSWORD", "")
+
+        if not imap_password:
             return False
 
         # Find the 2FA OTP code input field
