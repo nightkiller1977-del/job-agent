@@ -1,41 +1,57 @@
 {
   "user_profile": {
-    "current_title": "Your Current Title",
-    "years_experience": 10,
-    "clearance": "None",
-    "location": "Your City, State",
-    "open_to_relocation": ["remote"],
+    "current_title": "Director of Software Engineering",
+    "years_experience": 20,
+    "clearance": "Top Secret (TS)",
+    "location": "Miami, Florida",
+    "open_to_relocation": ["remote", "Miami on-site", "DC/DMV area"],
     "us_citizen": true,
-    "specialized_experience_gs14_equivalent": false
+    "specialized_experience_gs14_equivalent": true
   },
   "target_roles": [
+    "Director of Software Engineering",
     "Director of Engineering",
-    "VP of Engineering",
+    "Director of IT",
+    "VP of IT",
+    "VP of Software Engineering",
+    "AVP of Software Engineering",
+    "CTO",
+    "CIO",
     "Engineering Manager",
-    "Senior Software Engineer",
-    "Staff Engineer"
+    "Program Manager",
+    "GS-15",
+    "SES",
+    "SL"
   ],
   "reject_roles": [
+    "Software Engineer",
+    "Software Developer",
+    "Staff Engineer",
+    "Principal Engineer",
+    "Data Engineer",
+    "DevOps Engineer",
     "Intern",
     "Junior",
     "Entry Level"
   ],
   "compensation_thresholds": {
-    "remote":            { "min_comp": 120000 },
-    "onsite":            { "min_comp": 140000 },
-    "hybrid":            { "min_comp": 130000 },
-    "cleared_remote":    { "min_comp": 130000 },
-    "cleared_hybrid":    { "min_comp": 140000 },
+    "remote":            { "min_comp": 180000 },
+    "miami_onsite":      { "min_comp": 230000 },
+    "dc_area_onsite":    { "min_comp": 260000, "max_comp": 320000 },
+    "other_onsite":      { "action": "skip" },
+    "cleared_dod_remote":{ "min_comp": 170000 },
+    "cleared_dod_hybrid":{ "min_comp": 230000 },
     "federal_gs15":      { "action": "always_apply" },
     "federal_ses":       { "action": "always_apply" },
-    "contract_remote":   { "min_comp": 120000 },
-    "contract_hybrid":   { "action": "flag_for_review" }
+    "federal_sl":        { "action": "always_apply" },
+    "contract_remote":   { "min_comp": 180000 }
   },
   "search_settings": {
-    "keywords": "Engineering Manager Director VP Software",
+    "keywords": "Director Software Engineering VP Engineering IT",
     "location": "Remote",
     "days_posted": 7,
     "max_jobs_per_source": 50,
+    "min_apply_score": 70,
     "delay_min_seconds": 1,
     "delay_max_seconds": 3
   },
