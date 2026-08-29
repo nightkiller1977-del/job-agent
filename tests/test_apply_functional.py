@@ -105,8 +105,8 @@ async def test_mock_linkedin_easy_apply():
 
     # Subclass the scraper to inject our request interceptor immediately after page creation
     class InterceptingLinkedInScraper(LinkedInScraper):
-        async def _start_browser(self, load_extensions: bool = False):
-            page = await super()._start_browser(load_extensions)
+        async def _start_browser(self, *args, **kwargs):
+            page = await super()._start_browser(*args, **kwargs)
             await page.route("**/*", route_handler)
             return page
 
@@ -176,15 +176,15 @@ async def test_mock_indeed_ats_handoff():
 
     # Intercepting wrapper classes for Indeed and Jobright
     class InterceptingIndeedScraper(IndeedScraper):
-        async def _start_browser(self, load_extensions: bool = False):
-            page = await super()._start_browser(load_extensions)
+        async def _start_browser(self, *args, **kwargs):
+            page = await super()._start_browser(*args, **kwargs)
             await page.route("**/*", route_handler)
             return page
 
     # We patch JobrightScraper's _start_browser as well, since IndeedScraper delegates to it!
     original_jobright_start = JobrightScraper._start_browser
-    async def intercepting_jobright_start(self, load_extensions: bool = False):
-        page = await original_jobright_start(self, load_extensions)
+    async def intercepting_jobright_start(self, *args, **kwargs):
+        page = await original_jobright_start(self, *args, **kwargs)
         await page.route("**/*", route_handler)
         return page
 
@@ -448,8 +448,8 @@ async def test_mock_ats_score_gate_negative():
     }
 
     original_jobright_start = JobrightScraper._start_browser
-    async def intercepting_jobright_start(self, load_extensions: bool = False):
-        page = await original_jobright_start(self, load_extensions)
+    async def intercepting_jobright_start(self, *args, **kwargs):
+        page = await original_jobright_start(self, *args, **kwargs)
         await page.route("**/*", route_handler)
         return page
 
@@ -532,8 +532,8 @@ async def test_mock_ats_score_gate_positive():
     }
 
     original_jobright_start = JobrightScraper._start_browser
-    async def intercepting_jobright_start(self, load_extensions: bool = False):
-        page = await original_jobright_start(self, load_extensions)
+    async def intercepting_jobright_start(self, *args, **kwargs):
+        page = await original_jobright_start(self, *args, **kwargs)
         await page.route("**/*", route_handler)
         return page
 
@@ -605,8 +605,8 @@ async def test_mock_pre_submission_validation_empty_form():
 
     # Patch dependencies
     original_jobright_start = JobrightScraper._start_browser
-    async def intercepting_jobright_start(self, load_extensions: bool = False):
-        page = await original_jobright_start(self, load_extensions)
+    async def intercepting_jobright_start(self, *args, **kwargs):
+        page = await original_jobright_start(self, *args, **kwargs)
         await page.route("**/*", route_handler)
         return page
 
