@@ -361,6 +361,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Display all unanswered screening questions captured during application runs",
     )
 
+    # check-confirmations
+    conf_parser = subparsers.add_parser(
+        "check-confirmations",
+        help="Scan email inbox for application confirmation receipts and update confirmation status",
+    )
+    conf_parser.add_argument("--days", type=int, default=7, help="Number of days to search back (default: 7)")
+    conf_parser.add_argument("--dry-run", action="store_true", help="Preview matches without writing DB confirmation status")
+
+    # outreach
+    outreach_parser = subparsers.add_parser(
+        "outreach",
+        help="Generate and review executive outreach drafts for high-scoring jobs (score >= 85)",
+    )
+    outreach_parser.add_argument("--min-score", type=int, default=85, help="Minimum score to generate drafts (default: 85)")
+
+    # autopilot-status
+    ap_parser = subparsers.add_parser(
+        "autopilot-status",
+        help="Check status of background launchd autopilot daemons and execution locks",
+    )
+    ap_parser.add_argument("--verbose", action="store_true", help="Show full diagnostics and log paths")
+
     # session-status
     subparsers.add_parser(
         "session-status",
@@ -454,6 +476,40 @@ async def main_async(args: argparse.Namespace) -> int:
     elif args.command == "questions":
         from src.answers.unanswered_tracker import tracker
         tracker.display_table()
+        return 0
+
+    elif args.command == "check-confirmations":
+        from src.email_confirmation_tracker import EmailConfirmationTracker
+        tracker = EmailConfirmationTracker(state_manager=orchestrator.state)
+        results = tracker.scan_inbox_and_confirm(days=args.days, dry_run=args.dry_run)
+        console.print(f"[cyan]Confirmation scan complete:[/cyan] {len(results)} matches processed.")
+        return 0
+
+    elif args.command == "outreach":
+        from src.networking.outreach_matcher import OutreachMatcher
+        matcher = OutreachMatcher(state_manager=orchestrator.state)
+        drafts = matcher.process_high_scoring_jobs(min_score=args.min_score)
+        matcher.display_queue()
+        return 0
+
+    elif args.command == "autopilot-status":
+        from src.sources.adapters.profile_lock import ProfileLock
+        lock = ProfileLock(profile_dir=project_root / "state" / "autopilot")
+        pid = lock._read_owner_pid()
+        alive = lock._pid_alive(pid) if pid else False
+        status_color = "red" if (pid and alive) else "green"
+        lock_status = f"[{status_color}]LOCKED (PID {pid})[/{status_color}]" if (pid and alive) else "[green]FREE[/green]"
+        console.print(f"[bold cyan]Autopilot Execution Lock:[/bold cyan] {lock_status}")
+
+        console.print("\n[bold cyan]Launchd Background Daemons:[/bold cyan]")
+        plist_paths = [
+            Path.home() / "Library/LaunchAgents/com.jobagent.discover.plist",
+            Path.home() / "Library/LaunchAgents/com.jobagent.apply.plist",
+        ]
+        for p in plist_paths:
+            installed = p.exists()
+            status_str = "[green]INSTALLED[/green]" if installed else "[dim]NOT INSTALLED[/dim]"
+            console.print(f"  • {p.name}: {status_str}")
         return 0
 
     elif args.command == "session-status":
