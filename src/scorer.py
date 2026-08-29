@@ -138,7 +138,24 @@ _SENIORITY_PATTERNS = re.compile(
 
 def _build_profile_from_config(config: dict) -> tuple[str, str, str, str]:
     """Extract user-profile text strings from structured config.json."""
-    profile = config.get("user_profile", {})
+    profile = dict(config.get("user_profile", {}))
+    profile_json_path = os.path.join("state", "profile.json")
+    if os.path.isfile(profile_json_path):
+        try:
+            import json as _json
+            with open(profile_json_path) as _f:
+                _lp = _json.load(_f)
+                _disc = _lp.get("disclosures", {})
+                _pi = _lp.get("personal_info", {})
+                if _disc.get("security_clearance"):
+                    profile["clearance"] = _disc["security_clearance"]
+                if _pi.get("city") and _pi.get("state"):
+                    profile["location"] = f"{_pi['city']}, {_pi['state']}"
+                if _disc.get("total_years_experience"):
+                    profile["years_experience"] = _disc["total_years_experience"]
+        except Exception:
+            pass
+
     target = config.get("target_roles", [])
     reject = config.get("reject_roles", [])
     comp = config.get("compensation_thresholds", {})
