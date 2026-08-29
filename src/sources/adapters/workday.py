@@ -160,44 +160,140 @@ class WorkdayAdapter(GenericAtsAdapter):
             return False
 
     async def _fill_identity(self, page, ctx: AtsApplyContext, ev) -> None:
-        """Best-effort identity fill on the current wizard page via Workday's
+        """Best-effort identity & address fill on the current wizard page via Workday's
         data-automation-id text inputs."""
         mapping = {
             "legalNameSection_firstName": ("personal_info", "first_name"),
             "legalNameSection_lastName": ("personal_info", "last_name"),
             "email": ("personal_info", "email"),
             "phone-number": ("personal_info", "phone"),
+            "addressSection_addressLine1": ("personal_info", "address"),
+            "addressSection_city": ("personal_info", "city"),
+            "addressSection_postalCode": ("personal_info", "zip"),
         }
         for auto_id, (section, key) in mapping.items():
             val = self._profile_get(ctx, section, key)
             if not val:
                 continue
-            sel = f"input[data-automation-id='{auto_id}']"
+            sel = f"input[data-automation-id='{auto_id}'], input[id*='{auto_id}' i]"
             if await self._fill(page, sel, val):
                 ev.add_field(auto_id)
+
+    async def _fill_workday_questions(self, page, ctx: AtsApplyContext, ev) -> None:
+        """Auto-fill questionnaire radio buttons, selects, and text inputs across Workday wizard pages."""
+        try:
+            from ...answers.question_bank import AnswerBank
+            prof = ctx.profile if isinstance(ctx.profile, dict) else (getattr(ctx.profile, "__dict__", {}) or {})
+            bank = AnswerBank(prof)
+        except Exception:
+            return
+
+        # 1. Fill Radio Groups (Work Authorization, Sponsorship, Clearance, Disclosures)
+        try:
+            radios = await page.query_selector_all("input[type='radio']")
+            handled_groups = set()
+            for r in radios:
+                name = await r.get_attribute("name") or ""
+                if name in handled_groups:
+                    continue
+                
+                # Find label or fieldset text
+                label_text = await page.evaluate("""
+                    (el) => {
+                        const fieldset = el.closest('fieldset, [data-automation-id*="formField"], div[role="radiogroup"]');
+                        if (fieldset) {
+                            const legend = fieldset.querySelector('legend, label, [data-automation-id="formLabel"]');
+                            if (legend) return (legend.innerText || legend.textContent || '').trim();
+                        }
+                        const parentLabel = el.closest('label');
+                        if (parentLabel) return (parentLabel.innerText || parentLabel.textContent || '').trim();
+                        return '';
+                    }
+                """, r)
+                
+                if label_text:
+                    ans = bank.get_answer_for_question(label_text, field_type="boolean", job=getattr(ctx, "job", None))
+                    if ans is not None:
+                        # Find matching radio button in the group
+                        target_val = "yes" if ans is True else "no"
+                        clicked = await page.evaluate("""
+                            ({el, targetVal}) => {
+                                const container = el.closest('fieldset, [data-automation-id*="formField"], div[role="radiogroup"]') || document;
+                                const groupRadios = container.querySelectorAll('input[type="radio"]');
+                                for (const radio of groupRadios) {
+                                    const rText = (radio.value || radio.getAttribute('data-automation-id') || radio.closest('label')?.innerText || '').toLowerCase();
+                                    if (targetVal === 'yes' && (/yes|true|1|agree|accept/i.test(rText))) {
+                                        radio.click();
+                                        return true;
+                                    } else if (targetVal === 'no' && (/no|false|0|decline|disagree/i.test(rText))) {
+                                        radio.click();
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            }
+                        """, {"el": r, "targetVal": target_val})
+                        if clicked:
+                            ev.add_field(f"radio:{label_text[:30]}")
+                        if name:
+                            handled_groups.add(name)
+        except Exception:
+            pass
+
+        # 2. Fill Text Questions & Textareas
+        try:
+            text_inputs = await page.query_selector_all("textarea, input[data-automation-id*='text-input']:not([data-automation-id*='legalNameSection'])")
+            for inp in text_inputs:
+                curr = await inp.input_value()
+                if curr:
+                    continue
+                q_text = await page.evaluate("""
+                    (el) => {
+                        const formField = el.closest('[data-automation-id*="formField"], div.css-1');
+                        if (formField) {
+                            const lbl = formField.querySelector('label, [data-automation-id="formLabel"]');
+                            if (lbl) return (lbl.innerText || lbl.textContent || '').trim();
+                        }
+                        return el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+                    }
+                """, inp)
+                if q_text:
+                    ans = bank.get_answer_for_question(q_text, field_type="text", job=getattr(ctx, "job", None))
+                    if ans:
+                        await inp.fill(str(ans))
+                        ev.add_field(f"text:{q_text[:30]}")
+        except Exception:
+            pass
 
     async def _advance_to_submit(self, page, ctx: AtsApplyContext, ev) -> bool:
         """Click Next through wizard pages until a submit/review control appears.
         Bounded, and stops if neither Next nor Submit is present (stuck)."""
+        import asyncio
         for _ in range(_MAX_WIZARD_STEPS):
             _, submit_el = await self._first_selector(page, _SUBMIT_SELECTORS)
             if submit_el:
                 return True
-            # On the final review page the "Next" control IS the real submit. Stop here
-            # WITHOUT clicking so the shared gate (policy + receipt) performs that click,
-            # rather than burning the submit while advancing.
             if await self._is_review_page(page):
                 return True
+
+            # Fill identity & questions on each step
+            await self._fill_identity(page, ctx, ev)
+            await self._fill_workday_questions(page, ctx, ev)
+
             _, next_el = await self._first_selector(page, _NEXT_SELECTORS)
             if not next_el:
                 return False  # neither next nor submit — stuck
+
             try:
                 await next_el.click()
+                await asyncio.sleep(2)
             except Exception:
                 return False
-            # each new page may carry more identity fields
-            await self._fill_identity(page, ctx, ev)
-        # exhausted steps — reached submit only if a submit/review control is present
+
+            # Check if review page reached immediately after click
+            if await self._is_review_page(page):
+                return True
+
         _, submit_el = await self._first_selector(page, _SUBMIT_SELECTORS)
         return bool(submit_el) or await self._is_review_page(page)
 

@@ -3801,15 +3801,32 @@ class JobrightScraper(BaseScraper):
             try:
                 has_filled_fields = await page.evaluate("""
                     () => {
-                        const inputs = [...document.querySelectorAll(
-                            'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="file"]):not([type="checkbox"]):not([type="radio"]),' +
-                            'textarea, select'
-                        )];
-                        // At least one visible input must have a non-empty value
-                        return inputs.some(el => {
-                            const val = (el.value || el.textContent || '').trim();
-                            return val.length > 0 && !el.disabled;
-                        });
+                        const checkDoc = (d) => {
+                            try {
+                                const inputs = [...d.querySelectorAll(
+                                    'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select'
+                                )];
+                                for (const el of inputs) {
+                                    if (el.disabled) continue;
+                                    if (el.type === 'checkbox' || el.type === 'radio') {
+                                        if (el.checked) return true;
+                                    } else if (el.type === 'file') {
+                                        if (el.files && el.files.length > 0) return true;
+                                    } else {
+                                        const val = (el.value || el.textContent || '').trim();
+                                        if (val.length > 0) return true;
+                                    }
+                                }
+                                const iframes = d.querySelectorAll('iframe');
+                                for (const f of iframes) {
+                                    try {
+                                        if (f.contentDocument && checkDoc(f.contentDocument)) return true;
+                                    } catch (e) {}
+                                }
+                            } catch (e) {}
+                            return false;
+                        };
+                        return checkDoc(document);
                     }
                 """)
             except Exception:
