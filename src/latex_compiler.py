@@ -42,12 +42,17 @@ class LaTeXCompiler:
         self.cover_template_path = self.project_root / "cover_letters" / "cover_template.tex"
 
     def has_latex_compiler(self) -> str | None:
-        """Checks if a LaTeX compiler is available on the system PATH.
-        Returns the command name if found, or None.
+        """Checks if a LaTeX compiler is available on the system PATH or common macOS locations.
+        Returns the compiler executable path or command if found, or None.
         """
+        tex_path = "/Library/TeX/texbin"
+        if os.path.exists(tex_path) and tex_path not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = f"{tex_path}:{os.environ.get('PATH', '')}"
+
         for cmd in ["lualatex", "xelatex", "pdflatex"]:
-            if shutil.which(cmd):
-                return cmd
+            found = shutil.which(cmd)
+            if found:
+                return found
         return None
 
     def _compile_with_latex(self, tex_content: str, output_pdf_path: str, compiler_cmd: str) -> bool:
