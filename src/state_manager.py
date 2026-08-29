@@ -31,12 +31,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     discovered_at TEXT NOT NULL,
     reviewed_at   TEXT,
     applied_at    TEXT,
+    confirmation_status TEXT,
     extra_json  TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_status ON jobs(status);
-CREATE INDEX IF NOT EXISTS idx_source ON jobs(source);
-CREATE INDEX IF NOT EXISTS idx_discovered_at ON jobs(discovered_at);
 
 CREATE TABLE IF NOT EXISTS archived_jobs (
     job_id         TEXT PRIMARY KEY,
@@ -50,11 +47,30 @@ CREATE TABLE IF NOT EXISTS archived_jobs (
     discovered_at  TEXT,
     archived_at    TEXT NOT NULL,
     archive_reason TEXT,
+    confirmation_status TEXT,
     extra_json     TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_source ON jobs(source);
+CREATE INDEX IF NOT EXISTS idx_discovered_at ON jobs(discovered_at);
 CREATE INDEX IF NOT EXISTS idx_archived_at ON archived_jobs(archived_at);
 """
+
+
+class InvalidStateTransitionError(ValueError):
+    """Raised when an illegal confirmation_status transition is attempted."""
+
+
+VALID_CONFIRMATION_TRANSITIONS = {
+    None: {"submitting"},
+    "submitting": {"submitted", "submission_unverified"},
+    "submitted": {"receipt_pending", "confirmed_by_employer"},
+    "receipt_pending": {"confirmed_by_employer"},
+    "submission_unverified": {"reconciliation_required"},
+    "reconciliation_required": {"submitting"},
+    "confirmed_by_employer": set(),
+}
 
 
 class StateManager:
@@ -86,6 +102,19 @@ class StateManager:
 
     def _init_db(self) -> None:
         self._conn.executescript(DB_SCHEMA)
+        # Add confirmation_status column dynamically if migrating existing DB
+        try:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN confirmation_status TEXT NULL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.execute("ALTER TABLE archived_jobs ADD COLUMN confirmation_status TEXT NULL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_confirmation_status ON jobs(confirmation_status)")
+        except sqlite3.OperationalError:
+            pass
         # Hard-delete any legacy expired rows (pre-archive schema)
         self._conn.execute("DELETE FROM jobs WHERE status = 'expired'")
         self._conn.commit()
@@ -165,6 +194,31 @@ class StateManager:
                     "UPDATE jobs SET status = ? WHERE job_id = ?",
                     (status, job_id),
                 )
+
+    def transition_confirmation(self, job_id: str, to_status: str) -> None:
+        """Transitions confirmation_status following the formal state transition table."""
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError(f"Job {job_id} not found")
+
+        current_status = job.get("confirmation_status")
+        allowed = VALID_CONFIRMATION_TRANSITIONS.get(current_status, set())
+        if to_status not in allowed:
+            raise InvalidStateTransitionError(
+                f"Cannot transition confirmation_status from '{current_status}' to '{to_status}'. Allowed: {allowed}"
+            )
+
+        if to_status == "confirmed_by_employer" and job.get("status") != "applied":
+            raise InvalidStateTransitionError(
+                f"Cannot set confirmation_status='confirmed_by_employer' when job status is '{job.get('status')}' (must be 'applied')"
+            )
+
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET confirmation_status = ? WHERE job_id = ?",
+                (to_status, job_id),
+            )
+            conn.commit()
 
     def delete_job(self, job_id: str) -> None:
         """Delete a job record completely from the database."""
