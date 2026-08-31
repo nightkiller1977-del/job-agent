@@ -16,11 +16,14 @@ case "$action" in
     mkdir -p "$LAUNCHD_DIR"
     sed -e "s|/Users/alarkins/Dev/Projects/job-agent|$REPO_DIR|g" "$REPO_DIR/launchd/$DISCOVER_PLIST" > "$LAUNCHD_DIR/$DISCOVER_PLIST"
     sed -e "s|/Users/alarkins/Dev/Projects/job-agent|$REPO_DIR|g" "$REPO_DIR/launchd/$APPLY_PLIST" > "$LAUNCHD_DIR/$APPLY_PLIST"
-    launchctl load -w "$LAUNCHD_DIR/$DISCOVER_PLIST" 2>/dev/null || true
-    launchctl load -w "$LAUNCHD_DIR/$APPLY_PLIST" 2>/dev/null || true
-    echo "✓ Installed and loaded for $REPO_DIR:"
-    echo "  - Discovery pass: 07:00 AM daily"
-    echo "  - Apply pass:     11:00 PM daily"
+    
+    if launchctl load -w "$LAUNCHD_DIR/$DISCOVER_PLIST" && launchctl load -w "$LAUNCHD_DIR/$APPLY_PLIST"; then
+      echo "✓ Installed and successfully loaded for $REPO_DIR:"
+      echo "  - Discovery pass: 07:00 AM daily"
+      echo "  - Apply pass:     11:00 PM daily"
+    else
+      echo "⚠ Warning: Plists copied to $LAUNCHD_DIR, but launchctl load returned an error. Check launchctl permissions."
+    fi
     ;;
   uninstall)
     echo "Unloading and removing launchd daemons..."

@@ -1,13 +1,13 @@
-"""Phase 4 — ConnectionSphere & TrustGraph Executive Referral Matcher.
+"""Phase 4 — Executive Outreach Draft Generator.
 
-For high-scoring jobs (score >= 85), evaluates hiring manager/referral paths
-and drafts customized 3-sentence introduction notes into state/outreach_queue.json
-for human review and 1-tap dispatch.
+For high-scoring approved or applied jobs (score >= 85), prepares customized
+3-sentence introduction notes into state/outreach_queue.json for human review
+and dispatch.
 
 Guardrails:
-1. Human-in-the-loop: Zero autonomous message sending. All notes queued for review.
-2. Grounded facts: Mentions only verified roles and metrics from profile.
-3. Hierarchy ranking: 1st-degree referral > 2nd-degree path > Hiring Manager > Recruiter.
+1. Human-in-the-loop: Zero autonomous message sending. All notes queued for human review.
+2. Grounded facts: Mentions only verified roles and explicit metrics from profile without fabricating years.
+3. Inferred targeting: Explicitly marks role contacts as inferred_role_target.
 """
 from __future__ import annotations
 
@@ -25,7 +25,9 @@ console = Console()
 _OUTREACH_QUEUE_FILE = Path(__file__).resolve().parents[2] / "state" / "outreach_queue.json"
 
 
-class OutreachMatcher:
+class OutreachDraftGenerator:
+    """Drafts grounded, truthful executive introduction notes for eligible jobs."""
+
     def __init__(self, state_manager=None, queue_file: Optional[Path] = None, profile_data: Optional[Dict[str, Any]] = None):
         self.state_manager = state_manager
         self.queue_file = queue_file or _OUTREACH_QUEUE_FILE
@@ -59,19 +61,12 @@ class OutreachMatcher:
         except Exception as exc:
             logger.warning("Could not save outreach queue: %s", exc)
 
-    def _calculate_experience_years(self) -> str:
-        """Derives experience years from work history or profile metadata."""
+    def _format_experience_phrase(self) -> str:
+        """Returns verified years of experience only when explicitly provided in profile."""
         explicit_years = self.profile.get("years_of_experience") or self.profile.get("experience_years")
         if explicit_years:
-            return f"{explicit_years}+ years"
-
-        work_history = self.profile.get("work_history", [])
-        if work_history:
-            # Estimate from work history count
-            years = min(30, max(5, len(work_history) * 3))
-            return f"{years}+ years"
-
-        return "extensive experience"
+            return f"With {explicit_years}+ years of experience"
+        return "With extensive leadership background"
 
     def draft_outreach_note(self, job: Dict[str, Any], target_name: Optional[str] = None, target_role: Optional[str] = None) -> str:
         """Generate a truthful 3-sentence executive introduction note matching actual job state."""
@@ -79,7 +74,7 @@ class OutreachMatcher:
         job_title = job.get("title", "leadership role")
         candidate_name = self.profile.get("name", "Anthony")
         job_status = job.get("status", "")
-        exp_phrase = self._calculate_experience_years()
+        exp_phrase = self._format_experience_phrase()
 
         name_greeting = f"Hi {target_name.split()[0]}," if target_name else f"Hello {company} team,"
 
@@ -88,7 +83,7 @@ class OutreachMatcher:
         else:
             s1 = f"{name_greeting} I am preparing an application for the {job_title} role at {company} and wanted to connect with your team directly given our shared industry footprint."
 
-        s2 = f"With {exp_phrase} leading engineering organizations, cloud platforms, and distributed systems, I've spent my career scaling teams from early growth through enterprise scale."
+        s2 = f"{exp_phrase} leading engineering organizations, cloud platforms, and distributed systems, I've spent my career scaling teams from early growth through enterprise scale."
         s3 = f"I'd love to connect and share brief context on how my background aligns with {company}'s engineering roadmap."
 
         return f"{s1} {s2} {s3} Best, {candidate_name}"
@@ -161,3 +156,7 @@ class OutreachMatcher:
             )
 
         console.print(table)
+
+
+# Backwards-compatible alias
+OutreachMatcher = OutreachDraftGenerator

@@ -263,23 +263,30 @@ class StateManager:
                 else:
                     target_status = "submitting"
 
-            if target_status and target_status != job.get("confirmation_status"):
+            curr_conf = job.get("confirmation_status")
+            # Never downgrade terminal verified state
+            if curr_conf == "confirmed_by_employer":
+                return curr_conf
+
+            if target_status and target_status != curr_conf:
                 try:
                     self.transition_confirmation(job_id, target_status)
                     return target_status
-                except InvalidStateTransitionError:
-                    # If direct transition blocked by strict lifecycle, update directly under ledger projection
-                    with self._connect() as conn:
-                        conn.execute(
-                            "UPDATE jobs SET confirmation_status = ? WHERE job_id = ?",
-                            (target_status, job_id),
-                        )
-                        conn.commit()
-                    return target_status
+                except InvalidStateTransitionError as exc:
+                    _log.warning(
+                        "Cannot project ledger phase '%s' to confirmation_status '%s' for job %s (current: '%s'): %s",
+                        phase, target_status, job_id, curr_conf, exc,
+                    )
+                    # If conflict cannot transition directly, flag reconciliation_required if valid
+                    try:
+                        self.transition_confirmation(job_id, "reconciliation_required")
+                        return "reconciliation_required"
+                    except Exception:
+                        pass
+                    return curr_conf
 
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Error syncing confirmation from ledger for %s: %s", job_id, exc)
+            _log.warning("Error syncing confirmation from ledger for %s: %s", job_id, exc)
 
         return job.get("confirmation_status")
 

@@ -61,7 +61,6 @@ def _commander_dir() -> Path:
 CANONICAL_KEYS: tuple[str, ...] = (
     "AICC_OPENROUTER_API_KEY",
     "OPENROUTER_GATEWAY_URL",
-    "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD",

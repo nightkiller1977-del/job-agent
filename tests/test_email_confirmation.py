@@ -141,8 +141,9 @@ def test_requisition_id_verification_and_mismatch():
     assert ev_match.get("confirmation_id_verified") == "REQ-1001"
     assert score_match >= 0.85
 
-    # Case 2: Mismatched requisition ID in email -> mismatch penalty / no bonus
+    # Case 2: Mismatched requisition ID in email -> hard veto (score 0.0, cannot confirm)
     body_mismatch = "Thank you for applying. Requisition ID: REQ-9999"
     score_mismatch, ev_mismatch = tracker.calculate_match_score(sender, subject, body_mismatch, None, job_with_req)
     assert "confirmation_id_mismatch" in ev_mismatch
-    assert score_mismatch < score_match
+    assert ev_mismatch.get("hard_veto") is True
+    assert score_mismatch == 0.0

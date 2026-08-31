@@ -124,11 +124,23 @@ def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
     assert res2 == "submitted"
     assert state_mgr.get_job("job_ledger_1")["confirmation_status"] == "submitted"
 
-    # 3. Unverified failure -> 'submission_unverified'
-    ledger.complete(key, "att_2", verified=False)
-    res3 = state_mgr.sync_confirmation_from_ledger("job_ledger_1", ledger=ledger)
+    # 3. Unverified attempt on job_ledger_2 -> 'submission_unverified'
+    job2 = {
+        "job_id": "job_ledger_2",
+        "title": "Staff Engineer",
+        "company": "Stripe",
+        "url": "https://stripe.com/careers/999",
+        "source": "jobright",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job2)
+    key2 = canonical_key(job2)
+    ledger.begin(key2, "att_2")
+    state_mgr.sync_confirmation_from_ledger("job_ledger_2", ledger=ledger)
+    ledger.complete(key2, "att_2", verified=False)
+    res3 = state_mgr.sync_confirmation_from_ledger("job_ledger_2", ledger=ledger)
     assert res3 == "submission_unverified"
-    assert state_mgr.get_job("job_ledger_1")["confirmation_status"] == "submission_unverified"
+    assert state_mgr.get_job("job_ledger_2")["confirmation_status"] == "submission_unverified"
 
 
 def test_archive_job_preserves_confirmation_status(state_mgr):

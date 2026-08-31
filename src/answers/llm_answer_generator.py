@@ -17,9 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -132,7 +130,8 @@ class LLMAnswerGenerator:
         job_dict = job or {}
         job_key = job_dict.get("job_id") or job_dict.get("company", "") or "generic"
         norm_q = normalize_question(question_text)
-        cache_key = hashlib.sha256(f"{norm_q}:{job_key}".encode("utf-8")).hexdigest()
+        facts_hash = hashlib.sha256(json.dumps(self.profile, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+        cache_key = hashlib.sha256(f"{norm_q}:{job_key}:{max_chars}:{facts_hash}".encode("utf-8")).hexdigest()
 
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -194,76 +193,15 @@ class LLMAnswerGenerator:
             "4. Do not include introductory filler like 'Sure!' or 'Here is the answer'. Return only the final text."
         )
 
-    def _resolve_ollama_base_url(self) -> str:
-        return (os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
-
     def _call_model_cascade(self, prompt: str) -> Optional[str]:
-        """Dynamically routes through ModelClient / Ollama available models with fallback."""
-        # 1. Try unified ModelClient (handles resource gates, local Ollama, Claude, OpenAI)
+        """Routes generation strictly through the centralized ModelClient router."""
         try:
-            from ..model_client import ModelClient
-            import asyncio
-            import concurrent.futures
-
-            client = ModelClient()
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop and loop.is_running():
-                pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                future = pool.submit(lambda: asyncio.run(client.complete([{"role": "user", "content": prompt}], task_type="general", max_tokens=150)))
-                try:
-                    resp = future.result(timeout=15)
-                    pool.shutdown(wait=False)
-                except Exception:
-                    pool.shutdown(wait=False)
-                    raise
-            else:
-                resp = asyncio.run(client.complete([{"role": "user", "content": prompt}], task_type="general", max_tokens=150))
-
+            from ..model_client import query_model
+            resp = query_model(prompt, task_type="general", max_tokens=150)
             if resp and resp.strip():
                 return resp.strip()
         except Exception as exc:
             logger.debug("ModelClient completion failed in LLMAnswerGenerator: %s", exc)
-
-        # 2. Dynamic Ollama discovery fallback (no hardcoded model names)
-        base_url = self._resolve_ollama_base_url()
-        try:
-            req = urllib.request.Request(f"{base_url}/api/tags")
-            with urllib.request.urlopen(req, timeout=3) as r:
-                tags_data = json.loads(r.read().decode("utf-8"))
-                installed_models = [m.get("name") for m in tags_data.get("models", []) if m.get("name")]
-
-            for model in installed_models:
-                ans = self._call_ollama(model, prompt, base_url=base_url)
-                if ans:
-                    return ans
-        except Exception as exc:
-            logger.debug("Dynamic Ollama discovery failed in LLMAnswerGenerator: %s", exc)
-
-        return None
-
-    def _call_ollama(self, model: str, prompt: str, base_url: Optional[str] = None) -> Optional[str]:
-        resolved_base = (base_url or self._resolve_ollama_base_url()).rstrip("/")
-        try:
-            url = f"{resolved_base}/api/generate"
-            payload = json.dumps({
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.2, "num_predict": 120},
-            }).encode("utf-8")
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    text = data.get("response", "").strip()
-                    if text:
-                        return text
-        except Exception:
-            return None
         return None
 
     def _validate_answer(self, text: str, facts: List[str], max_chars: int) -> Optional[str]:

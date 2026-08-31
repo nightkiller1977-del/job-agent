@@ -496,15 +496,19 @@ class ModelClient:
         }
 
         headers = {"Content-Type": "application/json"}
-        api_key = os.environ.get("AICC_OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
+        api_key = os.environ.get("AICC_OPENROUTER_API_KEY", "")
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
         url = f"{OPENROUTER_GATEWAY_URL}/chat/completions"
         async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
             resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code == 402:
-                raise BudgetExceededError(f"AI-OpenRouter Gateway budget exceeded (HTTP 402): {resp.text}")
+            # Gateway budget/authorization refusal statuses:
+            # 402: Budget Exceeded
+            # 502: Unknown / unpriced model pricing rejection
+            # 503: Budget authority ledger/service unavailable
+            if resp.status_code in (402, 502, 503):
+                raise BudgetExceededError(f"AI-OpenRouter Gateway budget authority refusal (HTTP {resp.status_code}): {resp.text}")
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, dict):
@@ -718,8 +722,8 @@ class ModelClient:
 
 
 def check_inference_availability() -> tuple[bool, str]:
-    """Checks if at least one inference provider is available (Ollama, OpenRouter Gateway, Anthropic, or OpenAI)."""
-    # 1. Local Ollama
+    """Checks if at least one inference provider is available by probing live endpoints."""
+    # 1. Local Ollama — probe /api/tags
     try:
         base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
         req = urllib.request.Request(f"{base_url}/api/tags")
@@ -731,12 +735,28 @@ def check_inference_availability() -> tuple[bool, str]:
     except Exception:
         pass
 
-    # 2. AI-OpenRouter Gateway
-    aicc_key = (os.environ.get("AICC_OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    # 2. AI-OpenRouter Gateway — probe /health or /models
+    gateway_url = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
+    aicc_key = (os.environ.get("AICC_OPENROUTER_API_KEY") or "").strip()
     if aicc_key:
-        return True, "AI-OpenRouter Gateway"
+        try:
+            req = urllib.request.Request(f"{gateway_url}/health")
+            with urllib.request.urlopen(req, timeout=2) as r:
+                if r.status == 200:
+                    return True, "AI-OpenRouter Gateway"
+        except Exception:
+            try:
+                req_models = urllib.request.Request(
+                    f"{gateway_url}/models",
+                    headers={"Authorization": f"Bearer {aicc_key}"}
+                )
+                with urllib.request.urlopen(req_models, timeout=2) as r_m:
+                    if r_m.status == 200:
+                        return True, "AI-OpenRouter Gateway"
+            except Exception:
+                pass
 
-    # 3. Direct Anthropic
+    # 3. Direct Anthropic (Claude)
     anthropic_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if anthropic_key and anthropic_key != "your_key_here":
         return True, "Direct Anthropic (Claude)"
@@ -746,7 +766,7 @@ def check_inference_availability() -> tuple[bool, str]:
     if openai_key and openai_key != "your_key_here":
         return True, "Direct OpenAI"
 
-    return False, "No inference provider available (Ollama offline, no OpenRouter, Anthropic, or OpenAI keys)"
+    return False, "No inference provider available (Ollama unreachable, OpenRouter Gateway offline, no direct cloud keys)"
 
 
 def query_model(prompt: str, system: str = "", task_type: str = "general", max_tokens: int = 512, temperature: float | None = None) -> str:

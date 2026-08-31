@@ -228,8 +228,10 @@ class EmailConfirmationTracker:
                     score += 0.15
                     evidence["confirmation_id_verified"] = conf_id
                 else:
-                    # Explicit ID mismatch penalty
+                    # Explicit conflicting requisition ID — HARD VETO
                     evidence["confirmation_id_mismatch"] = f"email={conf_id} vs job={stored_req_id}"
+                    evidence["hard_veto"] = True
+                    return 0.0, evidence
             elif company in full_text and title_matched:
                 # No recorded req_id, but company and title confirmed
                 score += 0.10
@@ -288,7 +290,7 @@ class EmailConfirmationTracker:
             email_addr
             or os.environ.get("EMAIL_2FA_ADDRESS", "")
             or os.environ.get("USAJOBS_EMAIL", "")
-            or "anthonyclarkins@icloud.com"
+            or os.environ.get("IMAP_USER", "")
         )
         imap_pwd = (
             password
@@ -296,6 +298,10 @@ class EmailConfirmationTracker:
             or os.environ.get("ICLOUD_APP_PASSWORD", "")
             or os.environ.get("IMAP_PASSWORD", "")
         )
+
+        if not user_email:
+            console.print("[yellow]Email confirmation check skipped: EMAIL_2FA_ADDRESS / USAJOBS_EMAIL / IMAP_USER not configured.[/yellow]")
+            return []
 
         if not imap_pwd:
             console.print("[yellow]Email confirmation check skipped: ICLOUD_APP_PASSWORD_PERSONAL / IMAP_PASSWORD not configured.[/yellow]")
