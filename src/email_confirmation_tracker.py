@@ -307,6 +307,12 @@ class EmailConfirmationTracker:
             console.print("[yellow]Email confirmation check skipped: ICLOUD_APP_PASSWORD_PERSONAL / IMAP_PASSWORD not configured.[/yellow]")
             return []
 
+        # Reconcile submission ledger before evaluating emails
+        try:
+            self.state_manager.reconcile_active_jobs_from_ledger()
+        except Exception:
+            pass
+
         # Fetch applied jobs from state
         with self.state_manager._connect() as conn:
             applied_jobs = [

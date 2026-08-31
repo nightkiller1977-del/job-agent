@@ -72,6 +72,18 @@ VALID_CONFIRMATION_TRANSITIONS = {
     "confirmed_by_employer": set(),
 }
 
+# Monotonic recovery rank lattice to prevent lower-precedence ledger projections from overwriting higher-precedence states
+CONFIRMATION_STATUS_RANK: dict[str | None, int] = {
+    None: 0,
+    "": 0,
+    "submitting": 1,
+    "submission_unverified": 2,
+    "reconciliation_required": 2,
+    "submitted": 3,
+    "receipt_pending": 4,
+    "confirmed_by_employer": 5,
+}
+
 
 class StateManager:
     def __init__(self, db_path: str = "state/jobs.db"):
@@ -224,7 +236,11 @@ class StateManager:
         """Durable cold-start reconciliation: projects verified/stale ledger state onto confirmation_status.
 
         Guards:
-          1. 'confirmed_by_employer' is strictly terminal and will never be downgraded or overwritten.
+          1. Monotonic recovery: Ledger recovery cannot downgrade higher-precedence DB states.
+             Rank lattice: None (0) < submitting (1) < unverified/reconciliation (2) < submitted (3) < receipt_pending (4) < confirmed_by_employer (5).
+             - receipt_pending + receipt_verified -> stays receipt_pending (no downgrade to submitted).
+             - submitted + submit_in_progress -> stays submitted (no downgrade to submitting).
+             - confirmed_by_employer + anything -> stays confirmed_by_employer (immutable terminal).
           2. Only legitimate ledger phases (submitted, submission_unverified, reconciliation_required, submitting) can be recovered.
           3. If the current status matches target_status, no-op.
           4. Emits audit log for cold-start state reconstruction.
@@ -243,12 +259,26 @@ class StateManager:
         if curr_conf == target_status:
             return curr_conf
 
+        curr_rank = CONFIRMATION_STATUS_RANK.get(curr_conf, 0)
+        target_rank = CONFIRMATION_STATUS_RANK.get(target_status, 0)
+
+        # Monotonicity check: Never downgrade state unless transitioning equal-rank unverified -> reconciliation_required
+        if curr_rank > target_rank:
+            _log.info(
+                "Preserving confirmation_status for job %s: current '%s' (rank %d) outranks target '%s' (rank %d, ledger phase '%s')",
+                job_id, curr_conf, curr_rank, target_status, target_rank, phase,
+            )
+            return curr_conf
+
+        if curr_rank == target_rank and not (curr_conf == "submission_unverified" and target_status == "reconciliation_required"):
+            return curr_conf
+
         # 1. Try standard sequential state transition
         try:
             self.transition_confirmation(job_id, target_status)
             return target_status
         except InvalidStateTransitionError:
-            # 2. Cold-start recovery path: row was interrupted mid-flight or cold-started after crash
+            # 2. Cold-start recovery path: row was cold-started after crash (e.g. None -> submitted)
             with self._connect() as conn:
                 conn.execute(
                     "UPDATE jobs SET confirmation_status = ? WHERE job_id = ? AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')",

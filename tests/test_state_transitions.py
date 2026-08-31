@@ -174,6 +174,72 @@ def test_cold_start_ledger_recovery_from_crash(state_mgr, tmp_path):
     assert state_mgr.get_job("job_crashed_1")["confirmation_status"] == "submitted"
 
 
+def test_monotonic_ledger_recovery_matrix(state_mgr, tmp_path):
+    """Verifies that ledger recovery never downgrades higher-precedence DB states."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    ledger_path = tmp_path / "monotonic_ledger.json"
+    ledger = SubmissionLedger(path=ledger_path)
+
+    # 1. receipt_pending + receipt_verified (target 'submitted') -> stays receipt_pending
+    job1 = {
+        "job_id": "job_mono_1",
+        "title": "Principal Architect",
+        "company": "Databricks",
+        "source": "linkedin",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job1)
+    state_mgr.transition_confirmation("job_mono_1", "submitting")
+    state_mgr.transition_confirmation("job_mono_1", "submitted")
+    state_mgr.transition_confirmation("job_mono_1", "receipt_pending")
+    key1 = canonical_key(job1)
+    ledger.begin(key1, "att_1")
+    ledger.complete(key1, "att_1", verified=True)  # phase = PHASE_VERIFIED -> target 'submitted'
+
+    res1 = state_mgr.sync_confirmation_from_ledger("job_mono_1", ledger=ledger)
+    assert res1 == "receipt_pending"
+    assert state_mgr.get_job("job_mono_1")["confirmation_status"] == "receipt_pending"
+
+    # 2. submitted + submit_in_progress (target 'submitting') -> stays submitted
+    job2 = {
+        "job_id": "job_mono_2",
+        "title": "Staff Engineer",
+        "company": "Stripe",
+        "source": "jobright",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job2)
+    state_mgr.transition_confirmation("job_mono_2", "submitting")
+    state_mgr.transition_confirmation("job_mono_2", "submitted")
+    key2 = canonical_key(job2)
+    ledger.begin(key2, "att_2_in_flight")  # phase = PHASE_IN_PROGRESS -> target 'submitting'
+
+    res2 = state_mgr.sync_confirmation_from_ledger("job_mono_2", ledger=ledger)
+    assert res2 == "submitted"
+    assert state_mgr.get_job("job_mono_2")["confirmation_status"] == "submitted"
+
+    # 3. confirmed_by_employer + anything -> stays confirmed_by_employer
+    job3 = {
+        "job_id": "job_mono_3",
+        "title": "Director of Eng",
+        "company": "Google",
+        "source": "linkedin",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job3)
+    state_mgr.transition_confirmation("job_mono_3", "submitting")
+    state_mgr.transition_confirmation("job_mono_3", "submitted")
+    state_mgr.transition_confirmation("job_mono_3", "confirmed_by_employer")
+    key3 = canonical_key(job3)
+    ledger.begin(key3, "att_3")
+    ledger.complete(key3, "att_3", verified=False)  # phase = PHASE_UNVERIFIED -> target 'submission_unverified'
+
+    res3 = state_mgr.sync_confirmation_from_ledger("job_mono_3", ledger=ledger)
+    assert res3 == "confirmed_by_employer"
+    assert state_mgr.get_job("job_mono_3")["confirmation_status"] == "confirmed_by_employer"
+
+
 def test_archive_job_preserves_confirmation_status(state_mgr):
     job = {
         "job_id": "job_archive_test",

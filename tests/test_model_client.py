@@ -118,25 +118,55 @@ def test_check_inference_availability(monkeypatch):
     """check_inference_availability correctly identifies ready providers."""
     from src.model_client import check_inference_availability
 
+    class MockHttpResp:
+        def __init__(self, status=200):
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            return b'{"status": "ok", "models": ["llama3"]}'
+
+    def mock_urlopen(req, timeout=2):
+        return MockHttpResp(200)
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+
     # Clear all keys
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:99999")  # Unreachable
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:99999")
 
-    # 1. None available
+    # 1. Unreachable Ollama & No keys -> None available
+    def mock_urlopen_unreachable(req, timeout=2):
+        raise ConnectionRefusedError("Offline")
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen_unreachable)
     avail, msg = check_inference_availability()
     assert avail is False
     assert "No inference provider available" in msg
 
-    # 2. OpenRouter available
+    # 2. OpenRouter available with valid key + responsive /health probe (Ollama offline)
+    def mock_urlopen_openrouter(req, timeout=2):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "/api/tags" in url:
+            raise ConnectionRefusedError("Ollama Offline")
+        return MockHttpResp(200)
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen_openrouter)
     monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "aicc-token")
     avail, msg = check_inference_availability()
     assert avail is True
     assert msg == "AI-OpenRouter Gateway"
 
-    # 3. Direct Anthropic available
+    # 3. Direct Anthropic available (Ollama & Gateway offline)
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen_unreachable)
     monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-xxx")
     avail, msg = check_inference_availability()

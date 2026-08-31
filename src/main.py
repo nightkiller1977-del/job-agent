@@ -483,6 +483,13 @@ async def main_async(args: argparse.Namespace) -> int:
 
     elif args.command == "check-confirmations":
         from src.email_confirmation_tracker import EmailConfirmationTracker
+        try:
+            reconciled = orchestrator.state.reconcile_active_jobs_from_ledger()
+            if reconciled:
+                console.print(f"[cyan]Ledger pre-scan reconciliation:[/cyan] {reconciled} active jobs synced from submission ledger.")
+        except Exception as exc:
+            console.print(f"[dim]Ledger pre-scan reconciliation skipped: {exc}[/dim]")
+
         tracker = EmailConfirmationTracker(state_manager=orchestrator.state)
         results = tracker.scan_inbox_and_confirm(days=args.days, dry_run=args.dry_run)
         console.print(f"[cyan]Confirmation scan complete:[/cyan] {len(results)} matches processed.")
