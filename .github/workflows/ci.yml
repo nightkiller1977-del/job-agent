@@ -46,6 +46,9 @@ jobs:
                  tests/test_auth_routing.py \
                  tests/test_ats_checker.py \
                  tests/test_latex_compiler.py \
+                 tests/test_linkedin_screening_answers.py \
+                 tests/test_commander_config_fallback.py \
+                 tests/test_orchestrator_config_missing.py \
                  -q --tb=short --asyncio-mode=auto
 
   lint:
