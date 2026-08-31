@@ -14,15 +14,27 @@ attempt within one iteration.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import logging
+import time
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent
 BROWSER_PIPELINE_LOCK = "browser-pipeline"
+
+# Default bound for pipeline_lock_wait() — how long a scheduled one-shot run
+# (discover/apply) will wait for a busy lock before giving up. Those only fire
+# once via launchd (23:00/07:00), so silently skipping on contention costs a
+# full day; a bounded wait is worth it. Contrast with plain pipeline_lock(),
+# used by interactive/continuously-polling callers (prepare-sessions,
+# heartbeat, commander auto-fix) where an immediate skip-and-retry-later is
+# the right behavior instead.
+DEFAULT_WAIT_TIMEOUT_SECONDS = 600
+DEFAULT_WAIT_POLL_SECONDS = 10
 
 
 @contextlib.contextmanager
@@ -47,3 +59,30 @@ def pipeline_lock(name: str = BROWSER_PIPELINE_LOCK):
     finally:
         fcntl.flock(fh, fcntl.LOCK_UN)
         fh.close()
+
+
+@contextlib.asynccontextmanager
+async def pipeline_lock_wait(
+    name: str = BROWSER_PIPELINE_LOCK,
+    timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
+    poll_seconds: float = DEFAULT_WAIT_POLL_SECONDS,
+):
+    """Like pipeline_lock(), but retries (via asyncio.sleep, so it doesn't
+    block the event loop) for up to timeout_seconds before giving up. Yields
+    True as soon as the lock is acquired — held for the duration of the
+    caller's `async with` block, same as pipeline_lock() — or False once the
+    deadline passes without acquiring it."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        with pipeline_lock(name) as acquired:
+            if acquired:
+                yield True
+                return
+        if time.monotonic() >= deadline:
+            _log.warning(
+                "pipeline_lock.wait_timed_out name=%s timeout_seconds=%s",
+                name, timeout_seconds,
+            )
+            yield False
+            return
+        await asyncio.sleep(poll_seconds)

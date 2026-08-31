@@ -370,6 +370,11 @@ class AgentCommander:
                     "source": source,
                     "strategy": strategy,
                     "reason": "browser pipeline busy — another run holds it, will retry later",
+                    # Explicit marker (not just the reason string) so callers
+                    # like StatusWatcher can reliably distinguish "deferred,
+                    # try again later" from a real fix failure without
+                    # parsing free text.
+                    "lock_busy": True,
                 }
 
             _log.info(
