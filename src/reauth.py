@@ -137,8 +137,9 @@ class ReauthManager:
             notify_error(f"{source} reauth failed", "No automated reauth path for this source")
             return False
 
-        email    = os.environ.get(f"{source.upper()}_EMAIL", "")
-        password = os.environ.get(f"{source.upper()}_PASSWORD", "")
+        from .secret_store import resolve_secret
+        email    = resolve_secret(f"{source.upper()}_EMAIL") or ""
+        password = resolve_secret(f"{source.upper()}_PASSWORD") or ""
         if not email or not password:
             notify_error(
                 f"{source} reauth failed",
