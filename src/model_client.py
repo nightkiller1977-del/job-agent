@@ -366,10 +366,10 @@ class ModelClient:
 
     @classmethod
     def get_gateway_config(cls) -> tuple[bool, str, str]:
-        """Returns (is_configured, gateway_url, api_key) using strictly AICC_OPENROUTER_API_KEY."""
+        """Returns (is_configured, gateway_url, api_key) requiring AICC_OPENROUTER_API_KEY."""
         url = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
         key = (os.environ.get("AICC_OPENROUTER_API_KEY") or "").strip()
-        is_configured = bool(key or os.environ.get("OPENROUTER_GATEWAY_URL"))
+        is_configured = bool(key)
         return is_configured, url, key
 
     def __init__(
@@ -708,7 +708,7 @@ class ModelClient:
 
     async def _call_claude(self, messages: list[dict], system: str, max_tokens: int, temperature: float | None = None) -> str:
         import anthropic as _anthropic
-        client = _anthropic.Anthropic(api_key=self._api_key)
+        client = _anthropic.AsyncAnthropic(api_key=self._api_key)
         non_system = [m for m in messages if m.get("role") != "system"]
         kwargs: dict = dict(
             model=self._anthropic_model,
@@ -718,7 +718,7 @@ class ModelClient:
         )
         if temperature is not None:
             kwargs["temperature"] = temperature
-        response = client.messages.create(**kwargs)
+        response = await client.messages.create(**kwargs)
         for block in response.content:
             if block.type == "text":
                 return block.text
@@ -731,11 +731,11 @@ class ModelClient:
     async def _call_openai(self, messages: list[dict], system: str, max_tokens: int, temperature: float | None = None) -> str:
         import openai as _openai
         openai_key = os.environ.get("OPENAI_API_KEY", "")
-        client = _openai.OpenAI(api_key=openai_key)
+        client = _openai.AsyncOpenAI(api_key=openai_key)
         full_messages = list(messages)
         if system:
             full_messages = [{"role": "system", "content": system}] + full_messages
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=full_messages,
             max_tokens=max_tokens,

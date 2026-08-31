@@ -143,6 +143,37 @@ def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
     assert state_mgr.get_job("job_ledger_2")["confirmation_status"] == "submission_unverified"
 
 
+def test_cold_start_ledger_recovery_from_crash(state_mgr, tmp_path):
+    """After a process crash/restart, a job with confirmation_status=None successfully
+    recovers directly to 'submitted' or 'reconciliation_required' from durable ledger state."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    ledger_path = tmp_path / "crash_ledger.json"
+    ledger = SubmissionLedger(path=ledger_path)
+
+    # Job exists with confirmation_status = None (e.g. state reset or crash before DB update)
+    job = {
+        "job_id": "job_crashed_1",
+        "title": "VP Engineering",
+        "company": "Scale AI",
+        "url": "https://scale.com/careers/vp",
+        "source": "linkedin",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job)
+    assert state_mgr.get_job("job_crashed_1")["confirmation_status"] is None
+
+    # Ledger carries durable proof of verified submission
+    key = canonical_key(job)
+    ledger.begin(key, "att_crash")
+    ledger.complete(key, "att_crash", verified=True)
+
+    # Cold-start reconciliation reconstructs 'submitted' directly from None
+    recovered = state_mgr.sync_confirmation_from_ledger("job_crashed_1", ledger=ledger)
+    assert recovered == "submitted"
+    assert state_mgr.get_job("job_crashed_1")["confirmation_status"] == "submitted"
+
+
 def test_archive_job_preserves_confirmation_status(state_mgr):
     job = {
         "job_id": "job_archive_test",

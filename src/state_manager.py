@@ -220,6 +220,47 @@ class StateManager:
             )
             conn.commit()
 
+    def recover_confirmation_from_ledger(self, job_id: str, target_status: str, phase: str) -> str:
+        """Durable cold-start reconciliation: projects verified/stale ledger state onto confirmation_status.
+
+        Guards:
+          1. 'confirmed_by_employer' is strictly terminal and will never be downgraded or overwritten.
+          2. Only legitimate ledger phases (submitted, submission_unverified, reconciliation_required, submitting) can be recovered.
+          3. If the current status matches target_status, no-op.
+          4. Emits audit log for cold-start state reconstruction.
+        """
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError(f"Job {job_id} not found")
+
+        curr_conf = job.get("confirmation_status")
+        if curr_conf == "confirmed_by_employer":
+            return curr_conf
+
+        if target_status not in ("submitted", "submission_unverified", "reconciliation_required", "submitting"):
+            raise ValueError(f"Invalid target recovery confirmation status: {target_status}")
+
+        if curr_conf == target_status:
+            return curr_conf
+
+        # 1. Try standard sequential state transition
+        try:
+            self.transition_confirmation(job_id, target_status)
+            return target_status
+        except InvalidStateTransitionError:
+            # 2. Cold-start recovery path: row was interrupted mid-flight or cold-started after crash
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE jobs SET confirmation_status = ? WHERE job_id = ? AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')",
+                    (target_status, job_id),
+                )
+                conn.commit()
+            _log.info(
+                "Cold-start ledger recovery for job %s: confirmation_status '%s' -> '%s' (ledger phase: '%s')",
+                job_id, curr_conf, target_status, phase,
+            )
+            return target_status
+
     def sync_confirmation_from_ledger(self, job_id: str, ledger: Any = None) -> Optional[str]:
         """Projects SubmissionLedger attempt state onto the job's confirmation_status lifecycle.
 
@@ -269,21 +310,7 @@ class StateManager:
                 return curr_conf
 
             if target_status and target_status != curr_conf:
-                try:
-                    self.transition_confirmation(job_id, target_status)
-                    return target_status
-                except InvalidStateTransitionError as exc:
-                    _log.warning(
-                        "Cannot project ledger phase '%s' to confirmation_status '%s' for job %s (current: '%s'): %s",
-                        phase, target_status, job_id, curr_conf, exc,
-                    )
-                    # If conflict cannot transition directly, flag reconciliation_required if valid
-                    try:
-                        self.transition_confirmation(job_id, "reconciliation_required")
-                        return "reconciliation_required"
-                    except Exception:
-                        pass
-                    return curr_conf
+                return self.recover_confirmation_from_ledger(job_id, target_status, phase=str(phase))
 
         except Exception as exc:
             _log.warning("Error syncing confirmation from ledger for %s: %s", job_id, exc)
