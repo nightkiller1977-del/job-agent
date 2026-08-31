@@ -195,22 +195,45 @@ class LLMAnswerGenerator:
         )
 
     def _call_model_cascade(self, prompt: str) -> Optional[str]:
-        """Try local Ollama cascade first (devstral -> qwen3-coder:14b -> llama3.1), then fallback."""
-        # 1. Local Ollama attempt
-        models_to_try = ["devstral", "qwen2.5-coder:7b", "qwen3-coder:30b", "llama3.1", "gemma2"]
-        for model in models_to_try:
-            ans = self._call_ollama(model, prompt)
-            if ans:
-                return ans
-
-        # 2. Local fallback client if available
+        """Dynamically routes through ModelClient / Ollama available models with fallback."""
+        # 1. Try unified ModelClient (handles resource gates, local Ollama, Claude, OpenAI)
         try:
-            from ..model_client import query_model
-            resp = query_model(prompt, max_tokens=150)
-            if resp:
+            from ..model_client import ModelClient
+            import asyncio
+            import concurrent.futures
+
+            client = ModelClient()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(lambda: asyncio.run(client.complete([{"role": "user", "content": prompt}], task_type="general", max_tokens=150)))
+                    resp = future.result(timeout=15)
+            else:
+                resp = asyncio.run(client.complete([{"role": "user", "content": prompt}], task_type="general", max_tokens=150))
+
+            if resp and resp.strip():
                 return resp.strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("ModelClient completion failed in LLMAnswerGenerator: %s", exc)
+
+        # 2. Dynamic Ollama discovery fallback (no hardcoded model names)
+        try:
+            base_url = os.environ.get("OLLAMA_BASE_URL", os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")).rstrip("/")
+            req = urllib.request.Request(f"{base_url}/api/tags")
+            with urllib.request.urlopen(req, timeout=3) as r:
+                tags_data = json.loads(r.read().decode("utf-8"))
+                installed_models = [m.get("name") for m in tags_data.get("models", []) if m.get("name")]
+
+            for model in installed_models:
+                ans = self._call_ollama(model, prompt)
+                if ans:
+                    return ans
+        except Exception as exc:
+            logger.debug("Dynamic Ollama discovery failed in LLMAnswerGenerator: %s", exc)
 
         return None
 

@@ -32,8 +32,8 @@ console = Console()
 
 _PROCESSED_EMAILS_FILE = Path(__file__).resolve().parents[1] / "state" / "processed_emails.json"
 
-# Known ATS Vendor Domains
-ATS_VENDOR_DOMAINS = [
+# Default Known ATS Vendor Domains (can be overridden in config.json)
+DEFAULT_ATS_VENDOR_DOMAINS = [
     "myworkday.com",
     "myworkdayjobs.com",
     "greenhouse-mail.io",
@@ -49,7 +49,7 @@ ATS_VENDOR_DOMAINS = [
 ]
 
 # Receipt signal patterns (reused from receipt.py)
-CONFIRMATION_SUBJECT_PATTERNS = [
+DEFAULT_CONFIRMATION_PATTERNS = [
     r"thank you for (applying|your application)",
     r"application (received|submitted|confirmation|confirmed)",
     r"we(?:'|’|)ve received your application",
@@ -78,10 +78,24 @@ def _decode_header(hdr: str) -> str:
 
 
 class EmailConfirmationTracker:
-    def __init__(self, state_manager=None, processed_file: Optional[Path] = None):
+    def __init__(self, state_manager=None, processed_file: Optional[Path] = None, config: Optional[Dict[str, Any]] = None):
         self.state_manager = state_manager
         self.processed_file = processed_file or _PROCESSED_EMAILS_FILE
         self._processed_ids = self._load_processed_ids()
+        self.config = config or self._load_default_config()
+        self.vendor_domains = self.config.get("ats_vendor_domains", DEFAULT_ATS_VENDOR_DOMAINS)
+        self.confirmation_patterns = self.config.get("confirmation_patterns", DEFAULT_CONFIRMATION_PATTERNS)
+        self.min_confirmed_score = float(self.config.get("min_confirmation_score", 0.85))
+
+    def _load_default_config(self) -> Dict[str, Any]:
+        cfg_path = Path(__file__).resolve().parents[1] / "config.json"
+        if cfg_path.exists():
+            try:
+                with open(cfg_path) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
 
     def _load_processed_ids(self) -> set[str]:
         if self.processed_file.exists():
@@ -143,7 +157,7 @@ class EmailConfirmationTracker:
 
         # 2. Sender Domain Match (0.25)
         domain_matched = False
-        for vendor_dom in ATS_VENDOR_DOMAINS:
+        for vendor_dom in self.vendor_domains:
             if vendor_dom in sender_clean or vendor_dom in job_url:
                 domain_matched = True
                 evidence["vendor_domain"] = vendor_dom
@@ -293,7 +307,7 @@ class EmailConfirmationTracker:
                         pass
 
                 # Check if subject matches confirmation copy
-                if not any(re.search(pat, subject, re.IGNORECASE) for pat in CONFIRMATION_SUBJECT_PATTERNS):
+                if not any(re.search(pat, subject, re.IGNORECASE) for pat in self.confirmation_patterns):
                     continue
 
                 # Match against applied jobs
@@ -317,11 +331,11 @@ class EmailConfirmationTracker:
                         "evidence": best_evidence,
                         "subject": subject,
                         "sender": sender,
-                        "confirmed": best_score >= 0.85,
+                        "confirmed": best_score >= self.min_confirmed_score,
                     }
                     results.append(outcome)
 
-                    if best_score >= 0.85 and not dry_run:
+                    if best_score >= self.min_confirmed_score and not dry_run:
                         self._apply_confirmation_transition(best_job, best_score, outcome)
 
                     if msg_id and not dry_run:
