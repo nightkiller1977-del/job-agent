@@ -57,13 +57,16 @@ def load_env() -> None:
 
 
 def check_api_key() -> bool:
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key or key == "your_key_here":
+    """Preflight check: verifies that at least one inference provider is available (Ollama, OpenRouter Gateway, Anthropic, or OpenAI)."""
+    from src.model_client import check_inference_availability
+    available, provider_name = check_inference_availability()
+    if not available:
         console.print(
-            "[red]Error:[/red] ANTHROPIC_API_KEY not set.\n"
-            "  Copy .env.example to .env and add your key:\n"
-            "    cp .env.example .env\n"
-            "    # edit .env and paste your Anthropic API key"
+            f"[red]Error:[/red] {provider_name}.\n"
+            "  Please ensure local Ollama is running or configure one of:\n"
+            "    - AICC_OPENROUTER_API_KEY (AI-OpenRouter Gateway)\n"
+            "    - ANTHROPIC_API_KEY\n"
+            "    - OPENAI_API_KEY\n"
         )
         return False
     return True

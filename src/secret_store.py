@@ -59,6 +59,9 @@ def _commander_dir() -> Path:
 # Every secret this repo may need. Used as the default set for fill_missing() and
 # documented in SECRETS.md. Keep in sync with the email-agent catalog for shared keys.
 CANONICAL_KEYS: tuple[str, ...] = (
+    "AICC_OPENROUTER_API_KEY",
+    "OPENROUTER_GATEWAY_URL",
+    "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD",
