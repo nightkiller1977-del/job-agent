@@ -94,6 +94,18 @@ class Orchestrator:
             with open(p2) as f:
                 return json.load(f)
         console.print(f"[yellow]Warning: config not found at {path}, using defaults.[/yellow]")
+        # config.json is gitignored/personal (copy from config.example.json) — its
+        # target roles, reject roles, and compensation thresholds directly drive
+        # what discover/apply will act on. Falling back to {} silently would let
+        # an unattended cron run start scoring/auto-submitting against defaults
+        # instead of the real targeting criteria, so this must be loud, not just
+        # a console line an unattended run's log nobody is watching.
+        notify_error(
+            "job-agent config.json missing",
+            f"No config.json found at {path} or project root — discover/apply are running "
+            "with default targeting/compensation thresholds, not your real config. "
+            "Copy config.example.json to config.json and fill in your real values.",
+        )
         return {}
 
     # ------------------------------------------------------------------
