@@ -8,7 +8,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 _log = logging.getLogger(__name__)
 
@@ -70,6 +70,18 @@ VALID_CONFIRMATION_TRANSITIONS = {
     "submission_unverified": {"reconciliation_required"},
     "reconciliation_required": {"submitting"},
     "confirmed_by_employer": set(),
+}
+
+# Monotonic recovery rank lattice to prevent lower-precedence ledger projections from overwriting higher-precedence states
+CONFIRMATION_STATUS_RANK: dict[str | None, int] = {
+    None: 0,
+    "": 0,
+    "submitting": 1,
+    "submission_unverified": 2,
+    "reconciliation_required": 2,
+    "submitted": 3,
+    "receipt_pending": 4,
+    "confirmed_by_employer": 5,
 }
 
 
@@ -220,6 +232,143 @@ class StateManager:
             )
             conn.commit()
 
+    def recover_confirmation_from_ledger(self, job_id: str, target_status: str, phase: str) -> str:
+        """Durable cold-start reconciliation: projects verified/stale ledger state onto confirmation_status.
+
+        Guards:
+          1. Monotonic recovery: Ledger recovery cannot downgrade higher-precedence DB states.
+             Rank lattice: None (0) < submitting (1) < unverified/reconciliation (2) < submitted (3) < receipt_pending (4) < confirmed_by_employer (5).
+             - receipt_pending + receipt_verified -> stays receipt_pending (no downgrade to submitted).
+             - submitted + submit_in_progress -> stays submitted (no downgrade to submitting).
+             - confirmed_by_employer + anything -> stays confirmed_by_employer (immutable terminal).
+          2. Only legitimate ledger phases (submitted, submission_unverified, reconciliation_required, submitting) can be recovered.
+          3. If the current status matches target_status, no-op.
+          4. Emits audit log for cold-start state reconstruction.
+        """
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError(f"Job {job_id} not found")
+
+        curr_conf = job.get("confirmation_status")
+        if curr_conf == "confirmed_by_employer":
+            return curr_conf
+
+        if target_status not in ("submitted", "submission_unverified", "reconciliation_required", "submitting"):
+            raise ValueError(f"Invalid target recovery confirmation status: {target_status}")
+
+        if curr_conf == target_status:
+            return curr_conf
+
+        curr_rank = CONFIRMATION_STATUS_RANK.get(curr_conf, 0)
+        target_rank = CONFIRMATION_STATUS_RANK.get(target_status, 0)
+
+        # Monotonicity check: Never downgrade state unless transitioning equal-rank unverified -> reconciliation_required
+        if curr_rank > target_rank:
+            _log.info(
+                "Preserving confirmation_status for job %s: current '%s' (rank %d) outranks target '%s' (rank %d, ledger phase '%s')",
+                job_id, curr_conf, curr_rank, target_status, target_rank, phase,
+            )
+            return curr_conf
+
+        if curr_rank == target_rank and not (curr_conf == "submission_unverified" and target_status == "reconciliation_required"):
+            return curr_conf
+
+        # 1. Try standard sequential state transition
+        try:
+            self.transition_confirmation(job_id, target_status)
+            return target_status
+        except InvalidStateTransitionError:
+            # 2. Cold-start recovery path: row was cold-started after crash (e.g. None -> submitted)
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE jobs SET confirmation_status = ? WHERE job_id = ? AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')",
+                    (target_status, job_id),
+                )
+                conn.commit()
+            _log.info(
+                "Cold-start ledger recovery for job %s: confirmation_status '%s' -> '%s' (ledger phase: '%s')",
+                job_id, curr_conf, target_status, phase,
+            )
+            return target_status
+
+    def sync_confirmation_from_ledger(self, job_id: str, ledger: Any = None) -> Optional[str]:
+        """Projects SubmissionLedger attempt state onto the job's confirmation_status lifecycle.
+
+        Handles:
+          - receipt_verified -> 'submitted'
+          - submit_in_progress (live) -> 'submitting'
+          - submit_in_progress (stale) -> 'reconciliation_required'
+          - submission_unverified -> 'submission_unverified'
+        """
+        job = self.get_job(job_id)
+        if not job:
+            return None
+
+        if ledger is None:
+            try:
+                from .sources.adapters.idempotency import SubmissionLedger
+                ledger = SubmissionLedger()
+            except Exception:
+                return job.get("confirmation_status")
+
+        try:
+            from .sources.adapters.idempotency import canonical_key, PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED
+            key = canonical_key(job)
+            if not key:
+                return job.get("confirmation_status")
+
+            record = ledger.record(key) if hasattr(ledger, "record") else ledger.get(key)
+            if not record:
+                return job.get("confirmation_status")
+
+            phase = record.get("phase")
+            target_status = None
+
+            if phase == PHASE_VERIFIED:
+                target_status = "submitted"
+            elif phase == PHASE_UNVERIFIED:
+                target_status = "submission_unverified"
+            elif phase == PHASE_IN_PROGRESS:
+                if hasattr(ledger, "is_stale_in_progress") and ledger.is_stale_in_progress(key):
+                    target_status = "reconciliation_required"
+                else:
+                    target_status = "submitting"
+
+            curr_conf = job.get("confirmation_status")
+            # Never downgrade terminal verified state
+            if curr_conf == "confirmed_by_employer":
+                return curr_conf
+
+            if target_status and target_status != curr_conf:
+                return self.recover_confirmation_from_ledger(job_id, target_status, phase=str(phase))
+
+        except Exception as exc:
+            _log.warning("Error syncing confirmation from ledger for %s: %s", job_id, exc)
+
+        return job.get("confirmation_status")
+
+    def reconcile_active_jobs_from_ledger(self) -> int:
+        """Scans unconfirmed active applied jobs, projecting SubmissionLedger phase onto confirmation_status."""
+        try:
+            from .sources.adapters.idempotency import SubmissionLedger
+            ledger = SubmissionLedger()
+        except Exception:
+            return 0
+
+        reconciled_count = 0
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id FROM jobs WHERE status = 'applied' AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')"
+            ).fetchall()
+
+        for r in rows:
+            jid = r["job_id"]
+            new_status = self.sync_confirmation_from_ledger(jid, ledger=ledger)
+            if new_status:
+                reconciled_count += 1
+
+        return reconciled_count
+
     def delete_job(self, job_id: str) -> None:
         """Delete a job record completely from the database."""
         with self._connect() as conn:
@@ -244,8 +393,8 @@ class StateManager:
                 """
                 INSERT OR REPLACE INTO archived_jobs
                     (job_id, source, title, company, location, url, score,
-                     status, discovered_at, archived_at, archive_reason, extra_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     status, discovered_at, archived_at, archive_reason, extra_json, confirmation_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job["job_id"],
@@ -260,6 +409,7 @@ class StateManager:
                     now,
                     reason,
                     job.get("extra_json"),
+                    job.get("confirmation_status"),
                 ),
             )
             conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))

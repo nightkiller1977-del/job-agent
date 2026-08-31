@@ -14,10 +14,14 @@ Reference: electron/services/modelRegistry.js, modelRouterService.js, modelServi
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import json
 import logging
 import os
 import platform
 import subprocess
+import threading
+import urllib.request
 from contextlib import contextmanager
 from typing import Any
 
@@ -46,6 +50,16 @@ except Exception:
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))
 ANTHROPIC_MAX_TOKENS = 2048
+
+# AI-OpenRouter Gateway Configuration (Port 3848 default)
+OPENROUTER_GATEWAY_URL = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
+OPENROUTER_TIMEOUT = int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "30"))
+OPENROUTER_TASK_MODELS: dict[str, str] = {
+    "coding": os.environ.get("JOB_AGENT_OPENROUTER_CODING_MODEL", "qwen/qwen-2.5-coder-32b-instruct"),
+    "reasoning": os.environ.get("JOB_AGENT_OPENROUTER_REASONING_MODEL", "anthropic/claude-3.5-sonnet"),
+    "general": os.environ.get("JOB_AGENT_OPENROUTER_GENERAL_MODEL", "anthropic/claude-3.5-haiku"),
+    "monitoring": os.environ.get("JOB_AGENT_OPENROUTER_MONITORING_MODEL", "meta-llama/llama-3.3-70b-instruct"),
+}
 
 # Mirrors AI Commander's default fallback model names
 DEFAULT_ANTHROPIC_MODEL = os.environ.get("COMMANDER_ANTHROPIC_MODEL", "claude-haiku-4-5")
@@ -326,18 +340,21 @@ class ModelCascadeError(Exception):
     pass
 
 
+class BudgetExceededError(ModelCascadeError):
+    """Raised when AI-OpenRouter Gateway rejects a request due to budget exhaustion (HTTP 402)."""
+    pass
+
+
 class ModelClient:
-    """Routes completions through Ollama first (resource-aware), Claude second, OpenAI last.
+    """Routes completions through Ollama first (resource-aware), OpenRouter Gateway second, Claude third, OpenAI last.
 
     Model selection mirrors AI Commander's cascade:
       1. Query Ollama for pulled + warm models
       2. Apply SystemPerformanceGate to get RAM cap
-      3. For the preferred model list (by task_type), pick the first that:
-         a) Is pulled locally
-         b) Fits within RAM cap (resolveModelForCapacity)
-      4. Call Ollama with 3-attempt retry + backoff (matches modelService.js)
-      5. Escalate to Claude (Anthropic) on failure or empty response
-      6. Escalate to OpenAI as final fallback
+      3. For the preferred model list (by task_type), pick the first that fits
+      4. Escalate to AI-OpenRouter Gateway (centralized budget authority)
+      5. Escalate to Direct Claude (Anthropic API) if safe
+      6. Escalate to Direct OpenAI as final fallback
     """
 
     _semaphores: dict[str, asyncio.Semaphore] = {}
@@ -346,6 +363,14 @@ class ModelClient:
     def reset_semaphores(cls) -> None:
         """Reset all cached concurrency semaphores."""
         cls._semaphores.clear()
+
+    @classmethod
+    def get_gateway_config(cls) -> tuple[bool, str, str]:
+        """Returns (is_configured, gateway_url, api_key) requiring AICC_OPENROUTER_API_KEY."""
+        url = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
+        key = (os.environ.get("AICC_OPENROUTER_API_KEY") or "").strip()
+        is_configured = bool(key)
+        return is_configured, url, key
 
     def __init__(
         self,
@@ -369,10 +394,12 @@ class ModelClient:
         max_tokens: int = ANTHROPIC_MAX_TOKENS,
         temperature: float | None = None,
     ) -> str:
-        """Return the model response text.  Cascade: Ollama → Claude → OpenAI.
+        """Return the model response text.  Cascade: Ollama → OpenRouter Gateway → Claude → OpenAI.
 
         Pass temperature to override the default (0.2) for all backends.
         """
+        last_error = ""
+
         # Tier 1: Ollama with resource-aware model selection
         ollama_model = await self._pick_ollama_model(task_type)
         if ollama_model:
@@ -382,13 +409,38 @@ class ModelClient:
                 if text and text.strip():
                     _log.info("ModelClient: Ollama model=%s task=%s", ollama_model, task_type)
                     return text
-                _log.warning("ModelClient: Ollama returned empty — escalating to Claude")
+                _log.warning("ModelClient: Ollama returned empty — escalating to OpenRouter Gateway")
             except Exception as exc:
-                _log.warning("ModelClient: Ollama failed (%s) — escalating to Claude", exc)
+                last_error = str(exc)
+                _log.warning("ModelClient: Ollama failed (%s) — escalating to OpenRouter Gateway", exc)
         else:
-            _log.info("ModelClient: no Ollama models fit constraints — trying Claude")
+            _log.info("ModelClient: no Ollama models fit constraints — trying OpenRouter Gateway")
 
-        # Tier 2: Claude
+        # Tier 2: AI-OpenRouter Gateway (Centralized budget-managed cloud tier)
+        gateway_configured, gateway_url, gateway_key = self.get_gateway_config()
+        if gateway_configured:
+            try:
+                model_name = OPENROUTER_TASK_MODELS.get(task_type, OPENROUTER_TASK_MODELS["general"])
+                with _model_span("openrouter", model_name):
+                    text = await self._call_openrouter_gateway(messages, system, task_type, max_tokens, temperature=temperature)
+                if text and text.strip():
+                    _log.info("ModelClient: OpenRouter Gateway model=%s task=%s", model_name, task_type)
+                    return text
+                _log.warning("ModelClient: OpenRouter returned empty — escalating to Direct Claude")
+            except BudgetExceededError as exc:
+                # Do NOT bypass budget denial to spend direct cloud money without explicit authorization
+                allow_bypass = os.environ.get("ALLOW_DIRECT_CLOUD_FALLBACK_ON_BUDGET_DENIAL", "").lower() in ("true", "1")
+                if not allow_bypass:
+                    _log.error("ModelClient: Gateway budget/pricing exceeded. Failing closed to protect spending limits: %s", exc)
+                    raise
+                _log.warning("ModelClient: Gateway budget exceeded but explicit bypass authorized — escalating to Direct Claude")
+            except Exception as exc:
+                last_error = str(exc)
+                _log.warning("ModelClient: OpenRouter Gateway failed (%s) — escalating to Direct Claude", exc)
+        else:
+            _log.info("ModelClient: no AICC_OPENROUTER_API_KEY — skipping OpenRouter Gateway")
+
+        # Tier 3: Direct Claude
         if self._api_key:
             try:
                 with _model_span("anthropic", self._anthropic_model):
@@ -398,13 +450,13 @@ class ModelClient:
                     return text
                 _log.warning("ModelClient: Claude returned empty — escalating to OpenAI")
             except Exception as exc:
+                last_error = str(exc)
                 _log.warning("ModelClient: Claude failed (%s) — escalating to OpenAI", exc)
         else:
             _log.info("ModelClient: no ANTHROPIC_API_KEY — skipping Claude")
 
-        # Tier 3: OpenAI
+        # Tier 4: Direct OpenAI
         openai_key = os.environ.get("OPENAI_API_KEY", "")
-        last_error = ""
         if openai_key:
             try:
                 with _model_span("openai", OPENAI_MODEL):
@@ -418,7 +470,7 @@ class ModelClient:
         # All tiers exhausted
         degraded = (
             "No model available: Ollama is not running or has no models that fit RAM constraints, "
-            "ANTHROPIC_API_KEY and OPENAI_API_KEY are not set or failed."
+            "and OpenRouter Gateway, ANTHROPIC_API_KEY, and OPENAI_API_KEY are not set or failed."
         )
         _log.error(
             "ModelClient: all inference tiers failed last_error=%s", last_error,
@@ -427,9 +479,81 @@ class ModelClient:
         if _notify_error is not None:
             _notify_error(
                 "Model cascade total failure",
-                f"All tiers failed (Ollama + Claude + OpenAI). Scoring degraded. Last error: {last_error}",
+                f"All tiers failed (Ollama + OpenRouter + Claude + OpenAI). Scoring degraded. Last error: {last_error}",
             )
         raise ModelCascadeError(degraded)
+
+    async def _call_openrouter_gateway(
+        self,
+        messages: list[dict],
+        system: str,
+        task_type: str,
+        max_tokens: int,
+        temperature: float | None = None,
+    ) -> str:
+        """Calls AI-OpenRouter Gateway at /chat/completions with centralized budget tracking."""
+        model_name = OPENROUTER_TASK_MODELS.get(task_type, OPENROUTER_TASK_MODELS["general"])
+        full_messages = list(messages)
+        if system:
+            full_messages = [{"role": "system", "content": system}] + full_messages
+
+        payload = {
+            "model": model_name,
+            "messages": full_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature if temperature is not None else 0.2,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        api_key = os.environ.get("AICC_OPENROUTER_API_KEY", "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        url = f"{OPENROUTER_GATEWAY_URL}/chat/completions"
+        async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+
+            # 1. Direct Budget Refusal (HTTP 402) -> Always fail closed
+            if resp.status_code == 402:
+                raise BudgetExceededError(f"AI-OpenRouter Gateway budget exceeded (HTTP 402): {resp.text}")
+
+            # 2. Bad Gateway (HTTP 502) -> Distinguish unpriced model vs upstream provider outage
+            if resp.status_code == 502:
+                body_lower = resp.text.lower()
+                if any(term in body_lower for term in ("unpriced", "pricing", "budget", "cost")):
+                    raise BudgetExceededError(f"AI-OpenRouter Gateway unpriced model refusal (HTTP 502): {resp.text}")
+                # Ordinary upstream provider failure -> raise HTTPStatusError to safely cascade to Direct Anthropic
+                resp.raise_for_status()
+
+            # 3. Service Unavailable (HTTP 503) -> Distinguish budget authority outage vs generic gateway outage
+            if resp.status_code == 503:
+                body_lower = resp.text.lower()
+                if any(term in body_lower for term in ("budget", "ledger", "authoriz")):
+                    raise BudgetExceededError(f"AI-OpenRouter Gateway budget authority unavailable (HTTP 503): {resp.text}")
+                resp.raise_for_status()
+
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                # 1. AI-OpenRouter Gateway native top-level content contract (KAN-80)
+                if data.get("content"):
+                    return str(data["content"])
+                # 2. OpenAI / OpenRouter standard choices contract
+                choices = data.get("choices", [])
+                if choices and isinstance(choices, list) and isinstance(choices[0], dict):
+                    msg = choices[0].get("message", {})
+                    if isinstance(msg, dict) and msg.get("content"):
+                        return str(msg["content"])
+                    if choices[0].get("text"):
+                        return str(choices[0]["text"])
+                # 3. Fallback response / text fields
+                if data.get("response"):
+                    return str(data["response"])
+                if data.get("text"):
+                    return str(data["text"])
+            elif isinstance(data, str):
+                return data
+            return ""
 
     async def get_ollama_models(self) -> dict:
         """Return {'pulled': [...], 'warm': [...]} from Ollama /api/tags and /api/ps."""
@@ -584,7 +708,7 @@ class ModelClient:
 
     async def _call_claude(self, messages: list[dict], system: str, max_tokens: int, temperature: float | None = None) -> str:
         import anthropic as _anthropic
-        client = _anthropic.Anthropic(api_key=self._api_key)
+        client = _anthropic.AsyncAnthropic(api_key=self._api_key)
         non_system = [m for m in messages if m.get("role") != "system"]
         kwargs: dict = dict(
             model=self._anthropic_model,
@@ -594,7 +718,7 @@ class ModelClient:
         )
         if temperature is not None:
             kwargs["temperature"] = temperature
-        response = client.messages.create(**kwargs)
+        response = await client.messages.create(**kwargs)
         for block in response.content:
             if block.type == "text":
                 return block.text
@@ -607,14 +731,102 @@ class ModelClient:
     async def _call_openai(self, messages: list[dict], system: str, max_tokens: int, temperature: float | None = None) -> str:
         import openai as _openai
         openai_key = os.environ.get("OPENAI_API_KEY", "")
-        client = _openai.OpenAI(api_key=openai_key)
+        client = _openai.AsyncOpenAI(api_key=openai_key)
         full_messages = list(messages)
         if system:
             full_messages = [{"role": "system", "content": system}] + full_messages
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=full_messages,
             max_tokens=max_tokens,
             temperature=temperature if temperature is not None else 0.2,
         )
         return response.choices[0].message.content or ""
+
+
+def check_inference_availability() -> tuple[bool, str]:
+    """Checks if at least one inference provider is available by probing live endpoints."""
+    # 1. Local Ollama — probe /api/tags
+    try:
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+        req = urllib.request.Request(f"{base_url}/api/tags")
+        with urllib.request.urlopen(req, timeout=2) as r:
+            if r.status == 200:
+                tags_data = json.loads(r.read().decode("utf-8"))
+                if tags_data.get("models"):
+                    return True, f"Local Ollama ({len(tags_data['models'])} models available)"
+    except Exception:
+        pass
+
+    # 2. AI-OpenRouter Gateway — probe /health or /models
+    gateway_configured, gateway_url, aicc_key = ModelClient.get_gateway_config()
+    if aicc_key:
+        try:
+            req = urllib.request.Request(f"{gateway_url}/health")
+            with urllib.request.urlopen(req, timeout=2) as r:
+                if r.status == 200:
+                    return True, "AI-OpenRouter Gateway"
+        except Exception:
+            try:
+                req_models = urllib.request.Request(
+                    f"{gateway_url}/models",
+                    headers={"Authorization": f"Bearer {aicc_key}"}
+                )
+                with urllib.request.urlopen(req_models, timeout=2) as r_m:
+                    if r_m.status == 200:
+                        return True, "AI-OpenRouter Gateway"
+            except Exception:
+                pass
+
+    # 3. Direct Anthropic (Claude)
+    anthropic_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if anthropic_key and anthropic_key != "your_key_here":
+        return True, "Direct Anthropic (Claude)"
+
+    # 4. Direct OpenAI
+    openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if openai_key and openai_key != "your_key_here":
+        return True, "Direct OpenAI"
+
+    return False, "No inference provider available (Ollama unreachable, OpenRouter Gateway offline, no direct cloud keys)"
+
+
+class _AsyncModelRunner:
+    _loop: asyncio.AbstractEventLoop | None = None
+    _thread: threading.Thread | None = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_loop(cls) -> asyncio.AbstractEventLoop:
+        with cls._lock:
+            if cls._loop is None or not cls._loop.is_running():
+                cls._loop = asyncio.new_event_loop()
+                cls._thread = threading.Thread(target=cls._loop.run_forever, daemon=True, name="ModelRunnerThread")
+                cls._thread.start()
+            return cls._loop
+
+
+def query_model(
+    prompt: str,
+    system: str = "",
+    task_type: str = "general",
+    max_tokens: int = 512,
+    temperature: float | None = None,
+    timeout: float = 25.0,
+) -> str:
+    """Synchronous helper for ModelClient.complete() with active cancellation propagation on timeout."""
+    client = ModelClient()
+    runner_loop = _AsyncModelRunner.get_loop()
+    coro = client.complete(
+        [{"role": "user", "content": prompt}],
+        system=system,
+        task_type=task_type,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    future = asyncio.run_coroutine_threadsafe(coro, runner_loop)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise TimeoutError(f"Model query timed out after {timeout}s and was actively cancelled.")

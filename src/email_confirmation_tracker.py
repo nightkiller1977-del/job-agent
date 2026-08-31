@@ -31,9 +31,10 @@ logger = logging.getLogger(__name__)
 console = Console()
 
 _PROCESSED_EMAILS_FILE = Path(__file__).resolve().parents[1] / "state" / "processed_emails.json"
+_CONFIRMATION_REVIEW_QUEUE_FILE = Path(__file__).resolve().parents[1] / "state" / "confirmation_review_queue.json"
 
-# Known ATS Vendor Domains
-ATS_VENDOR_DOMAINS = [
+# Default Known ATS Vendor Domains (can be overridden in config.json)
+DEFAULT_ATS_VENDOR_DOMAINS = [
     "myworkday.com",
     "myworkdayjobs.com",
     "greenhouse-mail.io",
@@ -49,7 +50,7 @@ ATS_VENDOR_DOMAINS = [
 ]
 
 # Receipt signal patterns (reused from receipt.py)
-CONFIRMATION_SUBJECT_PATTERNS = [
+DEFAULT_CONFIRMATION_PATTERNS = [
     r"thank you for (applying|your application)",
     r"application (received|submitted|confirmation|confirmed)",
     r"we(?:'|’|)ve received your application",
@@ -78,10 +79,24 @@ def _decode_header(hdr: str) -> str:
 
 
 class EmailConfirmationTracker:
-    def __init__(self, state_manager=None, processed_file: Optional[Path] = None):
+    def __init__(self, state_manager=None, processed_file: Optional[Path] = None, config: Optional[Dict[str, Any]] = None):
         self.state_manager = state_manager
         self.processed_file = processed_file or _PROCESSED_EMAILS_FILE
         self._processed_ids = self._load_processed_ids()
+        self.config = config or self._load_default_config()
+        self.vendor_domains = self.config.get("ats_vendor_domains", DEFAULT_ATS_VENDOR_DOMAINS)
+        self.confirmation_patterns = self.config.get("confirmation_patterns", DEFAULT_CONFIRMATION_PATTERNS)
+        self.min_confirmed_score = float(self.config.get("min_confirmation_score", 0.85))
+
+    def _load_default_config(self) -> Dict[str, Any]:
+        cfg_path = Path(__file__).resolve().parents[1] / "config.json"
+        if cfg_path.exists():
+            try:
+                with open(cfg_path) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
 
     def _load_processed_ids(self) -> set[str]:
         if self.processed_file.exists():
@@ -99,6 +114,33 @@ class EmailConfirmationTracker:
                 json.dump(list(self._processed_ids), f, indent=2)
         except Exception as exc:
             logger.warning("Could not save processed email IDs: %s", exc)
+
+    def _save_to_review_queue(self, job: dict, score: float, outcome: dict) -> None:
+        """Persists flagged/ambiguous confirmation cases into state/confirmation_review_queue.json."""
+        try:
+            _CONFIRMATION_REVIEW_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            queue: dict = {}
+            if _CONFIRMATION_REVIEW_QUEUE_FILE.exists():
+                try:
+                    with open(_CONFIRMATION_REVIEW_QUEUE_FILE) as f:
+                        queue = json.load(f)
+                except Exception:
+                    queue = {}
+
+            item_key = f"{job.get('job_id')}_{outcome.get('subject', '')[:30]}"
+            queue[item_key] = {
+                "job_id": job.get("job_id"),
+                "company": job.get("company"),
+                "title": job.get("title"),
+                "score": score,
+                "outcome": outcome,
+                "flagged_at": datetime.utcnow().isoformat(),
+            }
+
+            with open(_CONFIRMATION_REVIEW_QUEUE_FILE, "w") as f:
+                json.dump(queue, f, indent=2)
+        except Exception as exc:
+            logger.warning("Could not persist confirmation review item: %s", exc)
 
     def extract_confirmation_id(self, text: str) -> Optional[str]:
         """Extract application/confirmation/requisition ID from text snippet."""
@@ -141,16 +183,16 @@ class EmailConfirmationTracker:
             score += 0.35
             evidence["company_matched"] = company
 
-        # 2. Sender Domain Match (0.25)
+        # 2. Sender Domain Match (0.25) - must originate from sender email address
         domain_matched = False
-        for vendor_dom in ATS_VENDOR_DOMAINS:
-            if vendor_dom in sender_clean or vendor_dom in job_url:
+        for vendor_dom in self.vendor_domains:
+            if vendor_dom in sender_clean:
                 domain_matched = True
                 evidence["vendor_domain"] = vendor_dom
                 break
 
         if not domain_matched and company:
-            # Check employer domain
+            # Check employer domain in sender
             company_token = re.sub(r"[^\w]", "", company.split()[0])
             if company_token and company_token in sender_clean:
                 domain_matched = True
@@ -160,20 +202,40 @@ class EmailConfirmationTracker:
             score += 0.25
 
         # 3. Title Match (0.20)
+        title_matched = False
         if title:
             # Match meaningful keywords from title
             title_words = [w for w in re.split(r"\W+", title) if len(w) > 3]
             matched_words = [w for w in title_words if w in full_text]
             if len(matched_words) >= 2 or (len(title_words) == 1 and matched_words):
                 score += 0.20
+                title_matched = True
                 evidence["title_matched"] = matched_words
 
-        # 4. Confirmation ID Found (0.15)
+        # 4. Confirmation / Requisition ID Matching (0.15)
         raw_text = f"{msg_subject} {msg_body_snippet}"
         conf_id = self.extract_confirmation_id(raw_text)
         if conf_id:
-            score += 0.15
-            evidence["confirmation_id"] = conf_id
+            extra = {}
+            if job.get("extra_json"):
+                try:
+                    extra = json.loads(job["extra_json"])
+                except Exception:
+                    extra = {}
+            stored_req_id = job.get("requisition_id") or extra.get("requisition_id") or extra.get("req_id")
+            if stored_req_id:
+                if str(stored_req_id).lower() == conf_id.lower():
+                    score += 0.15
+                    evidence["confirmation_id_verified"] = conf_id
+                else:
+                    # Explicit conflicting requisition ID — HARD VETO
+                    evidence["confirmation_id_mismatch"] = f"email={conf_id} vs job={stored_req_id}"
+                    evidence["hard_veto"] = True
+                    return 0.0, evidence
+            elif company in full_text and title_matched:
+                # No recorded req_id, but company and title confirmed
+                score += 0.10
+                evidence["confirmation_id_extracted"] = conf_id
 
         # 5. Timestamp Proximity (0.05)
         applied_at_str = job.get("applied_at")
@@ -195,7 +257,8 @@ class EmailConfirmationTracker:
         orchestrator from a real apply-success event. An email match alone is signal,
         not proof — it must never fabricate submitting/submitted history for a row that
         has none (e.g. a legacy row that predates this column, or one the orchestrator
-        never got to stamp). Those cases are flagged for manual review instead."""
+        never got to stamp). Those cases are flagged for manual review and saved to the
+        durable review queue instead."""
         curr_conf = job.get("confirmation_status")
         if curr_conf in ("submitted", "receipt_pending"):
             try:
@@ -209,6 +272,7 @@ class EmailConfirmationTracker:
                 f"[yellow]⚠ Email matched but confirmation_status='{curr_conf}' has no submission evidence on file "
                 f"— flagged for manual review, state not advanced:[/yellow] {job.get('title')} @ {job.get('company')}"
             )
+            self._save_to_review_queue(job, score, outcome)
 
     def scan_inbox_and_confirm(
         self,
@@ -226,7 +290,7 @@ class EmailConfirmationTracker:
             email_addr
             or os.environ.get("EMAIL_2FA_ADDRESS", "")
             or os.environ.get("USAJOBS_EMAIL", "")
-            or "anthonyclarkins@icloud.com"
+            or os.environ.get("IMAP_USER", "")
         )
         imap_pwd = (
             password
@@ -235,9 +299,19 @@ class EmailConfirmationTracker:
             or os.environ.get("IMAP_PASSWORD", "")
         )
 
+        if not user_email:
+            console.print("[yellow]Email confirmation check skipped: EMAIL_2FA_ADDRESS / USAJOBS_EMAIL / IMAP_USER not configured.[/yellow]")
+            return []
+
         if not imap_pwd:
             console.print("[yellow]Email confirmation check skipped: ICLOUD_APP_PASSWORD_PERSONAL / IMAP_PASSWORD not configured.[/yellow]")
             return []
+
+        # Reconcile submission ledger before evaluating emails
+        try:
+            self.state_manager.reconcile_active_jobs_from_ledger()
+        except Exception:
+            pass
 
         # Fetch applied jobs from state
         with self.state_manager._connect() as conn:
@@ -264,6 +338,8 @@ class EmailConfirmationTracker:
             if typ != "OK" or not msg_ids[0]:
                 mail.logout()
                 return []
+
+            min_candidate_cutoff = min(0.50, self.min_confirmed_score)
 
             for mid in msg_ids[0].split():
                 typ, data = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM DATE)] BODY.PEEK[TEXT]<0.1000>)")
@@ -293,38 +369,57 @@ class EmailConfirmationTracker:
                         pass
 
                 # Check if subject matches confirmation copy
-                if not any(re.search(pat, subject, re.IGNORECASE) for pat in CONFIRMATION_SUBJECT_PATTERNS):
+                if not any(re.search(pat, subject, re.IGNORECASE) for pat in self.confirmation_patterns):
                     continue
 
                 # Match against applied jobs
-                best_job = None
-                best_score = 0.0
-                best_evidence = {}
-
+                candidates = []
                 for job in applied_jobs:
                     score, ev = self.calculate_match_score(sender, subject, body_snippet, parsed_date, job)
-                    if score > best_score:
-                        best_score = score
-                        best_job = job
-                        best_evidence = ev
+                    if score >= min_candidate_cutoff:
+                        candidates.append((score, job, ev))
 
-                if best_job and best_score >= 0.50:
-                    outcome = {
-                        "job_id": best_job["job_id"],
-                        "title": best_job.get("title"),
-                        "company": best_job.get("company"),
-                        "score": best_score,
-                        "evidence": best_evidence,
-                        "subject": subject,
-                        "sender": sender,
-                        "confirmed": best_score >= 0.85,
-                    }
-                    results.append(outcome)
+                if not candidates:
+                    continue
 
-                    if best_score >= 0.85 and not dry_run:
-                        self._apply_confirmation_transition(best_job, best_score, outcome)
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                best_score, best_job, best_evidence = candidates[0]
 
-                    if msg_id and not dry_run:
+                margin = 1.0
+                if len(candidates) > 1:
+                    second_score = candidates[1][0]
+                    margin = round(best_score - second_score, 2)
+
+                is_confirmed = best_score >= self.min_confirmed_score and margin >= 0.15
+
+                outcome = {
+                    "job_id": best_job["job_id"],
+                    "title": best_job.get("title"),
+                    "company": best_job.get("company"),
+                    "score": best_score,
+                    "margin": margin,
+                    "evidence": best_evidence,
+                    "subject": subject,
+                    "sender": sender,
+                    "confirmed": is_confirmed,
+                }
+                results.append(outcome)
+
+                if is_confirmed and not dry_run:
+                    self._apply_confirmation_transition(best_job, best_score, outcome)
+                    if msg_id:
+                        self._processed_ids.add(msg_id)
+                elif not dry_run:
+                    # Ambiguous or below confirmation threshold:
+                    # Persist into review queue so candidates are never silently consumed/lost!
+                    outcome["needs_manual_confirmation"] = True
+                    if best_score >= self.min_confirmed_score and margin < 0.15:
+                        outcome["ambiguous"] = True
+                        console.print(f"[yellow]⚠ Ambiguous email confirmation (margin {margin} < 0.15):[/yellow] '{best_job.get('title')}' vs runner-up. Flagged for manual review.")
+                    else:
+                        console.print(f"[yellow]⚠ Candidate email match below confirmation threshold ({best_score} < {self.min_confirmed_score}):[/yellow] '{best_job.get('title')}'. Queued for manual review.")
+                    self._save_to_review_queue(best_job, best_score, outcome)
+                    if msg_id:
                         self._processed_ids.add(msg_id)
 
             mail.logout()

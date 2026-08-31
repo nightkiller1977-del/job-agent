@@ -35,6 +35,12 @@ jobs:
         run: |
           pytest tests/test_scorer.py \
                  tests/test_state_manager.py \
+                 tests/test_state_transitions.py \
+                 tests/test_model_client.py \
+                 tests/test_email_confirmation.py \
+                 tests/test_llm_answer_generator.py \
+                 tests/test_outreach_matcher.py \
+                 tests/test_question_bank.py \
                  tests/test_reauth_regressions.py \
                  tests/test_reauth_feature.py \
                  tests/test_auth_routing.py \

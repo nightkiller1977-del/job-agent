@@ -1192,7 +1192,11 @@ class Orchestrator:
             console.print(f"[dim]Dashboard sync failed (non-fatal): {e}[/dim]")
 
     def show_status(self) -> None:
-        """Display stats table."""
+        """Display stats table, reconciling ledger states for active jobs."""
+        try:
+            self.state.reconcile_active_jobs_from_ledger()
+        except Exception:
+            pass
         stats = self.state.get_stats()
         show_summary_table(stats)
 
@@ -1210,6 +1214,11 @@ class Orchestrator:
         so callers (tests, cloud push) can consume it too.
         """
         from rich.table import Table
+
+        try:
+            self.state.reconcile_active_jobs_from_ledger()
+        except Exception:
+            pass
 
         f = self.state.get_apply_funnel()
         rate_pct = f["attempt_success_rate"] * 100

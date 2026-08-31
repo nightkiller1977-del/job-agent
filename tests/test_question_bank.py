@@ -58,6 +58,7 @@ def test_years_of_experience_matching():
     
     assert bank.get_answer_for_question("How many years of experience do you have with Python?") == "7"
     assert bank.get_answer_for_question("years of experience with Python", field_type="number") == 7
-    assert bank.get_answer_for_question("years of experience with AWS") == "5"  # Fallback for string list items
     assert bank.get_answer_for_question("years of experience with Kubernetes", field_type="number") == 4
-    assert bank.get_answer_for_question("years of experience with Docker", field_type="number") == 5  # Global default fallback
+    # Skills without verified numeric years or absent skills fail closed (return None)
+    assert bank.get_answer_for_question("years of experience with AWS") is None
+    assert bank.get_answer_for_question("years of experience with Docker", field_type="number") is None
