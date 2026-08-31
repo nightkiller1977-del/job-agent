@@ -626,7 +626,8 @@ class Orchestrator:
             # external-apply profile regardless of discovery source: LinkedIn's
             # and Indeed's prepare_session only refresh their own site session,
             # which never clears a Workday/Microsoft/BrassRing auth wall.
-            if needs_external_portal_prep(readiness, job):
+            routed_to_external_portal = needs_external_portal_prep(readiness, job)
+            if routed_to_external_portal:
                 scraper_cls = SOURCE_MAP["jobright"]
                 console.print(
                     f"[cyan]Routing {job.get('source')} job to external ATS portal prep.[/cyan]"
@@ -655,7 +656,26 @@ class Orchestrator:
                 self.state.clear_session_block(job["job_id"])
                 await self._push_apply_attempt_to_cloud(job["job_id"])
                 job_source = job.get("source", "")
-                if job_source in AUTOMATED_SOURCES:
+                # Only reset job_source's own reauth circuit breaker when its
+                # own login session is what got prepared.
+                #
+                # routed_to_external_portal covers LinkedIn/Indeed-origin jobs
+                # explicitly routed to Jobright's external-portal flow —
+                # job_source's own session was never touched there.
+                #
+                # job_source == "jobright" needs its own exclusion:
+                # needs_external_portal_prep() returns False for jobright-origin
+                # jobs (it treats them as "already on that flow" rather than
+                # routing them), but JobrightScraper.prepare_session(job) — when
+                # given a job, as opposed to the job=None base-session-refresh
+                # path — ALWAYS opens the external ATS portal (Workday/Microsoft/
+                # etc.) for that job, never verifies Jobright's own login. Every
+                # status that lands a job in this loop (workday_session_expired,
+                # brassring_login_required, microsoft_login_required, ...) is an
+                # external-ATS-wall status, not a Jobright-login status, so this
+                # is not a hypothetical case. (Codex review, PR #81.)
+                own_source_login_prepared = not routed_to_external_portal and job_source != "jobright"
+                if job_source in AUTOMATED_SOURCES and own_source_login_prepared:
                     record_reauth_event(job_source, "human", "success", "manually prepared via prepare-sessions")
 
     async def apply_approved(
