@@ -81,7 +81,7 @@ Each scraper checks on startup whether it is logged in. If not, `_auto_login()` 
 | `src/resume_helper.py` | Resume path resolution and form-field fallback filler |
 | `dashboard/main.py` | Cloud dashboard API, sync, external placeholder jobs, credential endpoints |
 | `state/profile.json` | Real resume data for LinkedIn Easy Apply autofill (gitignored) |
-| `config.json` | Scoring config, search settings, local resume path |
+| `config.json` | Scoring config, search settings, local resume path (gitignored — copy from `config.example.json`) |
 | `.env` | Credentials + API keys (never committed) |
 
 ---
