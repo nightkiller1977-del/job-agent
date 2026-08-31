@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 console = Console()
 
 _PROCESSED_EMAILS_FILE = Path(__file__).resolve().parents[1] / "state" / "processed_emails.json"
+_CONFIRMATION_REVIEW_QUEUE_FILE = Path(__file__).resolve().parents[1] / "state" / "confirmation_review_queue.json"
 
 # Default Known ATS Vendor Domains (can be overridden in config.json)
 DEFAULT_ATS_VENDOR_DOMAINS = [
@@ -113,6 +114,33 @@ class EmailConfirmationTracker:
                 json.dump(list(self._processed_ids), f, indent=2)
         except Exception as exc:
             logger.warning("Could not save processed email IDs: %s", exc)
+
+    def _save_to_review_queue(self, job: dict, score: float, outcome: dict) -> None:
+        """Persists flagged/ambiguous confirmation cases into state/confirmation_review_queue.json."""
+        try:
+            _CONFIRMATION_REVIEW_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            queue: dict = {}
+            if _CONFIRMATION_REVIEW_QUEUE_FILE.exists():
+                try:
+                    with open(_CONFIRMATION_REVIEW_QUEUE_FILE) as f:
+                        queue = json.load(f)
+                except Exception:
+                    queue = {}
+
+            item_key = f"{job.get('job_id')}_{outcome.get('subject', '')[:30]}"
+            queue[item_key] = {
+                "job_id": job.get("job_id"),
+                "company": job.get("company"),
+                "title": job.get("title"),
+                "score": score,
+                "outcome": outcome,
+                "flagged_at": datetime.utcnow().isoformat(),
+            }
+
+            with open(_CONFIRMATION_REVIEW_QUEUE_FILE, "w") as f:
+                json.dump(queue, f, indent=2)
+        except Exception as exc:
+            logger.warning("Could not persist confirmation review item: %s", exc)
 
     def extract_confirmation_id(self, text: str) -> Optional[str]:
         """Extract application/confirmation/requisition ID from text snippet."""
@@ -227,7 +255,8 @@ class EmailConfirmationTracker:
         orchestrator from a real apply-success event. An email match alone is signal,
         not proof — it must never fabricate submitting/submitted history for a row that
         has none (e.g. a legacy row that predates this column, or one the orchestrator
-        never got to stamp). Those cases are flagged for manual review instead."""
+        never got to stamp). Those cases are flagged for manual review and saved to the
+        durable review queue instead."""
         curr_conf = job.get("confirmation_status")
         if curr_conf in ("submitted", "receipt_pending"):
             try:
@@ -241,6 +270,7 @@ class EmailConfirmationTracker:
                 f"[yellow]⚠ Email matched but confirmation_status='{curr_conf}' has no submission evidence on file "
                 f"— flagged for manual review, state not advanced:[/yellow] {job.get('title')} @ {job.get('company')}"
             )
+            self._save_to_review_queue(job, score, outcome)
 
     def scan_inbox_and_confirm(
         self,
@@ -297,6 +327,8 @@ class EmailConfirmationTracker:
                 mail.logout()
                 return []
 
+            min_candidate_cutoff = min(0.50, self.min_confirmed_score)
+
             for mid in msg_ids[0].split():
                 typ, data = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM DATE)] BODY.PEEK[TEXT]<0.1000>)")
                 if typ != "OK" or not data:
@@ -332,7 +364,7 @@ class EmailConfirmationTracker:
                 candidates = []
                 for job in applied_jobs:
                     score, ev = self.calculate_match_score(sender, subject, body_snippet, parsed_date, job)
-                    if score >= 0.50:
+                    if score >= min_candidate_cutoff:
                         candidates.append((score, job, ev))
 
                 if not candidates:
@@ -364,7 +396,11 @@ class EmailConfirmationTracker:
                 if is_confirmed and not dry_run:
                     self._apply_confirmation_transition(best_job, best_score, outcome)
                 elif best_score >= self.min_confirmed_score and margin < 0.15:
+                    outcome["needs_manual_confirmation"] = True
+                    outcome["ambiguous"] = True
                     console.print(f"[yellow]⚠ Ambiguous email confirmation (margin {margin} < 0.15):[/yellow] '{best_job.get('title')}' vs runner-up. Flagged for manual review.")
+                    if not dry_run:
+                        self._save_to_review_queue(best_job, best_score, outcome)
 
                 if msg_id and not dry_run:
                     self._processed_ids.add(msg_id)
