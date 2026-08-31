@@ -61,3 +61,13 @@ jobs:
       # E741: ambiguous variable name (pre-existing in email_helper.py)
       # F841/F541: pre-existing unused variable / f-string in orchestrator.py
       - run: ruff check src/ --select=E,W,F --ignore=E501,W291,E402,E741,F841,F541
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
