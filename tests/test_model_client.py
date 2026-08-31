@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 import pytest
@@ -141,4 +142,40 @@ def test_check_inference_availability(monkeypatch):
     avail, msg = check_inference_availability()
     assert avail is True
     assert msg == "Direct Anthropic (Claude)"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_gateway_parses_top_level_content_and_choices(monkeypatch):
+    """Verifies that _call_openrouter_gateway parses native gateway {content: ...} and {choices: ...} contracts."""
+    client = ModelClient()
+    monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-key")
+
+    class MockResponse:
+        def __init__(self, data, status_code=200):
+            self._data = data
+            self.status_code = status_code
+            self.text = json.dumps(data)
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._data
+
+    # 1. Native AI-OpenRouter Gateway contract: { content: "...", model: "..." }
+    async def mock_post_native(self, url, json, headers):
+        return MockResponse({"content": "Grounded answer from AI-OpenRouter gateway"})
+
+    monkeypatch.setattr("httpx.AsyncClient.post", mock_post_native)
+    res_native = await client._call_openrouter_gateway([{"role": "user", "content": "test"}], "", "general", 100)
+    assert res_native == "Grounded answer from AI-OpenRouter gateway"
+
+    # 2. OpenAI-compatible choices contract: { choices: [{ message: { content: "..." } }] }
+    async def mock_post_choices(self, url, json, headers):
+        return MockResponse({"choices": [{"message": {"content": "Answer from OpenAI style upstream"}}]})
+
+    monkeypatch.setattr("httpx.AsyncClient.post", mock_post_choices)
+    res_choices = await client._call_openrouter_gateway([{"role": "user", "content": "test"}], "", "general", 100)
+    assert res_choices == "Answer from OpenAI style upstream"
+
 

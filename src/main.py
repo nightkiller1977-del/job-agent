@@ -509,7 +509,6 @@ async def main_async(args: argparse.Namespace) -> int:
             Path.home() / "Library/LaunchAgents/com.jobagent.discover.plist",
             Path.home() / "Library/LaunchAgents/com.jobagent.apply.plist",
         ]
-        import subprocess
         launchctl_out = ""
         try:
             res = subprocess.run(["launchctl", "list"], capture_output=True, text=True)

@@ -8,7 +8,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 _log = logging.getLogger(__name__)
 

@@ -14,10 +14,12 @@ Reference: electron/services/modelRegistry.js, modelRouterService.js, modelServi
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import platform
 import subprocess
+import urllib.request
 from contextlib import contextmanager
 from typing import Any
 
@@ -505,10 +507,26 @@ class ModelClient:
                 raise BudgetExceededError(f"AI-OpenRouter Gateway budget exceeded (HTTP 402): {resp.text}")
             resp.raise_for_status()
             data = resp.json()
-            choices = data.get("choices", [])
-            if choices and "message" in choices[0]:
-                return choices[0]["message"].get("content", "")
-            return data.get("response", "")
+            if isinstance(data, dict):
+                # 1. AI-OpenRouter Gateway native top-level content contract (KAN-80)
+                if data.get("content"):
+                    return str(data["content"])
+                # 2. OpenAI / OpenRouter standard choices contract
+                choices = data.get("choices", [])
+                if choices and isinstance(choices, list) and isinstance(choices[0], dict):
+                    msg = choices[0].get("message", {})
+                    if isinstance(msg, dict) and msg.get("content"):
+                        return str(msg["content"])
+                    if choices[0].get("text"):
+                        return str(choices[0]["text"])
+                # 3. Fallback response / text fields
+                if data.get("response"):
+                    return str(data["response"])
+                if data.get("text"):
+                    return str(data["text"])
+            elif isinstance(data, str):
+                return data
+            return ""
 
     async def get_ollama_models(self) -> dict:
         """Return {'pulled': [...], 'warm': [...]} from Ollama /api/tags and /api/ps."""
@@ -701,8 +719,6 @@ class ModelClient:
 
 def check_inference_availability() -> tuple[bool, str]:
     """Checks if at least one inference provider is available (Ollama, OpenRouter Gateway, Anthropic, or OpenAI)."""
-    import urllib.request
-
     # 1. Local Ollama
     try:
         base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
