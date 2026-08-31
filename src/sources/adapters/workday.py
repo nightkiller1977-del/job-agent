@@ -196,7 +196,7 @@ class WorkdayAdapter(GenericAtsAdapter):
                 name = await r.get_attribute("name") or ""
                 if name in handled_groups:
                     continue
-                
+
                 # Find label or fieldset text
                 label_text = await page.evaluate("""
                     (el) => {
@@ -210,7 +210,7 @@ class WorkdayAdapter(GenericAtsAdapter):
                         return '';
                     }
                 """, r)
-                
+
                 if label_text:
                     ans = bank.get_answer_for_question(label_text, field_type="boolean", job=getattr(ctx, "job", None))
                     if ans is not None:

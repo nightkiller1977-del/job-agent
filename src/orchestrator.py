@@ -482,6 +482,16 @@ class Orchestrator:
         # inline and records a specific block reason for the dashboard.
         return ("ready", "")
 
+    def _mark_confirmation_submitted(self, job_id: str) -> None:
+        """Stamp confirmation_status from the real apply-success signal this run just
+        observed, so it reflects actual evidence rather than being backfilled later
+        from an inferred email match (see EmailConfirmationTracker)."""
+        try:
+            self.state.transition_confirmation(job_id, "submitting")
+            self.state.transition_confirmation(job_id, "submitted")
+        except Exception as exc:
+            console.print(f"[dim]confirmation_status bookkeeping skipped for {job_id}: {exc}[/dim]")
+
     def _apply_validation_metadata(self, scraper=None, exc: Exception | None = None) -> dict:
         metrics = getattr(scraper, "_apply_validation_metrics", None) if scraper else None
         if not metrics and exc is not None:
@@ -861,6 +871,7 @@ class Orchestrator:
                     break
                 if result:
                     self.state.set_status(job["job_id"], "applied")
+                    self._mark_confirmation_submitted(job["job_id"])
                     self.state.record_apply_attempt(
                         job["job_id"],
                         "applied",
@@ -919,6 +930,7 @@ class Orchestrator:
                         result = await scraper2.apply(job, auto_submit=auto_submit)
                         if result:
                             self.state.set_status(job["job_id"], "applied")
+                            self._mark_confirmation_submitted(job["job_id"])
                             self.state.record_apply_attempt(
                                 job["job_id"],
                                 "applied",
