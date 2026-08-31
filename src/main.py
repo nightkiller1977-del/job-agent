@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import fcntl
 import os
 import subprocess
 import sys
@@ -36,6 +38,33 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 console = Console()
+
+
+@contextlib.contextmanager
+def _pipeline_lock(name: str):
+    """Non-blocking advisory lock so overlapping launchd jobs (or a stray manual
+    run) can't execute the same pipeline concurrently — that produced duplicate
+    'nothing submitted' apply runs and Playwright browser contention when a
+    legacy scheduler and the current one both fired at 23:00/07:00."""
+    lock_dir = project_root / "state"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{name}.lock"
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        console.print(
+            f"[yellow]Another '{name}' run is already in progress — skipping "
+            f"(lock: {lock_path}).[/yellow]"
+        )
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
 
 
 def load_env() -> None:
@@ -418,16 +447,20 @@ async def main_async(args: argparse.Namespace) -> int:
     orchestrator = Orchestrator(config_path=config_path)
 
     if args.command == "discover":
-        await orchestrator.discover(source=args.source, no_review=args.no_review)
+        with _pipeline_lock("discover") as acquired:
+            if acquired:
+                await orchestrator.discover(source=args.source, no_review=args.no_review)
 
     elif args.command == "apply":
-        await orchestrator.apply_approved(
-            auto_submit=args.auto_submit,
-            limit=args.limit,
-            job_id=args.job_id,
-            source=args.source,
-            company=args.company,
-        )
+        with _pipeline_lock("apply") as acquired:
+            if acquired:
+                await orchestrator.apply_approved(
+                    auto_submit=args.auto_submit,
+                    limit=args.limit,
+                    job_id=args.job_id,
+                    source=args.source,
+                    company=args.company,
+                )
 
     elif args.command == "preflight":
         await orchestrator.preflight_approved(source=args.source, company=args.company)

@@ -290,6 +290,74 @@ async def test_prepare_sessions_does_not_clear_when_prep_bails_early(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_prepare_sessions_resets_automated_reauth_circuit_breaker(monkeypatch, tmp_path):
+    """A manual `prepare-sessions` success for an automated source (jobright/
+    indeed/linkedin) must clear ReauthManager's consecutive-failure streak —
+    otherwise a source that hit the circuit breaker's cap stays locked out of
+    automated reauth forever even after the human fixes it by hand."""
+    import json as _json
+    from src import orchestrator as orch_mod
+    from src.notifier import record_reauth_event, get_status
+
+    monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+    for i in range(3):
+        record_reauth_event("jobright", "automated", "failed", str(i))
+    assert len(get_status()["reauth_events"]) == 3
+
+    class _Scraper:
+        def __init__(self, config):
+            pass
+
+        async def prepare_session(self, job):
+            return True
+
+    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {"jobright": _Scraper})
+
+    jobs = [
+        {"job_id": "j1", "source": "jobright", "title": "T", "company": "C",
+         "url": "https://jobright.ai/jobs/info/1",
+         "extra_json": _json.dumps({"apply_last_status": "workday_session_expired"})},
+    ]
+
+    class _State:
+        def get_approved_unapplied(self):
+            return jobs
+
+        def clear_session_block(self, job_id):
+            pass
+
+        def get_job(self, job_id):
+            return None
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
+    o.config = {}
+    o.state = _State()
+    o.load_credentials_from_dashboard = _noop
+    o._pull_approved_from_cloud = _noop
+
+    with patch("sys.stdin") as mock_stdin:
+        mock_stdin.isatty.return_value = True
+        await o.prepare_sessions()
+
+    events = get_status()["reauth_events"]
+    assert events[-1]["outcome"] == "success"
+    assert events[-1]["source"] == "jobright"
+
+    # The circuit breaker in ReauthManager._reauth_automated walks events from the
+    # most recent and breaks on the first "success" regardless of mode, so the
+    # prior 3 automated failures no longer count toward the cap.
+    from src.reauth import ReauthManager
+    mgr = ReauthManager(config={})
+    with patch("src.reauth._get_source_map") as mock_get_map:
+        mock_get_map.return_value = {}
+        await mgr._reauth_automated("jobright")
+        mock_get_map.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_prepare_session_disables_extensions_for_known_teamtailor_portal(monkeypatch):
     """Codex #56 P2 / #57 P2: for a known Teamtailor portal, prepare_session must
     launch with extensions genuinely disabled — the Jobright extension's content
