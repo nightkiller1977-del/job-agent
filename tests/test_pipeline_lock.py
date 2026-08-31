@@ -1,18 +1,20 @@
-"""_pipeline_lock: prevents overlapping discover/apply/prepare-sessions/
-heartbeat runs from executing concurrently — the root cause of duplicate
-'nothing submitted' apply runs and Playwright browser contention when a
-legacy launchd job and the current one both fire at the same scheduled
-time (or when a manual prepare-sessions overlaps a scheduled run)."""
+"""_pipeline_lock / browser_pipeline_lock.pipeline_lock: prevents overlapping
+discover/apply/prepare-sessions/heartbeat/auto-fix runs from executing
+concurrently — the root cause of duplicate 'nothing submitted' apply runs and
+Playwright browser contention when a legacy launchd job and the current one
+both fire at the same scheduled time (or when a manual prepare-sessions, or a
+watcher-triggered auto-fix, overlaps a scheduled run)."""
 from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import src.main as main_mod
+import src.browser_pipeline_lock as lock_mod
 
 
 def test_second_acquire_is_rejected_while_first_holds_lock(tmp_path, monkeypatch):
-    monkeypatch.setattr(main_mod, "project_root", tmp_path)
+    monkeypatch.setattr(lock_mod, "PROJECT_ROOT", tmp_path)
 
     with main_mod._pipeline_lock("apply") as first_acquired:
         assert first_acquired is True
@@ -21,7 +23,7 @@ def test_second_acquire_is_rejected_while_first_holds_lock(tmp_path, monkeypatch
 
 
 def test_lock_is_released_after_the_with_block(tmp_path, monkeypatch):
-    monkeypatch.setattr(main_mod, "project_root", tmp_path)
+    monkeypatch.setattr(lock_mod, "PROJECT_ROOT", tmp_path)
 
     with main_mod._pipeline_lock("apply") as acquired:
         assert acquired is True
@@ -31,12 +33,12 @@ def test_lock_is_released_after_the_with_block(tmp_path, monkeypatch):
 
 
 def test_different_lock_names_do_not_contend(tmp_path, monkeypatch):
-    """Generic property of _pipeline_lock itself: distinct names are
+    """Generic property of pipeline_lock itself: distinct names are
     independent locks. main_async no longer exercises this directly (see
     test_discover_apply_prepare_sessions_heartbeat_share_one_lock below) —
     every browser-driving command now passes the same BROWSER_PIPELINE_LOCK
     name — but the primitive still supports separate lock names."""
-    monkeypatch.setattr(main_mod, "project_root", tmp_path)
+    monkeypatch.setattr(lock_mod, "PROJECT_ROOT", tmp_path)
 
     with main_mod._pipeline_lock("some-other-lock") as first_acquired:
         assert first_acquired is True
@@ -52,7 +54,7 @@ async def test_discover_apply_prepare_sessions_heartbeat_share_one_lock(tmp_path
     be blocked — which only happens if they all take the SAME lock name."""
     import types
 
-    monkeypatch.setattr(main_mod, "project_root", tmp_path)
+    monkeypatch.setattr(lock_mod, "PROJECT_ROOT", tmp_path)
 
     mock_orch = MagicMock()
     mock_orch.discover = AsyncMock()
@@ -84,3 +86,16 @@ async def test_discover_apply_prepare_sessions_heartbeat_share_one_lock(tmp_path
     mock_orch.discover.assert_awaited_once()
     mock_orch.apply_approved.assert_awaited_once()
     mock_orch.prepare_sessions.assert_awaited_once()
+
+
+def test_main_and_commander_use_the_same_underlying_lock(tmp_path, monkeypatch):
+    """main.py's CLI wrapper and commander.py's attempt_fix() must contend for
+    the literal same lock file, not just lock names that happen to match —
+    otherwise a scheduled apply run and a watcher-triggered auto-fix could
+    still launch competing Playwright contexts."""
+    monkeypatch.setattr(lock_mod, "PROJECT_ROOT", tmp_path)
+
+    with main_mod._pipeline_lock(main_mod.BROWSER_PIPELINE_LOCK) as held_by_main:
+        assert held_by_main is True
+        with lock_mod.pipeline_lock(lock_mod.BROWSER_PIPELINE_LOCK) as held_by_commander_path:
+            assert held_by_commander_path is False

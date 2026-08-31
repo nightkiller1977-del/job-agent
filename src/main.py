@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import fcntl
 import os
 import subprocess
 import sys
@@ -39,41 +38,23 @@ from rich.console import Console
 
 console = Console()
 
-
-BROWSER_PIPELINE_LOCK = "browser-pipeline"
+from src.browser_pipeline_lock import pipeline_lock as _browser_pipeline_lock, BROWSER_PIPELINE_LOCK
 
 
 @contextlib.contextmanager
-def _pipeline_lock(name: str):
-    """Non-blocking advisory lock so overlapping launchd jobs (or a stray manual
-    run) can't execute conflicting pipelines concurrently — that produced
-    duplicate 'nothing submitted' apply runs and Playwright browser contention
-    when a legacy scheduler and the current one both fired at 23:00/07:00.
-
-    discover/apply/prepare-sessions/heartbeat all drive the same Playwright
-    browser profile, so they share BROWSER_PIPELINE_LOCK rather than each
-    getting its own lock name — otherwise e.g. discover and apply could still
-    run at once (different lock names never contend with each other) even
-    though the legacy schedulers that caused that are gone."""
-    lock_dir = project_root / "state"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"{name}.lock"
-    fh = open(lock_path, "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        fh.close()
-        console.print(
-            f"[yellow]Another browser-pipeline run (discover/apply/prepare-sessions/"
-            f"heartbeat) is already in progress — skipping (lock: {lock_path}).[/yellow]"
-        )
-        yield False
-        return
-    try:
-        yield True
-    finally:
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
+def _pipeline_lock(name: str = BROWSER_PIPELINE_LOCK):
+    """CLI wrapper around the shared browser_pipeline_lock: same lock the
+    commander's auto-reauth path (attempt_fix) takes, so a scheduled
+    discover/apply/prepare-sessions/heartbeat run and a watcher-triggered
+    auto-fix can't launch competing Playwright contexts at once. Adds a
+    console message on top of the shared module's logging, for CLI UX."""
+    with _browser_pipeline_lock(name) as acquired:
+        if not acquired:
+            console.print(
+                "[yellow]Another browser-pipeline run (discover/apply/prepare-sessions/"
+                "heartbeat/auto-fix) is already in progress — skipping.[/yellow]"
+            )
+        yield acquired
 
 
 def load_env() -> None:

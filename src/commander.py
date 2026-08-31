@@ -13,6 +13,7 @@ from rich.table import Table
 from .state_manager import StateManager
 from .notifier import _load_status, notify_info, notify_error
 from .model_client import ModelClient, ModelCascadeError
+from .browser_pipeline_lock import pipeline_lock, BROWSER_PIPELINE_LOCK
 
 _log = logging.getLogger(__name__)
 SESSIONS_DIR = Path(__file__).parent.parent / "state" / "sessions"
@@ -353,53 +354,71 @@ class AgentCommander:
         _AUTOMATED = {"jobright", "indeed", "linkedin"}
         strategy = "automated" if source in _AUTOMATED else "human"
 
-        _log.info(
-            "heal.start source=%s strategy=%s root_cause=%s",
-            source, strategy, root_cause,
-        )
-        try:
-            success = await ReauthManager(self.config).handle(
-                source, root_cause, context="discover"
-            )
-            if success:
+        with pipeline_lock(BROWSER_PIPELINE_LOCK) as acquired:
+            if not acquired:
+                # Another discover/apply/prepare-sessions/heartbeat/auto-fix run
+                # holds the browser profile right now. Skip rather than launch a
+                # second Chromium context alongside it — the caller (a fresh
+                # `commander fix` invocation, or the watcher's next poll cycle)
+                # naturally gets another chance later.
                 _log.info(
-                    "heal.success source=%s strategy=%s root_cause=%s",
+                    "heal.skipped_lock_busy source=%s strategy=%s root_cause=%s",
                     source, strategy, root_cause,
                 )
-                notify_info(
-                    title=f"Auto-fix succeeded: {source}",
-                    detail=f"strategy={strategy} root_cause={root_cause}",
+                return {
+                    "success": False,
+                    "source": source,
+                    "strategy": strategy,
+                    "reason": "browser pipeline busy — another run holds it, will retry later",
+                }
+
+            _log.info(
+                "heal.start source=%s strategy=%s root_cause=%s",
+                source, strategy, root_cause,
+            )
+            try:
+                success = await ReauthManager(self.config).handle(
+                    source, root_cause, context="discover"
                 )
-            else:
-                _log.warning(
-                    "heal.failed source=%s strategy=%s root_cause=%s reason=reauth_returned_false",
-                    source, strategy, root_cause,
+                if success:
+                    _log.info(
+                        "heal.success source=%s strategy=%s root_cause=%s",
+                        source, strategy, root_cause,
+                    )
+                    notify_info(
+                        title=f"Auto-fix succeeded: {source}",
+                        detail=f"strategy={strategy} root_cause={root_cause}",
+                    )
+                else:
+                    _log.warning(
+                        "heal.failed source=%s strategy=%s root_cause=%s reason=reauth_returned_false",
+                        source, strategy, root_cause,
+                    )
+                    notify_error(
+                        title=f"Auto-fix failed: {source}",
+                        detail=f"strategy={strategy} root_cause={root_cause}",
+                    )
+                return {
+                    "success": bool(success),
+                    "source": source,
+                    "strategy": strategy,
+                    "detail": root_cause,
+                }
+            except Exception as exc:
+                _log.error(
+                    "heal.exception source=%s strategy=%s error=%s",
+                    source, strategy, exc,
                 )
                 notify_error(
-                    title=f"Auto-fix failed: {source}",
-                    detail=f"strategy={strategy} root_cause={root_cause}",
+                    title=f"Auto-fix exception: {source}",
+                    detail=str(exc),
                 )
-            return {
-                "success": bool(success),
-                "source": source,
-                "strategy": strategy,
-                "detail": root_cause,
-            }
-        except Exception as exc:
-            _log.error(
-                "heal.exception source=%s strategy=%s error=%s",
-                source, strategy, exc,
-            )
-            notify_error(
-                title=f"Auto-fix exception: {source}",
-                detail=str(exc),
-            )
-            return {
-                "success": False,
-                "source": source,
-                "strategy": strategy,
-                "detail": str(exc),
-            }
+                return {
+                    "success": False,
+                    "source": source,
+                    "strategy": strategy,
+                    "detail": str(exc),
+                }
 
     # ------------------------------------------------------------------
     # Report

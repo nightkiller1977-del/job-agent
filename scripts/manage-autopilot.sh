@@ -42,8 +42,19 @@ case "$action" in
     echo "Installing launchd daemons to $LAUNCHD_DIR..."
     mkdir -p "$LAUNCHD_DIR"
     remove_legacy_daemons || true
-    sed -e "s|/Users/alarkins/Dev/Projects/job-agent|$REPO_DIR|g" "$REPO_DIR/launchd/$DISCOVER_PLIST" > "$LAUNCHD_DIR/$DISCOVER_PLIST"
-    sed -e "s|/Users/alarkins/Dev/Projects/job-agent|$REPO_DIR|g" "$REPO_DIR/launchd/$APPLY_PLIST" > "$LAUNCHD_DIR/$APPLY_PLIST"
+    # Also rewrite the placeholder SOPS_AGE_KEY_FILE path to this user's actual
+    # $HOME — see SECRETS.md Phase 2 for why launchd needs this set explicitly:
+    # secret_store._read_store() only forwards SOPS_AGE_KEY_FILE to `sops -d`
+    # when it's already present in the process env, and launchd jobs don't
+    # inherit a login shell's exports. Harmless if secrets.enc.env / the age
+    # key don't exist yet — sops decryption just fails closed to the existing
+    # plaintext central-store fallback.
+    sed -e "s|/Users/alarkins/Dev/Projects/job-agent|$REPO_DIR|g" \
+        -e "s|/Users/alarkins/.config/aicc/age.key|$HOME/.config/aicc/age.key|g" \
+        "$REPO_DIR/launchd/$DISCOVER_PLIST" > "$LAUNCHD_DIR/$DISCOVER_PLIST"
+    sed -e "s|/Users/alarkins/Dev/Projects/job-agent|$REPO_DIR|g" \
+        -e "s|/Users/alarkins/.config/aicc/age.key|$HOME/.config/aicc/age.key|g" \
+        "$REPO_DIR/launchd/$APPLY_PLIST" > "$LAUNCHD_DIR/$APPLY_PLIST"
 
     if launchctl load -w "$LAUNCHD_DIR/$DISCOVER_PLIST" && launchctl load -w "$LAUNCHD_DIR/$APPLY_PLIST"; then
       echo "✓ Installed and successfully loaded for $REPO_DIR:"
