@@ -40,12 +40,21 @@ from rich.console import Console
 console = Console()
 
 
+BROWSER_PIPELINE_LOCK = "browser-pipeline"
+
+
 @contextlib.contextmanager
 def _pipeline_lock(name: str):
     """Non-blocking advisory lock so overlapping launchd jobs (or a stray manual
-    run) can't execute the same pipeline concurrently — that produced duplicate
-    'nothing submitted' apply runs and Playwright browser contention when a
-    legacy scheduler and the current one both fired at 23:00/07:00."""
+    run) can't execute conflicting pipelines concurrently — that produced
+    duplicate 'nothing submitted' apply runs and Playwright browser contention
+    when a legacy scheduler and the current one both fired at 23:00/07:00.
+
+    discover/apply/prepare-sessions/heartbeat all drive the same Playwright
+    browser profile, so they share BROWSER_PIPELINE_LOCK rather than each
+    getting its own lock name — otherwise e.g. discover and apply could still
+    run at once (different lock names never contend with each other) even
+    though the legacy schedulers that caused that are gone."""
     lock_dir = project_root / "state"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{name}.lock"
@@ -55,8 +64,8 @@ def _pipeline_lock(name: str):
     except BlockingIOError:
         fh.close()
         console.print(
-            f"[yellow]Another '{name}' run is already in progress — skipping "
-            f"(lock: {lock_path}).[/yellow]"
+            f"[yellow]Another browser-pipeline run (discover/apply/prepare-sessions/"
+            f"heartbeat) is already in progress — skipping (lock: {lock_path}).[/yellow]"
         )
         yield False
         return
@@ -447,12 +456,12 @@ async def main_async(args: argparse.Namespace) -> int:
     orchestrator = Orchestrator(config_path=config_path)
 
     if args.command == "discover":
-        with _pipeline_lock("discover") as acquired:
+        with _pipeline_lock(BROWSER_PIPELINE_LOCK) as acquired:
             if acquired:
                 await orchestrator.discover(source=args.source, no_review=args.no_review)
 
     elif args.command == "apply":
-        with _pipeline_lock("apply") as acquired:
+        with _pipeline_lock(BROWSER_PIPELINE_LOCK) as acquired:
             if acquired:
                 await orchestrator.apply_approved(
                     auto_submit=args.auto_submit,
@@ -466,11 +475,13 @@ async def main_async(args: argparse.Namespace) -> int:
         await orchestrator.preflight_approved(source=args.source, company=args.company)
 
     elif args.command == "prepare-sessions":
-        await orchestrator.prepare_sessions(
-            source=args.source,
-            company=args.company,
-            limit=args.limit,
-        )
+        with _pipeline_lock(BROWSER_PIPELINE_LOCK) as acquired:
+            if acquired:
+                await orchestrator.prepare_sessions(
+                    source=args.source,
+                    company=args.company,
+                    limit=args.limit,
+                )
 
     elif args.command == "setup":
         await orchestrator.browser_setup()
@@ -582,12 +593,15 @@ async def main_async(args: argparse.Namespace) -> int:
         return 1 if blocked else 0
 
     elif args.command == "heartbeat":
-        from src.session_watchdog import run_heartbeat
-        sources = [args.source] if getattr(args, "source", None) else None
-        results = await run_heartbeat(sources=sources, config=orchestrator.config)
-        for src, ok in results.items():
-            status = "[green]✓[/green]" if ok else "[red]✗[/red]"
-            console.print(f"  {status} {src}")
+        with _pipeline_lock(BROWSER_PIPELINE_LOCK) as acquired:
+            if not acquired:
+                return 0
+            from src.session_watchdog import run_heartbeat
+            sources = [args.source] if getattr(args, "source", None) else None
+            results = await run_heartbeat(sources=sources, config=orchestrator.config)
+            for src, ok in results.items():
+                status = "[green]✓[/green]" if ok else "[red]✗[/red]"
+                console.print(f"  {status} {src}")
         return 0
 
     elif args.command == "expand":

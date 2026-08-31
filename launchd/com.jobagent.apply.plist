@@ -10,6 +10,11 @@
         <string>-c</string>
         <string>cd /Users/alarkins/Dev/Projects/job-agent &amp;&amp; .venv/bin/python3 src/main.py apply --auto-submit</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
