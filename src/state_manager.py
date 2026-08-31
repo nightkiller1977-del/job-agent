@@ -220,6 +220,69 @@ class StateManager:
             )
             conn.commit()
 
+    def sync_confirmation_from_ledger(self, job_id: str, ledger: Any = None) -> Optional[str]:
+        """Projects SubmissionLedger attempt state onto the job's confirmation_status lifecycle.
+
+        Handles:
+          - receipt_verified -> 'submitted'
+          - submit_in_progress (live) -> 'submitting'
+          - submit_in_progress (stale) -> 'reconciliation_required'
+          - submission_unverified -> 'submission_unverified'
+        """
+        job = self.get_job(job_id)
+        if not job:
+            return None
+
+        if ledger is None:
+            try:
+                from .sources.adapters.idempotency import SubmissionLedger
+                ledger = SubmissionLedger()
+            except Exception:
+                return job.get("confirmation_status")
+
+        try:
+            from .sources.adapters.idempotency import canonical_key, PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED
+            key = canonical_key(job)
+            if not key:
+                return job.get("confirmation_status")
+
+            record = ledger.record(key) if hasattr(ledger, "record") else ledger.get(key)
+            if not record:
+                return job.get("confirmation_status")
+
+            phase = record.get("phase")
+            target_status = None
+
+            if phase == PHASE_VERIFIED:
+                target_status = "submitted"
+            elif phase == PHASE_UNVERIFIED:
+                target_status = "submission_unverified"
+            elif phase == PHASE_IN_PROGRESS:
+                if hasattr(ledger, "is_stale_in_progress") and ledger.is_stale_in_progress(key):
+                    target_status = "reconciliation_required"
+                else:
+                    target_status = "submitting"
+
+            if target_status and target_status != job.get("confirmation_status"):
+                try:
+                    self.transition_confirmation(job_id, target_status)
+                    return target_status
+                except InvalidStateTransitionError:
+                    # If direct transition blocked by strict lifecycle, update directly under ledger projection
+                    with self._connect() as conn:
+                        conn.execute(
+                            "UPDATE jobs SET confirmation_status = ? WHERE job_id = ?",
+                            (target_status, job_id),
+                        )
+                        conn.commit()
+                    return target_status
+
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Error syncing confirmation from ledger for %s: %s", job_id, exc)
+
+        return job.get("confirmation_status")
+
     def delete_job(self, job_id: str) -> None:
         """Delete a job record completely from the database."""
         with self._connect() as conn:
@@ -244,8 +307,8 @@ class StateManager:
                 """
                 INSERT OR REPLACE INTO archived_jobs
                     (job_id, source, title, company, location, url, score,
-                     status, discovered_at, archived_at, archive_reason, extra_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     status, discovered_at, archived_at, archive_reason, extra_json, confirmation_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job["job_id"],
@@ -260,6 +323,7 @@ class StateManager:
                     now,
                     reason,
                     job.get("extra_json"),
+                    job.get("confirmation_status"),
                 ),
             )
             conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))

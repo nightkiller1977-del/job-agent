@@ -91,7 +91,65 @@ def test_orchestrator_stamps_confirmation_status_on_apply_success(state_mgr):
     orch = Orchestrator.__new__(Orchestrator)  # skip __init__ side effects
     orch.config = {}
     orch.state = state_mgr
-
     orch._mark_confirmation_submitted("test_job_4")
 
     assert state_mgr.get_job("test_job_4")["confirmation_status"] == "submitted"
+
+
+def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key, PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED
+    ledger_path = tmp_path / "apply_ledger.json"
+    ledger = SubmissionLedger(path=ledger_path)
+
+    job = {
+        "job_id": "job_ledger_1",
+        "title": "Principal Architect",
+        "company": "Databricks",
+        "url": "https://databricks.com/careers/123",
+        "source": "linkedin",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job)
+    key = canonical_key(job)
+
+    # 1. Live in-progress -> 'submitting'
+    ledger.begin(key, "att_1")
+    res1 = state_mgr.sync_confirmation_from_ledger("job_ledger_1", ledger=ledger)
+    assert res1 == "submitting"
+    assert state_mgr.get_job("job_ledger_1")["confirmation_status"] == "submitting"
+
+    # 2. Complete verified -> 'submitted'
+    ledger.complete(key, "att_1", verified=True)
+    res2 = state_mgr.sync_confirmation_from_ledger("job_ledger_1", ledger=ledger)
+    assert res2 == "submitted"
+    assert state_mgr.get_job("job_ledger_1")["confirmation_status"] == "submitted"
+
+    # 3. Unverified failure -> 'submission_unverified'
+    ledger.complete(key, "att_2", verified=False)
+    res3 = state_mgr.sync_confirmation_from_ledger("job_ledger_1", ledger=ledger)
+    assert res3 == "submission_unverified"
+    assert state_mgr.get_job("job_ledger_1")["confirmation_status"] == "submission_unverified"
+
+
+def test_archive_job_preserves_confirmation_status(state_mgr):
+    job = {
+        "job_id": "job_archive_test",
+        "title": "Engineering Director",
+        "company": "Figma",
+        "url": "https://figma.com/careers/456",
+        "source": "linkedin",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job)
+    state_mgr.transition_confirmation("job_archive_test", "submitting")
+    state_mgr.transition_confirmation("job_archive_test", "submitted")
+    state_mgr.transition_confirmation("job_archive_test", "confirmed_by_employer")
+
+    archived = state_mgr.archive_job("job_archive_test", reason="accepted_offer")
+    assert archived["job_id"] == "job_archive_test"
+
+    # Check archived_jobs table has confirmation_status
+    with state_mgr._connect() as conn:
+        row = conn.execute("SELECT * FROM archived_jobs WHERE job_id = ?", ("job_archive_test",)).fetchone()
+        assert row is not None
+        assert dict(row)["confirmation_status"] == "confirmed_by_employer"

@@ -26,7 +26,7 @@ def test_workday_email_confirmation_scoring():
     assert score >= 0.85
     assert evidence.get("company_matched") == "salesforce"
     assert evidence.get("vendor_domain") == "myworkday.com"
-    assert evidence.get("confirmation_id") == "REQ-98412"
+    assert evidence.get("confirmation_id_extracted") == "REQ-98412" or evidence.get("confirmation_id_verified") == "REQ-98412"
 
 
 def test_greenhouse_email_confirmation_scoring():
@@ -121,3 +121,28 @@ def test_confirmation_transition_advances_with_submission_evidence(state_mgr):
 
     assert state_mgr.get_job("real_job_1")["confirmation_status"] == "confirmed_by_employer"
     assert "needs_manual_confirmation" not in outcome
+
+
+def test_requisition_id_verification_and_mismatch():
+    tracker = EmailConfirmationTracker()
+    job_with_req = {
+        "job_id": "job_req_1",
+        "company": "Amazon",
+        "title": "Software Development Manager",
+        "requisition_id": "REQ-1001",
+        "status": "applied",
+    }
+
+    # Case 1: Matching requisition ID in email -> verified bonus
+    sender = "Amazon Jobs <no-reply@amazon.com>"
+    subject = "Application Confirmation"
+    body = "Thank you for applying for Software Development Manager. Requisition ID: REQ-1001"
+    score_match, ev_match = tracker.calculate_match_score(sender, subject, body, None, job_with_req)
+    assert ev_match.get("confirmation_id_verified") == "REQ-1001"
+    assert score_match >= 0.85
+
+    # Case 2: Mismatched requisition ID in email -> mismatch penalty / no bonus
+    body_mismatch = "Thank you for applying. Requisition ID: REQ-9999"
+    score_mismatch, ev_mismatch = tracker.calculate_match_score(sender, subject, body_mismatch, None, job_with_req)
+    assert "confirmation_id_mismatch" in ev_mismatch
+    assert score_mismatch < score_match

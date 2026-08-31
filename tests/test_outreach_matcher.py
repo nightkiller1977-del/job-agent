@@ -9,15 +9,25 @@ def test_draft_outreach_note():
         "title": "VP Engineering",
     }
     matcher = OutreachMatcher(profile_data=profile)
-    job = {
+    job_applied = {
         "company": "Datadog",
         "title": "Director of Engineering",
+        "status": "applied",
     }
-    note = matcher.draft_outreach_note(job, target_name="Alex Smith", target_role="VP Engineering")
-    assert "Hi Alex," in note
-    assert "Director of Engineering" in note
-    assert "Datadog" in note
-    assert "Anthony Larkins" in note
+    note_applied = matcher.draft_outreach_note(job_applied, target_name="Alex Smith", target_role="VP Engineering")
+    assert "Hi Alex," in note_applied
+    assert "recently submitted an application" in note_applied
+    assert "Director of Engineering" in note_applied
+    assert "Datadog" in note_applied
+    assert "Anthony Larkins" in note_applied
+
+    job_approved = {
+        "company": "Datadog",
+        "title": "Director of Engineering",
+        "status": "approved",
+    }
+    note_approved = matcher.draft_outreach_note(job_approved, target_name="Alex Smith")
+    assert "preparing an application" in note_approved
 
 
 def test_process_high_scoring_jobs(tmp_path):

@@ -506,10 +506,26 @@ async def main_async(args: argparse.Namespace) -> int:
             Path.home() / "Library/LaunchAgents/com.jobagent.discover.plist",
             Path.home() / "Library/LaunchAgents/com.jobagent.apply.plist",
         ]
+        import subprocess
+        launchctl_out = ""
+        try:
+            res = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+            if res.returncode == 0:
+                launchctl_out = res.stdout
+        except Exception:
+            pass
+
         for p in plist_paths:
             installed = p.exists()
-            status_str = "[green]INSTALLED[/green]" if installed else "[dim]NOT INSTALLED[/dim]"
-            console.print(f"  • {p.name}: {status_str}")
+            label = p.stem
+            is_loaded = label in launchctl_out
+            if installed and is_loaded:
+                status_str = "[green]ACTIVE / LOADED[/green]"
+            elif installed:
+                status_str = "[yellow]INSTALLED (NOT LOADED)[/yellow]"
+            else:
+                status_str = "[dim]NOT INSTALLED[/dim]"
+            console.print(f"  • {label}: {status_str}")
         return 0
 
     elif args.command == "session-status":

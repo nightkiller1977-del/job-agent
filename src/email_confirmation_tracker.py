@@ -155,16 +155,16 @@ class EmailConfirmationTracker:
             score += 0.35
             evidence["company_matched"] = company
 
-        # 2. Sender Domain Match (0.25)
+        # 2. Sender Domain Match (0.25) - must originate from sender email address
         domain_matched = False
         for vendor_dom in self.vendor_domains:
-            if vendor_dom in sender_clean or vendor_dom in job_url:
+            if vendor_dom in sender_clean:
                 domain_matched = True
                 evidence["vendor_domain"] = vendor_dom
                 break
 
         if not domain_matched and company:
-            # Check employer domain
+            # Check employer domain in sender
             company_token = re.sub(r"[^\w]", "", company.split()[0])
             if company_token and company_token in sender_clean:
                 domain_matched = True
@@ -174,20 +174,38 @@ class EmailConfirmationTracker:
             score += 0.25
 
         # 3. Title Match (0.20)
+        title_matched = False
         if title:
             # Match meaningful keywords from title
             title_words = [w for w in re.split(r"\W+", title) if len(w) > 3]
             matched_words = [w for w in title_words if w in full_text]
             if len(matched_words) >= 2 or (len(title_words) == 1 and matched_words):
                 score += 0.20
+                title_matched = True
                 evidence["title_matched"] = matched_words
 
-        # 4. Confirmation ID Found (0.15)
+        # 4. Confirmation / Requisition ID Matching (0.15)
         raw_text = f"{msg_subject} {msg_body_snippet}"
         conf_id = self.extract_confirmation_id(raw_text)
         if conf_id:
-            score += 0.15
-            evidence["confirmation_id"] = conf_id
+            extra = {}
+            if job.get("extra_json"):
+                try:
+                    extra = json.loads(job["extra_json"])
+                except Exception:
+                    extra = {}
+            stored_req_id = job.get("requisition_id") or extra.get("requisition_id") or extra.get("req_id")
+            if stored_req_id:
+                if str(stored_req_id).lower() == conf_id.lower():
+                    score += 0.15
+                    evidence["confirmation_id_verified"] = conf_id
+                else:
+                    # Explicit ID mismatch penalty
+                    evidence["confirmation_id_mismatch"] = f"email={conf_id} vs job={stored_req_id}"
+            elif company in full_text and title_matched:
+                # No recorded req_id, but company and title confirmed
+                score += 0.10
+                evidence["confirmation_id_extracted"] = conf_id
 
         # 5. Timestamp Proximity (0.05)
         applied_at_str = job.get("applied_at")
@@ -311,35 +329,45 @@ class EmailConfirmationTracker:
                     continue
 
                 # Match against applied jobs
-                best_job = None
-                best_score = 0.0
-                best_evidence = {}
-
+                candidates = []
                 for job in applied_jobs:
                     score, ev = self.calculate_match_score(sender, subject, body_snippet, parsed_date, job)
-                    if score > best_score:
-                        best_score = score
-                        best_job = job
-                        best_evidence = ev
+                    if score >= 0.50:
+                        candidates.append((score, job, ev))
 
-                if best_job and best_score >= 0.50:
-                    outcome = {
-                        "job_id": best_job["job_id"],
-                        "title": best_job.get("title"),
-                        "company": best_job.get("company"),
-                        "score": best_score,
-                        "evidence": best_evidence,
-                        "subject": subject,
-                        "sender": sender,
-                        "confirmed": best_score >= self.min_confirmed_score,
-                    }
-                    results.append(outcome)
+                if not candidates:
+                    continue
 
-                    if best_score >= self.min_confirmed_score and not dry_run:
-                        self._apply_confirmation_transition(best_job, best_score, outcome)
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                best_score, best_job, best_evidence = candidates[0]
 
-                    if msg_id and not dry_run:
-                        self._processed_ids.add(msg_id)
+                margin = 1.0
+                if len(candidates) > 1:
+                    second_score = candidates[1][0]
+                    margin = round(best_score - second_score, 2)
+
+                is_confirmed = best_score >= self.min_confirmed_score and margin >= 0.15
+
+                outcome = {
+                    "job_id": best_job["job_id"],
+                    "title": best_job.get("title"),
+                    "company": best_job.get("company"),
+                    "score": best_score,
+                    "margin": margin,
+                    "evidence": best_evidence,
+                    "subject": subject,
+                    "sender": sender,
+                    "confirmed": is_confirmed,
+                }
+                results.append(outcome)
+
+                if is_confirmed and not dry_run:
+                    self._apply_confirmation_transition(best_job, best_score, outcome)
+                elif best_score >= self.min_confirmed_score and margin < 0.15:
+                    console.print(f"[yellow]⚠ Ambiguous email confirmation (margin {margin} < 0.15):[/yellow] '{best_job.get('title')}' vs runner-up. Flagged for manual review.")
+
+                if msg_id and not dry_run:
+                    self._processed_ids.add(msg_id)
 
             mail.logout()
             if not dry_run:
