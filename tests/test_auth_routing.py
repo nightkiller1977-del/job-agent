@@ -239,6 +239,72 @@ async def test_prepare_sessions_does_not_reset_circuit_breaker_for_externally_ro
 
 
 @pytest.mark.asyncio
+async def test_prepare_sessions_does_not_reset_jobright_circuit_breaker_for_a_jobright_origin_portal_job(tmp_path, monkeypatch):
+    """Codex review, PR #81: needs_external_portal_prep() returns False for a
+    Jobright-origin job (it's already "on that flow" by construction, not
+    because Jobright's own login is the blocker), so this job never sets
+    routed_to_external_portal. But JobrightScraper.prepare_session(job) — given
+    a job, as opposed to the job=None base-session-refresh path — always opens
+    the external ATS portal (Workday/etc.) for that job, never verifies
+    Jobright's own login. Every status that lands a job here
+    (workday_session_expired and friends) is an external-ATS-wall status, not a
+    Jobright-login one, so recording a Jobright reauth success would falsely
+    clear Jobright's own circuit breaker the same way the LinkedIn/Indeed case
+    above does."""
+    import json as _json
+    from src import orchestrator as orch_mod
+
+    monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+    from src.notifier import get_status
+
+    def make_scraper(name):
+        class _Scraper:
+            def __init__(self, config):
+                pass
+
+            async def prepare_session(self, job):
+                return True
+        return _Scraper
+
+    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {"jobright": make_scraper("jobright")})
+
+    ats = "https://acme.wd1.myworkdayjobs.com/job/1"
+    jobs = [
+        {"job_id": "jobright-portal", "source": "jobright", "title": "T", "company": "C",
+         "url": "https://jobright.ai/jobs/info/1",
+         "extra_json": _json.dumps(
+             {"apply_last_status": "workday_session_expired", "ats_url": ats})},
+    ]
+
+    class _State:
+        def get_approved_unapplied(self):
+            return jobs
+
+        def clear_session_block(self, job_id):
+            pass
+
+        def get_job(self, job_id):
+            return None
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
+    o.config = {}
+    o.state = _State()
+    o.load_credentials_from_dashboard = _noop
+    o._pull_approved_from_cloud = _noop
+
+    with patch("sys.stdin") as mock_stdin:
+        mock_stdin.isatty.return_value = True
+        await o.prepare_sessions()
+
+    events = get_status().get("reauth_events", [])
+    jobright_successes = [e for e in events if e["source"] == "jobright" and e["outcome"] == "success"]
+    assert jobright_successes == []
+
+
+@pytest.mark.asyncio
 async def test_linkedin_prepare_session_returns_true_when_already_authenticated_non_tty(monkeypatch):
     """Codex #57 P2b: an already-authenticated session is verified WITHOUT human
     input, so prepare_session must report success even under launchd (no TTY) —
@@ -365,14 +431,24 @@ async def test_prepare_sessions_resets_automated_reauth_circuit_breaker(monkeypa
     """A manual `prepare-sessions` success for an automated source (jobright/
     indeed/linkedin) must clear ReauthManager's consecutive-failure streak —
     otherwise a source that hit the circuit breaker's cap stays locked out of
-    automated reauth forever even after the human fixes it by hand."""
+    automated reauth forever even after the human fixes it by hand.
+
+    Uses a LinkedIn job blocked on LinkedIn's OWN session (linkedin_authwall) —
+    not an external-ATS-wall status like workday_session_expired. The latter
+    would route through Jobright's external-portal-prep profile even for a
+    LinkedIn-origin job, which never touches LinkedIn's own login and must NOT
+    reset LinkedIn's circuit breaker (see
+    test_prepare_sessions_does_not_reset_circuit_breaker_for_externally_routed_job
+    and test_prepare_sessions_does_not_reset_jobright_circuit_breaker_for_a_jobright_origin_portal_job,
+    both from Codex review on PR #79/#81 — this test used to (wrongly) use
+    that exact external-wall scenario for jobright before that fix)."""
     import json as _json
     from src import orchestrator as orch_mod
     from src.notifier import record_reauth_event, get_status
 
     monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
     for i in range(3):
-        record_reauth_event("jobright", "automated", "failed", str(i))
+        record_reauth_event("linkedin", "automated", "failed", str(i))
     assert len(get_status()["reauth_events"]) == 3
 
     class _Scraper:
@@ -382,12 +458,12 @@ async def test_prepare_sessions_resets_automated_reauth_circuit_breaker(monkeypa
         async def prepare_session(self, job):
             return True
 
-    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {"jobright": _Scraper})
+    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {"linkedin": _Scraper})
 
     jobs = [
-        {"job_id": "j1", "source": "jobright", "title": "T", "company": "C",
-         "url": "https://jobright.ai/jobs/info/1",
-         "extra_json": _json.dumps({"apply_last_status": "workday_session_expired"})},
+        {"job_id": "j1", "source": "linkedin", "title": "T", "company": "C",
+         "url": "https://www.linkedin.com/jobs/view/1",
+         "extra_json": _json.dumps({"apply_last_status": "linkedin_authwall"})},
     ]
 
     class _State:
@@ -415,7 +491,7 @@ async def test_prepare_sessions_resets_automated_reauth_circuit_breaker(monkeypa
 
     events = get_status()["reauth_events"]
     assert events[-1]["outcome"] == "success"
-    assert events[-1]["source"] == "jobright"
+    assert events[-1]["source"] == "linkedin"
 
     # The circuit breaker in ReauthManager._reauth_automated walks events from the
     # most recent and breaks on the first "success" regardless of mode, so the
@@ -424,7 +500,7 @@ async def test_prepare_sessions_resets_automated_reauth_circuit_breaker(monkeypa
     mgr = ReauthManager(config={})
     with patch("src.reauth._get_source_map") as mock_get_map:
         mock_get_map.return_value = {}
-        await mgr._reauth_automated("jobright")
+        await mgr._reauth_automated("linkedin")
         mock_get_map.assert_called_once()
 
 
