@@ -356,6 +356,10 @@ class TestReauthAutomated:
         monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
         monkeypatch.delenv("JOBRIGHT_EMAIL", raising=False)
         monkeypatch.delenv("JOBRIGHT_PASSWORD", raising=False)
+        # Deterministic regardless of what the host's central secret store has
+        # (env is still checked first inside resolve_secret; see the
+        # resolve_secret test below for the case where the store fills it in).
+        monkeypatch.setattr("src.secret_store.resolve_secret", lambda name: None)
 
         from src.reauth import ReauthManager
         mgr = ReauthManager(config={})
@@ -364,6 +368,37 @@ class TestReauthAutomated:
             result = await mgr._reauth_automated("jobright")
 
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_automated_reauth_falls_back_to_central_secret_store(self, tmp_path, monkeypatch):
+        """Credentials must resolve through secret_store.resolve_secret (env →
+        aicc-secrets CLI → sops-decrypted or plaintext central store), not bare
+        os.environ.get — otherwise a scheduled run whose shell env doesn't carry
+        JOBRIGHT_EMAIL/PASSWORD reports 'missing credentials' even when the
+        central store has them (ACES: PR review — reauth previously bypassed
+        the central store entirely)."""
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.delenv("JOBRIGHT_EMAIL", raising=False)
+        monkeypatch.delenv("JOBRIGHT_PASSWORD", raising=False)
+
+        resolved = {"JOBRIGHT_EMAIL": "store@example.com", "JOBRIGHT_PASSWORD": "store-secret"}
+        monkeypatch.setattr("src.secret_store.resolve_secret", lambda name: resolved.get(name))
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+
+        mock_scraper = AsyncMock()
+        mock_scraper._auto_login = AsyncMock(return_value=True)
+        mock_scraper._export_session_json = AsyncMock()
+        mock_scraper._close_browser = AsyncMock()
+        mock_page = AsyncMock()
+
+        with patch("src.reauth._get_source_map", return_value={"jobright": MagicMock(return_value=mock_scraper)}), \
+             patch.object(mock_scraper, "_start_browser", new_callable=AsyncMock, return_value=mock_page):
+            result = await mgr._reauth_automated("jobright")
+
+        assert result is True
+        mock_scraper._auto_login.assert_awaited_once_with(mock_page, "store@example.com", "store-secret")
 
     @pytest.mark.asyncio
     async def test_browser_always_closed_on_failure(self, tmp_path, monkeypatch):
@@ -644,3 +679,32 @@ class TestReauthRemediation:
             result = await mgr._reauth_automated("jobright")
             assert result is False
             mock_get_map.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_cap_is_half_open_after_cooldown(self, tmp_path, monkeypatch):
+        """At/above the cap, the source must not be locked out forever: once
+        CIRCUIT_OPEN_COOLDOWN_SECONDS has elapsed since the last failure it gets
+        one half-open retry instead of a permanent block (ACES: reauth circuit
+        breaker never recovered on its own, even after credentials were fixed)."""
+        import json as _json
+        from datetime import datetime, timedelta
+
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src.notifier import record_reauth_event
+        from src.reauth import CIRCUIT_OPEN_COOLDOWN_SECONDS
+
+        for i in range(3):
+            record_reauth_event("jobright", "automated", "failed", str(i))
+
+        status_file = tmp_path / "status.json"
+        status = _json.loads(status_file.read_text())
+        old_ts = (datetime.utcnow() - timedelta(seconds=CIRCUIT_OPEN_COOLDOWN_SECONDS + 60)).isoformat()
+        status["reauth_events"][-1]["ts"] = old_ts
+        status_file.write_text(_json.dumps(status))
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        with patch("src.reauth._get_source_map") as mock_get_map:
+            mock_get_map.return_value = {}
+            await mgr._reauth_automated("jobright")
+            mock_get_map.assert_called_once()

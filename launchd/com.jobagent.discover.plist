@@ -10,6 +10,13 @@
         <string>-c</string>
         <string>cd /Users/alarkins/Dev/Projects/job-agent &amp;&amp; .venv/bin/python3 src/main.py discover --no-review</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>SOPS_AGE_KEY_FILE</key>
+        <string>/Users/alarkins/.config/aicc/age.key</string>
+    </dict>
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>

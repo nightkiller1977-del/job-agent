@@ -28,8 +28,8 @@ from .sources.builtin import BuiltInScraper
 import logging
 
 from .sources.base import AuthFailedError, JobExpiredError
-from .notifier import notify_error, notify_info, notify_warning, record_run_stats
-from .reauth import ReauthManager
+from .notifier import notify_error, notify_info, notify_warning, record_run_stats, record_reauth_event
+from .reauth import ReauthManager, AUTOMATED_SOURCES
 from .resume_helper import ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
 from .blocker_classifier import should_attempt, classify, needs_preflight_reauth, preflight_reauth_viable
 from .session_watchdog import preflight_session_check
@@ -608,7 +608,9 @@ class Orchestrator:
                 prepare = getattr(scraper, "prepare_session", None)
                 if prepare:
                     console.print(f"[yellow]No approved {source} jobs need session preparation; opening the source session instead.[/yellow]")
-                    await prepare(None)
+                    prepared = await prepare(None)
+                    if prepared and source in AUTOMATED_SOURCES:
+                        record_reauth_event(source, "human", "success", "manually prepared via prepare-sessions")
                     return
             console.print("[green]No approved jobs need session preparation.[/green]")
             return
@@ -652,6 +654,9 @@ class Orchestrator:
             if job.get("job_id") and prepared:
                 self.state.clear_session_block(job["job_id"])
                 await self._push_apply_attempt_to_cloud(job["job_id"])
+                job_source = job.get("source", "")
+                if job_source in AUTOMATED_SOURCES:
+                    record_reauth_event(job_source, "human", "success", "manually prepared via prepare-sessions")
 
     async def apply_approved(
         self,
