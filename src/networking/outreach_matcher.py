@@ -72,7 +72,7 @@ class OutreachDraftGenerator:
         """Generate a truthful 3-sentence executive introduction note matching actual job state."""
         company = job.get("company", "your team")
         job_title = job.get("title", "leadership role")
-        candidate_name = self.profile.get("name", "Anthony")
+        candidate_name = self.profile.get("name", "[Your Name]")
         job_status = job.get("status", "")
         exp_phrase = self._format_experience_phrase()
 

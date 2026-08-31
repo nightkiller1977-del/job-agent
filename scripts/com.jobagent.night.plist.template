@@ -6,10 +6,11 @@
 
   Install:
     1. Copy this file to ~/Library/LaunchAgents/com.jobagent.night.plist
-    2. Replace __DASHBOARD_URL__ and __SYNC_SECRET__ with the real values from .env
+    2. Replace __PROJECT_DIR__ with the absolute path to your job-agent checkout.
+    3. Replace __DASHBOARD_URL__ and __SYNC_SECRET__ with the real values from .env
        (do NOT commit the filled-in copy — it contains a secret).
-    3. launchctl load ~/Library/LaunchAgents/com.jobagent.night.plist
-    4. Verify: launchctl list | grep com.jobagent.night
+    4. launchctl load ~/Library/LaunchAgents/com.jobagent.night.plist
+    5. Verify: launchctl list | grep com.jobagent.night
 
   Site credentials are read from .env by src/main.py; only the dashboard
   sync values are injected here as environment variables.
@@ -22,11 +23,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/alarkins/Dev/Projects/job-agent/scripts/night_run.sh</string>
+    <string>__PROJECT_DIR__/scripts/night_run.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/alarkins/Dev/Projects/job-agent</string>
+  <string>__PROJECT_DIR__</string>
 
   <key>StartCalendarInterval</key>
   <dict>
@@ -37,9 +38,9 @@
   </dict>
 
   <key>StandardOutPath</key>
-  <string>/Users/alarkins/Dev/Projects/job-agent/state/agent.night.log</string>
+  <string>__PROJECT_DIR__/state/agent.night.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/alarkins/Dev/Projects/job-agent/state/agent.night.log</string>
+  <string>__PROJECT_DIR__/state/agent.night.log</string>
 
   <key>EnvironmentVariables</key>
   <dict>

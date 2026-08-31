@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -41,13 +40,6 @@ LOGIN_URL_MARKERS = ("/login", "/authwall", "uas/login", "checkpoint", "challeng
 
 # User profile answers for Easy Apply forms
 USER_ANSWERS = {
-    "years_experience": "20",
-    "current_title": "Director of Software Engineering",
-    "clearance": "Top Secret",
-    "authorized_us": "Yes",
-    "require_sponsorship": "No",
-    "linkedin_profile_up_to_date": "Yes",
-    "willing_to_relocate": "Yes",
     "phone_default": "",  # filled from env if needed
 }
 
@@ -1393,7 +1385,12 @@ class LinkedInScraper(BaseScraper):
 
 
     async def _fill_select_fields(self, page) -> None:
-        """Fill dropdown selects based on common LinkedIn question patterns."""
+        """Fill dropdown selects using AnswerBank-resolved profile answers — never
+        a hardcoded guess at experience, authorization, citizenship, clearance, or
+        sponsorship. AnswerBank fails closed (returns None) when the profile has
+        no verified answer, so unanswered selects are left as-is rather than
+        submitting a fabricated response."""
+        bank = self._answer_bank()
         selects = await page.query_selector_all("select")
         for sel_elem in selects:
             try:
@@ -1407,36 +1404,19 @@ class LinkedInScraper(BaseScraper):
                     option_values.append((val, text.strip().lower()))
 
                 chosen = None
-                if "experience" in label_lower or "years" in label_lower:
-                    # Pick highest matching option >= 18
-                    for val, text in option_values:
-                        try:
-                            num = int(re.search(r"\d+", text).group())
-                            if num >= 10:
-                                chosen = val
-                        except Exception:
-                            pass
-                    if not chosen:
-                        # Try "10+" or "15+" style
-                        for val, text in option_values:
-                            if "10+" in text or "15+" in text or "16+" in text or "18+" in text or "20+" in text:
-                                chosen = val
-                                break
-                elif "authorized" in label_lower or "eligible" in label_lower or "citizen" in label_lower:
-                    for val, text in option_values:
-                        if "yes" in text:
-                            chosen = val
-                            break
-                elif "sponsor" in label_lower:
-                    for val, text in option_values:
-                        if "no" in text:
-                            chosen = val
-                            break
-                elif "phone" in label_lower and "country" in label_lower:
+                if "phone" in label_lower and "country" in label_lower:
                     for val, text in option_values:
                         if "united states" in text or "(+1)" in text:
                             chosen = val
                             break
+                elif bank is not None:
+                    ans = bank.get_answer_for_question(label_text, field_type="select")
+                    if ans is not None:
+                        ans_lower = str(ans).strip().lower()
+                        for val, text in option_values:
+                            if ans_lower == text or ans_lower in text:
+                                chosen = val
+                                break
 
                 if chosen:
                     await sel_elem.select_option(value=chosen)
@@ -1448,33 +1428,36 @@ class LinkedInScraper(BaseScraper):
                 continue
 
     async def _fill_radio_fields(self, page) -> None:
-        """Handle radio button questions."""
-        # Find all fieldsets or divs containing radio groups
+        """Handle radio button questions using AnswerBank-resolved profile answers.
+        Authorization, citizenship, clearance, and sponsorship are legally
+        consequential questions — they must reflect the real applicant's profile
+        disclosures, not a blanket "Yes"/"No" guess. AnswerBank fails closed
+        (returns None) when the profile has no verified answer for a question, so
+        the radio is left unanswered rather than submitting a false statement."""
+        bank = self._answer_bank()
         radio_groups = await page.query_selector_all('fieldset, div[class*="question"]')
         for group in radio_groups:
             try:
                 label_elem = await group.query_selector("legend, label")
                 label_text = ""
                 if label_elem:
-                    label_text = (await label_elem.inner_text()).lower()
+                    label_text = (await label_elem.inner_text()).strip()
 
                 radios = await group.query_selector_all('input[type="radio"]')
-                if not radios:
+                if not radios or bank is None or not label_text:
                     continue
 
+                ans = bank.get_answer_for_question(label_text, field_type="boolean")
+                if ans is None:
+                    continue
+                target_values = ("yes", "true", "1") if ans else ("no", "false", "0")
+
                 chosen_radio = None
-                if any(kw in label_text for kw in ["authorized", "citizen", "eligible", "cleared"]):
-                    for radio in radios:
-                        val = (await radio.get_attribute("value") or "").lower()
-                        if val in ("yes", "true", "1"):
-                            chosen_radio = radio
-                            break
-                elif "sponsor" in label_text:
-                    for radio in radios:
-                        val = (await radio.get_attribute("value") or "").lower()
-                        if val in ("no", "false", "0"):
-                            chosen_radio = radio
-                            break
+                for radio in radios:
+                    val = (await radio.get_attribute("value") or "").lower()
+                    if val in target_values:
+                        chosen_radio = radio
+                        break
 
                 if chosen_radio:
                     is_checked = await chosen_radio.is_checked()
@@ -1488,7 +1471,8 @@ class LinkedInScraper(BaseScraper):
                 continue
 
     async def _fill_text_questions(self, page) -> None:
-        """Fill short text answer boxes with profile-driven answers."""
+        """Fill short text answer boxes with profile-driven answers via AnswerBank."""
+        bank = self._answer_bank()
         text_inputs = await page.query_selector_all('input[type="text"], textarea')
         for inp in text_inputs:
             try:
@@ -1499,27 +1483,29 @@ class LinkedInScraper(BaseScraper):
                 label_lower = label_text.lower()
 
                 answer = None
-                # Location
+                # Location — from state/profile.json, never a hardcoded address
                 if "city" in label_lower:
-                    answer = "Miami"
+                    answer = self._profile_value("personal_info", "city")
                 elif "state" in label_lower and "zip" not in label_lower:
-                    answer = "Florida"
+                    answer = self._profile_value("personal_info", "state")
                 elif "zip" in label_lower or "postal" in label_lower:
-                    answer = "33101"
-                # Experience
-                elif "years" in label_lower and "experience" in label_lower:
-                    answer = "18"
-                elif "years" in label_lower and any(w in label_lower for w in ["manage", "leader", "director", "vp", "engineer"]):
-                    answer = "18"
-                # Compensation
-                elif any(w in label_lower for w in ["salary", "compensation", "pay", "rate", "expected"]):
-                    answer = "200000"
-                # Notice period
-                elif "notice" in label_lower or "start" in label_lower and "available" in label_lower:
-                    answer = "2 weeks"
-                # LinkedIn profile
+                    answer = self._profile_value("personal_info", "zip")
+                # Experience / compensation / notice period — resolved from
+                # verified profile disclosures via AnswerBank, never guessed.
+                elif (
+                    ("years" in label_lower and any(w in label_lower for w in ["experience", "manage", "leader", "director", "vp", "engineer"]))
+                    or any(w in label_lower for w in ["salary", "compensation", "pay", "rate", "expected"])
+                    or "notice" in label_lower
+                    or ("start" in label_lower and "available" in label_lower)
+                ):
+                    if bank is not None:
+                        ans = bank.get_answer_for_question(label_text, field_type="text")
+                        answer = str(ans) if ans is not None else ""
+                    else:
+                        answer = ""
+                # LinkedIn profile — from state/profile.json, never a hardcoded URL
                 elif "linkedin" in label_lower and "profile" in label_lower:
-                    answer = "https://www.linkedin.com/in/anthonyclarkins"
+                    answer = self._profile_value("social_links", "linkedin")
                 # Website / portfolio
                 elif any(w in label_lower for w in ["website", "portfolio", "github", "url"]):
                     answer = ""  # leave blank rather than guess
@@ -1540,16 +1526,29 @@ class LinkedInScraper(BaseScraper):
 
     def _profile_value(self, section: str, key: str) -> str:
         try:
+            data = self._load_profile()
+            return str(data.get(section, {}).get(key, "") or "")
+        except Exception:
+            return ""
+
+    def _load_profile(self) -> dict:
+        try:
             import json
             profile_path = Path("state/profile.json")
             if not profile_path.exists():
                 profile_path = Path(__file__).parent.parent.parent / "state" / "profile.json"
             if not profile_path.exists():
-                return ""
-            data = json.loads(profile_path.read_text())
-            return str(data.get(section, {}).get(key, "") or "")
+                return {}
+            return json.loads(profile_path.read_text())
         except Exception:
-            return ""
+            return {}
+
+    def _answer_bank(self):
+        try:
+            from src.answers.question_bank import AnswerBank
+            return AnswerBank(self._load_profile())
+        except Exception:
+            return None
 
 
 def _infer_remote_type(location: str, description: str) -> str:
