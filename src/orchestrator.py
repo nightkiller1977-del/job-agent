@@ -657,13 +657,25 @@ class Orchestrator:
                 await self._push_apply_attempt_to_cloud(job["job_id"])
                 job_source = job.get("source", "")
                 # Only reset job_source's own reauth circuit breaker when its
-                # own login session is what got prepared. When
-                # routed_to_external_portal is True, `prepare` opened the
-                # shared external-ATS (Workday/Microsoft/etc.) profile via
-                # Jobright's prepare_session — job_source's own session was
-                # never touched, so recording a success here would falsely
-                # clear its circuit breaker (Codex review, PR #79).
-                if job_source in AUTOMATED_SOURCES and not routed_to_external_portal:
+                # own login session is what got prepared.
+                #
+                # routed_to_external_portal covers LinkedIn/Indeed-origin jobs
+                # explicitly routed to Jobright's external-portal flow —
+                # job_source's own session was never touched there.
+                #
+                # job_source == "jobright" needs its own exclusion:
+                # needs_external_portal_prep() returns False for jobright-origin
+                # jobs (it treats them as "already on that flow" rather than
+                # routing them), but JobrightScraper.prepare_session(job) — when
+                # given a job, as opposed to the job=None base-session-refresh
+                # path — ALWAYS opens the external ATS portal (Workday/Microsoft/
+                # etc.) for that job, never verifies Jobright's own login. Every
+                # status that lands a job in this loop (workday_session_expired,
+                # brassring_login_required, microsoft_login_required, ...) is an
+                # external-ATS-wall status, not a Jobright-login status, so this
+                # is not a hypothetical case. (Codex review, PR #81.)
+                own_source_login_prepared = not routed_to_external_portal and job_source != "jobright"
+                if job_source in AUTOMATED_SOURCES and own_source_login_prepared:
                     record_reauth_event(job_source, "human", "success", "manually prepared via prepare-sessions")
 
     async def apply_approved(
