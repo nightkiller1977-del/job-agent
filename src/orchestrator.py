@@ -626,7 +626,8 @@ class Orchestrator:
             # external-apply profile regardless of discovery source: LinkedIn's
             # and Indeed's prepare_session only refresh their own site session,
             # which never clears a Workday/Microsoft/BrassRing auth wall.
-            if needs_external_portal_prep(readiness, job):
+            routed_to_external_portal = needs_external_portal_prep(readiness, job)
+            if routed_to_external_portal:
                 scraper_cls = SOURCE_MAP["jobright"]
                 console.print(
                     f"[cyan]Routing {job.get('source')} job to external ATS portal prep.[/cyan]"
@@ -655,7 +656,14 @@ class Orchestrator:
                 self.state.clear_session_block(job["job_id"])
                 await self._push_apply_attempt_to_cloud(job["job_id"])
                 job_source = job.get("source", "")
-                if job_source in AUTOMATED_SOURCES:
+                # Only reset job_source's own reauth circuit breaker when its
+                # own login session is what got prepared. When
+                # routed_to_external_portal is True, `prepare` opened the
+                # shared external-ATS (Workday/Microsoft/etc.) profile via
+                # Jobright's prepare_session — job_source's own session was
+                # never touched, so recording a success here would falsely
+                # clear its circuit breaker (Codex review, PR #79).
+                if job_source in AUTOMATED_SOURCES and not routed_to_external_portal:
                     record_reauth_event(job_source, "human", "success", "manually prepared via prepare-sessions")
 
     async def apply_approved(

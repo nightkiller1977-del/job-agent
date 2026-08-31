@@ -168,6 +168,77 @@ async def test_prepare_sessions_dispatches_portal_blocked_jobs_to_external_prep(
 
 
 @pytest.mark.asyncio
+async def test_prepare_sessions_does_not_reset_circuit_breaker_for_externally_routed_job(tmp_path, monkeypatch):
+    """Codex review, PR #79: when a LinkedIn/Indeed-origin job is blocked by an
+    external ATS wall (Workday/etc.), prepare_session runs through Jobright's
+    external-portal-prep profile — LinkedIn's own login session is never
+    touched. Recording a reauth success for job_source ("linkedin") in that
+    case would wrongly reset LinkedIn's own automated-reauth circuit breaker
+    even though nothing about LinkedIn's session was verified. Only the job
+    whose OWN source session was prepared should reset that source's breaker."""
+    import json as _json
+    from src import orchestrator as orch_mod
+
+    monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+    from src.notifier import get_status
+
+    def make_scraper(name):
+        class _Scraper:
+            def __init__(self, config):
+                pass
+
+            async def prepare_session(self, job):
+                return True
+        return _Scraper
+
+    monkeypatch.setattr(orch_mod, "SOURCE_MAP", {
+        "jobright": make_scraper("jobright"),
+        "linkedin": make_scraper("linkedin"),
+    })
+
+    ats = "https://acme.wd1.myworkdayjobs.com/job/1"
+    jobs = [
+        {"job_id": "portal", "source": "linkedin", "title": "T", "company": "C",
+         "url": "https://www.linkedin.com/jobs/view/1",
+         "extra_json": _json.dumps(
+             {"apply_last_status": "workday_session_expired", "ats_url": ats})},
+        {"job_id": "authwall", "source": "linkedin", "title": "T2", "company": "C2",
+         "url": "https://www.linkedin.com/jobs/view/2",
+         "extra_json": _json.dumps({"apply_last_status": "linkedin_authwall"})},
+    ]
+
+    class _State:
+        def get_approved_unapplied(self):
+            return jobs
+
+        def clear_session_block(self, job_id):
+            pass
+
+        def get_job(self, job_id):
+            return None
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
+    o.config = {}
+    o.state = _State()
+    o.load_credentials_from_dashboard = _noop
+    o._pull_approved_from_cloud = _noop
+
+    with patch("sys.stdin") as mock_stdin:
+        mock_stdin.isatty.return_value = True
+        await o.prepare_sessions()
+
+    events = get_status().get("reauth_events", [])
+    linkedin_successes = [e for e in events if e["source"] == "linkedin" and e["outcome"] == "success"]
+    # Exactly one reset — from the "authwall" job, whose own LinkedIn session
+    # was actually prepared. The "portal" job (routed to Jobright's external
+    # ATS profile) must NOT contribute a second one.
+    assert len(linkedin_successes) == 1
+
+
+@pytest.mark.asyncio
 async def test_linkedin_prepare_session_returns_true_when_already_authenticated_non_tty(monkeypatch):
     """Codex #57 P2b: an already-authenticated session is verified WITHOUT human
     input, so prepare_session must report success even under launchd (no TTY) —
