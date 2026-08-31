@@ -180,6 +180,38 @@ class TestTrustCommanderReauthIntegration:
         assert outcome["source"] == "jobright"
 
     @pytest.mark.asyncio
+    async def test_attempt_fix_skips_reauth_when_browser_pipeline_lock_is_held(
+        self, commander, tmp_status, sessions_dir, monkeypatch, tmp_path
+    ):
+        """A scheduled discover/apply/prepare-sessions/heartbeat run (src/main.py)
+        and the commander's auto-reauth path (attempt_fix, invoked by both
+        `commander fix` and StatusWatcher's poll loop) must not launch competing
+        Playwright contexts. If something else already holds
+        browser_pipeline_lock.BROWSER_PIPELINE_LOCK, attempt_fix() must not call
+        ReauthManager.handle() at all — it should skip and report the pipeline as
+        busy so the caller retries later instead of racing the held browser."""
+        import src.browser_pipeline_lock as lock_mod
+        monkeypatch.setattr(lock_mod, "PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setenv("JOBRIGHT_EMAIL", "test@example.com")
+        monkeypatch.setenv("JOBRIGHT_PASSWORD", "testpass")
+        session_file = sessions_dir / "jobright_chromium.json"
+        if session_file.exists():
+            session_file.unlink()
+
+        mock_reauth_instance = MagicMock()
+        mock_reauth_instance.handle = AsyncMock(return_value=True)
+        mock_reauth_class = MagicMock(return_value=mock_reauth_instance)
+
+        with lock_mod.pipeline_lock(lock_mod.BROWSER_PIPELINE_LOCK) as held:
+            assert held is True  # simulates a scheduled main.py run holding it
+            outcome = await commander.attempt_fix("jobright", _reauth_cls=mock_reauth_class)
+
+        assert outcome["success"] is False
+        assert "busy" in outcome.get("reason", "").lower()
+        mock_reauth_instance.handle.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_trust_fix_outcome_recorded_in_status_json(
         self, commander, tmp_status, sessions_dir, monkeypatch
     ):

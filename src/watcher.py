@@ -127,6 +127,15 @@ class StatusWatcher:
                         "watcher.fix_result source=%s success=%s strategy=%s",
                         source, success, fix_result.get("strategy", "unknown"),
                     )
+                    if fix_result.get("lock_busy"):
+                        # attempt_fix() didn't actually run — the browser
+                        # profile was held by another discover/apply/
+                        # prepare-sessions/heartbeat/auto-fix run. This alert
+                        # was never really handled, so don't let it stay
+                        # permanently marked seen — keep it eligible so the
+                        # next poll cycle gets a real attempt.
+                        self._seen_alert_keys.discard(key)
+                        log.info("watcher.fix_deferred source=%s reason=lock_busy", source)
                     actions.append(
                         {
                             "type": "alert",

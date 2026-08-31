@@ -36,6 +36,14 @@ _log = logging.getLogger(__name__)
 AUTOMATED_SOURCES = {"jobright", "indeed", "linkedin"}
 HUMAN_SOURCES     = {"usajobs"}
 
+# Circuit breaker for _reauth_automated: below this many consecutive failures we
+# use exponential backoff; at/above it we fall back to a long fixed cooldown and
+# then allow a half-open retry, rather than blocking the source forever. A manual
+# `prepare-sessions` success also clears the streak immediately — see
+# orchestrator.prepare_sessions().
+CIRCUIT_CAP_FAILURES = 3
+CIRCUIT_OPEN_COOLDOWN_SECONDS = 4 * 60 * 60
+
 
 def _is_interactive() -> bool:
     """True when attached to a terminal, i.e. a human is present to complete an
@@ -107,20 +115,21 @@ class ReauthManager:
                 elif event.get("outcome") == "success":
                     break
 
-        if consecutive_failures >= 3:
-            _log.warning("reauth.skip_retry_cap source=%s consecutive_failures=%d", source, consecutive_failures)
-            return False
-
         if consecutive_failures > 0 and last_failure_ts:
             if last_failure_ts.tzinfo is not None:
                 last_failure_ts = last_failure_ts.replace(tzinfo=None)
             now = datetime.utcnow()
-            backoff_seconds = (2 ** consecutive_failures) * 120
+            if consecutive_failures >= CIRCUIT_CAP_FAILURES:
+                backoff_seconds = CIRCUIT_OPEN_COOLDOWN_SECONDS
+            else:
+                backoff_seconds = (2 ** consecutive_failures) * 120
             time_since_failure = (now - last_failure_ts).total_seconds()
             if time_since_failure < backoff_seconds:
                 remaining = int(backoff_seconds - time_since_failure)
                 _log.info("reauth.backoff source=%s consecutive_failures=%d remaining=%ds", source, consecutive_failures, remaining)
                 return False
+            if consecutive_failures >= CIRCUIT_CAP_FAILURES:
+                _log.info("reauth.half_open_retry source=%s consecutive_failures=%d", source, consecutive_failures)
 
         source_map = _get_source_map()
         scraper_cls = source_map.get(source)
@@ -128,8 +137,9 @@ class ReauthManager:
             notify_error(f"{source} reauth failed", "No automated reauth path for this source")
             return False
 
-        email    = os.environ.get(f"{source.upper()}_EMAIL", "")
-        password = os.environ.get(f"{source.upper()}_PASSWORD", "")
+        from .secret_store import resolve_secret
+        email    = resolve_secret(f"{source.upper()}_EMAIL") or ""
+        password = resolve_secret(f"{source.upper()}_PASSWORD") or ""
         if not email or not password:
             notify_error(
                 f"{source} reauth failed",
