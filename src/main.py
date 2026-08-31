@@ -57,13 +57,16 @@ def load_env() -> None:
 
 
 def check_api_key() -> bool:
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key or key == "your_key_here":
+    """Preflight check: verifies that at least one inference provider is available (Ollama, OpenRouter Gateway, Anthropic, or OpenAI)."""
+    from src.model_client import check_inference_availability
+    available, provider_name = check_inference_availability()
+    if not available:
         console.print(
-            "[red]Error:[/red] ANTHROPIC_API_KEY not set.\n"
-            "  Copy .env.example to .env and add your key:\n"
-            "    cp .env.example .env\n"
-            "    # edit .env and paste your Anthropic API key"
+            f"[red]Error:[/red] {provider_name}.\n"
+            "  Please ensure local Ollama is running or configure one of:\n"
+            "    - AICC_OPENROUTER_API_KEY (AI-OpenRouter Gateway)\n"
+            "    - ANTHROPIC_API_KEY\n"
+            "    - OPENAI_API_KEY\n"
         )
         return False
     return True
@@ -480,6 +483,13 @@ async def main_async(args: argparse.Namespace) -> int:
 
     elif args.command == "check-confirmations":
         from src.email_confirmation_tracker import EmailConfirmationTracker
+        try:
+            reconciled = orchestrator.state.reconcile_active_jobs_from_ledger()
+            if reconciled:
+                console.print(f"[cyan]Ledger pre-scan reconciliation:[/cyan] {reconciled} active jobs synced from submission ledger.")
+        except Exception as exc:
+            console.print(f"[dim]Ledger pre-scan reconciliation skipped: {exc}[/dim]")
+
         tracker = EmailConfirmationTracker(state_manager=orchestrator.state)
         results = tracker.scan_inbox_and_confirm(days=args.days, dry_run=args.dry_run)
         console.print(f"[cyan]Confirmation scan complete:[/cyan] {len(results)} matches processed.")
@@ -506,10 +516,25 @@ async def main_async(args: argparse.Namespace) -> int:
             Path.home() / "Library/LaunchAgents/com.jobagent.discover.plist",
             Path.home() / "Library/LaunchAgents/com.jobagent.apply.plist",
         ]
+        launchctl_out = ""
+        try:
+            res = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+            if res.returncode == 0:
+                launchctl_out = res.stdout
+        except Exception:
+            pass
+
         for p in plist_paths:
             installed = p.exists()
-            status_str = "[green]INSTALLED[/green]" if installed else "[dim]NOT INSTALLED[/dim]"
-            console.print(f"  • {p.name}: {status_str}")
+            label = p.stem
+            is_loaded = label in launchctl_out
+            if installed and is_loaded:
+                status_str = "[green]ACTIVE / LOADED[/green]"
+            elif installed:
+                status_str = "[yellow]INSTALLED (NOT LOADED)[/yellow]"
+            else:
+                status_str = "[dim]NOT INSTALLED[/dim]"
+            console.print(f"  • {label}: {status_str}")
         return 0
 
     elif args.command == "session-status":

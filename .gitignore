@@ -40,5 +40,9 @@ state/extensions/
 playwright-report/
 test-results/
 
-# ── macOS ─────────────────────────────────────────────────────────────────────
+# ── IDEs and tooling ────────────────────────────────────────────────────────
 .DS_Store
+.claude/
+.cursor/
+.idea/
+.vscode/
