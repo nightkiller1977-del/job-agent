@@ -197,7 +197,7 @@ class LLMAnswerGenerator:
     def _call_model_cascade(self, prompt: str) -> Optional[str]:
         """Try local Ollama cascade first (devstral -> qwen3-coder:14b -> llama3.1), then fallback."""
         # 1. Local Ollama attempt
-        models_to_try = ["devstral", "qwen3-coder:14b", "llama3.1"]
+        models_to_try = ["devstral", "qwen2.5-coder:7b", "qwen3-coder:30b", "llama3.1", "gemma2"]
         for model in models_to_try:
             ans = self._call_ollama(model, prompt)
             if ans:
