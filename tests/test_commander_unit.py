@@ -511,6 +511,71 @@ class TestStatusWatcher:
         watcher._commander.attempt_fix.assert_awaited_once_with("linkedin")
         assert any(a.get("action") == "auto_fix_attempted" for a in result)
 
+    def test_lock_busy_fix_result_stays_eligible_for_a_later_poll(self, tmp_path, monkeypatch):
+        """When attempt_fix() reports lock_busy=True (the browser pipeline was
+        held by a scheduled discover/apply/prepare-sessions/heartbeat run), the
+        alert must NOT be permanently marked seen — otherwise this exact
+        failure (e.g. the 'Auto-fix failed: linkedin' notification) never gets
+        another real attempt, because _seen_alert_keys already added the key
+        before attempt_fix ran."""
+        watcher, status_file = _make_watcher(tmp_path, monkeypatch, auto_fix=True)
+        status = _make_status(
+            alerts=[
+                {"ts": "2026-06-26T00:00:00Z", "level": "error",
+                 "title": "linkedin session expired", "detail": "stale"}
+            ]
+        )
+        _write_status(status_file, status)
+
+        watcher._commander.diagnose = MagicMock(return_value={
+            "sources": {"linkedin": {"fixable": True, "severity": "warning", "root_cause": "stale session"}},
+            "summary": "",
+            "has_fixable": True,
+        })
+        watcher._commander.attempt_fix = AsyncMock(return_value={
+            "success": False, "source": "linkedin", "strategy": "automated",
+            "reason": "browser pipeline busy — another run holds it, will retry later",
+            "lock_busy": True,
+        })
+
+        first = asyncio.run(watcher.watch_once())
+        assert watcher._commander.attempt_fix.await_count == 1
+        assert any(a.get("action") == "auto_fix_attempted" for a in first)
+
+        # Same alert, next poll cycle: since it was deferred (not actually
+        # handled), it must be retried rather than silently dropped forever.
+        second = asyncio.run(watcher.watch_once())
+        assert watcher._commander.attempt_fix.await_count == 2
+        assert any(a.get("action") == "auto_fix_attempted" for a in second)
+
+    def test_real_fix_failure_does_not_get_endlessly_retried(self, tmp_path, monkeypatch):
+        """Contrast with the lock_busy case above: an actual fix failure (no
+        lock_busy marker) must stay marked seen — attempt_fix really ran and
+        failed, so retrying the identical alert every poll would just spam
+        auto-fix attempts for something that already failed for real."""
+        watcher, status_file = _make_watcher(tmp_path, monkeypatch, auto_fix=True)
+        status = _make_status(
+            alerts=[
+                {"ts": "2026-06-26T00:00:00Z", "level": "error",
+                 "title": "linkedin session expired", "detail": "stale"}
+            ]
+        )
+        _write_status(status_file, status)
+
+        watcher._commander.diagnose = MagicMock(return_value={
+            "sources": {"linkedin": {"fixable": True, "severity": "warning", "root_cause": "stale session"}},
+            "summary": "",
+            "has_fixable": True,
+        })
+        watcher._commander.attempt_fix = AsyncMock(return_value={
+            "success": False, "source": "linkedin", "strategy": "automated",
+            "reason": "_auto_login returned False",
+        })
+
+        asyncio.run(watcher.watch_once())
+        asyncio.run(watcher.watch_once())
+        assert watcher._commander.attempt_fix.await_count == 1
+
     def test_watch_once_fixable_auto_fix_false_does_not_call_attempt_fix(self, tmp_path, monkeypatch):
         """watch_once with fixable source and auto_fix=False does NOT call attempt_fix."""
         watcher, status_file = _make_watcher(tmp_path, monkeypatch, auto_fix=False)
