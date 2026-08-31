@@ -644,3 +644,32 @@ class TestReauthRemediation:
             result = await mgr._reauth_automated("jobright")
             assert result is False
             mock_get_map.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_cap_is_half_open_after_cooldown(self, tmp_path, monkeypatch):
+        """At/above the cap, the source must not be locked out forever: once
+        CIRCUIT_OPEN_COOLDOWN_SECONDS has elapsed since the last failure it gets
+        one half-open retry instead of a permanent block (ACES: reauth circuit
+        breaker never recovered on its own, even after credentials were fixed)."""
+        import json as _json
+        from datetime import datetime, timedelta
+
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src.notifier import record_reauth_event
+        from src.reauth import CIRCUIT_OPEN_COOLDOWN_SECONDS
+
+        for i in range(3):
+            record_reauth_event("jobright", "automated", "failed", str(i))
+
+        status_file = tmp_path / "status.json"
+        status = _json.loads(status_file.read_text())
+        old_ts = (datetime.utcnow() - timedelta(seconds=CIRCUIT_OPEN_COOLDOWN_SECONDS + 60)).isoformat()
+        status["reauth_events"][-1]["ts"] = old_ts
+        status_file.write_text(_json.dumps(status))
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        with patch("src.reauth._get_source_map") as mock_get_map:
+            mock_get_map.return_value = {}
+            await mgr._reauth_automated("jobright")
+            mock_get_map.assert_called_once()
