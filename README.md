@@ -171,6 +171,12 @@ Copy `config.example.json` to `config.json` (gitignored — this is where your r
 { "local_resume_path": "/path/to/your/resume.pdf" }
 ```
 
+> **Upgrading an existing checkout that predates this?** `config.json` used to be
+> tracked in git; pulling the commit that untracked it will delete an unmodified
+> local copy along with it. Run `scripts/migrate-config-json.sh backup` *before*
+> pulling/merging, then `scripts/migrate-config-json.sh restore` after — it
+> restores your real config.json (now gitignored) from the backup if it's gone.
+
 Fill in `state/profile.json` with your work history, skills, and contact information — this feeds LinkedIn Easy Apply autofill and Claude resume tailoring.
 
 ### 3. One-time setup
