@@ -622,11 +622,14 @@ async def main_async(args: argparse.Namespace) -> int:
         await analyzer.run_analysis()
 
     elif args.command == "commander":
-        import json
         from src.commander import AgentCommander
         from src.watcher import StatusWatcher
 
-        config = json.loads((project_root / "config.json").read_text())
+        # Reuse the orchestrator's already-loaded config (falls back to {} with a
+        # warning when config.json is absent) rather than re-reading the file —
+        # config.json is gitignored/optional, so a direct read here would crash
+        # every commander subcommand on a clean clone.
+        config = orchestrator.config
         commander = AgentCommander(config)
 
         if args.subcommand == "ask":
