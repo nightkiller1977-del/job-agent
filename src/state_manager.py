@@ -290,6 +290,28 @@ class StateManager:
 
         return job.get("confirmation_status")
 
+    def reconcile_active_jobs_from_ledger(self) -> int:
+        """Scans unconfirmed active applied jobs, projecting SubmissionLedger phase onto confirmation_status."""
+        try:
+            from .sources.adapters.idempotency import SubmissionLedger
+            ledger = SubmissionLedger()
+        except Exception:
+            return 0
+
+        reconciled_count = 0
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id FROM jobs WHERE status = 'applied' AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')"
+            ).fetchall()
+
+        for r in rows:
+            jid = r["job_id"]
+            new_status = self.sync_confirmation_from_ledger(jid, ledger=ledger)
+            if new_status:
+                reconciled_count += 1
+
+        return reconciled_count
+
     def delete_job(self, job_id: str) -> None:
         """Delete a job record completely from the database."""
         with self._connect() as conn:

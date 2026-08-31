@@ -179,3 +179,63 @@ async def test_openrouter_gateway_parses_top_level_content_and_choices(monkeypat
     assert res_choices == "Answer from OpenAI style upstream"
 
 
+@pytest.mark.asyncio
+async def test_gateway_distinguishes_unpriced_502_from_upstream_502(monkeypatch):
+    """502 with unpriced/budget refusal fails closed; ordinary upstream 502 falls through to Claude."""
+    import httpx
+    from src.model_client import BudgetExceededError
+
+    client = ModelClient(anthropic_api_key="sk-ant-test")
+    monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result=None))
+    monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-key")
+
+    class Mock502Response:
+        def __init__(self, text):
+            self.status_code = 502
+            self.text = text
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://test")
+            response = httpx.Response(502, request=request)
+            raise httpx.HTTPStatusError("502 Bad Gateway", request=request, response=response)
+
+    # 1. Unpriced 502 -> Fails closed
+    async def mock_post_unpriced(self, url, json, headers):
+        return Mock502Response("Model anthropic/claude-unknown is unpriced in registry")
+
+    monkeypatch.setattr("httpx.AsyncClient.post", mock_post_unpriced)
+    with pytest.raises(BudgetExceededError):
+        await client.complete([{"role": "user", "content": "hi"}])
+
+    # 2. Upstream provider 502 -> Falls through to Direct Claude
+    claude_called = False
+
+    async def mock_post_upstream_error(self, url, json, headers):
+        return Mock502Response("Upstream provider Cloudflare 502 Bad Gateway")
+
+    async def mock_call_claude(*args, **kwargs):
+        nonlocal claude_called
+        claude_called = True
+        return "claude fallback response"
+
+    monkeypatch.setattr("httpx.AsyncClient.post", mock_post_upstream_error)
+    monkeypatch.setattr(client, "_call_claude", mock_call_claude)
+
+    res = await client.complete([{"role": "user", "content": "hi"}])
+    assert res == "claude fallback response"
+    assert claude_called is True
+
+
+def test_query_model_timeout_cancellation(monkeypatch):
+    """query_model cancels running task on timeout."""
+    from src.model_client import query_model
+
+    async def slow_complete(*args, **kwargs):
+        await asyncio.sleep(5.0)
+        return "too late"
+
+    monkeypatch.setattr(ModelClient, "complete", slow_complete)
+    with pytest.raises(TimeoutError):
+        query_model("test question", timeout=0.1)
+
+

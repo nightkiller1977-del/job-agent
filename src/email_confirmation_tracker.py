@@ -401,15 +401,20 @@ class EmailConfirmationTracker:
 
                 if is_confirmed and not dry_run:
                     self._apply_confirmation_transition(best_job, best_score, outcome)
-                elif best_score >= self.min_confirmed_score and margin < 0.15:
+                    if msg_id:
+                        self._processed_ids.add(msg_id)
+                elif not dry_run:
+                    # Ambiguous or below confirmation threshold:
+                    # Persist into review queue so candidates are never silently consumed/lost!
                     outcome["needs_manual_confirmation"] = True
-                    outcome["ambiguous"] = True
-                    console.print(f"[yellow]⚠ Ambiguous email confirmation (margin {margin} < 0.15):[/yellow] '{best_job.get('title')}' vs runner-up. Flagged for manual review.")
-                    if not dry_run:
-                        self._save_to_review_queue(best_job, best_score, outcome)
-
-                if msg_id and not dry_run:
-                    self._processed_ids.add(msg_id)
+                    if best_score >= self.min_confirmed_score and margin < 0.15:
+                        outcome["ambiguous"] = True
+                        console.print(f"[yellow]⚠ Ambiguous email confirmation (margin {margin} < 0.15):[/yellow] '{best_job.get('title')}' vs runner-up. Flagged for manual review.")
+                    else:
+                        console.print(f"[yellow]⚠ Candidate email match below confirmation threshold ({best_score} < {self.min_confirmed_score}):[/yellow] '{best_job.get('title')}'. Queued for manual review.")
+                    self._save_to_review_queue(best_job, best_score, outcome)
+                    if msg_id:
+                        self._processed_ids.add(msg_id)
 
             mail.logout()
             if not dry_run:

@@ -165,3 +165,22 @@ def test_archive_job_preserves_confirmation_status(state_mgr):
         row = conn.execute("SELECT * FROM archived_jobs WHERE job_id = ?", ("job_archive_test",)).fetchone()
         assert row is not None
         assert dict(row)["confirmation_status"] == "confirmed_by_employer"
+
+
+def test_reconcile_active_jobs_from_ledger(state_mgr):
+    """reconcile_active_jobs_from_ledger scans unconfirmed applied jobs and reconciles against ledger."""
+    job = {
+        "job_id": "job_reconcile_test",
+        "title": "Staff ML Engineer",
+        "company": "Anthropic",
+        "url": "https://anthropic.com/careers/111",
+        "source": "indeed",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job)
+    state_mgr.transition_confirmation("job_reconcile_test", "submitting")
+
+    count = state_mgr.reconcile_active_jobs_from_ledger()
+    assert count >= 1
+    job_updated = state_mgr.get_job("job_reconcile_test")
+    assert job_updated["confirmation_status"] in ("submitting", "reconciliation_required", "submitted")

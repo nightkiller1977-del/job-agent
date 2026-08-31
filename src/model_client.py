@@ -14,11 +14,13 @@ Reference: electron/services/modelRegistry.js, modelRouterService.js, modelServi
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
 import platform
 import subprocess
+import threading
 import urllib.request
 from contextlib import contextmanager
 from typing import Any
@@ -362,6 +364,14 @@ class ModelClient:
         """Reset all cached concurrency semaphores."""
         cls._semaphores.clear()
 
+    @classmethod
+    def get_gateway_config(cls) -> tuple[bool, str, str]:
+        """Returns (is_configured, gateway_url, api_key) using strictly AICC_OPENROUTER_API_KEY."""
+        url = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
+        key = (os.environ.get("AICC_OPENROUTER_API_KEY") or "").strip()
+        is_configured = bool(key or os.environ.get("OPENROUTER_GATEWAY_URL"))
+        return is_configured, url, key
+
     def __init__(
         self,
         ollama_base_url: str = OLLAMA_BASE_URL,
@@ -407,8 +417,7 @@ class ModelClient:
             _log.info("ModelClient: no Ollama models fit constraints — trying OpenRouter Gateway")
 
         # Tier 2: AI-OpenRouter Gateway (Centralized budget-managed cloud tier)
-        gateway_key = os.environ.get("AICC_OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
-        gateway_configured = bool(gateway_key or os.environ.get("OPENROUTER_GATEWAY_URL"))
+        gateway_configured, gateway_url, gateway_key = self.get_gateway_config()
         if gateway_configured:
             try:
                 model_name = OPENROUTER_TASK_MODELS.get(task_type, OPENROUTER_TASK_MODELS["general"])
@@ -422,7 +431,7 @@ class ModelClient:
                 # Do NOT bypass budget denial to spend direct cloud money without explicit authorization
                 allow_bypass = os.environ.get("ALLOW_DIRECT_CLOUD_FALLBACK_ON_BUDGET_DENIAL", "").lower() in ("true", "1")
                 if not allow_bypass:
-                    _log.error("ModelClient: Gateway budget exceeded. Failing closed to protect spending limits: %s", exc)
+                    _log.error("ModelClient: Gateway budget/pricing exceeded. Failing closed to protect spending limits: %s", exc)
                     raise
                 _log.warning("ModelClient: Gateway budget exceeded but explicit bypass authorized — escalating to Direct Claude")
             except Exception as exc:
@@ -503,12 +512,26 @@ class ModelClient:
         url = f"{OPENROUTER_GATEWAY_URL}/chat/completions"
         async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
             resp = await client.post(url, json=payload, headers=headers)
-            # Gateway budget/authorization refusal statuses:
-            # 402: Budget Exceeded
-            # 502: Unknown / unpriced model pricing rejection
-            # 503: Budget authority ledger/service unavailable
-            if resp.status_code in (402, 502, 503):
-                raise BudgetExceededError(f"AI-OpenRouter Gateway budget authority refusal (HTTP {resp.status_code}): {resp.text}")
+
+            # 1. Direct Budget Refusal (HTTP 402) -> Always fail closed
+            if resp.status_code == 402:
+                raise BudgetExceededError(f"AI-OpenRouter Gateway budget exceeded (HTTP 402): {resp.text}")
+
+            # 2. Bad Gateway (HTTP 502) -> Distinguish unpriced model vs upstream provider outage
+            if resp.status_code == 502:
+                body_lower = resp.text.lower()
+                if any(term in body_lower for term in ("unpriced", "pricing", "budget", "cost")):
+                    raise BudgetExceededError(f"AI-OpenRouter Gateway unpriced model refusal (HTTP 502): {resp.text}")
+                # Ordinary upstream provider failure -> raise HTTPStatusError to safely cascade to Direct Anthropic
+                resp.raise_for_status()
+
+            # 3. Service Unavailable (HTTP 503) -> Distinguish budget authority outage vs generic gateway outage
+            if resp.status_code == 503:
+                body_lower = resp.text.lower()
+                if any(term in body_lower for term in ("budget", "ledger", "authoriz")):
+                    raise BudgetExceededError(f"AI-OpenRouter Gateway budget authority unavailable (HTTP 503): {resp.text}")
+                resp.raise_for_status()
+
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, dict):
@@ -736,8 +759,7 @@ def check_inference_availability() -> tuple[bool, str]:
         pass
 
     # 2. AI-OpenRouter Gateway — probe /health or /models
-    gateway_url = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
-    aicc_key = (os.environ.get("AICC_OPENROUTER_API_KEY") or "").strip()
+    gateway_configured, gateway_url, aicc_key = ModelClient.get_gateway_config()
     if aicc_key:
         try:
             req = urllib.request.Request(f"{gateway_url}/health")
@@ -769,24 +791,42 @@ def check_inference_availability() -> tuple[bool, str]:
     return False, "No inference provider available (Ollama unreachable, OpenRouter Gateway offline, no direct cloud keys)"
 
 
-def query_model(prompt: str, system: str = "", task_type: str = "general", max_tokens: int = 512, temperature: float | None = None) -> str:
-    """Synchronous helper for ModelClient.complete()."""
-    client = ModelClient()
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+class _AsyncModelRunner:
+    _loop: asyncio.AbstractEventLoop | None = None
+    _thread: threading.Thread | None = None
+    _lock = threading.Lock()
 
-    if loop and loop.is_running():
-        import concurrent.futures
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(lambda: asyncio.run(client.complete([{"role": "user", "content": prompt}], system=system, task_type=task_type, max_tokens=max_tokens, temperature=temperature)))
-        try:
-            res = future.result(timeout=25)
-            pool.shutdown(wait=False)
-            return res
-        except Exception:
-            pool.shutdown(wait=False)
-            raise
-    else:
-        return asyncio.run(client.complete([{"role": "user", "content": prompt}], system=system, task_type=task_type, max_tokens=max_tokens, temperature=temperature))
+    @classmethod
+    def get_loop(cls) -> asyncio.AbstractEventLoop:
+        with cls._lock:
+            if cls._loop is None or not cls._loop.is_running():
+                cls._loop = asyncio.new_event_loop()
+                cls._thread = threading.Thread(target=cls._loop.run_forever, daemon=True, name="ModelRunnerThread")
+                cls._thread.start()
+            return cls._loop
+
+
+def query_model(
+    prompt: str,
+    system: str = "",
+    task_type: str = "general",
+    max_tokens: int = 512,
+    temperature: float | None = None,
+    timeout: float = 25.0,
+) -> str:
+    """Synchronous helper for ModelClient.complete() with active cancellation propagation on timeout."""
+    client = ModelClient()
+    runner_loop = _AsyncModelRunner.get_loop()
+    coro = client.complete(
+        [{"role": "user", "content": prompt}],
+        system=system,
+        task_type=task_type,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    future = asyncio.run_coroutine_threadsafe(coro, runner_loop)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise TimeoutError(f"Model query timed out after {timeout}s and was actively cancelled.")
