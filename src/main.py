@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import subprocess
 import sys
@@ -36,6 +37,50 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 console = Console()
+
+from src.browser_pipeline_lock import (
+    pipeline_lock as _browser_pipeline_lock,
+    pipeline_lock_wait as _browser_pipeline_lock_wait,
+    BROWSER_PIPELINE_LOCK,
+)
+
+
+@contextlib.contextmanager
+def _pipeline_lock(name: str = BROWSER_PIPELINE_LOCK):
+    """CLI wrapper around the shared browser_pipeline_lock: same lock the
+    commander's auto-reauth path (attempt_fix) takes, so a scheduled
+    discover/apply/prepare-sessions/heartbeat run and a watcher-triggered
+    auto-fix can't launch competing Playwright contexts at once. Adds a
+    console message on top of the shared module's logging, for CLI UX.
+
+    Non-blocking — skips immediately on contention. Used by prepare-sessions
+    (interactive, the user can just retry) and heartbeat (low-stakes, next
+    scheduled run is fine). discover/apply use _pipeline_lock_wait instead —
+    see there for why."""
+    with _browser_pipeline_lock(name) as acquired:
+        if not acquired:
+            console.print(
+                "[yellow]Another browser-pipeline run (discover/apply/prepare-sessions/"
+                "heartbeat/auto-fix) is already in progress — skipping.[/yellow]"
+            )
+        yield acquired
+
+
+@contextlib.asynccontextmanager
+async def _pipeline_lock_wait(name: str = BROWSER_PIPELINE_LOCK):
+    """CLI wrapper around browser_pipeline_lock.pipeline_lock_wait(): retries
+    for a bounded window instead of skipping immediately. discover/apply only
+    fire once via launchd (23:00/07:00) — silently skipping the whole run on
+    a lock collision (e.g. the watcher's auto-fix, or an overlapping manual
+    run) costs a full day until the next scheduled attempt, so it's worth
+    waiting rather than giving up on first contention."""
+    async with _browser_pipeline_lock_wait(name) as acquired:
+        if not acquired:
+            console.print(
+                "[yellow]Another browser-pipeline run held the lock for the full wait "
+                "window — skipping this run.[/yellow]"
+            )
+        yield acquired
 
 
 def load_env() -> None:
@@ -418,26 +463,32 @@ async def main_async(args: argparse.Namespace) -> int:
     orchestrator = Orchestrator(config_path=config_path)
 
     if args.command == "discover":
-        await orchestrator.discover(source=args.source, no_review=args.no_review)
+        async with _pipeline_lock_wait(BROWSER_PIPELINE_LOCK) as acquired:
+            if acquired:
+                await orchestrator.discover(source=args.source, no_review=args.no_review)
 
     elif args.command == "apply":
-        await orchestrator.apply_approved(
-            auto_submit=args.auto_submit,
-            limit=args.limit,
-            job_id=args.job_id,
-            source=args.source,
-            company=args.company,
-        )
+        async with _pipeline_lock_wait(BROWSER_PIPELINE_LOCK) as acquired:
+            if acquired:
+                await orchestrator.apply_approved(
+                    auto_submit=args.auto_submit,
+                    limit=args.limit,
+                    job_id=args.job_id,
+                    source=args.source,
+                    company=args.company,
+                )
 
     elif args.command == "preflight":
         await orchestrator.preflight_approved(source=args.source, company=args.company)
 
     elif args.command == "prepare-sessions":
-        await orchestrator.prepare_sessions(
-            source=args.source,
-            company=args.company,
-            limit=args.limit,
-        )
+        with _pipeline_lock(BROWSER_PIPELINE_LOCK) as acquired:
+            if acquired:
+                await orchestrator.prepare_sessions(
+                    source=args.source,
+                    company=args.company,
+                    limit=args.limit,
+                )
 
     elif args.command == "setup":
         await orchestrator.browser_setup()
@@ -549,12 +600,15 @@ async def main_async(args: argparse.Namespace) -> int:
         return 1 if blocked else 0
 
     elif args.command == "heartbeat":
-        from src.session_watchdog import run_heartbeat
-        sources = [args.source] if getattr(args, "source", None) else None
-        results = await run_heartbeat(sources=sources, config=orchestrator.config)
-        for src, ok in results.items():
-            status = "[green]✓[/green]" if ok else "[red]✗[/red]"
-            console.print(f"  {status} {src}")
+        with _pipeline_lock(BROWSER_PIPELINE_LOCK) as acquired:
+            if not acquired:
+                return 0
+            from src.session_watchdog import run_heartbeat
+            sources = [args.source] if getattr(args, "source", None) else None
+            results = await run_heartbeat(sources=sources, config=orchestrator.config)
+            for src, ok in results.items():
+                status = "[green]✓[/green]" if ok else "[red]✗[/red]"
+                console.print(f"  {status} {src}")
         return 0
 
     elif args.command == "expand":
