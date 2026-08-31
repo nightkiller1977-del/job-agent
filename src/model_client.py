@@ -90,6 +90,13 @@ MODEL_REGISTRY: dict[str, dict] = {
         "tier": "specialist",
         "cloudEquivalent": None,
     },
+    "qwen2.5-coder:7b": {
+        "contextWindow": 32768,
+        "minRamGb": 5,
+        "bestFor": ["coding"],
+        "tier": "specialist",
+        "cloudEquivalent": None,
+    },
     "llama3.1:8b": {
         "contextWindow": 8192,
         "minRamGb": 5,
@@ -119,6 +126,7 @@ TASK_PREFERENCES: dict[str, list[str]] = {
     "coding": [
         "devstral",
         "qwen3-coder:30b",
+        "qwen2.5-coder:7b",
         "qwen3-coder:14b",
         "qwen3-coder:7b",
         "deepseek-r1:14b",
@@ -128,6 +136,8 @@ TASK_PREFERENCES: dict[str, list[str]] = {
     "reasoning": [
         "deepseek-r1:14b",
         "devstral",
+        "qwen3-coder:30b",
+        "qwen2.5-coder:7b",
         "qwen3-coder:14b",
         "qwen3-coder:7b",
         "llama3.1",
@@ -138,8 +148,8 @@ TASK_PREFERENCES: dict[str, list[str]] = {
         "llama3.1:8b",
         "gemma2",
         "devstral",
-        "qwen3-coder:14b",
-        "qwen3-coder:7b",
+        "qwen2.5-coder:7b",
+        "qwen3-coder:30b",
     ],
     "monitoring": [
         "gemma2",
