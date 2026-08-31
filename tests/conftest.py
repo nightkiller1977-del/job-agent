@@ -80,3 +80,19 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "live" in item.keywords:
             item.add_marker(skip_live)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_browser_pipeline_lock(tmp_path, monkeypatch):
+    """Isolate every test's advisory browser-pipeline lock from the real
+    repo's state/ dir. commander.attempt_fix() and main.py's discover/apply/
+    prepare-sessions/heartbeat all take browser_pipeline_lock.pipeline_lock().
+    Without this, any test that reaches attempt_fix() could spuriously fail
+    if a real job-agent process (a live launchd apply/discover run, or a
+    `prepare-sessions` triggered by a phone deep-link) happens to hold the
+    real state/browser-pipeline.lock at the same moment — observed during
+    PR #79 review: a genuine `prepare-sessions --source jobright` process
+    running on the dev machine made several unrelated attempt_fix() tests
+    fail because they weren't isolated from real machine state."""
+    import src.browser_pipeline_lock as _lock_mod
+    monkeypatch.setattr(_lock_mod, "PROJECT_ROOT", tmp_path)
