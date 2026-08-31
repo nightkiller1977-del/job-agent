@@ -17,9 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -132,7 +130,8 @@ class LLMAnswerGenerator:
         job_dict = job or {}
         job_key = job_dict.get("job_id") or job_dict.get("company", "") or "generic"
         norm_q = normalize_question(question_text)
-        cache_key = hashlib.sha256(f"{norm_q}:{job_key}".encode("utf-8")).hexdigest()
+        facts_hash = hashlib.sha256(json.dumps(self.profile, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+        cache_key = hashlib.sha256(f"{norm_q}:{job_key}:{max_chars}:{facts_hash}".encode("utf-8")).hexdigest()
 
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -195,58 +194,52 @@ class LLMAnswerGenerator:
         )
 
     def _call_model_cascade(self, prompt: str) -> Optional[str]:
-        """Try local Ollama cascade first (devstral -> qwen3-coder:14b -> llama3.1), then fallback."""
-        # 1. Local Ollama attempt
-        models_to_try = ["devstral", "qwen2.5-coder:7b", "qwen3-coder:30b", "llama3.1", "gemma2"]
-        for model in models_to_try:
-            ans = self._call_ollama(model, prompt)
-            if ans:
-                return ans
-
-        # 2. Local fallback client if available
+        """Routes generation strictly through the centralized ModelClient router."""
         try:
             from ..model_client import query_model
-            resp = query_model(prompt, max_tokens=150)
-            if resp:
+            resp = query_model(prompt, task_type="general", max_tokens=150)
+            if resp and resp.strip():
                 return resp.strip()
-        except Exception:
-            pass
-
-        return None
-
-    def _call_ollama(self, model: str, prompt: str) -> Optional[str]:
-        try:
-            url = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434") + "/api/generate"
-            payload = json.dumps({
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.2, "num_predict": 120},
-            }).encode("utf-8")
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    text = data.get("response", "").strip()
-                    if text:
-                        return text
-        except Exception:
-            return None
+        except Exception as exc:
+            logger.debug("ModelClient completion failed in LLMAnswerGenerator: %s", exc)
         return None
 
     def _validate_answer(self, text: str, facts: List[str], max_chars: int) -> Optional[str]:
-        """Post-generation validator for sentence count, character limits, and basic entity consistency."""
+        """Post-generation validator enforcing <=3 sentences, character limits, and fact/metric consistency."""
         clean = text.strip().strip('"').strip("'")
         if not clean:
             return None
 
-        # Check sentence limit (1 to 4 sentences max)
+        # Check sentence limit (strictly 1 to 3 sentences)
         sentences = [s.strip() for s in re.split(r"[.!?]+", clean) if s.strip()]
-        if len(sentences) > 4:
-            # truncate to 3 sentences
-            clean = ". ".join(sentences[:3]) + "."
+        if len(sentences) > 3 or len(sentences) == 0:
+            return None
 
         if len(clean) > max_chars:
             clean = clean[:max_chars].rsplit(" ", 1)[0] + "."
+
+        # Grounding & anti-hallucination validation against supplied facts
+        facts_text = " ".join(facts).lower()
+
+        # 1. Metric / Number grounding: any specific numbers (>3 digits, percentages, dollar amounts) must exist in facts
+        metric_matches = re.findall(r"(?:\$\d+(?:\.\d+)?[kmbKMB]?|\b\d+%\b|\b\d{2,}\b)", clean)
+        for m in metric_matches:
+            if m.lower() not in facts_text:
+                logger.warning("Rejecting answer due to unsourced metric/number hallucination: %s", m)
+                return None
+
+        # 2. Company / Entity grounding: check capitalised proper nouns that look like employers
+        # (Ignore sentence starters and common generic words)
+        words = re.findall(r"\b[A-Z][a-zA-Z0-9]+\b", clean)
+        common_words = {
+            "I", "At", "In", "As", "My", "The", "Our", "We", "With", "For", "By", "To", "On", "This",
+            "Software", "Engineering", "Platform", "Cloud", "Distributed", "Director", "Manager",
+            "Lead", "Senior", "Principal", "Architect", "Executive", "VP", "CTO", "Tech", "Systems"
+        }
+        for w in words:
+            if w not in common_words and w.lower() not in facts_text:
+                # If a proper noun entity is not anywhere in the facts, reject
+                logger.warning("Rejecting answer due to unsourced entity hallucination: %s", w)
+                return None
 
         return clean

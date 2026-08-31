@@ -272,17 +272,13 @@ class AnswerBank:
         return "Decline to Self-Identify"
 
     def _infer_years_of_experience(self, skill: str, field_type: str) -> Any:
-        """Infers years of experience for a skill from the profile data.
-
-        Checks profile skills object or compiles overall industry years.
-        """
+        """Infers years of experience for a skill from verified profile data."""
+        skill_lower = skill.lower()
         for s in self.skills:
-            if isinstance(s, dict) and s.get("name", "").lower() == skill.lower():
+            if isinstance(s, dict) and s.get("name", "").lower() == skill_lower:
                 years = s.get("years")
                 if years is not None:
                     return int(years) if field_type == "number" else str(years)
-            elif isinstance(s, str) and s.lower() == skill.lower():
-                return 5 if field_type == "number" else "5"
 
-        # General industry fallback based on executive profile
-        return 5 if field_type == "number" else "5"
+        # Do NOT invent unverified fallback numbers. Fail closed.
+        return None
