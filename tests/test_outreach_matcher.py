@@ -5,7 +5,7 @@ from src.networking.outreach_matcher import OutreachMatcher
 
 def test_draft_outreach_note():
     profile = {
-        "name": "Anthony Larkins",
+        "name": "Jordan Rivera",
         "title": "VP Engineering",
     }
     matcher = OutreachMatcher(profile_data=profile)
@@ -19,7 +19,7 @@ def test_draft_outreach_note():
     assert "recently submitted an application" in note_applied
     assert "Director of Engineering" in note_applied
     assert "Datadog" in note_applied
-    assert "Anthony Larkins" in note_applied
+    assert "Jordan Rivera" in note_applied
 
     job_approved = {
         "company": "Datadog",

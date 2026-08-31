@@ -5,7 +5,7 @@
 # and from the launchd agent's EnvironmentVariables (DASHBOARD_URL / SYNC_SECRET).
 set -uo pipefail
 
-PROJECT_DIR="/Users/alarkins/Dev/Projects/job-agent"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PROJECT_DIR}/.venv/bin/python3"
 LOG="${PROJECT_DIR}/state/agent.night.log"
 

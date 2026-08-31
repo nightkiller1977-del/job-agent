@@ -41,13 +41,6 @@ LOGIN_URL_MARKERS = ("/login", "/authwall", "uas/login", "checkpoint", "challeng
 
 # User profile answers for Easy Apply forms
 USER_ANSWERS = {
-    "years_experience": "20",
-    "current_title": "Director of Software Engineering",
-    "clearance": "Top Secret",
-    "authorized_us": "Yes",
-    "require_sponsorship": "No",
-    "linkedin_profile_up_to_date": "Yes",
-    "willing_to_relocate": "Yes",
     "phone_default": "",  # filled from env if needed
 }
 
@@ -1499,27 +1492,26 @@ class LinkedInScraper(BaseScraper):
                 label_lower = label_text.lower()
 
                 answer = None
-                # Location
+                # Location — from state/profile.json, never a hardcoded address
                 if "city" in label_lower:
-                    answer = "Miami"
+                    answer = self._profile_value("personal_info", "city")
                 elif "state" in label_lower and "zip" not in label_lower:
-                    answer = "Florida"
+                    answer = self._profile_value("personal_info", "state")
                 elif "zip" in label_lower or "postal" in label_lower:
-                    answer = "33101"
-                # Experience
+                    answer = self._profile_value("personal_info", "zip")
+                # Experience / compensation / notice period — no profile field for
+                # these; leave blank rather than guess.
                 elif "years" in label_lower and "experience" in label_lower:
-                    answer = "18"
+                    answer = ""
                 elif "years" in label_lower and any(w in label_lower for w in ["manage", "leader", "director", "vp", "engineer"]):
-                    answer = "18"
-                # Compensation
+                    answer = ""
                 elif any(w in label_lower for w in ["salary", "compensation", "pay", "rate", "expected"]):
-                    answer = "200000"
-                # Notice period
+                    answer = ""
                 elif "notice" in label_lower or "start" in label_lower and "available" in label_lower:
-                    answer = "2 weeks"
-                # LinkedIn profile
+                    answer = ""
+                # LinkedIn profile — from state/profile.json, never a hardcoded URL
                 elif "linkedin" in label_lower and "profile" in label_lower:
-                    answer = "https://www.linkedin.com/in/anthonyclarkins"
+                    answer = self._profile_value("social_links", "linkedin")
                 # Website / portfolio
                 elif any(w in label_lower for w in ["website", "portfolio", "github", "url"]):
                     answer = ""  # leave blank rather than guess

@@ -63,7 +63,8 @@ job-agent/
 │   ├── sessions/            # Per-source Chrome profiles + session JSON exports (gitignored)
 │   ├── tailored_resumes/    # Claude-generated and Orion-generated PDFs (gitignored)
 │   └── agent_status.json    # Live alerts + reauth event log
-├── config.json              # Scoring config, resume path, search settings
+├── config.example.json      # Template — copy to config.json (gitignored) and edit
+├── config.json              # Scoring config, resume path, search settings (gitignored, not committed)
 ├── .env.example             # Template with all required and optional keys
 ├── SECURITY.md              # Vulnerability disclosure and credential management policy
 ├── CLAUDE.md                # Critical constraints for Claude Code (Chrome profile isolation)
@@ -164,7 +165,7 @@ DASHBOARD_URL=...              # Render.com cloud dashboard URL
 SYNC_SECRET=...
 ```
 
-Set your resume path in `config.json`:
+Copy `config.example.json` to `config.json` (gitignored — this is where your real target roles, compensation thresholds, and resume path live) and set your resume path:
 
 ```json
 { "local_resume_path": "/path/to/your/resume.pdf" }
@@ -295,7 +296,7 @@ Scoring criteria are configured in `config.json`. The agent evaluates each job l
 
 Claude uses these to score each listing 0–100 and assign a recommendation. You review borderline scores in the terminal queue before any application is submitted.
 
-See `.env.example` and `config.json` for all configurable fields.
+See `.env.example` and `config.example.json` for all configurable fields.
 
 ---
 
