@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from src.ingest_email import ingest_email_payload, run_ingest_email_command
+from src.orchestrator import SOURCE_MAP
 from src.state_manager import StateManager
 
 
@@ -39,12 +40,14 @@ def _payload(**overrides):
 
 def test_inserted_email_job_defaults_to_discovered_and_preserves_redacted_metadata(temp_db):
     state = StateManager(temp_db)
-    results = ingest_email_payload(_payload(), state)
+    results = ingest_email_payload(_payload(), state, scorer=FixedScorer())
 
     assert [result.status for result in results] == ["inserted"]
     job = state.get_job(results[0].job_id)
     assert job["source"] == "email"
     assert job["status"] == "discovered"
+    assert job["score"] == 81
+    assert job["score_reason"] == "Strong match; review before apply."
     assert job["url"] == "https://jobs.example.com/acme/backend"
     assert job["description"] == "Senior Backend Engineer at Acme Cloud"
 
@@ -52,13 +55,19 @@ def test_inserted_email_job_defaults_to_discovered_and_preserves_redacted_metada
     assert extra["email_source"]["source_event_id"] == "icloud-mail-mcp:jobs:<alert@example.com>"
     assert extra["email_source"]["content_hash"] == "abc123"
     assert extra["email_source"]["redacted_excerpt"] == "Senior Backend Engineer at Acme Cloud"
+    assert extra["recommended_action"] == "review"
     assert "body" not in json.dumps(extra).lower()
+
+
+def test_email_source_routes_to_external_ats_apply_path():
+    assert "email" in SOURCE_MAP
+    assert SOURCE_MAP["email"] is SOURCE_MAP["external"]
 
 
 def test_duplicate_source_event_and_job_returns_duplicate_without_second_row(temp_db):
     state = StateManager(temp_db)
-    first = ingest_email_payload(_payload(), state)
-    second = ingest_email_payload(_payload(), state)
+    first = ingest_email_payload(_payload(), state, scorer=FixedScorer())
+    second = ingest_email_payload(_payload(), state, scorer=FixedScorer())
 
     assert first[0].status == "inserted"
     assert second[0].status == "duplicate"
@@ -96,7 +105,7 @@ def test_no_url_recruiter_review_lane_is_valid_and_not_approved(temp_db):
     }])
 
     state = StateManager(temp_db)
-    results = ingest_email_payload(payload, state)
+    results = ingest_email_payload(payload, state, scorer=FixedScorer())
     job = state.get_job(results[0].job_id)
     extra = json.loads(job["extra_json"])
 
@@ -105,6 +114,22 @@ def test_no_url_recruiter_review_lane_is_valid_and_not_approved(temp_db):
     assert job["url"] == ""
     assert extra["email_source"]["lane"] == "review-follow-up"
     assert extra["email_source"]["rejected_reason"] == "missing_url"
+
+
+def test_email_ingest_scores_before_lifecycle_decision(temp_db):
+    state = StateManager(temp_db)
+    results = ingest_email_payload(_payload(), state, scorer=FixedScorer(
+        score=12,
+        reason="Role mismatch.",
+        flags="SKIP",
+        action="skip",
+    ))
+    job = state.get_job(results[0].job_id)
+
+    assert results[0].status == "inserted"
+    assert job["status"] == "skipped"
+    assert job["score"] == 12
+    assert job["score_reason"] == "Role mismatch."
 
 
 def test_operational_failure_returns_failed_result():
@@ -136,3 +161,11 @@ def test_command_rejects_missing_json_stdin(capsys, temp_db):
     assert code == 2
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "invalid"
+
+
+class FixedScorer:
+    def __init__(self, score=81, reason="Strong match; review before apply.", flags="FLAG_FOR_REVIEW", action="review"):
+        self.result = (score, reason, flags, action)
+
+    async def score(self, job):
+        return self.result
