@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.state_manager import StateManager
+from src.scorer import JobScorer
 
 
 SUCCESS_STATUSES = {"inserted", "duplicate"}
@@ -40,7 +42,11 @@ def run_ingest_email_command(args: argparse.Namespace) -> int:
 
     try:
         payload = json.load(sys.stdin)
-        results = ingest_email_payload(payload, state=StateManager(args.db_path))
+        results = asyncio.run(ingest_email_payload_async(
+            payload,
+            state=StateManager(args.db_path),
+            scorer=JobScorer(),
+        ))
     except ValidationError as exc:
         _emit({"status": "invalid", "reason": str(exc)})
         return 2
@@ -56,13 +62,19 @@ def run_ingest_email_command(args: argparse.Namespace) -> int:
     return 0 if all(status in SUCCESS_STATUSES for status in statuses) else 1
 
 
-def ingest_email_payload(payload: dict[str, Any], state: StateManager) -> list[IngestResult]:
+def ingest_email_payload(payload: dict[str, Any], state: StateManager, scorer: Any | None = None) -> list[IngestResult]:
+    return asyncio.run(ingest_email_payload_async(payload, state, scorer=scorer or _ReviewOnlyScorer()))
+
+
+async def ingest_email_payload_async(payload: dict[str, Any], state: StateManager, scorer: Any | None = None) -> list[IngestResult]:
     normalized = validate_payload(payload)
     results: list[IngestResult] = []
+    scorer = scorer or _ReviewOnlyScorer()
 
     for index, job in enumerate(normalized["jobs"]):
-        job_id = _job_id(normalized["source_event_id"], job, index)
+        job_id = _resolve_job_id(state, normalized["source_event_id"], job, index)
         source_event_id = normalized["source_event_id"]
+        score, score_reason, flags, recommended_action = await _score_email_job(job, scorer)
         record = {
             "job_id": job_id,
             "source": "email",
@@ -71,11 +83,12 @@ def ingest_email_payload(payload: dict[str, Any], state: StateManager) -> list[I
             "location": job.get("location", ""),
             "url": job.get("apply_url") or "",
             "description": job.get("redacted_excerpt") or "",
-            "status": "discovered",
+            "status": _status_for_recommendation(recommended_action, job.get("lane", "review")),
             "discovered_at": normalized["received_at"],
-            "score": None,
-            "score_reason": "",
-            "flags": "email-origin,requires-review",
+            "score": score,
+            "score_reason": score_reason,
+            "flags": _merge_flags(flags, "email-origin"),
+            "recommended_action": recommended_action,
             "email_source": {
                 "source_event_id": source_event_id,
                 "provider": normalized["source"]["provider"],
@@ -203,7 +216,7 @@ def _required_str(mapping: dict[str, Any], field: str) -> str:
 
 
 def _job_id(source_event_id: str, job: dict[str, Any], index: int) -> str:
-    apply_url = job.get("apply_url", "").lower()
+    apply_url = _normalize_url_for_id(job.get("apply_url", ""))
     if apply_url:
         raw = "|".join(["email-url", apply_url])
     else:
@@ -215,6 +228,33 @@ def _job_id(source_event_id: str, job: dict[str, Any], index: int) -> str:
             job["company"].lower(),
         ])
     return f"email:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _resolve_job_id(state: StateManager, source_event_id: str, job: dict[str, Any], index: int) -> str:
+    legacy_id = _legacy_job_id(source_event_id, job, index)
+    if hasattr(state, "get_job") and state.get_job(legacy_id):
+        return legacy_id
+    return _job_id(source_event_id, job, index)
+
+
+def _legacy_job_id(source_event_id: str, job: dict[str, Any], index: int) -> str:
+    raw = "|".join([
+        source_event_id,
+        str(index),
+        job["title"].lower(),
+        job["company"].lower(),
+        job.get("apply_url", "").lower(),
+    ])
+    return f"email:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _normalize_url_for_id(value: str) -> str:
+    if not value:
+        return ""
+    parsed = urllib.parse.urlparse(value)
+    netloc = parsed.netloc.lower()
+    normalized = parsed._replace(scheme=parsed.scheme.lower(), netloc=netloc, fragment="")
+    return urllib.parse.urlunparse(normalized)
 
 
 def _redacted(value: Any) -> str:
@@ -250,3 +290,42 @@ def _emit(payload: dict[str, Any]) -> None:
 
 class ValidationError(ValueError):
     pass
+
+
+class _ReviewOnlyScorer:
+    async def score(self, job: dict[str, Any]) -> tuple[int, str, str, str]:
+        return 50, "Email-origin lead queued for review without live scorer.", "FLAG_FOR_REVIEW", "review"
+
+
+async def _score_email_job(job: dict[str, Any], scorer: Any) -> tuple[int, str, str, str]:
+    score_input = {
+        "source": "email",
+        "title": job["title"],
+        "company": job["company"],
+        "location": job.get("location", ""),
+        "url": job.get("apply_url", ""),
+        "description": job.get("redacted_excerpt", ""),
+    }
+    result = scorer.score(score_input)
+    if hasattr(result, "__await__"):
+        result = await result
+    score, reason, flags, action = result
+    return int(score), str(reason or ""), str(flags or ""), str(action or "review")
+
+
+def _status_for_recommendation(recommended_action: str, lane: str) -> str:
+    if recommended_action == "skip":
+        return "skipped"
+    return "discovered"
+
+
+def _merge_flags(*flags: str) -> str:
+    parts: list[str] = []
+    for group in flags:
+        for flag in str(group or "").split(","):
+            normalized = flag.strip()
+            if normalized and normalized not in parts:
+                parts.append(normalized)
+    if "requires-review" not in parts:
+        parts.append("requires-review")
+    return ",".join(parts)
