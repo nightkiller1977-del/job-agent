@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import io
 import json
 import sqlite3
@@ -62,6 +63,49 @@ def test_duplicate_source_event_and_job_returns_duplicate_without_second_row(tem
 
     assert first[0].status == "inserted"
     assert second[0].status == "duplicate"
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert count == 1
+
+
+def test_duplicate_email_across_accounts_and_folders_uses_apply_url_idempotency(temp_db):
+    state = StateManager(temp_db)
+    original = _payload()
+    forwarded = _payload(
+        source_event_id="icloud-mail-mcp:other:<forwarded@example.com>",
+        source={
+            "provider": "icloud-mail-mcp",
+            "account": "other-account",
+            "message_id": "icloud-mail-mcp:other:<forwarded@example.com>",
+            "content_hash": "different-email-copy",
+        },
+    )
+
+    first = ingest_email_payload(original, state)
+    second = ingest_email_payload(forwarded, state)
+
+    assert first[0].status == "inserted"
+    assert second[0].status == "duplicate"
+    assert first[0].job_id == second[0].job_id
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert count == 1
+
+
+def test_sqlite_contention_duplicate_ingests_create_one_job(temp_db):
+    payload = _payload()
+
+    def ingest_once():
+        state = StateManager(temp_db)
+        try:
+            return ingest_email_payload(payload, state)[0].status
+        finally:
+            state.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = sorted(executor.map(lambda _: ingest_once(), range(2)))
+
+    assert statuses == ["duplicate", "inserted"]
     with sqlite3.connect(temp_db) as conn:
         count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     assert count == 1
