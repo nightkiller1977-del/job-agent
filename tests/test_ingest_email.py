@@ -160,6 +160,8 @@ def test_existing_legacy_email_id_is_reused_without_duplicate_row(temp_db):
 
 def test_sqlite_contention_duplicate_ingests_create_one_job(temp_db):
     payload = _payload()
+    initial_state = StateManager(temp_db)
+    initial_state.close()
 
     def ingest_once():
         state = StateManager(temp_db)
