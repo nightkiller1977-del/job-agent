@@ -18,6 +18,7 @@ Usage:
   python src/main.py prune --max-age-days 14   # Use a shorter staleness window
   python src/main.py prune --dry-run           # Preview what would be pruned without changing anything
   python src/main.py reset-failures --reason keyword-validation --dry-run
+  python src/main.py ingest-email --json-stdin  # Ingest redacted email-origin job leads from stdin
 """
 from __future__ import annotations
 
@@ -364,6 +365,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show how many jobs would be reset without changing the database",
     )
 
+    # ingest-email
+    ingest_email_parser = subparsers.add_parser(
+        "ingest-email",
+        help="Ingest redacted email-origin job leads from a JSON payload on stdin",
+    )
+    ingest_email_parser.add_argument(
+        "--json-stdin",
+        action="store_true",
+        help="Read one validated JSON payload from stdin",
+    )
+    ingest_email_parser.add_argument(
+        "--db-path",
+        default=_db_path_from_config(),
+        help="SQLite jobs database path (default: configured state_db_path or state/jobs.db)",
+    )
+
     # commander
     commander_parser = subparsers.add_parser(
         "commander",
@@ -455,6 +472,10 @@ async def main_async(args: argparse.Namespace) -> int:
         from src.answers.unanswered_tracker import tracker
         tracker.display_table()
         return 0
+
+    if args.command == "ingest-email":
+        from src.ingest_email import run_ingest_email_command
+        return run_ingest_email_command(args)
 
     from src.orchestrator import Orchestrator
 
