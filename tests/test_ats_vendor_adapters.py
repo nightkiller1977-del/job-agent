@@ -222,11 +222,32 @@ async def test_ashby_unanswered_question_is_left_alone():
 
 @pytest.mark.asyncio
 async def test_ashby_multistep_wizard_advances_then_submits():
-    """Step 1 has no submit control (forces a Next click); step 2 does."""
+    """Step 1 has no submit control (forces a Next click); step 2 does. The loop
+    probes for a Next/Continue control on every step -- including step 2, where
+    it correctly finds none and falls through to the real submit -- so
+    next_click_count is 2 (one successful advance + one correctly-failed probe
+    on the final step), even though only one real Next click ever happens."""
     page = FakeAshbyPage(steps=[set(), {ASHBY_SUBMIT_SEL}], receipt="t:thank you for applying")
     res = await _ashby_adapter().apply(_ashby_ctx(page, auto_submit=True))
 
-    assert page.next_click_count == 1
+    assert page.next_click_count == 2
+    assert ASHBY_SUBMIT_SEL in page.clicks
+    assert res.submitted is True and res.verified is True and res.status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_ashby_next_button_matching_submit_selector_does_not_end_wizard_early():
+    """Regression: an intermediate step's Next/Continue button is commonly
+    type="submit" too, which matches SELECTORS["ashby"]["submit_button"]. Step 1
+    "presents" that selector (modeling the Next button sharing it) but is NOT
+    the final step -- the loop must still advance via _click_next rather than
+    mistaking it for the final submit and skipping step 2's fields."""
+    page = FakeAshbyPage(steps=[{ASHBY_SUBMIT_SEL}, {ASHBY_SUBMIT_SEL}],
+                          receipt="t:thank you for applying")
+    res = await _ashby_adapter().apply(_ashby_ctx(page, auto_submit=True))
+
+    # One successful advance off step 1, one correctly-failed probe on step 2.
+    assert page.next_click_count == 2
     assert ASHBY_SUBMIT_SEL in page.clicks
     assert res.submitted is True and res.verified is True and res.status == "applied"
 
@@ -725,6 +746,25 @@ async def test_lever_eeo_select_decline_maps_to_decline_worded_option():
     await LeverAdapter().apply(ctx)
 
     assert page.selected.get("#eeo-gender") == "3"
+
+
+def test_lever_match_eeo_option_no_match_returns_none_not_decline():
+    """Regression: a non-decline answer with no exact word-boundary match must
+    return None (leave the field unanswered), never silently fall through to a
+    decline-worded option -- e.g. a profile answer of "Onsite" against an
+    option worded "On-site" (hyphen breaks the word-boundary match), which
+    would otherwise select "Prefer not to answer" and submit information
+    different from the profile. Calls _match_eeo_option directly since
+    AnswerBank._format_disclosure has its own, separate decline-fallback for
+    genuinely-unmatched EEO keywords that would otherwise mask this bug."""
+    options = [
+        {"value": "1", "text": "On-site"},
+        {"value": "2", "text": "Hybrid"},
+        {"value": "3", "text": "Remote"},
+        {"value": "4", "text": "Prefer not to answer"},
+    ]
+
+    assert LeverAdapter()._match_eeo_option("Onsite", options) is None
 
 
 @pytest.mark.asyncio

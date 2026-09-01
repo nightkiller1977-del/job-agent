@@ -276,13 +276,21 @@ class AshbyAdapter(GenericAtsAdapter):
             for q in await self._answer_questions(page, ctx):
                 ev.add_field(f"q:{q}")
 
+            # Check for a Next/Continue control BEFORE the submit selector: an
+            # intermediate step's Next/Continue button is commonly type="submit"
+            # too (a plain HTML-forms pattern), which would otherwise match
+            # SELECTORS["ashby"]["submit_button"] and make the loop stop here,
+            # treating step-advancement as the final application submission and
+            # skipping every field on the steps after it.
+            if await self._click_next(page):
+                if self._step_delay:
+                    await asyncio.sleep(self._step_delay)
+                continue
+
             _, submit_el = await self._first_selector(page, submit_selectors)
             if submit_el:
                 break
-            if not await self._click_next(page):
-                break
-            if self._step_delay:
-                await asyncio.sleep(self._step_delay)
+            break
 
         # 3. Shared policy-gated submit + receipt verification (Ashby-augmented).
         return await self._gated_submit(page, ctx, submit_selectors, ev, "ashby")

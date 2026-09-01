@@ -160,7 +160,13 @@ class LeverAdapter(GenericAtsAdapter):
             for opt in options:
                 if pattern.search(opt.get("text") or ""):
                     return opt
-        # Decline (or no direct keyword match) -> fall back to a decline-worded option.
+            # A non-decline answer with no exact word-boundary match must NOT
+            # fall back to decline -- e.g. "Onsite" vs an option worded
+            # "On-site", or "Male" vs "Man", would otherwise silently select
+            # "Prefer not to answer" and submit information different from
+            # the profile. Leave the field unanswered instead.
+            return None
+        # Decline -> fall back to a decline-worded option.
         for opt in options:
             text = (opt.get("text") or "").lower()
             if any(s in text for s in _DECLINE_SYNONYMS):
