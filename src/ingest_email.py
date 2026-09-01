@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sqlite3
 import sys
 import urllib.parse
 from dataclasses import dataclass
@@ -90,6 +91,21 @@ def ingest_email_payload(payload: dict[str, Any], state: StateManager) -> list[I
 
         try:
             inserted = state.upsert_job(record)
+        except sqlite3.IntegrityError as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                results.append(IngestResult(
+                    status="duplicate",
+                    job_id=job_id,
+                    source_event_id=source_event_id,
+                ))
+                continue
+            results.append(IngestResult(
+                status="failed",
+                job_id=job_id,
+                source_event_id=source_event_id,
+                reason=str(exc),
+            ))
+            continue
         except Exception as exc:
             results.append(IngestResult(
                 status="failed",
@@ -187,13 +203,17 @@ def _required_str(mapping: dict[str, Any], field: str) -> str:
 
 
 def _job_id(source_event_id: str, job: dict[str, Any], index: int) -> str:
-    raw = "|".join([
-        source_event_id,
-        str(index),
-        job["title"].lower(),
-        job["company"].lower(),
-        job.get("apply_url", "").lower(),
-    ])
+    apply_url = job.get("apply_url", "").lower()
+    if apply_url:
+        raw = "|".join(["email-url", apply_url])
+    else:
+        raw = "|".join([
+            "email-review",
+            source_event_id,
+            str(index),
+            job["title"].lower(),
+            job["company"].lower(),
+        ])
     return f"email:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
 
 
