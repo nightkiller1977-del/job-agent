@@ -596,7 +596,12 @@ class TestReauthHuman:
             result = await mgr._reauth_human("usajobs", "2FA required", timeout_minutes=30)
 
         assert result is False
-        mock_desktop.assert_not_called()
+        assert mock_desktop.call_count == 1
+        title, message = mock_desktop.call_args.args[:2]
+        assert title == "usajobs session needs refresh"
+        assert "Tap to open Terminal and refresh" in message
+        assert "+13055551234" not in title
+        assert "+13055551234" not in message
         data = json.loads((tmp_path / "status.json").read_text())
         detail = data["alerts"][-1]["detail"]
         assert "+13055551234" not in detail
