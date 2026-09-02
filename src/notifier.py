@@ -41,31 +41,56 @@ def _sanitize_notification_text(value: str) -> str:
     text = str(value or "")
     home = str(Path.home())
     if home and home != "/":
+        terminal_delimiters = ".,;:!?)]}'\"`>"
+        protected_tokens: list[str] = []
+
+        def protect_token(match: re.Match) -> str:
+            protected_tokens.append(match.group(0))
+            return f"__JOB_AGENT_HOME_TOKEN_{len(protected_tokens) - 1}__"
+
+        spaced_sibling = rf"{re.escape(home)}(?:\s+[^\s{re.escape(terminal_delimiters)}/]+)+/[^\s{re.escape(terminal_delimiters)}]*"
+        text = re.sub(spaced_sibling, protect_token, text)
+
+        def quoted_token_end(start: int) -> int | None:
+            token_start = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start), text.rfind("\t", 0, start)) + 1
+            prefix = text[token_start:start]
+            opener = prefix[-1:] if prefix else ""
+            if opener not in "'\"`":
+                for wrapper in ("PosixPath(", "Path("):
+                    wrapped = prefix.rfind(wrapper)
+                    if wrapped >= 0 and len(prefix) > wrapped + len(wrapper):
+                        candidate = prefix[wrapped + len(wrapper)]
+                        if candidate in "'\"`":
+                            opener = candidate
+                            break
+            if opener not in "'\"`":
+                return None
+            closing = text.find(opener, start)
+            return closing if closing >= 0 else None
+
+        def is_spaced_sibling_path(start: int, end: int) -> bool:
+            token_end = quoted_token_end(start)
+            if token_end is None:
+                token_end = len(text)
+                for pos in range(end + 1, len(text)):
+                    if text[pos] in terminal_delimiters:
+                        token_end = pos
+                        break
+            tail = text[end:token_end]
+            slash = tail.find("/")
+            return slash > 0 and not tail[slash - 1].isspace()
+
         def redact_home(match: re.Match) -> str:
             idx = match.end()
             if idx >= len(text):
                 return "~"
             nxt = text[idx]
-            if nxt == "/" or nxt.isspace():
-                if nxt.isspace():
-                    token_tail = text[idx + 1:]
-                    sibling_prefix = []
-                    saw_path_separator = False
-                    for ch in token_tail:
-                        if ch == "/":
-                            saw_path_separator = True
-                            break
-                        if ch in ".,;:!?)]}'\"`>":
-                            break
-                        sibling_prefix.append(ch)
-                    if saw_path_separator and not re.search(
-                        r"\b(?:is|are|was|were|from|to|in|at|with|and|or|but|distinct)\b",
-                        "".join(sibling_prefix),
-                        re.IGNORECASE,
-                    ):
-                        return match.group(0)
+            if nxt == "/":
                 return "~"
-            terminal_delimiters = ".,;:!?)]}'\"`>"
+            if nxt.isspace():
+                if is_spaced_sibling_path(match.start(), idx):
+                    return match.group(0)
+                return "~"
             if nxt in terminal_delimiters and (
                 idx + 1 >= len(text)
                 or text[idx + 1].isspace()
@@ -75,6 +100,8 @@ def _sanitize_notification_text(value: str) -> str:
             return match.group(0)
 
         text = re.sub(rf"(?<![\w/.-]){re.escape(home)}", redact_home, text)
+        for index, token in enumerate(protected_tokens):
+            text = text.replace(f"__JOB_AGENT_HOME_TOKEN_{index}__", token)
     text = re.sub(
         r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\d)",
         "[phone]",
