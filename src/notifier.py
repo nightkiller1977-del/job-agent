@@ -41,7 +41,27 @@ def _sanitize_notification_text(value: str) -> str:
     text = str(value or "")
     home = str(Path.home())
     if home and home != "/":
-        text = re.sub(rf"(?<![\w/.-]){re.escape(home)}(?=/|$)", "~", text)
+        def redact_home(match: re.Match) -> str:
+            idx = match.end()
+            if idx >= len(text):
+                return "~"
+            nxt = text[idx]
+            if nxt == "/" or nxt.isspace():
+                if nxt.isspace():
+                    token_tail = text[idx + 1:].split(maxsplit=1)[0]
+                    if "/" in token_tail:
+                        return match.group(0)
+                return "~"
+            terminal_delimiters = ".,;:!?)]}'\"`>"
+            if nxt in terminal_delimiters and (
+                idx + 1 >= len(text)
+                or text[idx + 1].isspace()
+                or text[idx + 1] in terminal_delimiters
+            ):
+                return "~"
+            return match.group(0)
+
+        text = re.sub(rf"(?<![\w/.-]){re.escape(home)}", redact_home, text)
     text = re.sub(
         r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\d)",
         "[phone]",
