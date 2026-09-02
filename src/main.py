@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import os
 import subprocess
 import sys
@@ -177,6 +178,17 @@ def _db_path_from_config() -> str:
             except Exception:
                 break
     return "state/jobs.db"
+
+
+def _load_config_from_project() -> dict:
+    config_path = project_root / "config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
 def _sources_in_apply_queue(company: str | None) -> list[str]:
@@ -474,8 +486,8 @@ async def main_async(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "ingest-email":
-        from src.ingest_email import run_ingest_email_command
-        return run_ingest_email_command(args)
+        from src.ingest_email import run_ingest_email_command_async
+        return await run_ingest_email_command_async(args, config=_load_config_from_project())
 
     from src.orchestrator import Orchestrator
 
