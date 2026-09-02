@@ -591,10 +591,12 @@ class TestReauthHuman:
         mgr = ReauthManager(config={})
         mgr.notify_phone = "+13055551234"
 
-        with patch("src.reauth._is_interactive", return_value=False):
+        with patch("src.reauth._is_interactive", return_value=False), \
+             patch("src.notifier._desktop_notify") as mock_desktop:
             result = await mgr._reauth_human("usajobs", "2FA required", timeout_minutes=30)
 
         assert result is False
+        mock_desktop.assert_not_called()
         data = json.loads((tmp_path / "status.json").read_text())
         detail = data["alerts"][-1]["detail"]
         assert "+13055551234" not in detail
