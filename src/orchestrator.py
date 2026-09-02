@@ -44,6 +44,7 @@ SOURCE_MAP = {
     "usajobs": USAJobsScraper,
     "indeed":   IndeedScraper,
     "external": JobrightScraper,   # legacy fallback for manually-pasted non-source URLs
+    "email": JobrightScraper,      # email-origin leads route through the external ATS flow
     "jobspy":   JobSpyScraper,
     "glassdoor": JobrightScraper,  # routes external apply
     "ziprecruiter": JobrightScraper,
