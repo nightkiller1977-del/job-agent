@@ -6,8 +6,9 @@ import sqlite3
 
 import pytest
 
-from src.ingest_email import ingest_email_payload, run_ingest_email_command
+from src.ingest_email import ingest_email_payload, run_ingest_email_command, run_ingest_email_command_async
 from src.ingest_email import _legacy_job_id
+from src.main import main_async
 from src.orchestrator import SOURCE_MAP
 from src.state_manager import StateManager
 
@@ -158,6 +159,37 @@ def test_existing_legacy_email_id_is_reused_without_duplicate_row(temp_db):
     assert count == 1
 
 
+def test_existing_legacy_email_url_is_reused_for_forwarded_copy(temp_db):
+    state = StateManager(temp_db)
+    original = _payload()
+    forwarded = _payload(
+        source_event_id="icloud-mail-mcp:other:<forwarded@example.com>",
+        source={
+            "provider": "icloud-mail-mcp",
+            "account": "other-account",
+            "message_id": "icloud-mail-mcp:other:<forwarded@example.com>",
+            "content_hash": "different-email-copy",
+        },
+    )
+    legacy_id = _legacy_job_id(original["source_event_id"], original["jobs"][0], 0)
+    assert state.upsert_job({
+        "job_id": legacy_id,
+        "source": "email",
+        "title": original["jobs"][0]["title"],
+        "company": original["jobs"][0]["company"],
+        "url": original["jobs"][0]["apply_url"],
+        "status": "discovered",
+    })
+
+    result = ingest_email_payload(forwarded, state, scorer=FixedScorer())[0]
+
+    assert result.status == "duplicate"
+    assert result.job_id == legacy_id
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert count == 1
+
+
 def test_sqlite_contention_duplicate_ingests_create_one_job(temp_db):
     payload = _payload()
     initial_state = StateManager(temp_db)
@@ -188,13 +220,34 @@ def test_sqlite_contention_duplicate_ingests_create_one_job(temp_db):
         (_payload(jobs=[{"title": "Role", "apply_url": "https://jobs.example.com/1"}]), "jobs[0].company is required"),
         (_payload(jobs=[{"title": "Role", "company": "Acme", "apply_url": "ftp://jobs.example.com/1"}]), "absolute http(s)"),
         (_payload(jobs=[{"title": "Role", "company": "Acme", "apply_url": "http://127.0.0.1/1"}]), "private or local"),
+        (_payload(jobs=[{"title": "Role", "company": "Acme", "apply_url": "http://[fd00::1]/1"}]), "private or local"),
+        (_payload(jobs=[{"title": "Role", "company": "Acme", "apply_url": "http://2130706433/1"}]), "private or local"),
+        (_payload(jobs=[{"title": "Role", "company": "Acme", "apply_url": "http://jobs.localhost/1"}]), "private or local"),
         (_payload(jobs=[{"title": "Role", "company": "Acme", "apply_url": "https://click.example.com/1"}]), "tracking"),
+        (_payload(received_at={"bad": "date"}), "received_at must be an ISO-8601 string"),
+        (_payload(received_at="not-a-date"), "received_at must be an ISO-8601 string"),
     ],
 )
 def test_validation_rejects_missing_identity_and_invalid_urls(temp_db, payload, error):
     with pytest.raises(ValueError) as exc:
         ingest_email_payload(payload, StateManager(temp_db))
     assert error in str(exc.value)
+
+
+def test_validation_allows_legitimate_clickhouse_hostname(temp_db):
+    state = StateManager(temp_db)
+    payload = _payload(jobs=[{
+        "title": "Database Engineering Manager",
+        "company": "ClickHouse",
+        "location": "Remote",
+        "apply_url": "https://careers.clickhouse.com/roles/EngineeringManager",
+        "redacted_excerpt": "Database Engineering Manager at ClickHouse",
+        "lane": "job-agent-review",
+    }])
+
+    result = ingest_email_payload(payload, state, scorer=FixedScorer())[0]
+
+    assert result.status == "inserted"
 
 
 def test_no_url_recruiter_review_lane_is_valid_and_not_approved(temp_db):
@@ -258,6 +311,42 @@ def test_command_reads_json_from_stdin_and_returns_status(monkeypatch, capsys, t
     assert output["results"][0]["status"] == "inserted"
 
 
+@pytest.mark.asyncio
+async def test_async_command_runs_inside_existing_event_loop(monkeypatch, capsys, temp_db):
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_payload())))
+    args = argparse.Namespace(json_stdin=True, db_path=temp_db)
+
+    code = await run_ingest_email_command_async(args, scorer=FixedScorer())
+
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_main_async_ingest_email_uses_real_cli_boundary(monkeypatch, capsys, temp_db):
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_payload())))
+    monkeypatch.setattr("src.ingest_email.JobScorer", ConfigAwareFixedScorer)
+
+    code = await main_async(argparse.Namespace(command="ingest-email", json_stdin=True, db_path=temp_db))
+
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_command_classifies_malformed_json_as_invalid(monkeypatch, capsys, temp_db):
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"source_event_id":'))
+    args = argparse.Namespace(json_stdin=True, db_path=temp_db)
+
+    code = await run_ingest_email_command_async(args, scorer=FixedScorer())
+
+    assert code == 2
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "invalid"
+
+
 def test_command_rejects_missing_json_stdin(capsys, temp_db):
     code = run_ingest_email_command(argparse.Namespace(json_stdin=False, db_path=temp_db))
 
@@ -272,3 +361,9 @@ class FixedScorer:
 
     async def score(self, job):
         return self.result
+
+
+class ConfigAwareFixedScorer(FixedScorer):
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config or {}

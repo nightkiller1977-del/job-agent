@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import sqlite3
 import sys
@@ -35,18 +36,29 @@ class IngestResult:
         }.items() if v is not None}
 
 
-def run_ingest_email_command(args: argparse.Namespace) -> int:
+def run_ingest_email_command(args: argparse.Namespace, config: dict[str, Any] | None = None, scorer: Any | None = None) -> int:
+    return asyncio.run(run_ingest_email_command_async(args, config=config, scorer=scorer))
+
+
+async def run_ingest_email_command_async(
+    args: argparse.Namespace,
+    config: dict[str, Any] | None = None,
+    scorer: Any | None = None,
+) -> int:
     if not getattr(args, "json_stdin", False):
         _emit({"status": "invalid", "reason": "ingest-email requires --json-stdin"})
         return 2
 
     try:
         payload = json.load(sys.stdin)
-        results = asyncio.run(ingest_email_payload_async(
+        results = await ingest_email_payload_async(
             payload,
             state=StateManager(args.db_path),
-            scorer=JobScorer(),
-        ))
+            scorer=scorer or JobScorer(config=config or {}),
+        )
+    except json.JSONDecodeError as exc:
+        _emit({"status": "invalid", "reason": str(exc)})
+        return 2
     except ValidationError as exc:
         _emit({"status": "invalid", "reason": str(exc)})
         return 2
@@ -142,7 +154,7 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValidationError("payload must be a JSON object")
 
     source_event_id = _required_str(payload, "source_event_id")
-    received_at = payload.get("received_at") or _now()
+    received_at = _validate_received_at(payload.get("received_at") or _now())
     source = _validate_source(payload.get("source"))
     jobs = payload.get("jobs")
     if not isinstance(jobs, list) or not jobs:
@@ -150,7 +162,7 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "source_event_id": source_event_id,
-        "received_at": str(received_at),
+        "received_at": received_at,
         "source": source,
         "jobs": [_validate_job(job, i) for i, job in enumerate(jobs)],
     }
@@ -234,7 +246,28 @@ def _resolve_job_id(state: StateManager, source_event_id: str, job: dict[str, An
     legacy_id = _legacy_job_id(source_event_id, job, index)
     if hasattr(state, "get_job") and state.get_job(legacy_id):
         return legacy_id
+    existing_url_id = _existing_email_job_id_by_url(state, job.get("apply_url", ""))
+    if existing_url_id:
+        return existing_url_id
     return _job_id(source_event_id, job, index)
+
+
+def _existing_email_job_id_by_url(state: StateManager, apply_url: str) -> str | None:
+    normalized_apply_url = _normalize_url_for_id(apply_url)
+    if not normalized_apply_url or not hasattr(state, "_connect"):
+        return None
+    try:
+        with state._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, url FROM jobs WHERE source = ? AND COALESCE(url, '') != ''",
+                ("email",),
+            ).fetchall()
+    except Exception:
+        return None
+    for row in rows:
+        if _normalize_url_for_id(row["url"]) == normalized_apply_url:
+            return row["job_id"]
+    return None
 
 
 def _legacy_job_id(source_event_id: str, job: dict[str, Any], index: int) -> str:
@@ -265,19 +298,37 @@ def _redacted(value: Any) -> str:
 
 def _is_private_or_local_host(host: str) -> bool:
     h = host.lower()
-    return (
-        h in {"localhost", "0.0.0.0", "::1"}
-        or h.startswith("127.")
-        or h.startswith("10.")
-        or h.startswith("192.168.")
-        or any(h.startswith(f"172.{i}.") for i in range(16, 32))
-        or h.startswith("169.254.")
-    )
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(h)
+    except ValueError:
+        try:
+            address = ipaddress.ip_address(int(h, 0))
+        except (ValueError, TypeError):
+            return False
+    if getattr(address, "ipv4_mapped", None):
+        address = address.ipv4_mapped
+    return not address.is_global
 
 
 def _looks_tracking_host(host: str) -> bool:
     h = host.lower()
-    return "click" in h or "redirect" in h or h.startswith("trk.") or ".trk." in h or h.startswith("tracking.") or ".tracking." in h
+    labels = [label for label in h.split(".") if label]
+    return any(label in {"trk", "tracking", "click", "redirect"} for label in labels)
+
+
+def _validate_received_at(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("received_at must be an ISO-8601 string")
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValidationError("received_at must be an ISO-8601 string") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _now() -> str:
