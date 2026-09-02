@@ -581,6 +581,26 @@ class TestReauthHuman:
         assert "skipped_noninteractive" in outcomes
         assert "timeout" not in outcomes
 
+    @pytest.mark.asyncio
+    async def test_noninteractive_warning_does_not_include_phone_number(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.setattr("src.reauth.SESSIONS_DIR", tmp_path)
+        monkeypatch.setattr("src.reauth._send_imessage", lambda phone, msg: None)
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+        mgr.notify_phone = "+13055551234"
+
+        with patch("src.reauth._is_interactive", return_value=False):
+            result = await mgr._reauth_human("usajobs", "2FA required", timeout_minutes=30)
+
+        assert result is False
+        data = json.loads((tmp_path / "status.json").read_text())
+        detail = data["alerts"][-1]["detail"]
+        assert "+13055551234" not in detail
+        assert "[phone]" not in detail
+        assert "Auth refresh instructions were sent" in detail
+
 
 # ── _write_regression_test & _notify_correction ────────────────────────────────
 
