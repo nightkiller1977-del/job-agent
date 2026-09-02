@@ -6,8 +6,7 @@ import sqlite3
 
 import pytest
 
-from src.ingest_email import ingest_email_payload, run_ingest_email_command, run_ingest_email_command_async
-from src.ingest_email import _legacy_job_id
+from src.ingest_email import _legacy_job_id, ingest_email_payload, run_ingest_email_command, run_ingest_email_command_async
 from src.main import main_async
 from src.orchestrator import SOURCE_MAP
 from src.state_manager import StateManager
@@ -69,8 +68,8 @@ def test_email_source_routes_to_external_ats_apply_path():
 
 def test_duplicate_source_event_and_job_returns_duplicate_without_second_row(temp_db):
     state = StateManager(temp_db)
-    first = ingest_email_payload(_payload(), state)
-    second = ingest_email_payload(_payload(), state)
+    first = ingest_email_payload(_payload(), state, scorer=FixedScorer())
+    second = ingest_email_payload(_payload(), state, scorer=FixedScorer())
 
     assert first[0].status == "inserted"
     assert second[0].status == "duplicate"
