@@ -206,10 +206,14 @@ def _validate_job(job: Any, index: int) -> dict[str, Any]:
 
 
 def _validate_apply_url(value: str) -> urllib.parse.ParseResult:
-    parsed = urllib.parse.urlparse(value)
+    try:
+        parsed = urllib.parse.urlparse(value)
+        host = parsed.hostname or ""
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValidationError("apply_url must be an absolute http(s) URL") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValidationError("apply_url must be an absolute http(s) URL")
-    host = parsed.hostname or ""
     if _is_private_or_local_host(host):
         raise ValidationError("apply_url must not point to a private or local host")
     if _looks_tracking_host(host):
@@ -297,19 +301,55 @@ def _redacted(value: Any) -> str:
 
 
 def _is_private_or_local_host(host: str) -> bool:
-    h = host.lower()
+    h = host.lower().rstrip(".")
     if h == "localhost" or h.endswith(".localhost"):
         return True
     try:
         address = ipaddress.ip_address(h)
     except ValueError:
-        try:
-            address = ipaddress.ip_address(int(h, 0))
-        except (ValueError, TypeError):
+        address = _parse_legacy_ipv4_host(h)
+        if address is None:
             return False
     if getattr(address, "ipv4_mapped", None):
         address = address.ipv4_mapped
     return not address.is_global
+
+
+def _parse_legacy_ipv4_host(host: str) -> ipaddress.IPv4Address | None:
+    parts = host.split(".")
+    if not 1 <= len(parts) <= 4 or any(part == "" for part in parts):
+        return None
+    try:
+        numbers = [_parse_legacy_ipv4_part(part) for part in parts]
+    except ValueError:
+        return None
+
+    if len(numbers) == 1:
+        if numbers[0] > 0xFFFFFFFF:
+            return None
+        value = numbers[0]
+    elif len(numbers) == 2:
+        if numbers[0] > 0xFF or numbers[1] > 0xFFFFFF:
+            return None
+        value = (numbers[0] << 24) | numbers[1]
+    elif len(numbers) == 3:
+        if numbers[0] > 0xFF or numbers[1] > 0xFF or numbers[2] > 0xFFFF:
+            return None
+        value = (numbers[0] << 24) | (numbers[1] << 16) | numbers[2]
+    else:
+        if any(number > 0xFF for number in numbers):
+            return None
+        value = (numbers[0] << 24) | (numbers[1] << 16) | (numbers[2] << 8) | numbers[3]
+
+    return ipaddress.IPv4Address(value)
+
+
+def _parse_legacy_ipv4_part(part: str) -> int:
+    if part.lower().startswith("0x"):
+        return int(part[2:], 16)
+    if len(part) > 1 and part.startswith("0"):
+        return int(part[1:] or "0", 8)
+    return int(part, 10)
 
 
 def _looks_tracking_host(host: str) -> bool:
