@@ -48,7 +48,7 @@ def _sanitize_notification_text(value: str) -> str:
             protected_tokens.append(match.group(0))
             return f"__JOB_AGENT_HOME_TOKEN_{len(protected_tokens) - 1}__"
 
-        spaced_sibling = rf"{re.escape(home)}\s+[^\s/=\"'`<>]+/[^\s\"'`<>]*"
+        spaced_sibling = rf"{re.escape(home)}[ \t]+[^\s/=\"'`<>]+/[^\s\"'`<>]*"
         text = re.sub(spaced_sibling, protect_token, text)
 
         def quoted_token_end(start: int) -> int | None:
