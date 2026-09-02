@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,19 @@ def _save_status(data: dict) -> None:
 import time
 
 _last_notification_times: dict[str, float] = {}
+
+
+def _sanitize_notification_text(value: str) -> str:
+    text = str(value or "")
+    home = str(Path.home())
+    if home and home != "/":
+        text = text.replace(home, "~")
+    text = re.sub(
+        r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\d)",
+        "[phone]",
+        text,
+    )
+    return text
 
 def _load_telegram_config() -> tuple[str, str]:
     """Load Telegram bot token and chat ID.
@@ -78,6 +92,7 @@ def _load_telegram_config() -> tuple[str, str]:
 def _send_telegram(message: str) -> None:
     """Send a Telegram message. Silently does nothing if not configured."""
     try:
+        message = _sanitize_notification_text(message)
         token, chat_id = _load_telegram_config()
         if not token or not chat_id:
             return
@@ -95,6 +110,9 @@ def _send_telegram(message: str) -> None:
 def _desktop_notify(title: str, message: str, subtitle: str = "Job Agent") -> None:
     """Fire a native desktop notification with rate limiting (macOS and Linux)."""
     import sys
+    title = _sanitize_notification_text(title)
+    message = _sanitize_notification_text(message)
+    subtitle = _sanitize_notification_text(subtitle)
     now = time.time()
     cache_key = f"{title}:{message}"
     last_time = _last_notification_times.get(cache_key, 0)
@@ -121,6 +139,8 @@ def _desktop_notify(title: str, message: str, subtitle: str = "Job Agent") -> No
 
 
 def _add_alert(level: str, title: str, detail: str) -> None:
+    title = _sanitize_notification_text(title)
+    detail = _sanitize_notification_text(detail)
     status = _load_status()
     status.setdefault("alerts", [])
     status["last_run"] = datetime.utcnow().isoformat()
@@ -139,6 +159,8 @@ def _add_alert(level: str, title: str, detail: str) -> None:
 
 def notify_error(title: str, detail: str = "") -> None:
     """Signal a hard failure — missing credentials, crash, etc."""
+    title = _sanitize_notification_text(title)
+    detail = _sanitize_notification_text(detail)
     _add_alert("error", title, detail)
 
     # Send to Telegram (rate limited by caching key)
@@ -154,6 +176,8 @@ def notify_error(title: str, detail: str = "") -> None:
 
 def notify_warning(title: str, detail: str = "") -> None:
     """Signal something degraded but not fatal — login retry, skipped job."""
+    title = _sanitize_notification_text(title)
+    detail = _sanitize_notification_text(detail)
     _add_alert("warning", title, detail)
 
     # Send to Telegram (rate limited by caching key)
@@ -169,6 +193,8 @@ def notify_warning(title: str, detail: str = "") -> None:
 
 def notify_success(title: str, detail: str = "") -> None:
     """Signal a successful application submission."""
+    title = _sanitize_notification_text(title)
+    detail = _sanitize_notification_text(detail)
     _add_alert("success", title, detail)
     _send_telegram(f"✅ [Job Agent SUCCESS] {title}\nDetail: {detail}")
     _desktop_notify(f"✅ {title}", detail or title, subtitle="Job Agent")
@@ -176,6 +202,8 @@ def notify_success(title: str, detail: str = "") -> None:
 
 def notify_info(title: str, detail: str = "") -> None:
     """Informational — run started, jobs discovered, etc."""
+    title = _sanitize_notification_text(title)
+    detail = _sanitize_notification_text(detail)
     _add_alert("info", title, detail)
     # Don't fire a macOS popup or Telegram for info — just write to status file
 
