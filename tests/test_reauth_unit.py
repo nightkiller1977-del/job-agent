@@ -586,12 +586,16 @@ class TestReauthHuman:
         monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
         monkeypatch.setattr("src.reauth.SESSIONS_DIR", tmp_path)
         monkeypatch.setattr("src.reauth._send_imessage", lambda phone, msg: None)
+        from src import notifier
+        notifier._last_notification_times.clear()
 
         from src.reauth import ReauthManager
         mgr = ReauthManager(config={})
         mgr.notify_phone = "+13055551234"
 
         with patch("src.reauth._is_interactive", return_value=False), \
+             patch("src.notifier._send_telegram"), \
+             patch("src.session_watchdog._stage_prepare_sessions", return_value=True), \
              patch("src.notifier._desktop_notify") as mock_desktop:
             result = await mgr._reauth_human("usajobs", "2FA required", timeout_minutes=30)
 
@@ -607,6 +611,20 @@ class TestReauthHuman:
         assert "+13055551234" not in detail
         assert "[phone]" not in detail
         assert "Auth refresh instructions were sent" in detail
+
+    def test_missing_imessage_phone_records_without_desktop_popup(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src import reauth
+
+        desktop = []
+        monkeypatch.setattr("src.notifier._desktop_notify", lambda *args, **kwargs: desktop.append(args))
+        monkeypatch.setattr("src.notifier._send_telegram", lambda *args, **kwargs: None)
+
+        reauth._send_imessage("", "prepare-sessions")
+
+        assert desktop == []
+        data = json.loads((tmp_path / "status.json").read_text())
+        assert data["alerts"][-1]["title"] == "iMessage not configured"
 
 
 # ── _write_regression_test & _notify_correction ────────────────────────────────

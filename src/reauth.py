@@ -391,6 +391,7 @@ def _send_imessage(phone: str, message: str) -> None:
         notify_warning(
             "iMessage not configured",
             "Set NOTIFY_PHONE in .env to receive auth alerts via iMessage",
+            desktop=False,
         )
         return
 
