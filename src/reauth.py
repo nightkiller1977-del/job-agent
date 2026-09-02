@@ -29,7 +29,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from .sources.base import SESSIONS_DIR
-from .notifier import notify_error, notify_info, notify_success, notify_warning, record_reauth_event, _desktop_notify
+from .notifier import notify_error, notify_info, notify_success, notify_warning, record_reauth_event
 
 _log = logging.getLogger(__name__)
 
@@ -284,14 +284,16 @@ class ReauthManager:
             )
             notify_warning(
                 f"{source} session expired — action needed",
-                f"iMessage sent to {self.notify_phone or 'N/A'}. Skipping this source in the "
-                f"background run; it will retry once you refresh the session.",
+                "Auth refresh instructions were sent. Skipping this source in the background "
+                "run; it will retry once you refresh the session.",
+                desktop=False,
             )
             return False
 
         notify_warning(
             f"{source} session expired — action needed",
-            f"iMessage sent to {self.notify_phone or 'N/A'}. Waiting up to {timeout_minutes} min for refresh.",
+            f"Auth refresh instructions were sent. Waiting up to {timeout_minutes} min for refresh.",
+            desktop=False,
         )
 
         deadline = time.monotonic() + timeout_minutes * 60
@@ -385,9 +387,6 @@ async def test_regression_{source}_{ts_slug}():
 # ------------------------------------------------------------------
 
 def _send_imessage(phone: str, message: str) -> None:
-    # Always fire a macOS notification as a fallback regardless of iMessage success
-    _desktop_notify("Job Agent — Auth Required", message[:200], subtitle="Action Needed")
-
     if not phone:
         notify_warning(
             "iMessage not configured",
