@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import sqlite3
 import sys
 import urllib.parse
 from dataclasses import dataclass
@@ -83,7 +84,7 @@ async def ingest_email_payload_async(payload: dict[str, Any], state: StateManage
     scorer = scorer or _ReviewOnlyScorer()
 
     for index, job in enumerate(normalized["jobs"]):
-        job_id = _job_id(normalized["source_event_id"], job, index)
+        job_id = _resolve_job_id(state, normalized["source_event_id"], job, index)
         source_event_id = normalized["source_event_id"]
         score, score_reason, flags, recommended_action = await _score_email_job(job, scorer)
         record = {
@@ -115,6 +116,21 @@ async def ingest_email_payload_async(payload: dict[str, Any], state: StateManage
 
         try:
             inserted = state.upsert_job(record)
+        except sqlite3.IntegrityError as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                results.append(IngestResult(
+                    status="duplicate",
+                    job_id=job_id,
+                    source_event_id=source_event_id,
+                ))
+                continue
+            results.append(IngestResult(
+                status="failed",
+                job_id=job_id,
+                source_event_id=source_event_id,
+                reason=str(exc),
+            ))
+            continue
         except Exception as exc:
             results.append(IngestResult(
                 status="failed",
@@ -216,6 +232,49 @@ def _required_str(mapping: dict[str, Any], field: str) -> str:
 
 
 def _job_id(source_event_id: str, job: dict[str, Any], index: int) -> str:
+    apply_url = _normalize_url_for_id(job.get("apply_url", ""))
+    if apply_url:
+        raw = "|".join(["email-url", apply_url])
+    else:
+        raw = "|".join([
+            "email-review",
+            source_event_id,
+            str(index),
+            job["title"].lower(),
+            job["company"].lower(),
+        ])
+    return f"email:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _resolve_job_id(state: StateManager, source_event_id: str, job: dict[str, Any], index: int) -> str:
+    legacy_id = _legacy_job_id(source_event_id, job, index)
+    if hasattr(state, "get_job") and state.get_job(legacy_id):
+        return legacy_id
+    existing_url_id = _existing_email_job_id_by_url(state, job.get("apply_url", ""))
+    if existing_url_id:
+        return existing_url_id
+    return _job_id(source_event_id, job, index)
+
+
+def _existing_email_job_id_by_url(state: StateManager, apply_url: str) -> str | None:
+    normalized_apply_url = _normalize_url_for_id(apply_url)
+    if not normalized_apply_url or not hasattr(state, "_connect"):
+        return None
+    try:
+        with state._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, url FROM jobs WHERE source = ? AND COALESCE(url, '') != ''",
+                ("email",),
+            ).fetchall()
+    except Exception:
+        return None
+    for row in rows:
+        if _normalize_url_for_id(row["url"]) == normalized_apply_url:
+            return row["job_id"]
+    return None
+
+
+def _legacy_job_id(source_event_id: str, job: dict[str, Any], index: int) -> str:
     raw = "|".join([
         source_event_id,
         str(index),
@@ -224,6 +283,15 @@ def _job_id(source_event_id: str, job: dict[str, Any], index: int) -> str:
         job.get("apply_url", "").lower(),
     ])
     return f"email:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _normalize_url_for_id(value: str) -> str:
+    if not value:
+        return ""
+    parsed = urllib.parse.urlparse(value)
+    netloc = parsed.netloc.lower()
+    normalized = parsed._replace(scheme=parsed.scheme.lower(), netloc=netloc, fragment="")
+    return urllib.parse.urlunparse(normalized)
 
 
 def _redacted(value: Any) -> str:

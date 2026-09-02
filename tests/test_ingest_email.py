@@ -1,11 +1,12 @@
 import argparse
+import concurrent.futures
 import io
 import json
 import sqlite3
 
 import pytest
 
-from src.ingest_email import ingest_email_payload, run_ingest_email_command, run_ingest_email_command_async
+from src.ingest_email import _legacy_job_id, ingest_email_payload, run_ingest_email_command, run_ingest_email_command_async
 from src.main import main_async
 from src.orchestrator import SOURCE_MAP
 from src.state_manager import StateManager
@@ -72,6 +73,138 @@ def test_duplicate_source_event_and_job_returns_duplicate_without_second_row(tem
 
     assert first[0].status == "inserted"
     assert second[0].status == "duplicate"
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert count == 1
+
+
+def test_duplicate_email_across_accounts_and_folders_uses_apply_url_idempotency(temp_db):
+    state = StateManager(temp_db)
+    original = _payload()
+    forwarded = _payload(
+        source_event_id="icloud-mail-mcp:other:<forwarded@example.com>",
+        source={
+            "provider": "icloud-mail-mcp",
+            "account": "other-account",
+            "message_id": "icloud-mail-mcp:other:<forwarded@example.com>",
+            "content_hash": "different-email-copy",
+        },
+    )
+
+    first = ingest_email_payload(original, state, scorer=FixedScorer())
+    second = ingest_email_payload(forwarded, state, scorer=FixedScorer())
+
+    assert first[0].status == "inserted"
+    assert second[0].status == "duplicate"
+    assert first[0].job_id == second[0].job_id
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert count == 1
+
+
+def test_url_idempotency_preserves_path_case(temp_db):
+    state = StateManager(temp_db)
+    first = _payload(jobs=[{
+        "title": "Senior Backend Engineer",
+        "company": "Acme Cloud",
+        "location": "Remote",
+        "apply_url": "https://jobs.example.com/Acme/Backend",
+        "redacted_excerpt": "Senior Backend Engineer at Acme Cloud",
+        "lane": "job-agent-review",
+    }])
+    second = _payload(
+        source_event_id="icloud-mail-mcp:jobs:<second@example.com>",
+        jobs=[{
+            "title": "Senior Backend Engineer",
+            "company": "Acme Cloud",
+            "location": "Remote",
+            "apply_url": "https://JOBS.EXAMPLE.COM/acme/backend",
+            "redacted_excerpt": "Senior Backend Engineer at Acme Cloud",
+            "lane": "job-agent-review",
+        }],
+    )
+
+    first_result = ingest_email_payload(first, state, scorer=FixedScorer())[0]
+    second_result = ingest_email_payload(second, state, scorer=FixedScorer())[0]
+
+    assert first_result.status == "inserted"
+    assert second_result.status == "inserted"
+    assert first_result.job_id != second_result.job_id
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert count == 2
+
+
+def test_existing_legacy_email_id_is_reused_without_duplicate_row(temp_db):
+    state = StateManager(temp_db)
+    payload = _payload()
+    job = payload["jobs"][0]
+    legacy_id = _legacy_job_id(payload["source_event_id"], job, 0)
+    assert state.upsert_job({
+        "job_id": legacy_id,
+        "source": "email",
+        "title": job["title"],
+        "company": job["company"],
+        "url": job["apply_url"],
+        "status": "discovered",
+    })
+
+    result = ingest_email_payload(payload, state, scorer=FixedScorer())[0]
+
+    assert result.status == "duplicate"
+    assert result.job_id == legacy_id
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert count == 1
+
+
+def test_existing_legacy_email_url_is_reused_for_forwarded_copy(temp_db):
+    state = StateManager(temp_db)
+    original = _payload()
+    forwarded = _payload(
+        source_event_id="icloud-mail-mcp:other:<forwarded@example.com>",
+        source={
+            "provider": "icloud-mail-mcp",
+            "account": "other-account",
+            "message_id": "icloud-mail-mcp:other:<forwarded@example.com>",
+            "content_hash": "different-email-copy",
+        },
+    )
+    legacy_id = _legacy_job_id(original["source_event_id"], original["jobs"][0], 0)
+    assert state.upsert_job({
+        "job_id": legacy_id,
+        "source": "email",
+        "title": original["jobs"][0]["title"],
+        "company": original["jobs"][0]["company"],
+        "url": original["jobs"][0]["apply_url"],
+        "status": "discovered",
+    })
+
+    result = ingest_email_payload(forwarded, state, scorer=FixedScorer())[0]
+
+    assert result.status == "duplicate"
+    assert result.job_id == legacy_id
+    with sqlite3.connect(temp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert count == 1
+
+
+def test_sqlite_contention_duplicate_ingests_create_one_job(temp_db):
+    payload = _payload()
+    initial_state = StateManager(temp_db)
+    initial_state.close()
+
+    def ingest_once():
+        state = StateManager(temp_db)
+        try:
+            return ingest_email_payload(payload, state)[0].status
+        finally:
+            state.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = sorted(executor.map(lambda _: ingest_once(), range(2)))
+
+    assert statuses == ["duplicate", "inserted"]
     with sqlite3.connect(temp_db) as conn:
         count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     assert count == 1
