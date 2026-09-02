@@ -49,12 +49,20 @@ def _sanitize_notification_text(value: str) -> str:
             if nxt == "/" or nxt.isspace():
                 if nxt.isspace():
                     token_tail = text[idx + 1:]
-                    token_end = len(token_tail)
-                    for delimiter in ".,;:!?)]}'\"`>":
-                        delimiter_idx = token_tail.find(delimiter)
-                        if delimiter_idx != -1:
-                            token_end = min(token_end, delimiter_idx)
-                    if "/" in token_tail[:token_end]:
+                    sibling_prefix = []
+                    saw_path_separator = False
+                    for ch in token_tail:
+                        if ch == "/":
+                            saw_path_separator = True
+                            break
+                        if ch in ".,;:!?)]}'\"`>":
+                            break
+                        sibling_prefix.append(ch)
+                    if saw_path_separator and not re.search(
+                        r"\b(?:is|are|was|were|from|to|in|at|with|and|or|but|distinct)\b",
+                        "".join(sibling_prefix),
+                        re.IGNORECASE,
+                    ):
                         return match.group(0)
                 return "~"
             terminal_delimiters = ".,;:!?)]}'\"`>"
