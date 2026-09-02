@@ -41,7 +41,7 @@ def _sanitize_notification_text(value: str) -> str:
     text = str(value or "")
     home = str(Path.home())
     if home and home != "/":
-        text = text.replace(home, "~")
+        text = re.sub(rf"(?<![\w/.-]){re.escape(home)}(?=/|$)", "~", text)
     text = re.sub(
         r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\d)",
         "[phone]",
@@ -174,7 +174,7 @@ def notify_error(title: str, detail: str = "") -> None:
     _desktop_notify(f"🔴 {title}", detail or title, subtitle="Job Agent ERROR")
 
 
-def notify_warning(title: str, detail: str = "") -> None:
+def notify_warning(title: str, detail: str = "", *, desktop: bool = True) -> None:
     """Signal something degraded but not fatal — login retry, skipped job."""
     title = _sanitize_notification_text(title)
     detail = _sanitize_notification_text(detail)
@@ -188,7 +188,8 @@ def notify_warning(title: str, detail: str = "") -> None:
         _last_notification_times[cache_key] = now
         _send_telegram(f"⚠️ [Job Agent WARNING] {title}\nDetail: {detail}")
 
-    _desktop_notify(f"🟡 {title}", detail or title, subtitle="Job Agent WARNING")
+    if desktop:
+        _desktop_notify(f"🟡 {title}", detail or title, subtitle="Job Agent WARNING")
 
 
 def notify_success(title: str, detail: str = "") -> None:
@@ -220,6 +221,7 @@ def record_run_stats(applied: int, failed: int, skipped: int) -> None:
 
 def record_reauth_event(source: str, mode: str, outcome: str, detail: str = "") -> None:
     """Append a reauth attempt to state/agent_status.json under 'reauth_events'."""
+    detail = _sanitize_notification_text(detail)
     status = _load_status()
     status.setdefault("reauth_events", [])
     status["reauth_events"] = status["reauth_events"][-99:] + [{

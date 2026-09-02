@@ -286,12 +286,14 @@ class ReauthManager:
                 f"{source} session expired — action needed",
                 "Auth refresh instructions were sent. Skipping this source in the background "
                 "run; it will retry once you refresh the session.",
+                desktop=False,
             )
             return False
 
         notify_warning(
             f"{source} session expired — action needed",
             f"Auth refresh instructions were sent. Waiting up to {timeout_minutes} min for refresh.",
+            desktop=False,
         )
 
         deadline = time.monotonic() + timeout_minutes * 60
