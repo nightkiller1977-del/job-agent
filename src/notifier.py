@@ -55,7 +55,7 @@ def _sanitize_notification_text(value: str) -> str:
             token_start = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start), text.rfind("\t", 0, start)) + 1
             prefix = text[token_start:start]
             opener = prefix[-1:] if prefix else ""
-            if opener not in "'\"`":
+            if not opener or opener not in "'\"`":
                 for wrapper in ("PosixPath(", "Path("):
                     wrapped = prefix.rfind(wrapper)
                     if wrapped >= 0 and len(prefix) > wrapped + len(wrapper):
@@ -63,7 +63,7 @@ def _sanitize_notification_text(value: str) -> str:
                         if candidate in "'\"`":
                             opener = candidate
                             break
-            if opener not in "'\"`":
+            if not opener or opener not in "'\"`":
                 return None
             closing = text.find(opener, start)
             return closing if closing >= 0 else None
@@ -72,13 +72,20 @@ def _sanitize_notification_text(value: str) -> str:
             token_end = quoted_token_end(start)
             if token_end is None:
                 token_end = len(text)
-                for pos in range(end + 1, len(text)):
-                    if text[pos] in terminal_delimiters:
+                for pos in range(end, len(text)):
+                    if text[pos] in terminal_delimiters or text[pos] in "\r\n":
                         token_end = pos
                         break
             tail = text[end:token_end]
             slash = tail.find("/")
-            return slash > 0 and not tail[slash - 1].isspace()
+            before_slash = tail[:slash] if slash >= 0 else ""
+            sibling_words = before_slash.split()
+            return (
+                slash > 0
+                and "=" not in before_slash
+                and 0 < len(sibling_words) <= 2
+                and not tail[slash - 1].isspace()
+            )
 
         def redact_home(match: re.Match) -> str:
             idx = match.end()
