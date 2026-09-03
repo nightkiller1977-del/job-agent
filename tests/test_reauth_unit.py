@@ -29,6 +29,15 @@ from src.sources.base import AuthFailedError, BaseScraper
 from src.notifier import record_reauth_event
 
 
+@pytest.fixture(autouse=True)
+def _disable_default_regression_file_writes(monkeypatch, request):
+    if request.node.name.startswith("test_write_regression_test_"):
+        return
+    from src import reauth
+
+    monkeypatch.setattr(reauth.ReauthManager, "_write_regression_test", lambda *args, **kwargs: None)
+
+
 # ── AuthFailedError ───────────────────────────────────────────────────────────
 
 class TestAuthFailedError:
