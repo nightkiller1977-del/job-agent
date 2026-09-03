@@ -76,6 +76,7 @@ def test_home_redaction_accepts_non_path_delimiters_without_matching_prefixes():
     assert home not in notifier._sanitize_notification_text(f"Home {home} failed while opening config/settings.json")
     assert home not in notifier._sanitize_notification_text(f"Working directory: {home} config/settings.json")
     assert home not in notifier._sanitize_notification_text(f"Working directory: {home} cache/index.json")
+    assert home not in notifier._sanitize_notification_text(f'detail="{home} failed opening cache/index.json"')
     assert home not in notifier._sanitize_notification_text(f"Working directory: {home}\nconfig/settings.json could not be opened")
     assert "PosixPath('~')" == notifier._sanitize_notification_text(f"PosixPath('{home}')")
     assert '"~"' == notifier._sanitize_notification_text(f'"{home}"')
