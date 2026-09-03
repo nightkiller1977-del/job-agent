@@ -70,6 +70,8 @@ def test_home_redaction_accepts_non_path_delimiters_without_matching_prefixes():
     assert home not in notifier._sanitize_notification_text(f"{home} backup files/file")
     assert f"{home} backup files" in notifier._sanitize_notification_text(f"PosixPath('{home} backup files/file')")
     assert f"{home} family photo archive" in notifier._sanitize_notification_text(f"PosixPath('{home} family photo archive/file')")
+    assert f"{home} backup" in notifier._sanitize_notification_text(f"Path('{home} backup')")
+    assert f"{home}, backup/file" in notifier._sanitize_notification_text(f"Path('{home}, backup/file')")
     assert home not in notifier._sanitize_notification_text(f"Home {home} is distinct from /tmp/config")
     assert home not in notifier._sanitize_notification_text(f"Inspect {home} then check /tmp/config")
     assert home not in notifier._sanitize_notification_text(f"Inspect {home} then set TMP=/tmp/config")

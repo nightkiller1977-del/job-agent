@@ -71,7 +71,7 @@ def _sanitize_notification_text(value: str) -> str:
             tail = text[end:token_end]
             slash = tail.find("/")
             if has_quoted_boundary:
-                return slash > 0 and not tail[slash - 1].isspace()
+                return bool(tail) and (slash < 0 or not tail[slash - 1].isspace())
             return False
 
         def redact_home(match: re.Match) -> str:
@@ -90,6 +90,8 @@ def _sanitize_notification_text(value: str) -> str:
                 or text[idx + 1].isspace()
                 or text[idx + 1] in terminal_delimiters
             ):
+                if is_spaced_sibling_path(match.start(), idx):
+                    return match.group(0)
                 return "~"
             return match.group(0)
 
