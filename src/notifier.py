@@ -46,15 +46,14 @@ def _sanitize_notification_text(value: str) -> str:
         def quoted_token_end(start: int) -> int | None:
             token_start = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start), text.rfind("\t", 0, start)) + 1
             prefix = text[token_start:start]
-            opener = prefix[-1:] if prefix else ""
-            if not opener or opener not in "'\"`":
-                for wrapper in ("PosixPath(", "Path("):
-                    wrapped = prefix.rfind(wrapper)
-                    if wrapped >= 0 and len(prefix) > wrapped + len(wrapper):
-                        candidate = prefix[wrapped + len(wrapper)]
-                        if candidate in "'\"`":
-                            opener = candidate
-                            break
+            opener = ""
+            for wrapper in ("PosixPath(", "Path("):
+                wrapped = prefix.rfind(wrapper)
+                if wrapped >= 0 and len(prefix) > wrapped + len(wrapper):
+                    candidate = prefix[wrapped + len(wrapper)]
+                    if candidate in "'\"`":
+                        opener = candidate
+                        break
             if not opener or opener not in "'\"`":
                 return None
             closing = text.find(opener, start)
