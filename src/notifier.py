@@ -48,7 +48,7 @@ def _sanitize_notification_text(value: str) -> str:
             protected_tokens.append(match.group(0))
             return f"__JOB_AGENT_HOME_TOKEN_{len(protected_tokens) - 1}__"
 
-        spaced_sibling = rf"{re.escape(home)}[ \t]+[^\s/\"'`<>]+/[^\s\"'`<>]*"
+        spaced_sibling = rf"{re.escape(home)}[ \t]+(?!(?:config|settings|src|tests?|logs?|data)/)[^\s/\"'`<>]+/[^\s\"'`<>]*"
         text = re.sub(spaced_sibling, protect_token, text)
 
         def quoted_token_end(start: int) -> int | None:
@@ -70,6 +70,7 @@ def _sanitize_notification_text(value: str) -> str:
 
         def is_spaced_sibling_path(start: int, end: int) -> bool:
             token_end = quoted_token_end(start)
+            has_quoted_boundary = token_end is not None
             if token_end is None:
                 token_end = len(text)
                 for pos in range(end, len(text)):
@@ -80,9 +81,12 @@ def _sanitize_notification_text(value: str) -> str:
             slash = tail.find("/")
             before_slash = tail[:slash] if slash >= 0 else ""
             sibling_words = before_slash.split()
+            if has_quoted_boundary:
+                return slash > 0 and not tail[slash - 1].isspace()
             return (
                 slash > 0
                 and "=" not in before_slash
+                and not (sibling_words and sibling_words[0].lower() in {"config", "settings", "src", "test", "tests", "log", "logs", "data"})
                 and 0 < len(sibling_words) <= 2
                 and not tail[slash - 1].isspace()
             )
