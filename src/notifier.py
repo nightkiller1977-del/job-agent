@@ -56,8 +56,10 @@ def _sanitize_notification_text(value: str) -> str:
                         break
             if not opener or opener not in "'\"`":
                 return None
-            closing = text.find(opener, start)
-            return closing if closing >= 0 else None
+            for pos in range(start, len(text)):
+                if text[pos] == opener and (pos == 0 or text[pos - 1] != "\\"):
+                    return pos
+            return None
 
         def is_spaced_sibling_path(start: int, end: int) -> bool:
             token_end = quoted_token_end(start)
