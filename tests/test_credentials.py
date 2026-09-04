@@ -2,10 +2,12 @@
 Tests for the credentials management system.
 
 Covers:
-  - GET /api/credentials  — auth gate, decryption, plaintext fallback
+  - GET /api/credentials  — removed (ACES-65): it returned decrypted passwords to
+    any SYNC_SECRET holder and the agent no longer fetches credentials over the
+    network. Guarded so it cannot quietly come back.
   - POST /api/credentials — encryption at rest, upsert, invalid platform
   - _encrypt_password / _decrypt_password round-trip
-  - load_credentials_from_dashboard() in the orchestrator
+  - orchestrator → dashboard push sync (_push_apply_attempt_to_cloud)
 """
 import os
 import json
@@ -68,61 +70,18 @@ class TestCredentialsEndpoints(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
 
-    # ── GET /api/credentials ─────────────────────────────────────────────────
+    # ── GET /api/credentials — removed (ACES-65) ─────────────────────────────
 
     @patch("dashboard.main.get_conn")
-    def test_get_credentials_unauthorized_missing_header(self, _):
-        resp = self.client.get("/api/credentials")
-        self.assertEqual(resp.status_code, 403)
-        self.assertIn("Invalid sync secret", resp.json()["detail"])
-
-    @patch("dashboard.main.get_conn")
-    def test_get_credentials_unauthorized_wrong_header(self, _):
-        resp = self.client.get("/api/credentials", headers={"X-Sync-Secret": "wrongvalue"})
-        self.assertEqual(resp.status_code, 403)
-
-    @patch("dashboard.main.get_conn")
-    def test_get_credentials_decrypts_passwords(self, mock_get_conn):
-        """Encrypted passwords stored in DB should be decrypted in the response."""
-        encrypted_pw = _enc("mypassword")
-
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_conn.return_value.__enter__.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-        mock_cursor.fetchall.return_value = [
-            {"platform": "indeed",   "email": "a@indeed.com",   "password": encrypted_pw},
-            {"platform": "linkedin", "email": "a@linkedin.com", "password": encrypted_pw},
-        ]
-
-        with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY,
-                                        "SYNC_SECRET": "testsecret"}):
-            resp = self.client.get("/api/credentials", headers={"X-Sync-Secret": "testsecret"})
-
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertEqual(len(data), 2)
-        # Passwords must be returned decrypted
-        self.assertEqual(data[0]["password"], "mypassword")
-        self.assertEqual(data[1]["password"], "mypassword")
-
-    @patch("dashboard.main.get_conn")
-    def test_get_credentials_plaintext_fallback(self, mock_get_conn):
-        """Pre-encryption plaintext passwords are returned unchanged."""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_conn.return_value.__enter__.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-        mock_cursor.fetchall.return_value = [
-            {"platform": "jobright", "email": "j@jr.com", "password": "oldplaintext"},
-        ]
-
-        with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY,
-                                        "SYNC_SECRET": "testsecret"}):
-            resp = self.client.get("/api/credentials", headers={"X-Sync-Secret": "testsecret"})
-
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()[0]["password"], "oldplaintext")
+    def test_get_credentials_endpoint_removed(self, mock_get_conn):
+        """The route that returned DECRYPTED passwords to any SYNC_SECRET holder is
+        gone, and the agent no longer pulls credentials over the network at run
+        start (src/secret_store.py is the only resolver). Only POST — the dashboard
+        UI's save — remains on this path, so GET must be 405, never 200 or 403.
+        Even a correct secret must not get data back."""
+        resp = self.client.get("/api/credentials", headers={"X-Sync-Secret": "testsecret"})
+        self.assertEqual(resp.status_code, 405)
+        mock_get_conn.assert_not_called()
 
     # ── POST /api/credentials ────────────────────────────────────────────────
 
@@ -154,6 +113,38 @@ class TestCredentialsEndpoints(unittest.TestCase):
         # And must be decryptable back to the original
         decrypted = Fernet(_TEST_KEY.encode()).decrypt(stored_pw_arg.encode()).decode()
         self.assertEqual(decrypted, "secretpassword")
+
+    @patch("dashboard.main.get_conn")
+    def test_save_credentials_blank_password_keeps_existing(self, mock_get_conn):
+        """The Settings form no longer pre-fills the stored password (it is never sent
+        to the browser), so saving with a blank password must keep the saved one:
+        the statement binds NULL for the password and COALESCEs to the existing row."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_conn.return_value.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY}):
+            resp = self.client.post("/api/credentials", json={
+                "platform": "linkedin",
+                "email": "new@linkedin.com",
+                "password": "",
+            })
+
+        self.assertEqual(resp.status_code, 200)
+        sql, params = mock_cursor.execute.call_args[0]
+        self.assertIn("NULLIF(%s, '')", sql)
+        self.assertIn("COALESCE(EXCLUDED.password, credentials.password)", sql)
+        self.assertEqual(params, ("linkedin", "new@linkedin.com", ""))
+
+    def test_index_context_never_contains_plaintext_passwords(self):
+        """GET / has no application auth; the template context must carry only
+        email + a password_set flag, never a decrypted password."""
+        import inspect
+        import dashboard.main as dm
+        src = inspect.getsource(dm)
+        self.assertIn('"password_set": bool(r["password"])', src)
+        self.assertNotIn('"password": _decrypt_password(r["password"]', src)
 
     @patch("dashboard.main.get_conn")
     def test_save_credentials_all_valid_platforms(self, mock_get_conn):
@@ -190,79 +181,15 @@ class TestCredentialsEndpoints(unittest.TestCase):
 
 
 class TestAgentCredentialsSync(unittest.IsolatedAsyncioTestCase):
-    """Tests for orchestrator.load_credentials_from_dashboard()."""
+    """Tests for the orchestrator ↔ dashboard sync boundary."""
 
-    @patch("httpx.AsyncClient")
-    async def test_load_credentials_sets_env_vars(self, mock_client_class):
+    def test_orchestrator_has_no_network_credential_fetch(self):
+        """ACES-65: credential resolution is src/secret_store.py only (.env → central
+        SOPS store). The legacy per-run HTTP pull from the dashboard — a network
+        dependency at cred-load time that always ended in 'Kept local .env' — is
+        gone and must not be reintroduced under the same name."""
         from src.orchestrator import Orchestrator
-
-        old_url    = os.environ.get("DASHBOARD_URL")
-        old_secret = os.environ.get("SYNC_SECRET")
-
-        os.environ["DASHBOARD_URL"] = "https://dashboard-test.com"
-        os.environ["SYNC_SECRET"]   = "testsecret"
-
-        try:
-            mock_client = MagicMock()
-            mock_client_class.return_value = mock_client
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__  = AsyncMock(return_value=None)
-
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_response.json.return_value = [
-                {"platform": "indeed",   "email": "cloud@indeed.com",   "password": "cloudpw1"},
-                {"platform": "linkedin", "email": "cloud@linkedin.com", "password": "cloudpw2"},
-                {"platform": "jobright", "email": "cloud@jobright.com", "password": "cloudpw3"},
-            ]
-            mock_client.get = AsyncMock(return_value=mock_response)
-
-            orchestrator = Orchestrator()
-
-            # Pop AFTER construction: Orchestrator.__init__ reloads the project .env
-            # (and fills from the central store), so clearing before construction would
-            # be undone. We want these genuinely absent so the (legacy) cloud fetch —
-            # the lowest-precedence source — is what fills them in this test.
-            for key in ("INDEED_EMAIL", "INDEED_PASSWORD",
-                        "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
-                        "JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD"):
-                os.environ.pop(key, None)
-
-            await orchestrator.load_credentials_from_dashboard()
-
-            self.assertEqual(os.environ.get("INDEED_EMAIL"),    "cloud@indeed.com")
-            self.assertEqual(os.environ.get("INDEED_PASSWORD"),  "cloudpw1")
-            self.assertEqual(os.environ.get("LINKEDIN_EMAIL"),  "cloud@linkedin.com")
-            self.assertEqual(os.environ.get("LINKEDIN_PASSWORD"), "cloudpw2")
-            self.assertEqual(os.environ.get("JOBRIGHT_EMAIL"),  "cloud@jobright.com")
-            self.assertEqual(os.environ.get("JOBRIGHT_PASSWORD"), "cloudpw3")
-        finally:
-            for k, v in [("DASHBOARD_URL", old_url), ("SYNC_SECRET", old_secret)]:
-                if v is not None:
-                    os.environ[k] = v
-                else:
-                    os.environ.pop(k, None)
-
-    @patch("httpx.AsyncClient")
-    async def test_load_credentials_graceful_on_http_error(self, mock_client_class):
-        """A failed cloud fetch should not crash the agent — it logs and continues."""
-        from src.orchestrator import Orchestrator
-
-        os.environ["DASHBOARD_URL"] = "https://dashboard-test.com"
-        os.environ["SYNC_SECRET"]   = "testsecret"
-
-        mock_client = MagicMock()
-        mock_client_class.return_value = mock_client
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__  = AsyncMock(return_value=None)
-        mock_client.get = AsyncMock(side_effect=ConnectionError("simulated network failure"))
-
-        orchestrator = Orchestrator()
-        # Should NOT raise — failure is non-fatal
-        try:
-            await orchestrator.load_credentials_from_dashboard()
-        except Exception as exc:
-            self.fail(f"load_credentials_from_dashboard raised unexpectedly: {exc}")
+        self.assertFalse(hasattr(Orchestrator, "load_credentials_from_dashboard"))
 
     @patch("httpx.AsyncClient")
     async def test_push_apply_attempt_syncs_extra_json_to_dashboard(self, mock_client_class):
