@@ -16,6 +16,8 @@
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>SOPS_AGE_KEY_FILE</key>
         <string>__SOPS_AGE_KEY_FILE__</string>
+        <key>AICC_SECRETS_DIR</key>
+        <string>__AICC_SECRETS_DIR__</string>
     </dict>
     <key>StartCalendarInterval</key>
     <dict>

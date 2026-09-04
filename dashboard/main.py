@@ -286,13 +286,16 @@ async def index(request: Request):
                 row = cur.fetchone()
                 last_sync = row["last_sync"] if row else None
 
-                # Fetch credentials (decrypt passwords for template — UI pre-fills forms)
+                # Credentials for the Settings form: email + whether a password is
+                # saved. Never the password itself — this page has no application
+                # auth, so decrypting into an <input value> put every plaintext
+                # password on the wire to anyone who could reach GET / (ACES-65).
                 cur.execute("SELECT platform, email, password FROM credentials")
                 credentials_rows = cur.fetchall()
                 credentials = {
                     r["platform"]: {
                         "email": r["email"],
-                        "password": _decrypt_password(r["password"] or ""),
+                        "password_set": bool(r["password"]),
                     }
                     for r in credentials_rows
                 }
@@ -684,32 +687,6 @@ async def get_errors():
     return [dict(r) for r in rows]
 
 
-@app.get("/api/credentials")
-async def get_credentials(x_sync_secret: Optional[str] = Header(default=None)):
-    """Fetch all credentials for the local agent."""
-    if SYNC_SECRET and x_sync_secret != SYNC_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid sync secret")
-
-    if not DATABASE_URL:
-        raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
-
-    try:
-        with get_conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT platform, email, password FROM credentials")
-                rows = cur.fetchall()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    # Decrypt passwords before returning to the local agent
-    result = []
-    for r in rows:
-        row = dict(r)
-        row["password"] = _decrypt_password(row.get("password") or "")
-        result.append(row)
-    return result
-
-
 @app.post("/api/credentials")
 async def save_credentials(body: CredentialsRequest):
     """Save or update credentials for a platform. Encrypts password at rest."""
@@ -724,7 +701,10 @@ async def save_credentials(body: CredentialsRequest):
             detail=f"platform must be one of {sorted(valid_platforms)}",
         )
 
-    encrypted_pw = _encrypt_password(body.password.strip())
+    # A blank password means "keep the saved one" — the form no longer pre-fills
+    # the stored password, so re-saving an email must not wipe it.
+    new_pw = body.password.strip()
+    encrypted_pw = _encrypt_password(new_pw) if new_pw else ""
 
     try:
         with get_conn() as conn:
@@ -732,10 +712,10 @@ async def save_credentials(body: CredentialsRequest):
                 cur.execute(
                     """
                     INSERT INTO credentials (platform, email, password, updated_at)
-                    VALUES (%s, %s, %s, NOW())
+                    VALUES (%s, %s, NULLIF(%s, ''), NOW())
                     ON CONFLICT (platform) DO UPDATE SET
                         email    = EXCLUDED.email,
-                        password = EXCLUDED.password,
+                        password = COALESCE(EXCLUDED.password, credentials.password),
                         updated_at = NOW()
                     """,
                     (platform, body.email.strip(), encrypted_pw),

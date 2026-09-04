@@ -120,8 +120,6 @@ class Orchestrator:
         (written by the Claude-in-Chrome MCP scraper in the Claude Code session).
         All other sources use Playwright scrapers.
         """
-        await self.load_credentials_from_dashboard()
-
         # Hydrate any manual external jobs first
         await self.hydrate_external_jobs()
 
@@ -529,7 +527,6 @@ class Orchestrator:
 
     async def preflight_approved(self, source: Optional[str] = None, company: Optional[str] = None) -> None:
         """Pull cloud-approved jobs and print production-readiness blockers."""
-        await self.load_credentials_from_dashboard()
         await self._pull_approved_from_cloud()
         approved = self._filter_jobs(
             self.state.get_approved_unapplied(),
@@ -600,7 +597,6 @@ class Orchestrator:
         Microsoft, or BrassRing cookies once in the persistent browser profile,
         then run apply afterward without each job failing independently.
         """
-        await self.load_credentials_from_dashboard()
         await self._pull_approved_from_cloud()
         approved = self._filter_jobs(
             self.state.get_approved_unapplied(),
@@ -710,7 +706,6 @@ class Orchestrator:
         import sys as _sys
         is_interactive = bool(_sys.stdin and _sys.stdin.isatty())
 
-        await self.load_credentials_from_dashboard()
         self._log_credential_presence()
         # Pull cloud-approved jobs into local SQLite first
         await self._pull_approved_from_cloud()
@@ -1310,10 +1305,11 @@ class Orchestrator:
         return f
 
     def _log_credential_presence(self) -> None:
-        """BAND-AID / TODO(secrets): log which source credentials are present in
-        os.environ (names + SET/MISSING, never values) at the start of a run. Turns
-        'is JOBRIGHT_EMAIL actually loaded in the scheduled process?' from a guess into
-        a fact in the log. Remove once the single-source secrets store lands (roadmap).
+        """Log which source credentials are present in os.environ (names +
+        SET/MISSING, never values) at the start of a run, so 'is JOBRIGHT_EMAIL
+        actually loaded in the scheduled process?' is a fact in the log, not a
+        guess. Credentials are resolved by src/secret_store.py (.env → central
+        SOPS store); this is observability only.
         """
         pairs = {
             "jobright": ("JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD"),
@@ -1328,68 +1324,9 @@ class Orchestrator:
             parts.append(f"{name}={'SET' if ok else 'MISSING'}")
         console.print(f"[dim]🔑 Credential presence: {'  '.join(parts)}[/dim]")
 
-    async def load_credentials_from_dashboard(self) -> None:
-        """Fetch credentials from the cloud dashboard and populate os.environ.
-        Falls back to local env variables if not found or on error.
-        """
-        dashboard_url = os.environ.get("DASHBOARD_URL", "")
-        sync_secret = os.environ.get("SYNC_SECRET", "")
-        if not dashboard_url:
-            return
-
-        console.print("[cyan]☁ Fetching platform credentials from cloud...[/cyan]")
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(
-                    f"{dashboard_url}/api/credentials",
-                    headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
-                )
-                if r.status_code == 200:
-                    creds = r.json()
-                    loaded = []
-                    kept_local = []
-                    # BAND-AID / TODO(secrets): .env is the authoritative source. The cloud
-                    # dashboard may only FILL MISSING creds — never overwrite a value already
-                    # present locally. A stale/empty cloud value previously clobbered good
-                    # .env creds and broke reauth (jobright/usajobs). Replace this whole
-                    # multi-source scheme with the single-source secrets store
-                    # (SOPS + age + Azure Key Vault) — see roadmap.
-                    _platform_keys = {
-                        "indeed":        ("INDEED_EMAIL",   "INDEED_PASSWORD",   "Indeed"),
-                        "linkedin":      ("LINKEDIN_EMAIL", "LINKEDIN_PASSWORD", "LinkedIn"),
-                        "jobright":      ("JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD", "Jobright"),
-                        "company_portal":("COMPANY_EMAIL",  "COMPANY_PASSWORD",  "Company ATS"),
-                    }
-                    for item in creds:
-                        email = item.get("email")
-                        password = item.get("password")
-                        keys = _platform_keys.get(item.get("platform"))
-                        if not email or not password or not keys:
-                            continue
-                        email_key, pw_key, label = keys
-                        # .env wins: only fill when BOTH local values are empty/absent
-                        if os.environ.get(email_key) or os.environ.get(pw_key):
-                            kept_local.append(label)
-                            continue
-                        os.environ[email_key] = email
-                        os.environ[pw_key] = password
-                        loaded.append(label)
-                    if loaded:
-                        console.print(f"[green]☁ Cloud filled missing credentials: {', '.join(loaded)}[/green]")
-                    if kept_local:
-                        console.print(f"[dim]☁ Kept local .env credentials (cloud not applied): {', '.join(kept_local)}[/dim]")
-                    if not loaded and not kept_local:
-                        console.print("[yellow]☁ No platform credentials configured on cloud.[/yellow]")
-                else:
-                    console.print(f"[yellow]☁ Cloud credentials pull returned {r.status_code} — using local env fallbacks.[/yellow]")
-        except Exception as e:
-            console.print(f"[dim]Failed to load credentials from cloud (non-fatal): {e}[/dim]")
-
     async def hydrate_external_jobs(self) -> None:
         """Fetch unhydrated placeholders from the cloud dashboard, scrape them locally,
         score them with Claude, and sync the results back to the dashboard."""
-        await self.load_credentials_from_dashboard()
         dashboard_url = os.environ.get("DASHBOARD_URL", "")
         sync_secret = os.environ.get("SYNC_SECRET", "")
         if not dashboard_url:

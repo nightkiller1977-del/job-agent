@@ -695,7 +695,7 @@
         <form class="ccard" onsubmit="saveCredentials(event, 'indeed')">
           <div class="ccard-head"><span class="cdot cdot-indeed"></span> Indeed</div>
           <div class="frow"><label>Email</label><input type="email" id="creds-indeed-email" placeholder="your@email.com" value="{{ credentials.get('indeed', {}).get('email', '') }}" /></div>
-          <div class="frow"><label>Password</label><input type="password" id="creds-indeed-password" placeholder="••••••••" value="{{ credentials.get('indeed', {}).get('password', '') }}" /></div>
+          <div class="frow"><label>Password</label><input type="password" id="creds-indeed-password" placeholder="{{ 'saved — leave blank to keep' if credentials.get('indeed', {}).get('password_set') else '••••••••' }}" value="" autocomplete="new-password" /></div>
           <button type="submit" class="jbtn jb-blue" style="margin-top:8px;">Save Indeed</button>
         </form>
 
@@ -703,7 +703,7 @@
         <form class="ccard" onsubmit="saveCredentials(event, 'linkedin')">
           <div class="ccard-head"><span class="cdot cdot-linkedin"></span> LinkedIn</div>
           <div class="frow"><label>Email</label><input type="email" id="creds-linkedin-email" placeholder="your@email.com" value="{{ credentials.get('linkedin', {}).get('email', '') }}" /></div>
-          <div class="frow"><label>Password</label><input type="password" id="creds-linkedin-password" placeholder="••••••••" value="{{ credentials.get('linkedin', {}).get('password', '') }}" /></div>
+          <div class="frow"><label>Password</label><input type="password" id="creds-linkedin-password" placeholder="{{ 'saved — leave blank to keep' if credentials.get('linkedin', {}).get('password_set') else '••••••••' }}" value="" autocomplete="new-password" /></div>
           <button type="submit" class="jbtn jb-blue" style="margin-top:8px;">Save LinkedIn</button>
         </form>
 
@@ -711,7 +711,7 @@
         <form class="ccard" onsubmit="saveCredentials(event, 'jobright')">
           <div class="ccard-head"><span class="cdot cdot-jobright"></span> Jobright</div>
           <div class="frow"><label>Email</label><input type="email" id="creds-jobright-email" placeholder="your@email.com" value="{{ credentials.get('jobright', {}).get('email', '') }}" /></div>
-          <div class="frow"><label>Password</label><input type="password" id="creds-jobright-password" placeholder="••••••••" value="{{ credentials.get('jobright', {}).get('password', '') }}" /></div>
+          <div class="frow"><label>Password</label><input type="password" id="creds-jobright-password" placeholder="{{ 'saved — leave blank to keep' if credentials.get('jobright', {}).get('password_set') else '••••••••' }}" value="" autocomplete="new-password" /></div>
           <button type="submit" class="jbtn jb-blue" style="margin-top:8px;">Save Jobright</button>
         </form>
 
@@ -972,7 +972,9 @@
     var email    = document.getElementById('creds-' + platform + '-email').value.trim();
     var password = document.getElementById('creds-' + platform + '-password').value.trim();
     var btn = event.target.querySelector('button[type="submit"]');
-    if (!email || !password) return;
+    // Password may be blank: the server keeps the saved one (it is never sent back
+    // to the browser any more), so an email-only change must still be saveable.
+    if (!email) return;
     var orig = btn.textContent;
     btn.disabled = true; btn.textContent = 'Saving…';
     try {

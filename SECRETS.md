@@ -26,7 +26,13 @@ A secret is resolved in this order; **fill-missing, empty string treated as abse
 "Empty treated as absent" is load-bearing: Claude Code sets `ANTHROPIC_API_KEY=""` in the
 shell, and a naive `override=False`/`??` load would treat that as "present" and refuse to fill.
 
-Override `AICC_SECRETS_DIR` to relocate the store (used by tests).
+Override `AICC_SECRETS_DIR` to relocate the store. **This is how the encrypted
+store is reached in practice:** `secrets.enc.env` lives in the `aicc-secrets`
+git repo (ciphertext only — see its README), not in the platform-default
+`Application Support` dir, so every consumer must have `AICC_SECRETS_DIR`
+pointing at that checkout. For launchd runs `scripts/manage-autopilot.sh install`
+writes it into the plists (exported value → sibling `aicc-secrets` checkout →
+empty/default). Without it the resolver silently reads only the plaintext `.env`.
 
 ## Canonical key catalog
 
@@ -58,22 +64,22 @@ Keep the lists in `CANONICAL_KEYS` (both repos) in sync for the shared keys.
   understand `secrets.enc.env` and the `aicc-secrets` CLI, so Phases 2–3 need no
   further wiring in the agents. **Run `scripts/consolidate-secrets.sh` to populate
   the central store** from the existing per-app `.env` files.
-- **Phase 2 — encrypt at rest (SOPS + age).** Generate an age key, store the private
-  key in macOS Keychain **with a `0600` key-file fallback** so launchd/headless runs
-  can still decrypt offline. Encrypt the plaintext `.env` → `secrets.enc.env`:
-  ```sh
-  age-keygen -o ~/.config/aicc/age.key          # 0600; back up the public key
-  export SOPS_AGE_KEY_FILE=~/.config/aicc/age.key
-  sops --encrypt --age <public-key> \
-    "~/Library/Application Support/ai-command-center/.env" \
-    > "~/Library/Application Support/ai-command-center/secrets.enc.env"
-  # verify: sops -d secrets.enc.env  → then shred the plaintext .env
-  ```
-- **Phase 3 — `aicc-secrets` CLI.** AI Commander ships `aicc-secrets get <NAME>`
-  (prints value to stdout, exit 0; non-zero if absent). Agents already prefer it.
-  Retire the cloud-dashboard credential fetch and the duplicate readers.
-- **Phase 4 — Azure Key Vault.** Optional cloud tier for the Render/hybrid deploy,
-  gated by `USE_KEYVAULT=1`.
+- **Phase 2 — encrypt at rest (SOPS + age). Done, in the `aicc-secrets` repo.**
+  The age key is a `0600` file at `~/.config/aicc/age.key` so launchd/headless runs
+  decrypt offline; `secrets.enc.env` is committed (ciphertext) to `aicc-secrets`.
+  What was missing until ACES-65 was the *wiring*: consumers must set
+  `AICC_SECRETS_DIR` to that checkout (see above), and launchd needs both
+  `SOPS_AGE_KEY_FILE` and `AICC_SECRETS_DIR` in the plist env. Rotate a secret with
+  `sops secrets.enc.env` in that repo, commit, push.
+- **Cloud-dashboard credential fetch — retired (ACES-65).** `GET /api/credentials`
+  (which returned decrypted passwords to any `SYNC_SECRET` holder) and
+  `Orchestrator.load_credentials_from_dashboard()` (a per-run network call at
+  cred-load time that always ended in "Kept local .env") are deleted. The
+  dashboard still stores credentials for its own UI via `POST /api/credentials`;
+  the agent never reads them.
+- **Phase 3 — `aicc-secrets` CLI** and **Phase 4 — Azure Key Vault**: dropped from
+  scope. No consumer needs them; the resolver keeps the `aicc-secrets get` and
+  `USE_KEYVAULT` hooks only so nothing breaks if either ever appears.
 
 ## Security notes
 
