@@ -5,17 +5,20 @@ scheduled reauth failures (see commit 55e1e55 "band-aid" and its TODO(secrets)).
 There is now ONE resolution order, shared by every entry point in this repo and
 mirrored by the email-agent (src/lib/secrets.js):
 
-  1. process / shell env         — a non-empty value here always wins
-  2. project .env                — loaded by main.load_env() / Orchestrator
+  1. process / shell env         — a non-empty value here always wins*
+  2. project .env                — loaded by main.load_env() / Orchestrator*
   3. central store (AI Commander, ~/Library/Application Support/ai-command-center):
        a. `aicc-secrets get <NAME>` CLI, if on PATH        (Phase 3 target)
        b. secrets.enc.env decrypted via `sops -d`          (Phase 2 target)
        c. .env plaintext                                   (Phase 1 / today)
   4. Azure Key Vault             — Phase 4, gated by USE_KEYVAULT (stub below)
 
+* except STORE_AUTHORITATIVE_KEYS (shared AI-service credentials such as
+  ANTHROPIC_API_KEY): for those the central store wins over any local value.
+
 Fill semantics are **fill-missing, empty-string treated as absent**: we never
-overwrite a real value already in os.environ, but an absent OR empty ("") key is
-filled from the central store. Empty-as-absent matters because Claude Code sets
+overwrite a real value already in os.environ (store-authoritative keys aside), but
+an absent OR empty ("") key is filled from the central store. Empty-as-absent matters because Claude Code sets
 ANTHROPIC_API_KEY="" in the shell — a plain `override=False` load would treat
 that as "present" and refuse to fill it.
 
@@ -66,7 +69,7 @@ CANONICAL_KEYS: tuple[str, ...] = (
     "JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD",
     "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
     "INDEED_EMAIL", "INDEED_PASSWORD",
-    "USAJOBS_EMAIL", "USAJOBS_PASSWORD", "USAJOBS_2FA_SECRET", "IMAP_PASSWORD",
+    "USAJOBS_EMAIL", "USAJOBS_PASSWORD", "USAJOBS_2FA_SECRET", "IMAP_PASSWORD",  # gitleaks:allow — key NAMES, not values
     "COMPANY_EMAIL", "COMPANY_PASSWORD",
     "COMPANY_EMAIL_ALT", "COMPANY_PASSWORD_ALT",
     "DASHBOARD_URL", "SYNC_SECRET", "CREDENTIAL_ENCRYPTION_KEY",
@@ -74,6 +77,24 @@ CANONICAL_KEYS: tuple[str, ...] = (
     "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER",
     "APPROVAL_SEND_EMAIL", "APPROVAL_SEND_PASSWORD", "APPROVAL_NOTIFY_EMAIL",
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+)
+
+
+# Shared service credentials that are OWNED by the central store. For these the store
+# is authoritative: a value it holds replaces whatever the process env / project .env
+# carried. Everything else keeps fill-missing semantics.
+#
+# Why: these keys are shared by every agent (job-agent, email-agent, the desktop app)
+# and rotated in one place — aicc-secrets. With fill-missing alone, a stale copy in a
+# project .env silently won over the rotation: on 2026-09-04 every local copy of
+# ANTHROPIC_API_KEY was identical to a store value that Anthropic rejected with 401,
+# and a rotation in the store would not have reached the agent (ACES-282). Local
+# copies of these keys are a misconfiguration, not a fallback.
+STORE_AUTHORITATIVE_KEYS: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "AICC_OPENROUTER_API_KEY",
+    "OPENROUTER_GATEWAY_URL",
 )
 
 
@@ -163,9 +184,50 @@ def resolve_secret(name: str) -> str | None:
     return store_val or None
 
 
+def _store_get(name: str) -> str | None:
+    """The central store's value for *name* (CLI → sops → plaintext), ignoring the
+    process env. None when the store does not have it."""
+    cli_val = _cli_get(name)
+    if cli_val:
+        return cli_val
+    store_val = _read_store().get(name, "").strip()
+    return store_val or None
+
+
+def apply_store_authoritative(names: tuple[str, ...] | list[str] | None = None) -> list[str]:
+    """For every STORE_AUTHORITATIVE_KEYS entry in *names* (default: all of them) that
+    the central store holds, set os.environ to the store's value — overriding a
+    different local value. Keys the store lacks are left alone, so a machine with no
+    store (CI) is unaffected.
+
+    Returns the NAMES whose local value was replaced (values are never logged).
+    """
+    keys = names if names is not None else STORE_AUTHORITATIVE_KEYS
+    overridden: list[str] = []
+    for name in keys:
+        if name not in STORE_AUTHORITATIVE_KEYS:
+            continue
+        store_val = _store_get(name)
+        if not store_val:
+            continue
+        if (os.environ.get(name) or "").strip() != store_val:
+            if not _missing(name):
+                overridden.append(name)
+            os.environ[name] = store_val
+    if overridden:
+        _log.warning(
+            "secrets: central store overrode a local value for %d key(s): %s — these are "
+            "store-owned; remove the local copy (see SECRETS.md)",
+            len(overridden), ", ".join(overridden),
+        )
+    return overridden
+
+
 def fill_missing(names: tuple[str, ...] | list[str] | None = None) -> list[str]:
     """Fill os.environ for every *names* entry that is absent or empty, pulling from
-    the central store (CLI → sops → plaintext). Never overwrites a real value.
+    the central store (CLI → sops → plaintext). Never overwrites a real value —
+    EXCEPT for STORE_AUTHORITATIVE_KEYS, where the store wins (see
+    apply_store_authoritative); both entry points get that for free by calling this.
 
     Returns the list of key NAMES that were filled (values are never logged), so the
     caller can report central-store usage without leaking secrets.
@@ -181,6 +243,7 @@ def fill_missing(names: tuple[str, ...] | list[str] | None = None) -> list[str]:
             filled.append(name)
     if filled:
         _log.info("secrets: filled %d key(s) from central store: %s", len(filled), ", ".join(filled))
+    apply_store_authoritative([k for k in keys if k in STORE_AUTHORITATIVE_KEYS])
     return filled
 
 
