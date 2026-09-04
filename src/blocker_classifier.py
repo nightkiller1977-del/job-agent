@@ -17,11 +17,17 @@ from enum import Enum
 # Mirror of reauth.HUMAN_SOURCES + per-source credential env pairs. Kept here (a
 # pure, import-light module) so the preflight guard is testable without pulling
 # reauth.py's playwright/browser import chain. If reauth's sets change, update both.
-_HUMAN_SOURCES = {"usajobs"}
+#
+# HUMAN_SOURCES now means "automated first, human as the fallback" (ACES-283/286):
+# ReauthManager tries the stored-credential login (+ TOTP / emailed code) and only
+# then notifies a person. So a proactive mid-apply reauth is viable for these
+# sources exactly like any automated one — gated on credentials, not on the source.
+_HUMAN_FALLBACK_SOURCES = {"usajobs"}
 _REAUTH_CREDS = {
     "jobright": ("JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD"),
     "linkedin": ("LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"),
     "indeed": ("INDEED_EMAIL", "INDEED_PASSWORD"),
+    "usajobs": ("USAJOBS_EMAIL", "USAJOBS_PASSWORD"),
 }
 
 
@@ -53,6 +59,7 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     "teamtailor_login_required": BlockerClass.AUTH_REQUIRED,
     "reauth_failed": BlockerClass.AUTH_REQUIRED,
     "session_expired": BlockerClass.AUTH_REQUIRED,
+    "usajobs_login_required": BlockerClass.AUTH_REQUIRED,  # historic rows; apply now raises AuthFailedError instead
     "needs_session_prep": BlockerClass.AUTH_REQUIRED,  # P3: human source, run prepare-sessions
     # config — user must fix .env / creds; never auto-retry
     "credentials_missing": BlockerClass.PERMANENT,
@@ -118,12 +125,12 @@ def preflight_reauth_viable(source: str) -> tuple[bool, str]:
     doomed reauths that either block on a human-login timeout or fail on missing
     credentials — turning a 10-minute block / scary error into a clean skip.
 
-    - Human sources (usajobs): not viable mid-apply — they wait for a person and
-      time out. Handle via `prepare-sessions` instead → "needs_session_prep".
-    - Automated sources missing credentials: not viable → "credentials_missing".
+    - Any source missing its login credentials: not viable → "credentials_missing".
+    - Human-fallback sources (usajobs) used to be unconditionally "needs_session_prep"
+      here, which meant a scheduled run could never recover a USAJobs session on its
+      own. ReauthManager now runs the automated login first and never blocks a
+      non-interactive run waiting for a person, so they follow the same rule.
     """
-    if source in _HUMAN_SOURCES:
-        return False, "needs_session_prep"
     missing = [c for c in _REAUTH_CREDS.get(source, ()) if not os.environ.get(c)]
     if missing:
         return False, "credentials_missing"
