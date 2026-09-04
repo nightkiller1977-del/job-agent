@@ -405,9 +405,10 @@ class USAJobsScraper(BaseScraper):
         # same key names. It never falls back to USAJOBS_PASSWORD: that is the login.gov
         # password, which iCloud IMAP always rejects — the old fallback guaranteed
         # AUTHENTICATIONFAILED and silently degraded every 2FA to "human" (ACES-283).
-        email_addr, imap_password = resolve_imap_credentials(
-            os.environ.get("USAJOBS_EMAIL", "") or os.environ.get("EMAIL_2FA_ADDRESS", "")
-        )
+        # No explicit address: let the resolver apply its own precedence
+        # (EMAIL_2FA_ADDRESS → USAJOBS_EMAIL → IMAP_USER), so a dedicated 2FA mailbox
+        # is honoured instead of always pairing the app password with the login alias.
+        email_addr, imap_password = resolve_imap_credentials()
         if not email_addr:
             return False
         if not imap_password:

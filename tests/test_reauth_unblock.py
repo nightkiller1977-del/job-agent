@@ -89,3 +89,25 @@ def test_state_errors_never_propagate(tmp_path):
 
     o.state = _Broken()
     assert o._unblock_session_jobs_after_reauth("usajobs") == 0
+
+
+def test_one_failing_row_does_not_stop_the_others(tmp_path):
+    """A transient failure clearing ONE job (locked row) must be skipped, not
+    propagate — the remaining jobs are still re-armed (Codex/Copilot, PR #88)."""
+    o = _orch(tmp_path)
+    _job(o.state, "u1", "usajobs", "usajobs_login_required")
+    _job(o.state, "u2", "usajobs", "usajobs_login_required")
+    _job(o.state, "u3", "usajobs", "usajobs_login_required")
+
+    real_clear = o.state.clear_session_block
+
+    def flaky_clear(job_id):
+        if job_id == "u2":
+            raise RuntimeError("database is locked")
+        return real_clear(job_id)
+
+    o.state.clear_session_block = flaky_clear
+    assert o._unblock_session_jobs_after_reauth("usajobs") == 2
+    assert _prepared(o.state, "u1")
+    assert not _prepared(o.state, "u2")
+    assert _prepared(o.state, "u3")

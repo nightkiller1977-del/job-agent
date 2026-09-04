@@ -81,8 +81,15 @@ class ReauthManager:
         self.notify_phone = os.environ.get("NOTIFY_PHONE", "")
         self.timeout_discover = int(os.environ.get("REAUTH_TIMEOUT_MINUTES", "30"))
         self.timeout_apply    = int(os.environ.get("REAUTH_TIMEOUT_APPLY_MINUTES", "10"))
-        self.regression_test_path: Path = (
+        # Where a self-heal appends an auto-generated regression test. OFF by default:
+        # production code mutating a tracked test file on every successful reauth
+        # grew tests/test_reauth_regressions.py to 35 identical USAJobs tests and
+        # leaked runtime artifacts into unrelated PRs (ACES-287). Opt in with
+        # JOBAGENT_WRITE_REGRESSION_TESTS=1; tests point this at a tmp file directly.
+        self.regression_test_path: Path | None = (
             Path(__file__).parent.parent / "tests" / "test_reauth_regressions.py"
+            if os.environ.get("JOBAGENT_WRITE_REGRESSION_TESTS", "").strip().lower() in ("1", "true", "yes", "on")
+            else None
         )
 
     async def handle(self, source: str, detail: str = "", context: str = "discover") -> bool:
@@ -166,11 +173,13 @@ class ReauthManager:
         email    = resolve_secret(f"{source.upper()}_EMAIL") or ""
         password = resolve_secret(f"{source.upper()}_PASSWORD") or ""
         if not email or not password:
-            notify_error(
-                f"{source} reauth failed",
-                f"Add {source.upper()}_EMAIL and {source.upper()}_PASSWORD to .env",
-            )
             record_reauth_event(source, "automated", "failed", "missing credentials")
+            _log.warning("reauth.failed source=%s mode=automated reason=missing_credentials", source)
+            if escalate:
+                notify_error(
+                    f"{source} reauth failed",
+                    f"Add {source.upper()}_EMAIL and {source.upper()}_PASSWORD to .env",
+                )
             return False
 
         notify_info(f"{source} reauth", "Attempting automated session refresh…")
@@ -364,7 +373,11 @@ class ReauthManager:
     # ------------------------------------------------------------------
 
     def _write_regression_test(self, source: str, mode: str, detail: str) -> None:
-        """Append an auto-generated regression test to tests/test_reauth_regressions.py."""
+        """Append an auto-generated regression test to self.regression_test_path
+        (no-op when that is None — the default; see __init__)."""
+        if not self.regression_test_path:
+            _log.debug("ReauthManager: regression-test writing disabled; skipping for %s", source)
+            return
         ts = datetime.now(timezone.utc)
         ts_slug = ts.strftime("%Y%m%d_%H%M%S")
         ts_human = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
