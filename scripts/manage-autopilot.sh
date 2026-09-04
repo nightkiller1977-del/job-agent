@@ -68,15 +68,28 @@ case "$action" in
       echo "⚠ AICC_SECRETS_DIR is not set and no sibling aicc-secrets checkout was found;"
       echo "  job-agent will fall back to the platform-default central store. See SECRETS.md."
     fi
-    sed -e "s|__PROJECT_DIR__|$REPO_DIR|g" \
-        -e "s|__SOPS_AGE_KEY_FILE__|$HOME/.config/aicc/age.key|g" \
-        -e "s|__AICC_SECRETS_DIR__|$local_secrets_dir|g" \
+    # Paths are substituted into a sed replacement: escape the characters sed
+    # gives meaning to there (`&` = whole match, `|` = our delimiter, `\`) so a
+    # path like /tmp/a&b or one containing `|` is written verbatim (Codex, PR #87).
+    sed_escape() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+    esc_repo="$(sed_escape "$REPO_DIR")"
+    esc_agekey="$(sed_escape "$HOME/.config/aicc/age.key")"
+    esc_secrets="$(sed_escape "$local_secrets_dir")"
+    sed -e "s|__PROJECT_DIR__|$esc_repo|g" \
+        -e "s|__SOPS_AGE_KEY_FILE__|$esc_agekey|g" \
+        -e "s|__AICC_SECRETS_DIR__|$esc_secrets|g" \
         "$REPO_DIR/launchd/$DISCOVER_PLIST" > "$LAUNCHD_DIR/$DISCOVER_PLIST"
-    sed -e "s|__PROJECT_DIR__|$REPO_DIR|g" \
-        -e "s|__SOPS_AGE_KEY_FILE__|$HOME/.config/aicc/age.key|g" \
-        -e "s|__AICC_SECRETS_DIR__|$local_secrets_dir|g" \
+    sed -e "s|__PROJECT_DIR__|$esc_repo|g" \
+        -e "s|__SOPS_AGE_KEY_FILE__|$esc_agekey|g" \
+        -e "s|__AICC_SECRETS_DIR__|$esc_secrets|g" \
         "$REPO_DIR/launchd/$APPLY_PLIST" > "$LAUNCHD_DIR/$APPLY_PLIST"
 
+    # launchd does not re-read a plist for a job that is already loaded — a plain
+    # `load` on an upgrade is a no-op ("service already loaded") and the running
+    # jobs keep their OLD environment (no AICC_SECRETS_DIR). Unload first so the
+    # rendered plists, env included, are what actually gets loaded (Copilot, PR #87).
+    launchctl unload "$LAUNCHD_DIR/$DISCOVER_PLIST" 2>/dev/null || true
+    launchctl unload "$LAUNCHD_DIR/$APPLY_PLIST" 2>/dev/null || true
     if launchctl load -w "$LAUNCHD_DIR/$DISCOVER_PLIST" && launchctl load -w "$LAUNCHD_DIR/$APPLY_PLIST"; then
       echo "✓ Installed and successfully loaded for $REPO_DIR:"
       echo "  - Discovery pass: 07:00 AM daily"
