@@ -56,7 +56,8 @@ email-agent `src/lib/secrets.js`, the desktop app) is expected to apply the same
 | `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | ✓ | |
 | `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` | ✓ | |
 | `INDEED_EMAIL` / `INDEED_PASSWORD` | ✓ | |
-| `USAJOBS_EMAIL` / `USAJOBS_PASSWORD` / `USAJOBS_2FA_SECRET` / `IMAP_PASSWORD` | ✓ | |
+| `USAJOBS_EMAIL` / `USAJOBS_PASSWORD` / `USAJOBS_2FA_SECRET` | ✓ | |
+| `IMAP_PASSWORD` / `ICLOUD_APP_PASSWORD_PERSONAL` / `ICLOUD_APP_PASSWORD` / `ICLOUD_APP_PASSWORD_ICLOUD` / `ICLOUD_APP_PASSWORD_MAC` / `EMAIL_2FA_ADDRESS` / `IMAP_USER` — IMAP *app-specific* password (+ address) for email-code 2FA and confirmation tracking; resolved by `email_helper.resolve_imap_credentials`, which never falls back to a site login password | ✓ | |
 | `COMPANY_EMAIL(_ALT)` / `COMPANY_PASSWORD(_ALT)` | ✓ | |
 | `DASHBOARD_URL` / `SYNC_SECRET` / `CREDENTIAL_ENCRYPTION_KEY` | ✓ | |
 | `NOTIFY_PHONE` / `TWILIO_*` / `APPROVAL_*` | ✓ | |

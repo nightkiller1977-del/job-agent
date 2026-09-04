@@ -59,6 +59,18 @@ SOURCE_MAP = {
 # scrape Jobright twice per run.
 DEFAULT_DISCOVERY_SOURCES = ["jobright", "linkedin", "usajobs", "indeed", "jobspy", "themuse", "builtin"]
 
+# Apply statuses meaning "<source>'s OWN login session was the blocker" — a successful
+# reauth of that source makes such jobs attemptable again (see
+# _unblock_session_jobs_after_reauth). _ANY applies to every source; the dict adds
+# per-source statuses. External-ATS walls (workday_session_expired,
+# brassring_login_required, ...) are deliberately NOT here: a discovery source's own
+# login never clears those (the distinction prepare_sessions draws, PR #81).
+_OWN_SESSION_STATUSES_ANY = {"reauth_failed", "needs_session_prep"}
+_OWN_SESSION_STATUSES = {
+    "linkedin": {"linkedin_authwall", "linkedin_login_required"},
+    "usajobs": {"usajobs_login_required"},
+}
+
 # Path to the file written by the Claude-in-Chrome MCP scraper
 MCP_SCRAPED_FILE = Path(__file__).parent.parent / "state" / "mcp_scraped.json"
 
@@ -160,6 +172,7 @@ class Orchestrator:
                 reauth_mgr = ReauthManager(self.config)
                 refreshed = await reauth_mgr.handle(src_name, auth_exc.detail, context="discover")
                 if refreshed:
+                    self._unblock_session_jobs_after_reauth(src_name)
                     t_scrape2 = time.perf_counter()
                     try:
                         scraper2 = SOURCE_MAP[src_name](self.config)
@@ -406,6 +419,38 @@ class Orchestrator:
             filtered = filtered[: max(0, limit)]
         return filtered
 
+    def _unblock_session_jobs_after_reauth(self, source: str) -> int:
+        """After *source*'s login session was refreshed, mark its approved jobs that
+        were blocked on that same login retryable (ACES-284, first slice).
+
+        Mirrors what prepare_sessions() does after a *human* sign-in — stamping
+        clear_session_block()'s one-shot marker — so an automated reauth success has
+        the same effect: the jobs are attempted on the next run instead of sitting in
+        circuit-open until they expire. Only statuses meaning "<source>'s own login
+        was the blocker" qualify (see _OWN_SESSION_STATUSES*). Returns the count.
+        """
+        own = _OWN_SESSION_STATUSES_ANY | _OWN_SESSION_STATUSES.get(source, set())
+        try:
+            approved = self.state.get_approved_unapplied()
+        except Exception as exc:  # noqa: BLE001 — bookkeeping must never break a reauth
+            _log.warning("reauth.unblock_failed source=%s error=%s", source, exc)
+            return 0
+        cleared = 0
+        for job in approved:
+            if (job.get("source") or "").lower() != source or not job.get("job_id"):
+                continue
+            try:
+                extra = json.loads(job.get("extra_json") or "{}")
+            except Exception:
+                extra = {}
+            if str(extra.get("apply_last_status") or "") in own:
+                self.state.clear_session_block(job["job_id"])
+                cleared += 1
+        if cleared:
+            console.print(f"[cyan]{source} session refreshed — {cleared} login-blocked job(s) marked retryable.[/cyan]")
+            _log.info("reauth.unblocked_jobs source=%s count=%d", source, cleared)
+        return cleared
+
     def _classify_apply_readiness(self, job: dict) -> tuple[str, str]:
         import json as _json
         source = (job.get("source") or "").lower()
@@ -444,7 +489,21 @@ class Orchestrator:
             return ("ready", "Session prepared via prepare-sessions; retrying.")
 
         if source == "usajobs":
-            return ("needs-session", "USAJobs requires a signed-in USAJobs/Login.gov browser session and a saved resume.")
+            # USAJobs needs a signed-in Login.gov browser session. This used to be an
+            # unconditional "needs-session", which meant a scheduled run NEVER attempted
+            # a USAJobs job until a human ran prepare-sessions — the whole source was
+            # human-gated. Now the only hard block is "no saved session exists at all".
+            # A saved-but-stale session is attempted: USAJobsScraper.apply() raises
+            # AuthFailedError on the login wall and the apply loop's reauth path
+            # (automated login + TOTP / emailed code, human only as fallback) recovers
+            # it once per run (ACES-283/286).
+            from .sources.base import SESSIONS_DIR as _sessions_dir
+            if not (_sessions_dir / "usajobs_chromium.json").exists():
+                return (
+                    "needs-session",
+                    "No saved USAJobs/Login.gov session yet — run `prepare-sessions --source usajobs` "
+                    "once, or let the next discover run's automated login create it.",
+                )
 
         last_status = ""
         last_detail = ""
@@ -877,6 +936,7 @@ class Orchestrator:
                     skipped_count += 1
                     outcomes.append({"job": job, "status": "reauth_failed", "reason": "preflight reauth failed"})
                     continue
+                self._unblock_session_jobs_after_reauth(src)
 
             if src not in SOURCE_MAP:
                 console.print(f"[red]Unknown source '{src}' — skipping.[/red]")
@@ -959,6 +1019,7 @@ class Orchestrator:
                 reauthed_this_run.add(src)
                 refreshed = await apply_reauth_mgr.handle(src, auth_exc.detail, context="apply")
                 if refreshed:
+                    self._unblock_session_jobs_after_reauth(src)
                     try:
                         scraper2 = SOURCE_MAP[src](self.config)
                         result = await scraper2.apply(job, auto_submit=auto_submit)
