@@ -94,6 +94,53 @@ def test_quoted_and_export_lines_parsed(store, monkeypatch):
     assert secrets.resolve_secret("SYNC_SECRET") == "quoted-value"
 
 
+# ── ACES-282: store-authoritative shared keys ───────────────────────────────────
+
+def test_store_overrides_local_value_for_authoritative_key(store, monkeypatch):
+    """Shared AI-service keys are owned by the central store: a stale copy in the
+    process env / project .env must NOT win over the store (this is exactly how an
+    invalid ANTHROPIC_API_KEY survived — every local copy masked the store)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-stale-local")
+    store(ANTHROPIC_API_KEY="sk-from-store")
+
+    filled = secrets.fill_missing(["ANTHROPIC_API_KEY"])
+
+    assert filled == []                       # it was not "missing"...
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-from-store"   # ...but the store still wins
+
+
+def test_apply_store_authoritative_reports_overrides_only(store, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-stale-local")
+    monkeypatch.setenv("OPENAI_API_KEY", "same-both-places")
+    store(ANTHROPIC_API_KEY="sk-from-store", OPENAI_API_KEY="same-both-places")
+
+    overridden = secrets.apply_store_authoritative()
+
+    assert overridden == ["ANTHROPIC_API_KEY"]
+    assert os.environ["OPENAI_API_KEY"] == "same-both-places"
+
+
+def test_authoritative_key_absent_from_store_keeps_local(store, monkeypatch):
+    """No store value (e.g. CI, or a key the store never held) → local stays."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-local-only")
+    store(JOBRIGHT_EMAIL="x@y.com")
+
+    assert secrets.apply_store_authoritative() == []
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-local-only"
+
+
+def test_non_authoritative_keys_keep_fill_missing_semantics(store, monkeypatch):
+    monkeypatch.setenv("LINKEDIN_PASSWORD", "local-wins")
+    store(LINKEDIN_PASSWORD="store-loses", ANTHROPIC_API_KEY="sk-from-store")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-stale-local")
+
+    secrets.fill_missing()
+
+    assert os.environ["LINKEDIN_PASSWORD"] == "local-wins"
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-from-store"
+    assert "LINKEDIN_PASSWORD" not in secrets.STORE_AUTHORITATIVE_KEYS
+
+
 def test_default_fill_includes_imap_password(store, monkeypatch):
     monkeypatch.delenv("IMAP_PASSWORD", raising=False)
     store(IMAP_PASSWORD="imap-app-password")

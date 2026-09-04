@@ -68,7 +68,8 @@ class Orchestrator:
         # Single-source secrets resolution (SECRETS.md). Defensively load the project
         # .env — with override=False so it never stomps intentionally-set shell/launchd
         # vars; main.py stays the authoritative override=True load — then let the central
-        # AI Commander store fill anything still missing. This path matters because
+        # AI Commander store fill anything still missing (and, for the shared AI-service
+        # keys in STORE_AUTHORITATIVE_KEYS, replace any local copy). This path matters because
         # scheduled/launchd runs construct the Orchestrator directly without going through
         # main.load_env(); that gap is what broke reauth before.
         try:
