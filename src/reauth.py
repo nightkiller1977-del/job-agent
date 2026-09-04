@@ -1,14 +1,20 @@
 """
 ReauthManager — recover from expired source sessions automatically.
 
-Automated path (jobright, indeed, linkedin):
+Automated path (jobright, indeed, linkedin, usajobs):
     Spins up a fresh Playwright context, calls the source's existing
-    _auto_login(), saves the refreshed session, returns True/False.
+    _auto_login() (for usajobs that includes TOTP / backup-code / emailed-code
+    2FA), verifies the result, saves the refreshed session, returns True/False.
 
-Human-assisted path (usajobs):
-    Sends an iMessage to NOTIFY_PHONE with the exact terminal command
-    to run, then polls the session file mtime until the user completes
-    the interactive login (or the timeout expires).
+Human-assisted fallback (usajobs):
+    Only after the automated path has failed. Sends an iMessage to NOTIFY_PHONE
+    with the exact terminal command to run, then polls the session file mtime
+    until the user completes the interactive login (or the timeout expires).
+    Non-interactive runs notify and return immediately — they never block.
+
+    Until ACES-283 usajobs was human-ONLY: every expiry became a notification
+    nobody could act on at 23:00 and the source stayed dead for weeks. Automated
+    first, human last is the rule now.
 
 On every successful correction:
     1. A regression test is appended to tests/test_reauth_regressions.py
@@ -33,7 +39,11 @@ from .notifier import notify_error, notify_info, notify_success, notify_warning,
 
 _log = logging.getLogger(__name__)
 
-AUTOMATED_SOURCES = {"jobright", "indeed", "linkedin"}
+# Every source with an _auto_login() gets the automated attempt first.
+AUTOMATED_SOURCES = {"jobright", "indeed", "linkedin", "usajobs"}
+# Sources that additionally fall back to the human-assisted path when the automated
+# attempt fails (2FA method unavailable, CAPTCHA, ...). Mirrored by
+# blocker_classifier._HUMAN_FALLBACK_SOURCES — keep both in sync.
 HUMAN_SOURCES     = {"usajobs"}
 
 # Circuit breaker for _reauth_automated: below this many consecutive failures we
@@ -56,10 +66,12 @@ def _get_source_map():
     from .sources.jobright import JobrightScraper
     from .sources.indeed import IndeedScraper
     from .sources.linkedin import LinkedInScraper
+    from .sources.usajobs import USAJobsScraper
     return {
         "jobright": JobrightScraper,
         "indeed":   IndeedScraper,
         "linkedin": LinkedInScraper,
+        "usajobs":  USAJobsScraper,
     }
 
 
@@ -69,8 +81,15 @@ class ReauthManager:
         self.notify_phone = os.environ.get("NOTIFY_PHONE", "")
         self.timeout_discover = int(os.environ.get("REAUTH_TIMEOUT_MINUTES", "30"))
         self.timeout_apply    = int(os.environ.get("REAUTH_TIMEOUT_APPLY_MINUTES", "10"))
-        self.regression_test_path: Path = (
+        # Where a self-heal appends an auto-generated regression test. OFF by default:
+        # production code mutating a tracked test file on every successful reauth
+        # grew tests/test_reauth_regressions.py to 35 identical USAJobs tests and
+        # leaked runtime artifacts into unrelated PRs (ACES-287). Opt in with
+        # JOBAGENT_WRITE_REGRESSION_TESTS=1; tests point this at a tmp file directly.
+        self.regression_test_path: Path | None = (
             Path(__file__).parent.parent / "tests" / "test_reauth_regressions.py"
+            if os.environ.get("JOBAGENT_WRITE_REGRESSION_TESTS", "").strip().lower() in ("1", "true", "yes", "on")
+            else None
         )
 
     async def handle(self, source: str, detail: str = "", context: str = "discover") -> bool:
@@ -83,9 +102,16 @@ class ReauthManager:
         Returns True if the session was refreshed and the caller should retry.
         """
         _log.info("reauth.start source=%s context=%s", source, context)
+        has_human_fallback = source in HUMAN_SOURCES
         if source in AUTOMATED_SOURCES:
-            return await self._reauth_automated(source)
-        elif source in HUMAN_SOURCES:
+            # When a human fallback follows, the automated attempt must not fire its
+            # own phone escalation — _reauth_human sends the (single) notification.
+            kwargs = {"escalate": False} if has_human_fallback else {}
+            refreshed = await self._reauth_automated(source, **kwargs)
+            if refreshed or not has_human_fallback:
+                return refreshed
+            _log.info("reauth.automated_failed_falling_back_to_human source=%s", source)
+        if has_human_fallback:
             timeout = self.timeout_discover if context == "discover" else self.timeout_apply
             return await self._reauth_human(source, detail, timeout)
         _log.warning("reauth.unknown_source source=%s", source)
@@ -95,7 +121,13 @@ class ReauthManager:
     # Automated path
     # ------------------------------------------------------------------
 
-    async def _reauth_automated(self, source: str) -> bool:
+    async def _reauth_automated(self, source: str, *, escalate: bool = True) -> bool:
+        """Stored-credential login for *source*.
+
+        escalate=False suppresses this path's own failure notifications / phone
+        deep-link (used when handle() will fall back to _reauth_human, which sends
+        the single human-facing notification). Breaker events are recorded either way.
+        """
         # Cap retries and implement exponential backoff
         from .notifier import get_status
         status = get_status()
@@ -141,11 +173,13 @@ class ReauthManager:
         email    = resolve_secret(f"{source.upper()}_EMAIL") or ""
         password = resolve_secret(f"{source.upper()}_PASSWORD") or ""
         if not email or not password:
-            notify_error(
-                f"{source} reauth failed",
-                f"Add {source.upper()}_EMAIL and {source.upper()}_PASSWORD to .env",
-            )
             record_reauth_event(source, "automated", "failed", "missing credentials")
+            _log.warning("reauth.failed source=%s mode=automated reason=missing_credentials", source)
+            if escalate:
+                notify_error(
+                    f"{source} reauth failed",
+                    f"Add {source.upper()}_EMAIL and {source.upper()}_PASSWORD to .env",
+                )
             return False
 
         notify_info(f"{source} reauth", "Attempting automated session refresh…")
@@ -168,10 +202,27 @@ class ReauthManager:
                 if not _is_logged_in_url(source, cur_url):
                     record_reauth_event(source, "automated", "failed", f"auto_login returned True but URL is {cur_url}")
                     _log.warning("reauth.false_positive source=%s url=%s", source, cur_url)
-                    notify_warning(
-                        f"{source} automated reauth false-positive",
-                        f"Login returned True but was redirected to login page: {cur_url}",
+                    if escalate:
+                        notify_warning(
+                            f"{source} automated reauth false-positive",
+                            f"Login returned True but was redirected to login page: {cur_url}",
+                        )
+                    return False
+                # Second, stronger check where the scraper offers one: a DOM probe for
+                # logged-in state. The URL heuristic alone passes a redirect to a home
+                # page that never shows a login wall (Jobright), and a false "success"
+                # both exports a stale session and resets the circuit breaker (ACES-72).
+                if not await _dom_says_logged_in(scraper, page):
+                    record_reauth_event(
+                        source, "automated", "failed",
+                        f"auto_login returned True but the page shows no logged-in state ({cur_url})",
                     )
+                    _log.warning("reauth.false_positive_dom source=%s url=%s", source, cur_url)
+                    if escalate:
+                        notify_warning(
+                            f"{source} automated reauth false-positive",
+                            f"Login returned True but the page shows no logged-in state: {cur_url}",
+                        )
                     return False
                 await scraper._export_session_json()
                 record_reauth_event(source, "automated", "success")
@@ -193,32 +244,34 @@ class ReauthManager:
             else:
                 record_reauth_event(source, "automated", "failed", "_auto_login returned False")
                 _log.warning("reauth.failed source=%s mode=automated reason=login_returned_false", source)
-                notify_warning(
-                    f"{source} automated reauth failed",
-                    "Login returned False — may need human assist or CAPTCHA",
-                )
-                # Escalate: send a one-tap deep-link so user can fix from phone
-                try:
-                    from .session_watchdog import _send_deep_link_notification
-                    _send_deep_link_notification(
-                        source,
-                        f"[Job Agent] {source.capitalize()} automated login failed (CAPTCHA/2FA). Tap to open Terminal and fix:",
+                if escalate:
+                    notify_warning(
+                        f"{source} automated reauth failed",
+                        "Login returned False — may need human assist or CAPTCHA",
                     )
-                except Exception:
-                    pass
+                    # Escalate: send a one-tap deep-link so user can fix from phone
+                    try:
+                        from .session_watchdog import _send_deep_link_notification
+                        _send_deep_link_notification(
+                            source,
+                            f"[Job Agent] {source.capitalize()} automated login failed (CAPTCHA/2FA). Tap to open Terminal and fix:",
+                        )
+                    except Exception:
+                        pass
                 return False
         except Exception as exc:
             record_reauth_event(source, "automated", "failed", str(exc)[:300])
             _log.error("reauth.error source=%s mode=automated error=%s", source, exc)
-            notify_error(f"{source} automated reauth error", str(exc)[:200])
-            try:
-                from .session_watchdog import _send_deep_link_notification
-                _send_deep_link_notification(
-                    source,
-                    f"[Job Agent] {source.capitalize()} reauth error: {str(exc)[:120]}. Tap to fix:",
-                )
-            except Exception:
-                pass
+            if escalate:
+                notify_error(f"{source} automated reauth error", str(exc)[:200])
+                try:
+                    from .session_watchdog import _send_deep_link_notification
+                    _send_deep_link_notification(
+                        source,
+                        f"[Job Agent] {source.capitalize()} reauth error: {str(exc)[:120]}. Tap to fix:",
+                    )
+                except Exception:
+                    pass
             return False
         finally:
             try:
@@ -320,16 +373,23 @@ class ReauthManager:
     # ------------------------------------------------------------------
 
     def _write_regression_test(self, source: str, mode: str, detail: str) -> None:
-        """Append an auto-generated regression test to tests/test_reauth_regressions.py."""
+        """Append an auto-generated regression test to self.regression_test_path
+        (no-op when that is None — the default; see __init__)."""
+        if not self.regression_test_path:
+            _log.debug("ReauthManager: regression-test writing disabled; skipping for %s", source)
+            return
         ts = datetime.now(timezone.utc)
         ts_slug = ts.strftime("%Y%m%d_%H%M%S")
         ts_human = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
 
         strategy = "_reauth_automated" if mode == "automated" else "_reauth_human"
+        other    = "_reauth_human" if mode == "automated" else "_reauth_automated"
         set_name = "AUTOMATED_SOURCES" if mode == "automated" else "HUMAN_SOURCES"
 
         safe_detail = re.sub(r"[^\w\s.,:;'()/-]", "", detail)[:120]
 
+        # Both strategies are patched: a human-fallback source runs the automated path
+        # first, and an unpatched strategy would launch a real browser from a unit test.
         test_body = f'''
 @pytest.mark.asyncio
 async def test_regression_{source}_{ts_slug}():
@@ -346,9 +406,11 @@ async def test_regression_{source}_{ts_slug}():
     assert exc.source == "{source}"
     assert "{safe_detail}" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
     mgr = ReauthManager(config={{}})
-    with patch.object(mgr, "{strategy}", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "{strategy}", new_callable=AsyncMock, return_value=True) as mock, \\
+         patch.object(mgr, "{other}", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("{source}", "{safe_detail}")
         mock.assert_called_once()
     assert result is True
@@ -407,6 +469,23 @@ def _send_imessage(phone: str, message: str) -> None:
         subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
     except Exception as exc:
         _log.warning("iMessage send failed: %s", exc)
+
+
+async def _dom_says_logged_in(scraper, page) -> bool:
+    """Post-login DOM probe via the scraper's own ``_is_logged_in(page)`` when it has
+    one (USAJobs does). Scrapers without a probe — or a probe that raises — pass, so
+    this only ever *adds* a rejection on top of the URL heuristic; it never blesses a
+    session the URL check already refused."""
+    probe = getattr(scraper, "_is_logged_in", None)
+    # asyncio's check (not inspect's) so both real `async def` methods and AsyncMock
+    # test doubles count as probes; a non-awaitable attribute is not a probe at all.
+    if probe is None or not asyncio.iscoroutinefunction(probe):
+        return True
+    try:
+        return bool(await probe(page))
+    except Exception as exc:  # noqa: BLE001 — a broken probe must not fail a good login
+        _log.warning("reauth.dom_probe_error error=%s", exc)
+        return True
 
 
 def _is_logged_in_url(source: str, url: str) -> bool:
