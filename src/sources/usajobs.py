@@ -399,23 +399,22 @@ class USAJobsScraper(BaseScraper):
         import os
         import asyncio
 
-        email_addr = os.environ.get("USAJOBS_EMAIL", "") or os.environ.get("EMAIL_2FA_ADDRESS", "")
+        from ..email_helper import resolve_imap_credentials
+
+        # One shared resolver (also used by the confirmation tracker) so both accept the
+        # same key names. It never falls back to USAJOBS_PASSWORD: that is the login.gov
+        # password, which iCloud IMAP always rejects — the old fallback guaranteed
+        # AUTHENTICATIONFAILED and silently degraded every 2FA to "human" (ACES-283).
+        email_addr, imap_password = resolve_imap_credentials(
+            os.environ.get("USAJOBS_EMAIL", "") or os.environ.get("EMAIL_2FA_ADDRESS", "")
+        )
         if not email_addr:
             return False
-
-        # Scope iCloud app password to iCloud domains; otherwise prefer explicit IMAP or USAJOBS password
-        is_icloud = any(dom in email_addr.lower() for dom in ("@icloud.com", "@me.com", "@mac.com"))
-        if is_icloud:
-            imap_password = (
-                os.environ.get("IMAP_PASSWORD", "")
-                or os.environ.get("ICLOUD_APP_PASSWORD_PERSONAL", "")
-                or os.environ.get("ICLOUD_APP_PASSWORD", "")
-                or os.environ.get("USAJOBS_PASSWORD", "")
-            )
-        else:
-            imap_password = os.environ.get("IMAP_PASSWORD", "") or os.environ.get("USAJOBS_PASSWORD", "")
-
         if not imap_password:
+            console.print(
+                "[yellow]USAJobs:[/yellow] No IMAP app-specific password configured for the "
+                "email 2FA path (IMAP_PASSWORD / ICLOUD_APP_PASSWORD_*) — skipping it."
+            )
             return False
 
         # Find the 2FA OTP code input field
@@ -664,9 +663,15 @@ class USAJobsScraper(BaseScraper):
             await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
             await self._delay(2, 3)
             if not await self._is_logged_in(page):
-                return self._set_apply_outcome(
-                    "usajobs_login_required",
-                    "USAJobs session is not authenticated. Run prepare-sessions --source usajobs and sign in once.",
+                # Raise instead of returning a status: the orchestrator's apply loop
+                # catches AuthFailedError, runs ReauthManager (automated login + TOTP /
+                # emailed code, human only as fallback) ONCE per source per run and
+                # retries this job, then skips the rest of the source cheaply. Returning
+                # "usajobs_login_required" left every USAJobs job burning a browser
+                # launch each and waiting for a human to run prepare-sessions (ACES-283).
+                raise AuthFailedError(
+                    "usajobs",
+                    "USAJobs session is not authenticated (login wall on the job page).",
                 )
 
             # Check if job is expired/closed
