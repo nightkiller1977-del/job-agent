@@ -153,7 +153,6 @@ async def test_prepare_sessions_dispatches_portal_blocked_jobs_to_external_prep(
     o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
     o.config = {}
     o.state = _State()
-    o.load_credentials_from_dashboard = _noop
     o._pull_approved_from_cloud = _noop
 
     with patch("sys.stdin") as mock_stdin:
@@ -223,7 +222,6 @@ async def test_prepare_sessions_does_not_reset_circuit_breaker_for_externally_ro
     o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
     o.config = {}
     o.state = _State()
-    o.load_credentials_from_dashboard = _noop
     o._pull_approved_from_cloud = _noop
 
     with patch("sys.stdin") as mock_stdin:
@@ -292,7 +290,6 @@ async def test_prepare_sessions_does_not_reset_jobright_circuit_breaker_for_a_jo
     o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
     o.config = {}
     o.state = _State()
-    o.load_credentials_from_dashboard = _noop
     o._pull_approved_from_cloud = _noop
 
     with patch("sys.stdin") as mock_stdin:
@@ -416,7 +413,6 @@ async def test_prepare_sessions_does_not_clear_when_prep_bails_early(monkeypatch
     o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
     o.config = {}
     o.state = _State()
-    o.load_credentials_from_dashboard = _noop
     o._pull_approved_from_cloud = _noop
 
     with patch("sys.stdin") as mock_stdin:
@@ -482,7 +478,6 @@ async def test_prepare_sessions_resets_automated_reauth_circuit_breaker(monkeypa
     o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
     o.config = {}
     o.state = _State()
-    o.load_credentials_from_dashboard = _noop
     o._pull_approved_from_cloud = _noop
 
     with patch("sys.stdin") as mock_stdin:
@@ -747,7 +742,6 @@ async def test_preflight_block_keeps_portal_status_for_prepare_sessions(tmp_path
     o = orch_mod.Orchestrator.__new__(orch_mod.Orchestrator)
     o.config = {}
     o.state = sm
-    o.load_credentials_from_dashboard = _noop
     o._pull_approved_from_cloud = _noop
     o._push_apply_attempt_to_cloud = _noop
     o._log_credential_presence = lambda: None

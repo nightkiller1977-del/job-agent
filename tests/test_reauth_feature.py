@@ -44,7 +44,6 @@ def orchestrator(tmp_path):
     """Orchestrator wired to an in-memory DB with no cloud sync."""
     config = {"state_db_path": str(tmp_path / "jobs.db")}
     with patch("src.orchestrator.JobScorer"), \
-         patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock), \
          patch("src.orchestrator.Orchestrator.hydrate_external_jobs", new_callable=AsyncMock), \
          patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
          patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
@@ -191,8 +190,7 @@ class TestApplyReauth:
              patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
             MockReauthMgr.return_value.handle = mock_reauth
             await orchestrator.apply_approved(auto_submit=True)
 
@@ -217,8 +215,7 @@ class TestApplyReauth:
              patch("src.orchestrator.ReauthManager") as MockReauthMgr, \
              patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
             MockReauthMgr.return_value.handle = mock_reauth
             await orchestrator.apply_approved(auto_submit=True)
 
@@ -247,8 +244,7 @@ class TestApplyReauth:
              patch("src.orchestrator.Orchestrator._classify_apply_readiness", return_value=("ready", "")), \
              patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
             MockReauthMgr.return_value.handle = mock_reauth
             await orchestrator.apply_approved(auto_submit=True)
 
@@ -277,8 +273,7 @@ class TestApplyReauth:
              patch("src.orchestrator.ReauthManager") as MockReauthMgr, \
              patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
             MockReauthMgr.return_value.handle = mock_reauth
             await orchestrator.apply_approved(auto_submit=True)
 
@@ -300,8 +295,7 @@ class TestApplyReauth:
              patch("src.orchestrator.ReauthManager") as MockReauthMgr, \
              patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
             await orchestrator.apply_approved(auto_submit=True)
             MockReauthMgr.return_value.handle.assert_not_called()
 
@@ -342,8 +336,7 @@ class TestApplyReauth:
              patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
             MockReauthMgr.return_value.handle = mock_reauth
             await orchestrator.apply_approved(auto_submit=True)
 
@@ -383,8 +376,7 @@ class TestApplyReauth:
              patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock), \
-             patch("src.orchestrator.Orchestrator.load_credentials_from_dashboard", new_callable=AsyncMock):
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
             await orchestrator.apply_approved(auto_submit=True)
 
         scraper.apply.assert_not_called()

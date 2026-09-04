@@ -684,32 +684,6 @@ async def get_errors():
     return [dict(r) for r in rows]
 
 
-@app.get("/api/credentials")
-async def get_credentials(x_sync_secret: Optional[str] = Header(default=None)):
-    """Fetch all credentials for the local agent."""
-    if SYNC_SECRET and x_sync_secret != SYNC_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid sync secret")
-
-    if not DATABASE_URL:
-        raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
-
-    try:
-        with get_conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT platform, email, password FROM credentials")
-                rows = cur.fetchall()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    # Decrypt passwords before returning to the local agent
-    result = []
-    for r in rows:
-        row = dict(r)
-        row["password"] = _decrypt_password(row.get("password") or "")
-        result.append(row)
-    return result
-
-
 @app.post("/api/credentials")
 async def save_credentials(body: CredentialsRequest):
     """Save or update credentials for a platform. Encrypts password at rest."""
