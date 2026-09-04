@@ -60,9 +60,12 @@ async def test_regression_usajobs_20260626_214736():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -126,9 +129,12 @@ async def test_regression_usajobs_20260626_214832():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -192,9 +198,12 @@ async def test_regression_usajobs_20260626_214908():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -258,9 +267,12 @@ async def test_regression_usajobs_20260626_230724():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -324,9 +336,12 @@ async def test_regression_usajobs_20260626_230947():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -390,9 +405,12 @@ async def test_regression_usajobs_20260626_231032():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -456,9 +474,12 @@ async def test_regression_usajobs_20260626_231329():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -522,9 +543,12 @@ async def test_regression_usajobs_20260627_001156():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -588,9 +612,12 @@ async def test_regression_usajobs_20260627_001349():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -654,9 +681,12 @@ async def test_regression_usajobs_20260627_002137():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -720,9 +750,12 @@ async def test_regression_usajobs_20260627_010351():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -786,9 +819,12 @@ async def test_regression_usajobs_20260627_010532():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -852,9 +888,12 @@ async def test_regression_usajobs_20260627_061156():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -918,9 +957,12 @@ async def test_regression_usajobs_20260627_195245():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -984,9 +1026,12 @@ async def test_regression_usajobs_20260627_195452():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1050,9 +1095,12 @@ async def test_regression_usajobs_20260627_195541():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1116,9 +1164,12 @@ async def test_regression_usajobs_20260627_203925():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1182,9 +1233,12 @@ async def test_regression_usajobs_20260627_204511():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1248,9 +1302,12 @@ async def test_regression_usajobs_20260627_213540():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1314,9 +1371,12 @@ async def test_regression_usajobs_20260627_220406():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1380,9 +1440,12 @@ async def test_regression_usajobs_20260708_155039():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1446,9 +1509,12 @@ async def test_regression_usajobs_20260710_020508():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1512,9 +1578,12 @@ async def test_regression_usajobs_20260710_020645():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1578,9 +1647,12 @@ async def test_regression_usajobs_20260710_020716():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1644,9 +1716,12 @@ async def test_regression_usajobs_20260710_020732():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1710,9 +1785,12 @@ async def test_regression_usajobs_20260710_131011():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1776,9 +1854,12 @@ async def test_regression_usajobs_20260710_131352():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1842,9 +1923,12 @@ async def test_regression_usajobs_20260710_132349():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1908,9 +1992,12 @@ async def test_regression_usajobs_20260710_141141():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -1974,9 +2061,12 @@ async def test_regression_usajobs_20260710_173854():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -2040,9 +2130,12 @@ async def test_regression_usajobs_20260726_000757():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -2106,9 +2199,12 @@ async def test_regression_usajobs_20260726_001021():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -2172,9 +2268,12 @@ async def test_regression_usajobs_20260828_162331():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -2238,9 +2337,12 @@ async def test_regression_usajobs_20260829_045426():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
@@ -2304,9 +2406,324 @@ async def test_regression_usajobs_20260829_045537():
     assert exc.source == "usajobs"
     assert "2FA required" in str(exc)
 
-    # Verify ReauthManager routes to the correct strategy
+    # Verify ReauthManager reaches the human path once the automated attempt fails
+    # (usajobs is automated-first since ACES-283; the automated strategy is patched to
+    # fail so no real browser runs and the fallback order is what's exercised)
     mgr = ReauthManager(config={})
-    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("usajobs", "2FA required")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_035743():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 03:57:43 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_035748():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 03:57:48 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_usajobs_20260904_035751():
+    """Auto-generated regression: usajobs — _auto_login returned True after session expiry — corrected 2026-09-04 03:57:51 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "usajobs" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("usajobs", "_auto_login returned True after session expiry")
+    assert exc.source == "usajobs"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("usajobs", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_linkedin_20260904_035754():
+    """Auto-generated regression: linkedin — _auto_login returned True after session expiry — corrected 2026-09-04 03:57:54 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "linkedin" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("linkedin", "_auto_login returned True after session expiry")
+    assert exc.source == "linkedin"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("linkedin", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_usajobs_20260904_035802():
+    """Auto-generated regression: usajobs — 2FA required — corrected 2026-09-04 03:58:02 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "usajobs" in HUMAN_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("usajobs", "2FA required")
+    assert exc.source == "usajobs"
+    assert "2FA required" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("usajobs", "2FA required")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_035847():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 03:58:47 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_035851():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 03:58:51 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_linkedin_20260904_035855():
+    """Auto-generated regression: linkedin — _auto_login returned True after session expiry — corrected 2026-09-04 03:58:55 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "linkedin" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("linkedin", "_auto_login returned True after session expiry")
+    assert exc.source == "linkedin"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("linkedin", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_usajobs_20260904_035856():
+    """Auto-generated regression: usajobs — 2FA required — corrected 2026-09-04 03:58:56 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "usajobs" in HUMAN_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("usajobs", "2FA required")
+    assert exc.source == "usajobs"
+    assert "2FA required" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("usajobs", "2FA required")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_040001():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 04:00:01 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_040004():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 04:00:04 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_linkedin_20260904_040011():
+    """Auto-generated regression: linkedin — _auto_login returned True after session expiry — corrected 2026-09-04 04:00:11 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "linkedin" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("linkedin", "_auto_login returned True after session expiry")
+    assert exc.source == "linkedin"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False):
+        result = await mgr.handle("linkedin", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_usajobs_20260904_040015():
+    """Auto-generated regression: usajobs — 2FA required — corrected 2026-09-04 04:00:15 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "usajobs" in HUMAN_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("usajobs", "2FA required")
+    assert exc.source == "usajobs"
+    assert "2FA required" in str(exc)
+
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
+         patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True

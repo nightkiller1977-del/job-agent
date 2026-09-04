@@ -19,7 +19,6 @@ import email.utils
 import imaplib
 import json
 import logging
-import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -286,25 +285,17 @@ class EmailConfirmationTracker:
             from .state_manager import StateManager
             self.state_manager = StateManager()
 
-        user_email = (
-            email_addr
-            or os.environ.get("EMAIL_2FA_ADDRESS", "")
-            or os.environ.get("USAJOBS_EMAIL", "")
-            or os.environ.get("IMAP_USER", "")
-        )
-        imap_pwd = (
-            password
-            or os.environ.get("ICLOUD_APP_PASSWORD_PERSONAL", "")
-            or os.environ.get("ICLOUD_APP_PASSWORD", "")
-            or os.environ.get("IMAP_PASSWORD", "")
-        )
+        # Same resolver as the USAJobs email-2FA reader, so one set of key names
+        # (and one rotation) serves both IMAP consumers (ACES-283).
+        from .email_helper import resolve_imap_credentials
+        user_email, imap_pwd = resolve_imap_credentials(email_addr or "", password or "")
 
         if not user_email:
             console.print("[yellow]Email confirmation check skipped: EMAIL_2FA_ADDRESS / USAJOBS_EMAIL / IMAP_USER not configured.[/yellow]")
             return []
 
         if not imap_pwd:
-            console.print("[yellow]Email confirmation check skipped: ICLOUD_APP_PASSWORD_PERSONAL / IMAP_PASSWORD not configured.[/yellow]")
+            console.print("[yellow]Email confirmation check skipped: no IMAP app-specific password (IMAP_PASSWORD / ICLOUD_APP_PASSWORD_*) configured.[/yellow]")
             return []
 
         # Reconcile submission ledger before evaluating emails

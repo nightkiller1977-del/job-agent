@@ -11,6 +11,79 @@ from email.mime.text import MIMEText
 
 _log = logging.getLogger(__name__)
 
+# Env names an IMAP *app-specific* password may be stored under. IMAP_PASSWORD is the
+# canonical name; ICLOUD_APP_PASSWORD_ICLOUD / _MAC are what the central aicc-secrets
+# store uses for the two iCloud accounts (the icloud-mail MCP reads the same names),
+# so one rotation there is picked up here without renaming anything.
+#
+# The *site* login password (USAJOBS_PASSWORD etc.) is deliberately absent: iCloud,
+# Gmail and Yahoo reject account passwords over IMAP outright, so falling back to it
+# — which the old code did — can only ever produce AUTHENTICATIONFAILED, and then
+# burned the whole 2FA window retrying that same doomed login every 10 s (ACES-283).
+_IMAP_ADDRESS_KEYS = ("EMAIL_2FA_ADDRESS", "USAJOBS_EMAIL", "IMAP_USER")
+_IMAP_PASSWORD_KEYS_GENERIC = (
+    "IMAP_PASSWORD",
+    "ICLOUD_APP_PASSWORD_PERSONAL",
+    "ICLOUD_APP_PASSWORD",
+)
+_IMAP_PASSWORD_KEYS_BY_DOMAIN = {
+    "@icloud.com": ("ICLOUD_APP_PASSWORD_ICLOUD", "ICLOUD_APP_PASSWORD_MAC"),
+    "@me.com":     ("ICLOUD_APP_PASSWORD_MAC", "ICLOUD_APP_PASSWORD_ICLOUD"),
+    "@mac.com":    ("ICLOUD_APP_PASSWORD_MAC", "ICLOUD_APP_PASSWORD_ICLOUD"),
+}
+
+# Substrings (upper-cased) that identify a rejected-credential IMAP response, as
+# opposed to a transient connection/server error worth retrying.
+_IMAP_AUTH_FAILURE_MARKERS = (
+    "AUTHENTICATIONFAILED",
+    "AUTHENTICATE FAILED",
+    "LOGIN FAILED",
+    "INVALID CREDENTIALS",
+)
+
+
+def imap_password_candidates(email_addr: str) -> tuple[str, ...]:
+    """Env var names to try, in order, for *email_addr*'s IMAP app password."""
+    keys = list(_IMAP_PASSWORD_KEYS_GENERIC)
+    addr = (email_addr or "").lower()
+    for domain, names in _IMAP_PASSWORD_KEYS_BY_DOMAIN.items():
+        if domain in addr:
+            keys.extend(n for n in names if n not in keys)
+            break
+    return tuple(keys)
+
+
+def resolve_imap_credentials(email_addr: str = "", password: str = "") -> tuple[str, str]:
+    """Return ``(address, app_password)`` for IMAP access, or ``("", "")`` parts when
+    unresolved. Explicit arguments win; otherwise the address comes from
+    EMAIL_2FA_ADDRESS / USAJOBS_EMAIL / IMAP_USER and the password from
+    :func:`imap_password_candidates`. Shared by the USAJobs email-2FA reader and the
+    employer-confirmation tracker so both accept the same key names and neither can
+    drift back to a site-login password."""
+    import os
+    addr = (email_addr or "").strip()
+    if not addr:
+        for key in _IMAP_ADDRESS_KEYS:
+            val = (os.environ.get(key) or "").strip()
+            if val:
+                addr = val
+                break
+    pwd = (password or "").strip()
+    if not pwd and addr:
+        for key in imap_password_candidates(addr):
+            val = (os.environ.get(key) or "").strip()
+            if val:
+                pwd = val
+                break
+    return addr, pwd
+
+
+def is_imap_auth_failure(exc: BaseException) -> bool:
+    """True when *exc* is the server rejecting the credentials (not a transient error)."""
+    text = str(exc).upper()
+    return any(marker in text for marker in _IMAP_AUTH_FAILURE_MARKERS)
+
+
 def get_imap_server_for_email(email_addr: str) -> str:
     """Guess the standard IMAP server based on the email domain name."""
     addr = email_addr.lower()
@@ -66,7 +139,25 @@ def retrieve_email_2fa_code(
     while time.monotonic() - start_time < timeout:
         try:
             mail = imaplib.IMAP4_SSL(imap_server, port=993)
-            mail.login(email_address, password)
+            try:
+                mail.login(email_address, password)
+            except imaplib.IMAP4.error as login_exc:
+                if is_imap_auth_failure(login_exc):
+                    # Rejected credentials will not fix themselves inside this window:
+                    # fail fast with one actionable line instead of retrying the same
+                    # doomed login every 10 s until the 2FA timeout (ACES-283).
+                    _log.warning(
+                        "mail.2fa_auth_failed imap=%s — IMAP rejected the app-specific "
+                        "password; rotate it (IMAP_PASSWORD / ICLOUD_APP_PASSWORD_*, see "
+                        "SECRETS.md). Not retrying this run.",
+                        imap_server,
+                    )
+                    try:
+                        mail.logout()
+                    except Exception:
+                        pass
+                    return None
+                raise
             mail.select("INBOX")
 
             search_query = f'(FROM "{sender_pattern}" SUBJECT "{subject_pattern}")'

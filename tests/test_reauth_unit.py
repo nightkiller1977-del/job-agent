@@ -253,17 +253,47 @@ class TestReauthManagerRouting:
                 assert result is True
 
     @pytest.mark.asyncio
-    async def test_usajobs_routes_to_human(self, tmp_path, monkeypatch):
+    async def test_usajobs_tries_automated_first_then_falls_back_to_human(self, tmp_path, monkeypatch):
+        """ACES-283/286: usajobs is automated-first (stored creds + TOTP / emailed
+        code); the human path is the fallback, not the default. The automated attempt
+        runs with escalate=False so its own phone deep-link doesn't double the human
+        path's notification."""
         monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
         from src.reauth import ReauthManager
         mgr = ReauthManager(config={})
 
-        with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock) as mock_auto, \
+        with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False) as mock_auto, \
              patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False) as mock_human:
             result = await mgr.handle("usajobs", "2FA required")
-            mock_human.assert_called_once()
-            mock_auto.assert_not_called()
-            assert result is False
+        mock_auto.assert_called_once_with("usajobs", escalate=False)
+        mock_human.assert_called_once()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_usajobs_automated_success_never_notifies_a_human(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+
+        with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock_auto, \
+             patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=False) as mock_human:
+            result = await mgr.handle("usajobs", "2FA required")
+        mock_auto.assert_called_once()
+        mock_human.assert_not_called()
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_fully_automated_sources_do_not_fall_back_to_human(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+
+        with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False) as mock_auto, \
+             patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock_human:
+            result = await mgr.handle("jobright", "cookie expired")
+        mock_auto.assert_called_once_with("jobright")
+        mock_human.assert_not_called()
+        assert result is False
 
     @pytest.mark.asyncio
     async def test_unknown_source_returns_false(self, tmp_path, monkeypatch):
@@ -285,7 +315,8 @@ class TestReauthManagerRouting:
             captured["timeout"] = timeout_minutes
             return False
 
-        with patch.object(mgr, "_reauth_human", side_effect=fake_human):
+        with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False), \
+             patch.object(mgr, "_reauth_human", side_effect=fake_human):
             await mgr.handle("usajobs", "detail", context="discover")
         assert captured["timeout"] == 30
 
@@ -301,7 +332,8 @@ class TestReauthManagerRouting:
             captured["timeout"] = timeout_minutes
             return False
 
-        with patch.object(mgr, "_reauth_human", side_effect=fake_human):
+        with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False), \
+             patch.object(mgr, "_reauth_human", side_effect=fake_human):
             await mgr.handle("usajobs", "detail", context="apply")
         assert captured["timeout"] == 10
 
@@ -399,6 +431,65 @@ class TestReauthAutomated:
 
         assert result is True
         mock_scraper._auto_login.assert_awaited_once_with(mock_page, "store@example.com", "store-secret")
+
+    @pytest.mark.asyncio
+    async def test_dom_probe_rejects_url_only_false_positive(self, tmp_path, monkeypatch):
+        """ACES-72 residual: _auto_login says True and the URL looks fine, but the
+        scraper's own _is_logged_in(page) sees no logged-in state → must be a failure
+        (no session export, a 'failed' breaker event), not a blessed stale session."""
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.setenv("USAJOBS_EMAIL", "test@test.com")
+        monkeypatch.setenv("USAJOBS_PASSWORD", "password")
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+
+        mock_page = AsyncMock()
+        mock_page.url = "https://www.usajobs.gov/"        # passes the URL heuristic
+        mock_scraper = AsyncMock()
+        mock_scraper._auto_login = AsyncMock(return_value=True)
+        mock_scraper._is_logged_in = AsyncMock(return_value=False)
+        mock_scraper._export_session_json = AsyncMock()
+        mock_scraper._close_browser = AsyncMock()
+
+        with patch("src.reauth._get_source_map", return_value={"usajobs": MagicMock(return_value=mock_scraper)}), \
+             patch.object(mock_scraper, "_start_browser", new_callable=AsyncMock, return_value=mock_page):
+            result = await mgr._reauth_automated("usajobs")
+
+        assert result is False
+        mock_scraper._is_logged_in.assert_awaited_once_with(mock_page)
+        mock_scraper._export_session_json.assert_not_called()
+        events = json.loads((tmp_path / "status.json").read_text()).get("reauth_events", [])
+        assert any(e["source"] == "usajobs" and e["outcome"] == "failed" and "no logged-in state" in e.get("detail", "")
+                   for e in events)
+
+    @pytest.mark.asyncio
+    async def test_escalate_false_suppresses_phone_deep_link(self, tmp_path, monkeypatch):
+        """With a human fallback following, the automated path must not send its own
+        deep-link (the human path sends the one notification) — but it still records
+        the failure so the circuit breaker sees it."""
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.setenv("USAJOBS_EMAIL", "test@test.com")
+        monkeypatch.setenv("USAJOBS_PASSWORD", "password")
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+
+        mock_scraper = AsyncMock()
+        mock_scraper._auto_login = AsyncMock(return_value=False)
+        mock_scraper._close_browser = AsyncMock()
+
+        with patch("src.reauth._get_source_map", return_value={"usajobs": MagicMock(return_value=mock_scraper)}), \
+             patch.object(mock_scraper, "_start_browser", new_callable=AsyncMock, return_value=AsyncMock()), \
+             patch("src.session_watchdog._send_deep_link_notification") as mock_link, \
+             patch("src.reauth.notify_warning") as mock_warn:
+            result = await mgr._reauth_automated("usajobs", escalate=False)
+
+        assert result is False
+        mock_link.assert_not_called()
+        mock_warn.assert_not_called()
+        events = json.loads((tmp_path / "status.json").read_text()).get("reauth_events", [])
+        assert any(e["source"] == "usajobs" and e["mode"] == "automated" and e["outcome"] == "failed" for e in events)
 
     @pytest.mark.asyncio
     async def test_browser_always_closed_on_failure(self, tmp_path, monkeypatch):
