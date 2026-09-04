@@ -34,6 +34,19 @@ pointing at that checkout. For launchd runs `scripts/manage-autopilot.sh install
 writes it into the plists (exported value → sibling `aicc-secrets` checkout →
 empty/default). Without it the resolver silently reads only the plaintext `.env`.
 
+### Store-authoritative keys (ACES-282)
+
+Steps 1–2 do **not** apply to shared AI-service credentials — `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `AICC_OPENROUTER_API_KEY`, `OPENROUTER_GATEWAY_URL`
+(`secret_store.STORE_AUTHORITATIVE_KEYS`). Those are owned by the central store and
+rotated in one place; when the store holds a value it **replaces** whatever the process
+env or project `.env` carried, and the resolver logs a warning naming the key. A local
+copy of one of these is a misconfiguration to remove, not a fallback: with fill-missing
+alone, every local copy of `ANTHROPIC_API_KEY` masked the store — on 2026-09-04 all three
+copies were identical and the key was already rejected by Anthropic (HTTP 401), and a
+rotation in the store would never have reached the agent. **Every agent** (job-agent,
+email-agent `src/lib/secrets.js`, the desktop app) is expected to apply the same rule.
+
 ## Canonical key catalog
 
 | Key | job-agent | email-agent |
