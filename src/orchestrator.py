@@ -444,7 +444,11 @@ class Orchestrator:
             except Exception:
                 extra = {}
             if str(extra.get("apply_last_status") or "") in own:
-                self.state.clear_session_block(job["job_id"])
+                try:
+                    self.state.clear_session_block(job["job_id"])
+                except Exception as exc:  # noqa: BLE001 — one locked row must not fail the refresh or the rest
+                    _log.warning("reauth.unblock_job_failed source=%s job_id=%s error=%s", source, job["job_id"], exc)
+                    continue
                 cleared += 1
         if cleared:
             console.print(f"[cyan]{source} session refreshed — {cleared} login-blocked job(s) marked retryable.[/cyan]")

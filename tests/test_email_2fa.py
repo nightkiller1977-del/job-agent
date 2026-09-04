@@ -59,13 +59,27 @@ def test_resolve_explicit_arguments_win(monkeypatch):
     assert resolve_imap_credentials("arg@icloud.com", "arg-pw") == ("arg@icloud.com", "arg-pw")
 
 
+def test_icloud_keys_are_never_used_for_other_providers(monkeypatch):
+    """An iCloud app password handed to Gmail can only fail auth; a Gmail address with
+    only ICLOUD_* keys set must resolve to 'no password' instead (Copilot, PR #88)."""
+    _clear(monkeypatch)
+    monkeypatch.setenv("USAJOBS_EMAIL", "me@gmail.com")
+    monkeypatch.setenv("ICLOUD_APP_PASSWORD_PERSONAL", "icloud-only")
+    monkeypatch.setenv("ICLOUD_APP_PASSWORD", "icloud-only-2")
+    assert resolve_imap_credentials() == ("me@gmail.com", "")
+    monkeypatch.setenv("IMAP_PASSWORD", "generic")
+    assert resolve_imap_credentials()[1] == "generic"
+
+
 def test_candidates_are_domain_aware():
     assert imap_password_candidates("x@icloud.com")[-2:] == ("ICLOUD_APP_PASSWORD_ICLOUD", "ICLOUD_APP_PASSWORD_MAC")
     assert imap_password_candidates("x@mac.com")[-2:] == ("ICLOUD_APP_PASSWORD_MAC", "ICLOUD_APP_PASSWORD_ICLOUD")
     assert imap_password_candidates("x@me.com")[-2:] == ("ICLOUD_APP_PASSWORD_MAC", "ICLOUD_APP_PASSWORD_ICLOUD")
     gmail = imap_password_candidates("x@gmail.com")
-    assert gmail[0] == "IMAP_PASSWORD"
-    assert "ICLOUD_APP_PASSWORD_ICLOUD" not in gmail
+    assert gmail == ("IMAP_PASSWORD",)
+    assert imap_password_candidates("x@icloud.com")[:3] == (
+        "IMAP_PASSWORD", "ICLOUD_APP_PASSWORD_PERSONAL", "ICLOUD_APP_PASSWORD",
+    )
     for keys in (imap_password_candidates(a) for a in ("x@icloud.com", "x@gmail.com", "")):
         assert "USAJOBS_PASSWORD" not in keys
 
