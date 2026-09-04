@@ -434,7 +434,8 @@ class IndeedScraper(BaseScraper):
         """Open Indeed and establish a persistent session.
 
         Tries auto-login with INDEED_EMAIL / INDEED_PASSWORD from env first
-        (populated by load_credentials_from_dashboard() at run start).
+        (resolved at run start by src/secret_store.py: .env, then the central
+        SOPS store).
         Falls back to a manual login prompt in interactive mode.
 
         Returns True when the session is confirmed ready to clear: credential
