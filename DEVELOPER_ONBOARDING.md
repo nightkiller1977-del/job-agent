@@ -61,7 +61,7 @@ Each scraper checks on startup whether it is logged in. If not, `_auto_login()` 
 
 **USAJobs** — uses login.gov. `_auto_login()` fills email and password automatically, then waits up to 90 seconds if 2FA is triggered (user completes it in the open browser window). Once past 2FA, the session is saved in the Chrome profile and won't require 2FA again for weeks.
 
-`orchestrator.load_credentials_from_dashboard()` also pulls credentials from the cloud dashboard at runtime, setting them as environment variables.
+Credentials are resolved once, by `src/secret_store.py`: process env → project `.env` → the central SOPS store (`AICC_SECRETS_DIR`, see `SECRETS.md`). The agent makes no network call to obtain credentials; the dashboard's stored credentials are for its own UI only.
 
 ---
 

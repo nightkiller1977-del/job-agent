@@ -30,7 +30,6 @@ async def test_pdf_text_layer_error_pauses_the_batch():
     state.get_approved_unapplied.return_value = [job1, job2]
     orch.state = state
 
-    orch.load_credentials_from_dashboard = AsyncMock()
     orch._pull_approved_from_cloud = AsyncMock()
     orch._push_apply_attempt_to_cloud = AsyncMock()
     orch._push_status_to_cloud = AsyncMock()
@@ -73,7 +72,6 @@ async def test_ats_readability_error_does_not_abort_batch():
     orch.state = state
 
     # Neutralize cloud / credential / notifier side effects
-    orch.load_credentials_from_dashboard = AsyncMock()
     orch._pull_approved_from_cloud = AsyncMock()
     orch._push_apply_attempt_to_cloud = AsyncMock()
     orch._push_status_to_cloud = AsyncMock()

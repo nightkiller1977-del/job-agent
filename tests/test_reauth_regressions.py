@@ -2310,3 +2310,179 @@ async def test_regression_usajobs_20260829_045537():
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_034559():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 03:45:59 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager routes to the correct strategy
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_034602():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 03:46:02 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager routes to the correct strategy
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_linkedin_20260904_034604():
+    """Auto-generated regression: linkedin — _auto_login returned True after session expiry — corrected 2026-09-04 03:46:04 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "linkedin" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("linkedin", "_auto_login returned True after session expiry")
+    assert exc.source == "linkedin"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager routes to the correct strategy
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle("linkedin", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_usajobs_20260904_034605():
+    """Auto-generated regression: usajobs — 2FA required — corrected 2026-09-04 03:46:05 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "usajobs" in HUMAN_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("usajobs", "2FA required")
+    assert exc.source == "usajobs"
+    assert "2FA required" in str(exc)
+
+    # Verify ReauthManager routes to the correct strategy
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle("usajobs", "2FA required")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_034919():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 03:49:19 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager routes to the correct strategy
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_jobright_20260904_034923():
+    """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-09-04 03:49:23 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "jobright" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("jobright", "_auto_login returned True after session expiry")
+    assert exc.source == "jobright"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager routes to the correct strategy
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle("jobright", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_linkedin_20260904_034925():
+    """Auto-generated regression: linkedin — _auto_login returned True after session expiry — corrected 2026-09-04 03:49:25 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "linkedin" in AUTOMATED_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("linkedin", "_auto_login returned True after session expiry")
+    assert exc.source == "linkedin"
+    assert "_auto_login returned True after session expiry" in str(exc)
+
+    # Verify ReauthManager routes to the correct strategy
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle("linkedin", "_auto_login returned True after session expiry")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_regression_usajobs_20260904_034926():
+    """Auto-generated regression: usajobs — 2FA required — corrected 2026-09-04 03:49:26 UTC"""
+    from src.sources.base import AuthFailedError
+    from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
+    from unittest.mock import patch, AsyncMock
+
+    # Verify source routing hasn't regressed
+    assert "usajobs" in HUMAN_SOURCES
+
+    # Verify AuthFailedError carries correct attributes for this scenario
+    exc = AuthFailedError("usajobs", "2FA required")
+    assert exc.source == "usajobs"
+    assert "2FA required" in str(exc)
+
+    # Verify ReauthManager routes to the correct strategy
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle("usajobs", "2FA required")
+        mock.assert_called_once()
+    assert result is True
