@@ -396,7 +396,6 @@ class USAJobsScraper(BaseScraper):
 
     async def _try_email_2fa(self, page) -> bool:
         """Attempt to retrieve and submit an email 2FA code automatically."""
-        import os
         import asyncio
 
         from ..email_helper import resolve_imap_credentials
