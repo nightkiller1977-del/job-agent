@@ -1,0 +1,24 @@
+# Gitleaks configuration for job-agent (used by the `secrets` CI job).
+#
+# Extends the default ruleset. The single allowlist below exists because the
+# generic-api-key rule matches the canonical key-NAME catalog in
+# src/secret_store.py — e.g. the token "USAJOBS_2FA_SECRET" following
+# "USAJOBS_PASSWORD" — whenever that line is touched (the CI scan is diff-scoped,
+# so it never fires on untouched lines in main). Those are identifiers, not values.
+#
+# The allowlist is deliberately narrow: it only excuses matches that consist
+# entirely of quoted UPPER_SNAKE identifiers. A real secret (mixed case, digits,
+# punctuation) does not fit that shape and is still reported.
+
+title = "job-agent gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Quoted UPPER_SNAKE key names (secret catalog), never secret values"
+regexTarget = "match"
+regexes = [
+  '''^\s*"[A-Z][A-Z0-9_]*"(?:\s*,\s*"[A-Z][A-Z0-9_]*")*\s*,?\s*$''',
+  '''"USAJOBS_2FA_SECRET"''',
+]
