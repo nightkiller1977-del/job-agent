@@ -50,11 +50,31 @@ case "$action" in
     # Harmless if secrets.enc.env / the age key don't exist yet — sops
     # decryption just fails closed to the existing plaintext central-store
     # fallback.
+    #
+    # __AICC_SECRETS_DIR__ tells secret_store._commander_dir() where
+    # secrets.enc.env lives (aicc-secrets/README.md step 5). Without it the
+    # resolver looks in the platform-default AI Commander userData dir, which
+    # holds only the plaintext .env — so the SOPS store was silently never read
+    # (ACES-65). Resolved portably, no hardcoded paths: an exported
+    # AICC_SECRETS_DIR wins; else a sibling `aicc-secrets` checkout next to
+    # this repo; else empty, which _commander_dir() treats as unset.
+    local_secrets_dir="${AICC_SECRETS_DIR:-}"
+    if [ -z "$local_secrets_dir" ] && [ -f "$(dirname "$REPO_DIR")/aicc-secrets/secrets.enc.env" ]; then
+      local_secrets_dir="$(dirname "$REPO_DIR")/aicc-secrets"
+    fi
+    if [ -n "$local_secrets_dir" ]; then
+      echo "Secrets store: $local_secrets_dir/secrets.enc.env (AICC_SECRETS_DIR)"
+    else
+      echo "⚠ AICC_SECRETS_DIR is not set and no sibling aicc-secrets checkout was found;"
+      echo "  job-agent will fall back to the platform-default central store. See SECRETS.md."
+    fi
     sed -e "s|__PROJECT_DIR__|$REPO_DIR|g" \
         -e "s|__SOPS_AGE_KEY_FILE__|$HOME/.config/aicc/age.key|g" \
+        -e "s|__AICC_SECRETS_DIR__|$local_secrets_dir|g" \
         "$REPO_DIR/launchd/$DISCOVER_PLIST" > "$LAUNCHD_DIR/$DISCOVER_PLIST"
     sed -e "s|__PROJECT_DIR__|$REPO_DIR|g" \
         -e "s|__SOPS_AGE_KEY_FILE__|$HOME/.config/aicc/age.key|g" \
+        -e "s|__AICC_SECRETS_DIR__|$local_secrets_dir|g" \
         "$REPO_DIR/launchd/$APPLY_PLIST" > "$LAUNCHD_DIR/$APPLY_PLIST"
 
     if launchctl load -w "$LAUNCHD_DIR/$DISCOVER_PLIST" && launchctl load -w "$LAUNCHD_DIR/$APPLY_PLIST"; then
