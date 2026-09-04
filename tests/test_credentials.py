@@ -115,6 +115,38 @@ class TestCredentialsEndpoints(unittest.TestCase):
         self.assertEqual(decrypted, "secretpassword")
 
     @patch("dashboard.main.get_conn")
+    def test_save_credentials_blank_password_keeps_existing(self, mock_get_conn):
+        """The Settings form no longer pre-fills the stored password (it is never sent
+        to the browser), so saving with a blank password must keep the saved one:
+        the statement binds NULL for the password and COALESCEs to the existing row."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_conn.return_value.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY}):
+            resp = self.client.post("/api/credentials", json={
+                "platform": "linkedin",
+                "email": "new@linkedin.com",
+                "password": "",
+            })
+
+        self.assertEqual(resp.status_code, 200)
+        sql, params = mock_cursor.execute.call_args[0]
+        self.assertIn("NULLIF(%s, '')", sql)
+        self.assertIn("COALESCE(EXCLUDED.password, credentials.password)", sql)
+        self.assertEqual(params, ("linkedin", "new@linkedin.com", ""))
+
+    def test_index_context_never_contains_plaintext_passwords(self):
+        """GET / has no application auth; the template context must carry only
+        email + a password_set flag, never a decrypted password."""
+        import inspect
+        import dashboard.main as dm
+        src = inspect.getsource(dm)
+        self.assertIn('"password_set": bool(r["password"])', src)
+        self.assertNotIn('"password": _decrypt_password(r["password"]', src)
+
+    @patch("dashboard.main.get_conn")
     def test_save_credentials_all_valid_platforms(self, mock_get_conn):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
