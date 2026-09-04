@@ -319,7 +319,14 @@ class EmailConfirmationTracker:
 
         results = []
         try:
-            imap_server = "imap.mail.me.com"
+            # Derive the host from the address like the 2FA reader does; this used
+            # to be hard-wired to iCloud, so any non-iCloud address sent valid
+            # credentials to the wrong provider and always failed (Copilot, PR #88).
+            from .email_helper import get_imap_server_for_email
+            imap_server = get_imap_server_for_email(user_email)
+            if not imap_server:
+                console.print(f"[yellow]Email confirmation check skipped: no known IMAP host for the configured address domain.[/yellow]")
+                return []
             mail = imaplib.IMAP4_SSL(imap_server, 993)
             mail.login(user_email, imap_pwd)
             mail.select("INBOX", readonly=True)

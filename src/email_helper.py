@@ -21,15 +21,15 @@ _log = logging.getLogger(__name__)
 # — which the old code did — can only ever produce AUTHENTICATIONFAILED, and then
 # burned the whole 2FA window retrying that same doomed login every 10 s (ACES-283).
 _IMAP_ADDRESS_KEYS = ("EMAIL_2FA_ADDRESS", "USAJOBS_EMAIL", "IMAP_USER")
-_IMAP_PASSWORD_KEYS_GENERIC = (
-    "IMAP_PASSWORD",
-    "ICLOUD_APP_PASSWORD_PERSONAL",
-    "ICLOUD_APP_PASSWORD",
-)
+# Only IMAP_PASSWORD is provider-neutral. Every ICLOUD_* name is scoped to the iCloud
+# domains: handing an iCloud app password to Gmail/Yahoo/Outlook can only fail auth,
+# and a clear "no IMAP password configured" beats a misleading AUTHENTICATIONFAILED.
+_IMAP_PASSWORD_KEYS_GENERIC = ("IMAP_PASSWORD",)
+_ICLOUD_KEYS_COMMON = ("ICLOUD_APP_PASSWORD_PERSONAL", "ICLOUD_APP_PASSWORD")
 _IMAP_PASSWORD_KEYS_BY_DOMAIN = {
-    "@icloud.com": ("ICLOUD_APP_PASSWORD_ICLOUD", "ICLOUD_APP_PASSWORD_MAC"),
-    "@me.com":     ("ICLOUD_APP_PASSWORD_MAC", "ICLOUD_APP_PASSWORD_ICLOUD"),
-    "@mac.com":    ("ICLOUD_APP_PASSWORD_MAC", "ICLOUD_APP_PASSWORD_ICLOUD"),
+    "@icloud.com": _ICLOUD_KEYS_COMMON + ("ICLOUD_APP_PASSWORD_ICLOUD", "ICLOUD_APP_PASSWORD_MAC"),
+    "@me.com":     _ICLOUD_KEYS_COMMON + ("ICLOUD_APP_PASSWORD_MAC", "ICLOUD_APP_PASSWORD_ICLOUD"),
+    "@mac.com":    _ICLOUD_KEYS_COMMON + ("ICLOUD_APP_PASSWORD_MAC", "ICLOUD_APP_PASSWORD_ICLOUD"),
 }
 
 # Substrings (upper-cased) that identify a rejected-credential IMAP response, as

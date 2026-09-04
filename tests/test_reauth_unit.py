@@ -492,6 +492,40 @@ class TestReauthAutomated:
         assert any(e["source"] == "usajobs" and e["mode"] == "automated" and e["outcome"] == "failed" for e in events)
 
     @pytest.mark.asyncio
+    async def test_missing_credentials_with_escalate_false_is_silent(self, tmp_path, monkeypatch):
+        """Missing creds on a human-fallback source: record the breaker event, but no
+        notify_error — _reauth_human sends the one notification (Codex, PR #88)."""
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.delenv("USAJOBS_EMAIL", raising=False)
+        monkeypatch.delenv("USAJOBS_PASSWORD", raising=False)
+        monkeypatch.setattr("src.secret_store.resolve_secret", lambda name: None)
+
+        from src.reauth import ReauthManager
+        mgr = ReauthManager(config={})
+
+        with patch("src.reauth._get_source_map", return_value={"usajobs": MagicMock()}), \
+             patch("src.reauth.notify_error") as mock_err:
+            result = await mgr._reauth_automated("usajobs", escalate=False)
+
+        assert result is False
+        mock_err.assert_not_called()
+        events = json.loads((tmp_path / "status.json").read_text()).get("reauth_events", [])
+        assert any(e["source"] == "usajobs" and e["outcome"] == "failed" and "missing credentials" in e.get("detail", "")
+                   for e in events)
+
+    def test_regression_test_writing_is_off_by_default(self, monkeypatch):
+        """Production code must not append to a tracked test file on every self-heal
+        unless explicitly opted in (ACES-287); tests point the path at tmp files."""
+        monkeypatch.delenv("JOBAGENT_WRITE_REGRESSION_TESTS", raising=False)
+        from src.reauth import ReauthManager
+        assert ReauthManager(config={}).regression_test_path is None
+        # and the writer is a no-op rather than an error
+        ReauthManager(config={})._write_regression_test("usajobs", "automated", "x")
+
+        monkeypatch.setenv("JOBAGENT_WRITE_REGRESSION_TESTS", "1")
+        assert ReauthManager(config={}).regression_test_path is not None
+
+    @pytest.mark.asyncio
     async def test_browser_always_closed_on_failure(self, tmp_path, monkeypatch):
         monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
         monkeypatch.setenv("JOBRIGHT_EMAIL", "test@test.com")

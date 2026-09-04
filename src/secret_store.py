@@ -69,7 +69,7 @@ CANONICAL_KEYS: tuple[str, ...] = (
     "JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD",
     "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
     "INDEED_EMAIL", "INDEED_PASSWORD",
-    "USAJOBS_EMAIL", "USAJOBS_PASSWORD", "USAJOBS_2FA_SECRET",
+    "USAJOBS_EMAIL", "USAJOBS_PASSWORD", "USAJOBS_2FA_SECRET",  # gitleaks:allow — key NAMES, not values
     # IMAP app-specific passwords for email-code 2FA + confirmation tracking. The
     # ICLOUD_* names are the central store's own names for them (email_helper
     # resolves all of these); listing them here is what lets fill_missing() pull them.
