@@ -1,6 +1,14 @@
 """Auto-generated regression tests — written by ReauthManager on each successful self-heal."""
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _disable_regression_test_generation(monkeypatch):
+    from src import reauth
+
+    monkeypatch.setattr(reauth.ReauthManager, "_write_regression_test", lambda *args, **kwargs: None)
+
+
 @pytest.mark.asyncio
 async def test_regression_jobright_20260626_214734():
     """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-06-26 21:47:34 UTC"""
@@ -2413,5 +2421,46 @@ async def test_regression_usajobs_20260829_045537():
     with patch.object(mgr, "_reauth_human", new_callable=AsyncMock, return_value=True) as mock, \
          patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False):
         result = await mgr.handle("usajobs", "2FA required")
+        mock.assert_called_once()
+    assert result is True
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "reason", "expected_pool", "handler_name"),
+    [
+        (
+            "jobright",
+            "_auto_login returned True after session expiry",
+            "automated",
+            "_reauth_automated",
+        ),
+        (
+            "linkedin",
+            "_auto_login returned True after session expiry",
+            "automated",
+            "_reauth_automated",
+        ),
+        ("usajobs", "2FA required", "human", "_reauth_human"),
+    ],
+)
+async def test_regression_session_expiry_reauth_routing_20260903(
+    source, reason, expected_pool, handler_name
+):
+    """Cover repeated session-expiry regressions without appending duplicate tests."""
+    from unittest.mock import AsyncMock, patch
+
+    from src.reauth import AUTOMATED_SOURCES, HUMAN_SOURCES, ReauthManager
+    from src.sources.base import AuthFailedError
+
+    expected_sources = AUTOMATED_SOURCES if expected_pool == "automated" else HUMAN_SOURCES
+    assert source in expected_sources
+
+    exc = AuthFailedError(source, reason)
+    assert exc.source == source
+    assert reason in str(exc)
+
+    mgr = ReauthManager(config={})
+    with patch.object(mgr, handler_name, new_callable=AsyncMock, return_value=True) as mock:
+        result = await mgr.handle(source, reason)
         mock.assert_called_once()
     assert result is True

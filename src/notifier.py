@@ -41,7 +41,63 @@ def _sanitize_notification_text(value: str) -> str:
     text = str(value or "")
     home = str(Path.home())
     if home and home != "/":
-        text = re.sub(rf"(?<![\w/.-]){re.escape(home)}(?=/|$)", "~", text)
+        terminal_delimiters = ".,;:!?)]}'\"`>"
+
+        def quoted_token_end(start: int) -> int | None:
+            token_start = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start), text.rfind("\t", 0, start)) + 1
+            prefix = text[token_start:start]
+            opener = ""
+            for wrapper in ("PosixPath(", "Path("):
+                wrapped = prefix.rfind(wrapper)
+                if wrapped >= 0 and len(prefix) > wrapped + len(wrapper):
+                    candidate = prefix[wrapped + len(wrapper)]
+                    if candidate in "'\"`":
+                        opener = candidate
+                        break
+            if not opener or opener not in "'\"`":
+                return None
+            for pos in range(start, len(text)):
+                if text[pos] == opener and (pos == 0 or text[pos - 1] != "\\"):
+                    return pos
+            return None
+
+        def is_spaced_sibling_path(start: int, end: int) -> bool:
+            token_end = quoted_token_end(start)
+            has_quoted_boundary = token_end is not None
+            if token_end is None:
+                token_end = len(text)
+                for pos in range(end, len(text)):
+                    if text[pos] in terminal_delimiters or text[pos] in "\r\n":
+                        token_end = pos
+                        break
+            tail = text[end:token_end]
+            slash = tail.find("/")
+            if has_quoted_boundary:
+                return bool(tail) and (slash < 0 or not tail[slash - 1].isspace())
+            return False
+
+        def redact_home(match: re.Match) -> str:
+            idx = match.end()
+            if idx >= len(text):
+                return "~"
+            nxt = text[idx]
+            if nxt == "/":
+                return "~"
+            if nxt.isspace():
+                if is_spaced_sibling_path(match.start(), idx):
+                    return match.group(0)
+                return "~"
+            if nxt in terminal_delimiters and (
+                idx + 1 >= len(text)
+                or text[idx + 1].isspace()
+                or text[idx + 1] in terminal_delimiters
+            ):
+                if is_spaced_sibling_path(match.start(), idx):
+                    return match.group(0)
+                return "~"
+            return match.group(0)
+
+        text = re.sub(rf"(?<![\w/.-]){re.escape(home)}", redact_home, text)
     text = re.sub(
         r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\d)",
         "[phone]",

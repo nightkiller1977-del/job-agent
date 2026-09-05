@@ -47,6 +47,47 @@ def test_reauth_events_redact_detail_without_corrupting_path_prefixes(tmp_path, 
     assert "~fs/config" not in detail
 
 
+def test_home_redaction_accepts_non_path_delimiters_without_matching_prefixes():
+    home = str(notifier.Path.home())
+
+    sanitized = notifier._sanitize_notification_text(
+        f"missing config at {home}. Retry from {home}) or {home}, but leave {home}fs alone"
+    )
+
+    assert f"{home}." not in sanitized
+    assert f"{home})" not in sanitized
+    assert f"{home}," not in sanitized
+    assert "~. Retry" in sanitized
+    assert "~)" in sanitized
+    assert "~," in sanitized
+    assert f"{home}fs" in sanitized
+    assert f"{home}-backup" in notifier._sanitize_notification_text(f"{home}-backup/file")
+    assert f"{home}.config" in notifier._sanitize_notification_text(f"{home}.config")
+    assert f"{home},backup" in notifier._sanitize_notification_text(f"{home},backup/file")
+    assert home not in notifier._sanitize_notification_text(f"{home} backup/file")
+    assert home not in notifier._sanitize_notification_text(f"{home} backup.files/file")
+    assert home not in notifier._sanitize_notification_text(f"{home} backup=2026/file")
+    assert home not in notifier._sanitize_notification_text(f"{home} backup files/file")
+    assert f"{home} backup files" in notifier._sanitize_notification_text(f"PosixPath('{home} backup files/file')")
+    assert f"{home} family photo archive" in notifier._sanitize_notification_text(f"PosixPath('{home} family photo archive/file')")
+    assert f"{home} backup" in notifier._sanitize_notification_text(f"Path('{home} backup')")
+    assert f"{home}, backup/file" in notifier._sanitize_notification_text(f"Path('{home}, backup/file')")
+    escaped_path = f"PosixPath('{home} backup\\'s \"archive\"/file')"
+    assert f"{home} backup\\'s \"archive\"/file" in notifier._sanitize_notification_text(escaped_path)
+    assert home not in notifier._sanitize_notification_text(f"Home {home} is distinct from /tmp/config")
+    assert home not in notifier._sanitize_notification_text(f"Inspect {home} then check /tmp/config")
+    assert home not in notifier._sanitize_notification_text(f"Inspect {home} then set TMP=/tmp/config")
+    assert home not in notifier._sanitize_notification_text(f"Home {home} failed while opening config/settings.json")
+    assert home not in notifier._sanitize_notification_text(f"Working directory: {home} config/settings.json")
+    assert home not in notifier._sanitize_notification_text(f"Working directory: {home} cache/index.json")
+    assert home not in notifier._sanitize_notification_text(f'detail="{home} failed opening cache/index.json"')
+    assert home not in notifier._sanitize_notification_text(f"Working directory: {home}\nconfig/settings.json could not be opened")
+    assert "PosixPath('~')" == notifier._sanitize_notification_text(f"PosixPath('{home}')")
+    assert '"~"' == notifier._sanitize_notification_text(f'"{home}"')
+    assert f"{home}'backup" in notifier._sanitize_notification_text(f"{home}'backup/file")
+    assert "~fs" not in sanitized
+
+
 def test_warning_can_record_without_desktop_popup(tmp_path, monkeypatch):
     desktop = []
     monkeypatch.setattr(notifier, "STATUS_FILE", tmp_path / "status.json")
