@@ -66,6 +66,8 @@ CANONICAL_KEYS: tuple[str, ...] = (
     "OPENROUTER_GATEWAY_URL",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "LOKI_URL_REMOTE", "LOKI_REMOTE_AUTH",
+    "LOKI_USER", "LOKI_API_KEY",  # Legacy split-auth compatibility; not new credentials.
     "JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD",
     "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
     "INDEED_EMAIL", "INDEED_PASSWORD",
