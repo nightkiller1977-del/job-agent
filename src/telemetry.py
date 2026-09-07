@@ -25,18 +25,25 @@ from typing import Generator
 
 import openlit
 
-_LOKI_URL = (
-    os.environ.get("LOKI_URL_REMOTE")
-    or os.environ.get("LOKI_URL")
-    or "http://localhost:3100/loki/api/v1/push"
-)
-_LOKI_USER = os.environ.get("LOKI_USER", "")
-_LOKI_API_KEY = os.environ.get("LOKI_API_KEY", "")
-_OTLP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-
 _setup_done = False
 
 log = logging.getLogger("telemetry")
+
+
+def resolve_loki_url() -> str:
+    """Prefer the shared remote-observability key, then the legacy local key."""
+    return (
+        os.environ.get("LOKI_URL_REMOTE")
+        or os.environ.get("LOKI_URL")
+        or "http://localhost:3100/loki/api/v1/push"
+    )
+
+
+def resolve_loki_auth() -> tuple[str, str] | None:
+    """Return Grafana/Loki basic-auth credentials only when both halves exist."""
+    user = os.environ.get("LOKI_USER", "")
+    api_key = os.environ.get("LOKI_API_KEY", "")
+    return (user, api_key) if user and api_key else None
 
 
 def setup(agent: str = "job-agent", environment: str = "production") -> None:
@@ -55,9 +62,11 @@ def _setup_loki_handler(agent: str, environment: str) -> None:
     from urllib.parse import urlparse
     import socket
 
+    loki_url = resolve_loki_url()
+
     # Quick TCP check to avoid spawning a Loki emitter thread when the server is offline
     try:
-        parsed = urlparse(_LOKI_URL)
+        parsed = urlparse(loki_url)
         host = parsed.hostname or "localhost"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         with socket.create_connection((host, port), timeout=0.5):
@@ -69,15 +78,14 @@ def _setup_loki_handler(agent: str, environment: str) -> None:
     try:
         import logging_loki
         logging_loki.emitter.LokiEmitter.level_tag = "level"
-        auth = (_LOKI_USER, _LOKI_API_KEY) if _LOKI_USER and _LOKI_API_KEY else None
         handler = logging_loki.LokiHandler(
-            url=_LOKI_URL,
+            url=loki_url,
             tags={
                 "application": "ai-agents",
                 "agent": agent,
                 "environment": environment,
             },
-            auth=auth,
+            auth=resolve_loki_auth(),
             version="1",
         )
         handler.setLevel(logging.DEBUG)
@@ -95,14 +103,15 @@ def _setup_loki_handler(agent: str, environment: str) -> None:
 
 
 def _setup_openlit(agent: str, environment: str) -> None:
-    if not _OTLP_ENDPOINT:
+    otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    if not otlp_endpoint:
         # No OTel collector configured — skip OpenLIT to avoid noisy console
         # span output. Set OTEL_EXPORTER_OTLP_ENDPOINT in .env to enable
         # full distributed tracing (e.g. when Tempo is added later).
         return
     try:
         openlit.init(
-            otlp_endpoint=_OTLP_ENDPOINT,
+            otlp_endpoint=otlp_endpoint,
             application_name=agent,
             environment=environment,
             capture_message_content=False,
