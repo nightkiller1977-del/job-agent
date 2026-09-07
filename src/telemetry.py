@@ -1,8 +1,9 @@
 """
 Observability for the job agent and future AI agents.
 
-Ships all Python logging to Loki (http://localhost:3100) so every agent's
-events, model calls, errors, and latencies appear in Grafana automatically.
+Ships all Python logging to Loki so every agent's events, model calls, errors,
+and latencies appear in Grafana automatically. Local Loki remains the default;
+Grafana Cloud can be selected with LOKI_URL_REMOTE plus LOKI_USER/LOKI_API_KEY.
 
 Usage:
     from src.telemetry import setup, model_span
@@ -24,7 +25,13 @@ from typing import Generator
 
 import openlit
 
-_LOKI_URL = os.environ.get("LOKI_URL", "http://localhost:3100/loki/api/v1/push")
+_LOKI_URL = (
+    os.environ.get("LOKI_URL_REMOTE")
+    or os.environ.get("LOKI_URL")
+    or "http://localhost:3100/loki/api/v1/push"
+)
+_LOKI_USER = os.environ.get("LOKI_USER", "")
+_LOKI_API_KEY = os.environ.get("LOKI_API_KEY", "")
 _OTLP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
 _setup_done = False
@@ -62,6 +69,7 @@ def _setup_loki_handler(agent: str, environment: str) -> None:
     try:
         import logging_loki
         logging_loki.emitter.LokiEmitter.level_tag = "level"
+        auth = (_LOKI_USER, _LOKI_API_KEY) if _LOKI_USER and _LOKI_API_KEY else None
         handler = logging_loki.LokiHandler(
             url=_LOKI_URL,
             tags={
@@ -69,7 +77,7 @@ def _setup_loki_handler(agent: str, environment: str) -> None:
                 "agent": agent,
                 "environment": environment,
             },
-            auth=None,
+            auth=auth,
             version="1",
         )
         handler.setLevel(logging.DEBUG)
