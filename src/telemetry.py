@@ -3,20 +3,13 @@ Observability for the job agent and future AI agents.
 
 Ships all Python logging to Loki so every agent's events, model calls, errors,
 and latencies appear in Grafana automatically. Local Loki remains the default;
-Grafana Cloud can be selected with LOKI_URL_REMOTE plus LOKI_USER/LOKI_API_KEY.
-
-Usage:
-    from src.telemetry import setup, model_span
-
-    setup(agent="job-agent")          # once at startup
-
-    async with model_span("anthropic", "claude-sonnet-4-6") as span:
-        result = await client.messages.create(...)
-        span["output_tokens"] = result.usage.output_tokens
+Grafana Cloud can be selected with the shared AI Commander contract:
+LOKI_URL_REMOTE + LOKI_REMOTE_AUTH.
 """
 from __future__ import annotations
 
 import atexit
+import base64
 import contextlib
 import logging
 import os
@@ -26,12 +19,10 @@ from typing import Generator
 import openlit
 
 _setup_done = False
-
 log = logging.getLogger("telemetry")
 
 
 def resolve_loki_url() -> str:
-    """Prefer the shared remote-observability key, then the legacy local key."""
     return (
         os.environ.get("LOKI_URL_REMOTE")
         or os.environ.get("LOKI_URL")
@@ -40,19 +31,27 @@ def resolve_loki_url() -> str:
 
 
 def resolve_loki_auth() -> tuple[str, str] | None:
-    """Return Grafana/Loki basic-auth credentials only when both halves exist."""
+    """Resolve the shared Basic auth header, with legacy split-key fallback."""
+    header = os.environ.get("LOKI_REMOTE_AUTH", "").strip()
+    if header.lower().startswith("basic "):
+        try:
+            decoded = base64.b64decode(header.split(" ", 1)[1], validate=True).decode("utf-8")
+            user, password = decoded.split(":", 1)
+            if user and password:
+                return (user, password)
+        except (ValueError, UnicodeDecodeError):
+            pass
+
     user = os.environ.get("LOKI_USER", "")
     api_key = os.environ.get("LOKI_API_KEY", "")
     return (user, api_key) if user and api_key else None
 
 
 def setup(agent: str = "job-agent", environment: str = "production") -> None:
-    """Wire Loki log handler + OpenLIT LLM auto-instrumentation. Safe to call multiple times."""
     global _setup_done
     if _setup_done:
         return
     _setup_done = True
-
     _setup_loki_handler(agent, environment)
     _setup_openlit(agent, environment)
     log.info("Telemetry initialised", extra={"tags": {"agent": agent, "env": environment}})
@@ -63,8 +62,6 @@ def _setup_loki_handler(agent: str, environment: str) -> None:
     import socket
 
     loki_url = resolve_loki_url()
-
-    # Quick TCP check to avoid spawning a Loki emitter thread when the server is offline
     try:
         parsed = urlparse(loki_url)
         host = parsed.hostname or "localhost"
@@ -92,11 +89,8 @@ def _setup_loki_handler(agent: str, environment: str) -> None:
         root = logging.getLogger()
         if not any(isinstance(h, logging_loki.LokiHandler) for h in root.handlers):
             root.addHandler(handler)
-        # Ensure root logger passes INFO+ to the handler (default is WARNING)
-        if root.level == logging.WARNING or root.level == logging.NOTSET:
+        if root.level in (logging.WARNING, logging.NOTSET):
             root.setLevel(logging.INFO)
-        # Flush the background push thread on clean exit so short-lived
-        # processes (smoke tests, quick commands) don't lose their last logs.
         atexit.register(lambda: time.sleep(1.5))
     except Exception as exc:
         print(f"[telemetry] Loki handler failed to init ({exc}) — logging to console only")
@@ -105,9 +99,6 @@ def _setup_loki_handler(agent: str, environment: str) -> None:
 def _setup_openlit(agent: str, environment: str) -> None:
     otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
     if not otlp_endpoint:
-        # No OTel collector configured — skip OpenLIT to avoid noisy console
-        # span output. Set OTEL_EXPORTER_OTLP_ENDPOINT in .env to enable
-        # full distributed tracing (e.g. when Tempo is added later).
         return
     try:
         openlit.init(
@@ -127,18 +118,6 @@ def model_span(
     agent: str = "job-agent",
     **extra_labels: str,
 ) -> Generator[dict, None, None]:
-    """
-    Context manager that measures and logs every model call to Loki.
-
-    Usage:
-        async with model_span("anthropic", "claude-sonnet-4-6") as span:
-            resp = await client.messages.create(...)
-            span["input_tokens"]  = resp.usage.input_tokens
-            span["output_tokens"] = resp.usage.output_tokens
-
-    Loki labels: provider, model, agent, success
-    Loki line:   JSON with latency_ms, tokens, error (if any)
-    """
     _log = logging.getLogger("model.call")
     span: dict = {"provider": provider, "model": model, "agent": agent}
     t_start = time.perf_counter()
@@ -169,8 +148,4 @@ def model_span(
         for k, v in span.items():
             if k not in ("provider", "model", "agent", "error"):
                 msg += f" {k}={v}"
-
-        if error:
-            _log.error(msg, extra=record_extra)
-        else:
-            _log.info(msg, extra=record_extra)
+        (_log.error if error else _log.info)(msg, extra=record_extra)
