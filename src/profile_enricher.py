@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from pathlib import Path
 import httpx
 from rich.console import Console

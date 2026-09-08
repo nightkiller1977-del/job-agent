@@ -453,7 +453,6 @@ class Orchestrator:
         return cleared
 
     def _classify_apply_readiness(self, job: dict) -> tuple[str, str]:
-        import json as _json
         source = (job.get("source") or "").lower()
         company = (job.get("company") or "").lower()
         url = (job.get("url") or "").lower()
