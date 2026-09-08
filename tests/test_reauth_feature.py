@@ -299,7 +299,10 @@ class TestApplyReauth:
             await orchestrator.apply_approved(auto_submit=True)
             MockReauthMgr.return_value.handle.assert_not_called()
 
-        assert orchestrator.state.get_job("job1") is None  # expired → deleted
+        # expired → retained with a distinct status so the dashboard can show it
+        expired = orchestrator.state.get_job("job1")
+        assert expired is not None
+        assert expired["status"] == "expired"
 
     @pytest.mark.asyncio
     async def test_prepared_session_bypasses_circuit_breaker_and_preflight(self, orchestrator, tmp_status):

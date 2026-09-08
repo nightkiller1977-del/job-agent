@@ -34,6 +34,14 @@
     "delay_min_seconds": 1,
     "delay_max_seconds": 3
   },
+  "expiry": {
+    "enabled": true,
+    "max_age_days": 30,
+    "sweep_interval_hours": 24,
+    "probe_enabled": true,
+    "probe_limit": 15,
+    "probe_timeout_s": 10
+  },
   "local_resume_path": "~/resume.pdf",
   "state_db_path": "state/jobs.db"
 }
