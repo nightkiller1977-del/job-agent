@@ -66,6 +66,9 @@ CANONICAL_KEYS: tuple[str, ...] = (
     "OPENROUTER_GATEWAY_URL",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    # Atomic remote-observability pair (see ATOMIC_PAIRS below and SECRETS.md).
+    # Legacy LOKI_USER/LOKI_API_KEY split-auth names are retired (ACES-293).
+    "LOKI_URL_REMOTE", "LOKI_REMOTE_AUTH",
     "JOBRIGHT_EMAIL", "JOBRIGHT_PASSWORD",
     "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
     "INDEED_EMAIL", "INDEED_PASSWORD",
@@ -101,6 +104,17 @@ STORE_AUTHORITATIVE_KEYS: tuple[str, ...] = (
     "OPENAI_API_KEY",
     "AICC_OPENROUTER_API_KEY",
     "OPENROUTER_GATEWAY_URL",
+)
+
+
+# Key groups that must resolve from a single authority (ACES-293; same P1 fixed
+# in email-agent): an env-provided LOKI_URL_REMOTE must never be completed with
+# a store credential, or the reverse. fill_missing() fills such a group from the
+# central store only when EVERY member is absent from the process env and the
+# store holds ALL of them; a one-sided env value leaves the group untouched
+# (loki_config.resolve_loki_config() then disables remote export and warns).
+ATOMIC_PAIRS: tuple[tuple[str, ...], ...] = (
+    ("LOKI_URL_REMOTE", "LOKI_REMOTE_AUTH"),
 )
 
 
@@ -240,8 +254,34 @@ def fill_missing(names: tuple[str, ...] | list[str] | None = None) -> list[str]:
     """
     keys = names if names is not None else CANONICAL_KEYS
     filled: list[str] = []
+    paired = {name: group for group in ATOMIC_PAIRS for name in group}
+    skipped_groups: set[tuple[str, ...]] = set()
     for name in keys:
         if not _missing(name):
+            continue
+        group = paired.get(name)
+        if group is not None:
+            # Atomic group: never mix authorities. Fill only when the whole
+            # group is missing from env AND the store holds every member.
+            if group in skipped_groups:
+                continue
+            if not all(_missing(member) for member in group):
+                skipped_groups.add(group)
+                _log.warning(
+                    "secrets: %s is set in the environment without its paired key(s) %s — "
+                    "not completing the pair from the central store (atomic pair, see SECRETS.md)",
+                    next(m for m in group if not _missing(m)),
+                    ", ".join(m for m in group if _missing(m)),
+                )
+                continue
+            values = {member: resolve_secret(member) for member in group}
+            if not all(values.values()):
+                skipped_groups.add(group)
+                continue
+            for member in group:  # always the whole group, never a subset
+                os.environ[member] = values[member]
+                filled.append(member)
+            skipped_groups.add(group)
             continue
         val = resolve_secret(name)
         if val:

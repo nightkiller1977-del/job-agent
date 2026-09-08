@@ -53,6 +53,7 @@ email-agent `src/lib/secrets.js`, the desktop app) is expected to apply the same
 |-----|:---------:|:-----------:|
 | `ANTHROPIC_API_KEY` | ✓ | ✓ |
 | `OPENAI_API_KEY` | ✓ | ✓ |
+| `LOKI_URL_REMOTE` / `LOKI_REMOTE_AUTH` — **atomic pair**, see below | ✓ | ✓ |
 | `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | ✓ | |
 | `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` | ✓ | |
 | `INDEED_EMAIL` / `INDEED_PASSWORD` | ✓ | |
@@ -68,6 +69,29 @@ email-agent `src/lib/secrets.js`, the desktop app) is expected to apply the same
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | ✓ | ✓ |
 
 Keep the lists in `CANONICAL_KEYS` (both repos) in sync for the shared keys.
+
+### Remote observability: `LOKI_URL_REMOTE` + `LOKI_REMOTE_AUTH` (atomic pair, ACES-293)
+
+These two keys configure Grafana Cloud Loki export and must resolve **from the
+same authority**. `secret_store.ATOMIC_PAIRS` enforces this: `fill_missing()`
+pulls the pair from the central store only when *both* are absent from the
+process env and the store holds *both*; if the env carries one without the
+other, neither is completed from the store (a warning names the keys, never
+values) and `src/loki_config.resolve_loki_config()` disables remote export.
+Mixing an env URL with a store credential (or the reverse) is the same P1
+pattern fixed in email-agent and is never allowed.
+
+- `LOKI_REMOTE_AUTH` must be `Basic <base64(user:password)>` with non-empty
+  user and password; anything else (wrong scheme, bad base64, control
+  characters) disables export up front — it never starts an export worker.
+- Default policy: remote export auto-enables **in production** (detected via
+  the `RENDER` env var, which Render sets on every service) and is **off in
+  dev/test** unless `OBSERVABILITY_REMOTE=1`. `OBSERVABILITY_REMOTE=0` opts out
+  even in production. Local Loki logging (`LOKI_URL`, default localhost) is
+  independent and unaffected — local + cloud run in parallel.
+- **Retired:** the legacy split-auth names `LOKI_USER` / `LOKI_API_KEY` are no
+  longer read by any code path and were removed from `CANONICAL_KEYS`. Delete
+  them from stores/`.env` files; use the atomic pair above instead.
 
 ## Migration phases
 

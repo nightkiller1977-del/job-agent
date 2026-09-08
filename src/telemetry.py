@@ -2,14 +2,16 @@
 Observability for the job agent and future AI agents.
 
 Ships all Python logging to Loki so every agent's events, model calls, errors,
-and latencies appear in Grafana automatically. Local Loki remains the default;
-Grafana Cloud can be selected with the shared AI Commander contract:
-LOKI_URL_REMOTE + LOKI_REMOTE_AUTH.
+and latencies appear in Grafana automatically. Local Loki (LOKI_URL, default
+localhost) remains the default and is independent of remote export; Grafana
+Cloud is selected only through the shared atomic contract resolved by
+src/loki_config.resolve_loki_config(): LOKI_URL_REMOTE + LOKI_REMOTE_AUTH,
+auto-on in production (RENDER), off in dev/test unless OBSERVABILITY_REMOTE=1.
+The legacy LOKI_USER/LOKI_API_KEY split-key fallback is retired (ACES-293).
 """
 from __future__ import annotations
 
 import atexit
-import base64
 import contextlib
 import logging
 import os
@@ -18,33 +20,29 @@ from typing import Generator
 
 import openlit
 
+from src.loki_config import basic_auth_credentials, resolve_loki_config
+
 _setup_done = False
 log = logging.getLogger("telemetry")
 
 
 def resolve_loki_url() -> str:
-    return (
-        os.environ.get("LOKI_URL_REMOTE")
-        or os.environ.get("LOKI_URL")
-        or "http://localhost:3100/loki/api/v1/push"
-    )
+    config = resolve_loki_config()
+    if config.enabled:
+        return config.url
+    return os.environ.get("LOKI_URL") or "http://localhost:3100/loki/api/v1/push"
 
 
 def resolve_loki_auth() -> tuple[str, str] | None:
-    """Resolve the shared Basic auth header, with legacy split-key fallback."""
-    header = os.environ.get("LOKI_REMOTE_AUTH", "").strip()
-    if header.lower().startswith("basic "):
-        try:
-            decoded = base64.b64decode(header.split(" ", 1)[1], validate=True).decode("utf-8")
-            user, password = decoded.split(":", 1)
-            if user and password:
-                return (user, password)
-        except (ValueError, UnicodeDecodeError):
-            pass
+    """Credentials only when the atomic remote pair is enabled and valid.
 
-    user = os.environ.get("LOKI_USER", "")
-    api_key = os.environ.get("LOKI_API_KEY", "")
-    return (user, api_key) if user and api_key else None
+    Local Loki (LOKI_URL / localhost) is unauthenticated; a partial or invalid
+    remote pair disables remote export instead of half-configuring it.
+    """
+    config = resolve_loki_config()
+    if not config.enabled:
+        return None
+    return basic_auth_credentials(config.auth)
 
 
 def setup(agent: str = "job-agent", environment: str = "production") -> None:
