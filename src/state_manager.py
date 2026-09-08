@@ -173,8 +173,6 @@ class StateManager:
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_confirmation_status ON jobs(confirmation_status)")
         except sqlite3.OperationalError:
             pass
-        # Hard-delete any legacy expired rows (pre-archive schema)
-        self._conn.execute("DELETE FROM jobs WHERE status = 'expired'")
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -236,7 +234,9 @@ class StateManager:
     def set_status(self, job_id: str, status: str) -> None:
         _log.info("job.status job_id=%s status=%s", job_id, status)
         if status == "expired":
-            self.archive_job(job_id, reason="expired")
+            # Route through mark_expired so the row is retained (with reason
+            # metadata) instead of silently vanishing from the dashboard.
+            self.mark_expired(job_id, reason="status set to expired")
             return
 
         now = datetime.utcnow().isoformat()
@@ -420,6 +420,47 @@ class StateManager:
                 reconciled_count += 1
 
         return reconciled_count
+
+    def mark_expired(self, job_id: str, reason: str, signal: str = "manual") -> bool:
+        """Mark a job as expired: dead posting, removed from the applyable pool.
+
+        The row is KEPT in the jobs table with status='expired' (rather than
+        archived/deleted) so the dashboard can show the user what expired and
+        why. Expiry metadata is merged into extra_json:
+          expired_at / expired_reason / expired_signal / expired_prior_status
+
+        signal: "source" (adapter raised JobExpiredError), "probe"
+        (check_job_alive said the URL is dead), "ttl" (older than the
+        configured max age), or "manual".
+
+        upsert_job() never resurrects an existing job_id, so an expired job
+        can't re-enter the pool even if a scraper re-discovers it.
+        Returns True if the job was found (and is now expired), False otherwise.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status, extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                _log.warning("job.expire.missing job_id=%s", job_id)
+                return False
+            prior_status = row["status"]
+            extra = parse_extra_json(row["extra_json"])
+            if prior_status != "expired":
+                extra["expired_prior_status"] = prior_status
+            extra["expired_at"] = now
+            extra["expired_reason"] = (reason or "")[:300]
+            extra["expired_signal"] = signal
+            conn.execute(
+                "UPDATE jobs SET status = 'expired', extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+        _log.info(
+            "job.expired job_id=%s prior_status=%s signal=%s reason=%s",
+            job_id, prior_status, signal, (reason or "")[:200],
+        )
+        return True
 
     def delete_job(self, job_id: str) -> None:
         """Delete a job record completely from the database."""

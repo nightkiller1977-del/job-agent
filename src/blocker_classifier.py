@@ -77,6 +77,7 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     # permanent — structurally cannot succeed
     "bad_ats_url": BlockerClass.PERMANENT,
     "unknown_source": BlockerClass.PERMANENT,
+    "expired": BlockerClass.PERMANENT,  # posting is gone/closed — never retry
 }
 
 # Per-class attempt caps. Once apply_attempt_count reaches the cap for a job's
