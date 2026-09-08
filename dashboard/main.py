@@ -316,6 +316,8 @@ async def index(request: Request):
         "required_field_unanswered", "linkedin_stuck_on_required_field",
         "needs-answer", "needs-review",
         "needs-hydration",  # placeholder/invalid URL — run hydrate or fix the URL
+        "needs_resume_review",   # tailored resume never reached resume.min_score
+        "dummy_resume_blocked",  # configured resume resolves to the test fixture
     }
     import json as _json
     approved_ready:     list[dict] = []

@@ -171,6 +171,32 @@ Copy `config.example.json` to `config.json` (gitignored — this is where your r
 { "local_resume_path": "/path/to/your/resume.pdf" }
 ```
 
+To enable per-job resume tailoring with a score gate, also point `resume.baseline_path`
+at your source-of-truth resume (Markdown recommended; `.txt`, `.json`, or `.pdf` also work —
+a PDF baseline is text-extracted once into `state/resumes/baseline_extracted.md`):
+
+```json
+{
+  "resume": {
+    "enabled": true,
+    "baseline_path": "~/resume_baseline.md",
+    "min_score": 90,
+    "max_iterations": 3,
+    "output_dir": "state/resumes"
+  }
+}
+```
+
+Before each apply, the agent scores the baseline against the job description
+(keyword coverage / title alignment / experience relevance), iteratively rewrites
+emphasis and wording toward the job (never inventing employers, titles, dates,
+degrees, certifications, or skills — a verification pass rejects fabricated drafts),
+and only applies once the tailored resume scores ≥ `min_score`. Jobs that can't reach
+the threshold are held with a `needs_resume_review` marker (visible in the dashboard)
+instead of being applied to. Tailored artifacts persist under `state/resumes/<job_id>.*`.
+Without a `resume.baseline_path`, the agent falls back to `local_resume_path` — but it
+will always refuse to apply with the bundled `tests/dummy_resume.pdf` fixture.
+
 > **Upgrading an existing checkout that predates this?** `config.json` used to be
 > tracked in git; pulling the commit that untracked it will delete an unmodified
 > local copy along with it. Run `scripts/migrate-config-json.sh backup` *before*

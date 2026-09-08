@@ -36,7 +36,9 @@ def tmp_status(tmp_path, monkeypatch):
 
 def _make_orchestrator(tmp_path, config_extra: dict | None = None) -> Orchestrator:
     """Orchestrator wired to a temp DB with no cloud sync (mirrors test_reauth_feature)."""
-    config = {"state_db_path": str(tmp_path / "jobs.db")}
+    resume_pdf = tmp_path / "resume.pdf"
+    resume_pdf.write_text("real resume")
+    config = {"state_db_path": str(tmp_path / "jobs.db"), "local_resume_path": str(resume_pdf)}
     if config_extra:
         config.update(config_extra)
     with patch("src.orchestrator.JobScorer"):
