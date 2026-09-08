@@ -14,7 +14,7 @@ from typing import Optional
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
-from .state_manager import StateManager
+from .state_manager import StateManager, parse_extra_json
 from .scorer import JobScorer
 from .review_queue import run_review_queue, show_summary_table
 from .sources.jobright import JobrightScraper
@@ -439,10 +439,7 @@ class Orchestrator:
         for job in approved:
             if (job.get("source") or "").lower() != source or not job.get("job_id"):
                 continue
-            try:
-                extra = json.loads(job.get("extra_json") or "{}")
-            except Exception:
-                extra = {}
+            extra = parse_extra_json(job.get("extra_json"))
             if str(extra.get("apply_last_status") or "") in own:
                 try:
                     self.state.clear_session_block(job["job_id"])
@@ -456,7 +453,6 @@ class Orchestrator:
         return cleared
 
     def _classify_apply_readiness(self, job: dict) -> tuple[str, str]:
-        import json as _json
         source = (job.get("source") or "").lower()
         company = (job.get("company") or "").lower()
         url = (job.get("url") or "").lower()
@@ -465,9 +461,7 @@ class Orchestrator:
         # clear_session_block).
         session_prepared_at = ""
         try:
-            extra = job.get("extra_json") or {}
-            if isinstance(extra, str):
-                extra = _json.loads(extra)
+            extra = parse_extra_json(job.get("extra_json"))
             ats_url = (extra.get("ats_url") or "").lower()
             session_prepared_at = str(extra.get("session_prepared_at") or "")
         except Exception:
@@ -512,9 +506,7 @@ class Orchestrator:
         last_status = ""
         last_detail = ""
         try:
-            extra = job.get("extra_json") or {}
-            if isinstance(extra, str):
-                extra = _json.loads(extra)
+            extra = parse_extra_json(job.get("extra_json"))
             last_status = str(extra.get("apply_last_status") or "")
             last_detail = str(extra.get("apply_last_detail") or "")
         except Exception:
@@ -875,10 +867,7 @@ class Orchestrator:
             # P2 circuit breaker: stop burning attempts on jobs that have exhausted
             # their retry budget for their blocker class (baseline: 245 wasted retries,
             # some jobs attempted 17×). Reads the prior outcome; does not run apply.
-            try:
-                _extra = json.loads(job.get("extra_json") or "{}")
-            except Exception:
-                _extra = {}
+            _extra = parse_extra_json(job.get("extra_json"))
             _last = _extra.get("apply_last_status")
             _attempts = int(_extra.get("apply_attempt_count", 0) or 0)
             # clear_session_block() stamped this after a human signed in to the job's
