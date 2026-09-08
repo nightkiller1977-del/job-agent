@@ -57,7 +57,19 @@ def _sanitize_notification_text(value: str) -> str:
             if not opener or opener not in "'\"`":
                 return None
             for pos in range(start, len(text)):
-                if text[pos] == opener and (pos == 0 or text[pos - 1] != "\\"):
+                if text[pos] != opener:
+                    continue
+                # A quote is escaped only when preceded by an ODD run of
+                # backslashes: in «backup\\'» the two backslashes escape each
+                # other and the quote is a real closer, while «backup\'» has a
+                # single escaping backslash. Checking just text[pos-1] misread
+                # every even-length run as an escape.
+                backslashes = 0
+                scan = pos - 1
+                while scan >= start and text[scan] == "\\":
+                    backslashes += 1
+                    scan -= 1
+                if backslashes % 2 == 0:
                     return pos
             return None
 
