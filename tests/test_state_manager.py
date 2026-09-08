@@ -30,9 +30,9 @@ def test_delete_job(temp_db):
     state.delete_job("test123")
     assert state.get_job("test123") is None
 
-def test_set_status_expired_deletes_job(temp_db):
+def test_set_status_expired_keeps_row_with_expired_status(temp_db):
     state = StateManager(db_path=temp_db)
-    
+
     job = {
         "job_id": "test456",
         "source": "linkedin",
@@ -40,18 +40,25 @@ def test_set_status_expired_deletes_job(temp_db):
         "company": "Test Company",
         "status": "discovered",
     }
-    
+
     # Insert job
     assert state.upsert_job(job) is True
     assert state.get_job("test456") is not None
-    
+
     # Set status to expired
     state.set_status("test456", "expired")
-    
-    # Verify job is deleted (no longer in DB)
-    assert state.get_job("test456") is None
 
-def test_init_db_removes_existing_expired_jobs(temp_db):
+    # Row is retained with a distinct status so the dashboard can show it
+    row = state.get_job("test456")
+    assert row is not None
+    assert row["status"] == "expired"
+    from src.state_manager import parse_extra_json
+    extra = parse_extra_json(row["extra_json"])
+    assert extra["expired_signal"] == "manual"
+    assert extra["expired_prior_status"] == "discovered"
+    assert extra["expired_at"]
+
+def test_init_db_retains_existing_expired_jobs(temp_db):
     # Manually create db and insert an expired job using raw sqlite
     conn = sqlite3.connect(temp_db)
     conn.execute("""
@@ -89,8 +96,11 @@ def test_init_db_removes_existing_expired_jobs(temp_db):
     # Initialize StateManager on the pre-populated database
     state = StateManager(db_path=temp_db)
     
-    # Verify expired job was deleted on init, but active job remains
-    assert state.get_job("exp1") is None
+    # Expired rows are first-class now: init must retain them (dashboard shows
+    # them; upsert_job never resurrects them into the applyable pool).
+    exp = state.get_job("exp1")
+    assert exp is not None
+    assert exp["status"] == "expired"
     assert state.get_job("act1") is not None
 
 def test_record_apply_attempt_merges_metadata_without_truncating(temp_db):

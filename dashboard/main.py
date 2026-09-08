@@ -492,8 +492,11 @@ async def job_action(body: ActionRequest):
                 if not cur.fetchone():
                     raise HTTPException(status_code=404, detail="Job not found")
                 if body.action == "expired":
+                    # Keep the row with a distinct status (instead of deleting)
+                    # so the dashboard can show what expired and why.
                     cur.execute(
-                        "DELETE FROM jobs WHERE job_id = %s", (body.job_id,)
+                        "UPDATE jobs SET status = 'expired', updated_at = NOW() WHERE job_id = %s",
+                        (body.job_id,),
                     )
                 elif body.action == "archive":
                     cur.execute(
