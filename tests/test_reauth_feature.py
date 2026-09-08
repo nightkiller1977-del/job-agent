@@ -42,7 +42,9 @@ def tmp_status(tmp_path, monkeypatch):
 @pytest.fixture
 def orchestrator(tmp_path):
     """Orchestrator wired to an in-memory DB with no cloud sync."""
-    config = {"state_db_path": str(tmp_path / "jobs.db")}
+    resume_pdf = tmp_path / "resume.pdf"
+    resume_pdf.write_text("real resume")
+    config = {"state_db_path": str(tmp_path / "jobs.db"), "local_resume_path": str(resume_pdf)}
     with patch("src.orchestrator.JobScorer"), \
          patch("src.orchestrator.Orchestrator.hydrate_external_jobs", new_callable=AsyncMock), \
          patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \

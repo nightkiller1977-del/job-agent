@@ -619,7 +619,14 @@ class LinkedInScraper(BaseScraper):
         self.last_apply_status = "started"
         self.last_apply_detail = ""
         console.print(f"\n[blue]LinkedIn Apply:[/blue] {job.get('title')} @ {job.get('company')}")
-        tailored_resume_path = await self._tailor_resume_with_jobright(job)
+        # A resume tailored + score-gated by the orchestrator (resume_tailor.py)
+        # takes precedence over Jobright/Orion tailoring — it is already ≥ the
+        # configured min match score, so skip the extra Jobright round-trip.
+        gated_resume_path = (job.get("resume_path") or "").strip()
+        if gated_resume_path and os.path.isfile(os.path.expanduser(gated_resume_path)):
+            tailored_resume_path = gated_resume_path
+        else:
+            tailored_resume_path = await self._tailor_resume_with_jobright(job)
         resume_path = tailored_resume_path or self._configured_resume_path()
         if tailored_resume_path:
             console.print(f"[blue]LinkedIn Apply:[/blue] Using tailored resume: {tailored_resume_path}")
