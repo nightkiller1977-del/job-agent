@@ -11,7 +11,6 @@ config change propagates everywhere without restarting.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 from typing import Optional
