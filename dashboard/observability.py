@@ -2,16 +2,43 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
+import importlib.util
 import json
 import math
 import os
 import queue
+import sys
 import threading
 import time
 import urllib.request
-from urllib.parse import urlsplit
+from pathlib import Path
+
+
+def _load_loki_config():
+    """Load the repo-shared atomic config resolver (src/loki_config.py).
+
+    The Dashboard deploys with ``rootDir: dashboard`` so ``src`` may not be an
+    importable package; fall back to loading the module by path. One resolver
+    implementation serves the CLI (src/telemetry.py) and this Dashboard.
+    """
+    try:
+        from src import loki_config  # repository root on sys.path
+        return loki_config
+    except ImportError:
+        existing = sys.modules.get("_job_agent_loki_config")
+        if existing is not None:
+            return existing
+        path = Path(__file__).resolve().parents[1] / "src" / "loki_config.py"
+        spec = importlib.util.spec_from_file_location("_job_agent_loki_config", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["_job_agent_loki_config"] = module
+        spec.loader.exec_module(module)
+        return module
+
+
+loki_config = _load_loki_config()
+resolve_loki_config = loki_config.resolve_loki_config
+validate_basic_auth = loki_config.validate_basic_auth
 
 _ALLOWED = {"method", "route", "status", "duration_ms", "error_type", "reason", "storage_degraded", "redis_enabled"}
 
@@ -25,19 +52,6 @@ def _send_http(url, auth, body):
     request = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json", "Authorization": auth})
     with opener.open(request, timeout=1.5) as response:
         return 200 <= response.status < 300
-
-
-def _valid_basic_auth(header):
-    if "\r" in header or "\n" in header:
-        return False
-    if not header.lower().startswith("basic "):
-        return False
-    try:
-        decoded = base64.b64decode(header.split(" ", 1)[1], validate=True).decode("utf-8")
-        user, password = decoded.split(":", 1)
-    except (ValueError, UnicodeDecodeError, binascii.Error):
-        return False
-    return bool(user and password)
 
 
 class LokiEmitter:
@@ -54,13 +68,14 @@ class LokiEmitter:
         self.stats = {"accepted": 0, "dropped": 0, "sent": 0, "failed": 0}
 
     def emit(self, event, **fields):
-        url = os.getenv("LOKI_URL_REMOTE", "").strip()
-        auth = os.getenv("LOKI_REMOTE_AUTH", "").strip()
+        # Atomic pair + policy + Basic-auth validation live in one resolver
+        # (src/loki_config.py). Invalid or partial config never starts the
+        # worker, so a malformed credential can never become a retry loop.
+        config = resolve_loki_config()
+        if not config.enabled:
+            return False
+        url, auth = config.url, config.auth
         try:
-            target = urlsplit(url)
-            if (target.scheme != "https" or not target.hostname or target.username or target.password
-                    or target.query or target.fragment or not auth or not _valid_basic_auth(auth)):
-                return False
             safe = {"service": self.service, "event": event}
             for key, value in fields.items():
                 if key not in _ALLOWED:
@@ -74,6 +89,8 @@ class LokiEmitter:
                 "environment": os.getenv("ENVIRONMENT", "production"),
             }, "values": [[str(time.time_ns()), json.dumps(safe, separators=(",", ":"))]]}]}).encode()
             if len(body) > 4096:
+                with self._lock:
+                    self.stats["dropped"] += 1
                 return False
         except (TypeError, ValueError):
             return False

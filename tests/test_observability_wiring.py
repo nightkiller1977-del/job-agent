@@ -39,8 +39,8 @@ class SecretWiringTests(unittest.TestCase):
                 self.assertEqual(os.environ["LOKI_REMOTE_AUTH"], "Basic dGVzdDp0ZXN0")
                 decrypt.assert_called_once()
                 self.assertEqual(decrypt.call_args.args[0][:2], ["sops", "-d"])
-                self.assertIn("LOKI_USER", store.CANONICAL_KEYS)
-                self.assertIn("LOKI_API_KEY", store.CANONICAL_KEYS)
+                self.assertNotIn("LOKI_USER", store.CANONICAL_KEYS)  # legacy split-auth retired (ACES-293)
+                self.assertNotIn("LOKI_API_KEY", store.CANONICAL_KEYS)
 
     def test_nonempty_platform_settings_are_preserved(self):
         with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://platform.example/push", "LOKI_REMOTE_AUTH": "platform-auth"}, clear=True), \
@@ -49,6 +49,45 @@ class SecretWiringTests(unittest.TestCase):
             store.fill_missing()
             self.assertEqual(os.environ["LOKI_REMOTE_AUTH"], "platform-auth")
             self.assertEqual(os.environ["LOKI_URL_REMOTE"], "https://platform.example/push")
+
+    def test_env_url_is_never_completed_with_store_credential(self):
+        """Atomic pair (ACES-293): same P1 pattern fixed in email-agent."""
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://platform.example/push"}, clear=True), \
+                patch.object(store, "_cli_get", return_value=None), \
+                patch.object(store, "_read_store", return_value={
+                    "LOKI_URL_REMOTE": "https://store.example/push", "LOKI_REMOTE_AUTH": "Basic c3RvcmU6c3RvcmU="}):
+            store.fill_missing()
+            self.assertEqual(os.environ["LOKI_URL_REMOTE"], "https://platform.example/push")
+            self.assertNotIn("LOKI_REMOTE_AUTH", os.environ)
+
+    def test_env_auth_is_never_completed_with_store_url(self):
+        with patch.dict(os.environ, {"LOKI_REMOTE_AUTH": "Basic ZW52OmVudg=="}, clear=True), \
+                patch.object(store, "_cli_get", return_value=None), \
+                patch.object(store, "_read_store", return_value={
+                    "LOKI_URL_REMOTE": "https://store.example/push", "LOKI_REMOTE_AUTH": "Basic c3RvcmU6c3RvcmU="}):
+            store.fill_missing()
+            self.assertEqual(os.environ["LOKI_REMOTE_AUTH"], "Basic ZW52OmVudg==")
+            self.assertNotIn("LOKI_URL_REMOTE", os.environ)
+
+    def test_complete_store_pair_fills_both_atomically(self):
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(store, "_cli_get", return_value=None), \
+                patch.object(store, "_read_store", return_value={
+                    "LOKI_URL_REMOTE": "https://store.example/push", "LOKI_REMOTE_AUTH": "Basic c3RvcmU6c3RvcmU="}):
+            filled = store.fill_missing()
+            self.assertIn("LOKI_URL_REMOTE", filled)
+            self.assertIn("LOKI_REMOTE_AUTH", filled)
+            self.assertEqual(os.environ["LOKI_URL_REMOTE"], "https://store.example/push")
+            self.assertEqual(os.environ["LOKI_REMOTE_AUTH"], "Basic c3RvcmU6c3RvcmU=")
+
+    def test_one_sided_store_pair_fills_neither(self):
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(store, "_cli_get", return_value=None), \
+                patch.object(store, "_read_store", return_value={"LOKI_URL_REMOTE": "https://store.example/push"}):
+            filled = store.fill_missing()
+            self.assertNotIn("LOKI_URL_REMOTE", filled)
+            self.assertNotIn("LOKI_URL_REMOTE", os.environ)
+            self.assertNotIn("LOKI_REMOTE_AUTH", os.environ)
 
 class EntryPointTests(unittest.TestCase):
     def test_render_working_directory_entry_wraps_original_application(self):

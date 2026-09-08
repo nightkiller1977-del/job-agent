@@ -21,7 +21,7 @@ class TransportTests(unittest.TestCase):
             received.append(json.loads(body))
             return True
         emitter = module.LokiEmitter("test-agent", sender=sender, capacity=3)
-        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "Basic dGVzdDp0ZXN0"}):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "Basic dGVzdDp0ZXN0", "OBSERVABILITY_REMOTE": "1"}):
             try:
                 accepted = sum(emitter.emit("test", status=200, body="PRIVATE", token="PRIVATE") for _ in range(100))
                 self.assertLessEqual(accepted, 4)
@@ -38,15 +38,71 @@ class TransportTests(unittest.TestCase):
 
     def test_unconfigured_and_unsafe_target_start_no_thread(self):
         emitter = module.LokiEmitter("test-agent")
-        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "", "LOKI_REMOTE_AUTH": ""}):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "", "LOKI_REMOTE_AUTH": "", "OBSERVABILITY_REMOTE": "1"}):
             self.assertFalse(emitter.emit("test"))
-        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "http://example.com", "LOKI_REMOTE_AUTH": "Basic dGVzdDp0ZXN0"}):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "http://example.com", "LOKI_REMOTE_AUTH": "Basic dGVzdDp0ZXN0", "OBSERVABILITY_REMOTE": "1"}):
             self.assertFalse(emitter.emit("test"))
-        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "******"}):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "******", "OBSERVABILITY_REMOTE": "1"}):
             self.assertFalse(emitter.emit("test"))
-        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "Basic Zm9v"}):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "Basic Zm9v", "OBSERVABILITY_REMOTE": "1"}):
             self.assertFalse(emitter.emit("test"))
         self.assertIsNone(emitter._worker)
+
+    def test_malformed_auth_never_starts_worker(self):
+        emitter = module.LokiEmitter("test-agent")
+        url = "https://logs.example.grafana.net/loki/api/v1/push"
+        for bad in ["Bearer dGVzdDp0ZXN0", "Basic !!!notbase64!!!", "Basic dGVzdDo=",  # empty password
+                    "Basic OnRlc3Q=",  # empty user
+                    "Basic dGVzdDp0ZXN0\r\nX: y", "basic"]:
+            with patch.dict(os.environ, {"LOKI_URL_REMOTE": url, "LOKI_REMOTE_AUTH": bad, "OBSERVABILITY_REMOTE": "1"}):
+                self.assertFalse(emitter.emit("test"), bad)
+        self.assertIsNone(emitter._worker)
+        self.assertEqual(emitter.stats["accepted"], 0)
+
+    def test_partial_pair_disables_export(self):
+        emitter = module.LokiEmitter("test-agent")
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "", "OBSERVABILITY_REMOTE": "1"}):
+            self.assertFalse(emitter.emit("test"))
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "", "LOKI_REMOTE_AUTH": "Basic dGVzdDp0ZXN0", "OBSERVABILITY_REMOTE": "1"}):
+            self.assertFalse(emitter.emit("test"))
+        self.assertIsNone(emitter._worker)
+
+    def test_oversized_body_increments_dropped_counter(self):
+        emitter = module.LokiEmitter("test-agent", sender=lambda *a: True)
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "Basic dGVzdDp0ZXN0", "OBSERVABILITY_REMOTE": "1"}):
+            self.assertFalse(emitter.emit("x" * 5000))
+        self.assertEqual(emitter.stats["dropped"], 1)
+
+class PolicyTests(unittest.TestCase):
+    URL = "https://logs.example.grafana.net/loki/api/v1/push"
+    AUTH = "Basic dGVzdDp0ZXN0"
+
+    def test_dev_test_default_off_even_with_valid_pair(self):
+        env = {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH}
+        with patch.dict(os.environ, env, clear=True):
+            config = module.resolve_loki_config()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.reason, "non_production_default_off")
+        emitter = module.LokiEmitter("test-agent")
+        with patch.dict(os.environ, env, clear=True):
+            self.assertFalse(emitter.emit("test"))
+        self.assertIsNone(emitter._worker)
+
+    def test_production_auto_on_with_complete_valid_pair(self):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH, "RENDER": "true"}, clear=True):
+            config = module.resolve_loki_config()
+        self.assertTrue(config.enabled)
+        self.assertEqual((config.url, config.auth, config.source), (self.URL, self.AUTH, "env"))
+
+    def test_opt_out_wins_even_in_production(self):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH, "RENDER": "true", "OBSERVABILITY_REMOTE": "0"}, clear=True):
+            config = module.resolve_loki_config()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.reason, "opted_out")
+
+    def test_explicit_opt_in_enables_outside_production(self):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH, "OBSERVABILITY_REMOTE": "1"}, clear=True):
+            self.assertTrue(module.resolve_loki_config().enabled)
 
 class ASGITests(unittest.IsolatedAsyncioTestCase):
     async def test_exception_is_observed_and_reraised_without_raw_path(self):

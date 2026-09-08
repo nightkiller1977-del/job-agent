@@ -16,8 +16,18 @@ headers, query strings, job records, mailbox contents or credentials.
 
 The runtime consumes the existing `LOKI_URL_REMOTE` and `LOKI_REMOTE_AUTH` process
 environment variables populated by the authorized platform/SOPS workflow. No
-new Grafana key is required. The CLI's default canonical secret catalog now
-loads those same names (legacy split-auth names remain supported).
+new Grafana key is required. Both variables are resolved **atomically** by the
+repo-shared `src/loki_config.resolve_loki_config()` (also used by the CLI's
+`src/telemetry.py`): export is enabled only when both are present from one
+authority and valid — `LOKI_REMOTE_AUTH` must be `Basic <base64(user:password)>`
+with non-empty user/password. A partial or malformed pair disables export with
+a single warning (values are never logged) and never starts the export worker.
+The legacy split-auth names `LOKI_USER`/`LOKI_API_KEY` are retired.
+
+Default policy (ACES-293): remote export auto-enables in production — detected
+via the `RENDER` env var, which Render sets on every service — and is off in
+dev/test unless `OBSERVABILITY_REMOTE=1`. `OBSERVABILITY_REMOTE=0` opts out
+even in production. Local logging is independent and unchanged.
 
 The Dashboard exporter has one worker and a queue of 64 events. Overflow is
 best-effort loss, not additional threads or blocked application requests. HTTP
