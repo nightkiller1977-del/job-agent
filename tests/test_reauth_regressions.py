@@ -2415,3 +2415,55 @@ async def test_regression_usajobs_20260829_045537():
         result = await mgr.handle("usajobs", "2FA required")
         mock.assert_called_once()
     assert result is True
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "reason", "expected_pool", "handler_name"),
+    [
+        (
+            "jobright",
+            "_auto_login returned True after session expiry",
+            "automated",
+            "_reauth_automated",
+        ),
+        (
+            "linkedin",
+            "_auto_login returned True after session expiry",
+            "automated",
+            "_reauth_automated",
+        ),
+        ("usajobs", "2FA required", "human", "_reauth_human"),
+    ],
+)
+async def test_regression_session_expiry_reauth_routing_20260903(
+    source, reason, expected_pool, handler_name
+):
+    """Cover repeated session-expiry regressions without appending duplicate tests."""
+    from unittest.mock import AsyncMock, patch
+
+    from src.reauth import AUTOMATED_SOURCES, HUMAN_SOURCES, ReauthManager
+    from src.sources.base import AuthFailedError
+
+    expected_sources = AUTOMATED_SOURCES if expected_pool == "automated" else HUMAN_SOURCES
+    assert source in expected_sources
+
+    exc = AuthFailedError(source, reason)
+    assert exc.source == source
+    assert reason in str(exc)
+
+    mgr = ReauthManager(config={})
+    if expected_pool == "human":
+        # ACES-283/286: usajobs is automated-first with the human path as
+        # fallback — the automated attempt must be patched to fail (mirroring
+        # main's routing tests) so handle() reaches the human handler without
+        # a real stored-credential login attempt.
+        with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False) as mock_auto, \
+             patch.object(mgr, handler_name, new_callable=AsyncMock, return_value=True) as mock:
+            result = await mgr.handle(source, reason)
+            mock_auto.assert_called_once_with(source, escalate=False)
+            mock.assert_called_once()
+    else:
+        with patch.object(mgr, handler_name, new_callable=AsyncMock, return_value=True) as mock:
+            result = await mgr.handle(source, reason)
+            mock.assert_called_once()
+    assert result is True
