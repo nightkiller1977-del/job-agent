@@ -1620,7 +1620,13 @@ class JobrightScraper(BaseScraper):
         url = job.get("url", "")
         if "jobright.ai" not in url:
             console.print(f"[magenta]Jobright ATS:[/magenta] Delegating external URL apply: {url}")
-            tailored_path = await self.tailor_resume_for_external_job(job)
+            # Prefer a resume already tailored + score-gated by the orchestrator
+            # (resume_tailor.py) — skip the Jobright/Orion round-trip entirely.
+            gated_path = (job.get("resume_path") or "").strip()
+            if gated_path and os.path.isfile(os.path.expanduser(gated_path)):
+                tailored_path = gated_path
+            else:
+                tailored_path = await self.tailor_resume_for_external_job(job)
             # Persist so _confirm_and_submit / outcome messages can reference it
             self._last_tailored_resume_path = tailored_path
             return await self.apply_external_ats_job(
@@ -1660,8 +1666,14 @@ class JobrightScraper(BaseScraper):
             ext_url = popup_ext_url or await self._extract_external_url(page)
             console.print(f"[magenta]Jobright:[/magenta] ATS URL: {ext_url or '(will try Apply Now)'}")
 
-            # ── Step 3: Generate/download a tailored resume if Jobright exposes it
-            tailored_resume_path = await self._generate_tailored_resume(page, job)
+            # ── Step 3: Generate/download a tailored resume if Jobright exposes it.
+            # A resume already tailored + score-gated by the orchestrator
+            # (resume_tailor.py) takes precedence over Orion's in-portal tailoring.
+            _gated_path = (job.get("resume_path") or "").strip()
+            if _gated_path and os.path.isfile(os.path.expanduser(_gated_path)):
+                tailored_resume_path = _gated_path
+            else:
+                tailored_resume_path = await self._generate_tailored_resume(page, job)
             resume_path = resolve_resume_path(self.config, preferred=tailored_resume_path)
             if tailored_resume_path:
                 console.print(f"[green]Jobright:[/green] Using tailored resume: {tailored_resume_path}")

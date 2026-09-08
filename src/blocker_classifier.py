@@ -74,6 +74,14 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     "pdf_text_layer_failed": BlockerClass.NEEDS_HUMAN,
     "resume_upload_failed": BlockerClass.NEEDS_HUMAN,
     "ats_selector_failed": BlockerClass.NEEDS_HUMAN,
+    # resume-tailoring gate (src/resume_tailor.py): the tailored resume never
+    # cleared resume.min_score — a human should review/extend the baseline.
+    "needs_resume_review": BlockerClass.NEEDS_HUMAN,
+    # tailoring model/render hiccups are retryable
+    "resume_tailor_error": BlockerClass.TRANSIENT,
+    "resume_render_failed": BlockerClass.TRANSIENT,
+    # config error: the only resolvable resume is the tests/ fixture — never retry
+    "dummy_resume_blocked": BlockerClass.PERMANENT,
     # permanent — structurally cannot succeed
     "bad_ats_url": BlockerClass.PERMANENT,
     "unknown_source": BlockerClass.PERMANENT,

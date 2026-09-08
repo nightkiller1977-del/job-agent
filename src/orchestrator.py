@@ -33,6 +33,7 @@ from .notifier import notify_error, notify_info, notify_warning, record_run_stat
 from .reauth import ReauthManager, AUTOMATED_SOURCES
 from .resume_helper import ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
 from .blocker_classifier import should_attempt, classify, needs_preflight_reauth, preflight_reauth_viable
+from .resume_tailor import evaluate_resume_gate, ResumeTailor
 from .session_watchdog import preflight_session_check
 
 console = Console()
@@ -875,6 +876,8 @@ class Orchestrator:
         outcomes: list[dict] = []
         reauthed_this_run: set[str] = set()  # P3: reauth each source at most once per run
         apply_reauth_mgr = ReauthManager(self.config)
+        # One tailor per run so the baseline is loaded/hashed once, not per job.
+        resume_tailor = ResumeTailor(self.config)
 
         for job in ready:
             console.rule(f"[bold]{job.get('title')} @ {job.get('company')}[/bold]")
@@ -954,7 +957,39 @@ class Orchestrator:
                 await self._push_apply_attempt_to_cloud(job["job_id"])
                 continue
 
-            scraper = SOURCE_MAP[src](self.config)
+            # ── Resume gate: tailor the baseline resume for THIS job and only
+            # proceed when the match score clears resume.min_score (default 90).
+            # Blocks are recorded in extra_json (needs_resume_review etc.) so the
+            # dashboard shows why a job wasn't applied to.
+            try:
+                gate = await evaluate_resume_gate(job, self.config, self.state, tailor=resume_tailor)
+            except Exception as _gate_exc:
+                _log.warning("resume.gate.error job_id=%s error=%s", job["job_id"], _gate_exc)
+                gate_detail = f"resume gate errored: {_gate_exc}"
+                self.state.record_apply_attempt(job["job_id"], "resume_tailor_error", gate_detail[:400])
+                await self._push_apply_attempt_to_cloud(job["job_id"])
+                skipped_count += 1
+                outcomes.append({"job": job, "status": "resume_tailor_error", "reason": gate_detail})
+                continue
+            if not gate.proceed:
+                await self._push_apply_attempt_to_cloud(job["job_id"])
+                skipped_count += 1
+                outcomes.append({"job": job, "status": gate.status, "reason": gate.detail})
+                continue
+            scraper_config = self.config
+            if gate.resume_path:
+                # Route the gated tailored resume through every existing pickup
+                # path: job["resume_path"] (external ATS adapters) and the config
+                # local_resume_path override (resolve_resume_path callers).
+                job["resume_path"] = gate.resume_path
+                job["tailored_resume_path"] = gate.resume_path
+                scraper_config = {
+                    **self.config,
+                    "local_resume_path": gate.resume_path,
+                    "resume_path": gate.resume_path,
+                }
+
+            scraper = SOURCE_MAP[src](scraper_config)
             try:
                 # One-shot same-run retry: when the adapter path reports it refreshed a
                 # session mid-attempt (analytics["reauth_refreshed"], set by
@@ -1029,7 +1064,7 @@ class Orchestrator:
                 if refreshed:
                     self._unblock_session_jobs_after_reauth(src)
                     try:
-                        scraper2 = SOURCE_MAP[src](self.config)
+                        scraper2 = SOURCE_MAP[src](scraper_config)
                         result = await scraper2.apply(job, auto_submit=auto_submit)
                         if result:
                             self.state.set_status(job["job_id"], "applied")
