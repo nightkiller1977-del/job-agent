@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import math
 import os
@@ -25,6 +27,19 @@ def _send_http(url, auth, body):
         return 200 <= response.status < 300
 
 
+def _valid_basic_auth(header):
+    if "\r" in header or "\n" in header:
+        return False
+    if not header.lower().startswith("basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header.split(" ", 1)[1], validate=True).decode("utf-8")
+        user, password = decoded.split(":", 1)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return False
+    return bool(user and password)
+
+
 class LokiEmitter:
     """One worker and a finite queue per runtime, never one thread per event."""
     def __init__(self, service, *, sender=None, capacity=64):
@@ -44,7 +59,7 @@ class LokiEmitter:
         try:
             target = urlsplit(url)
             if (target.scheme != "https" or not target.hostname or target.username or target.password
-                    or target.query or target.fragment or not auth or "\r" in auth or "\n" in auth):
+                    or target.query or target.fragment or not auth or not _valid_basic_auth(auth)):
                 return False
             safe = {"service": self.service, "event": event}
             for key, value in fields.items():

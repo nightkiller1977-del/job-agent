@@ -53,6 +53,7 @@ email-agent `src/lib/secrets.js`, the desktop app) is expected to apply the same
 |-----|:---------:|:-----------:|
 | `ANTHROPIC_API_KEY` | ✓ | ✓ |
 | `OPENAI_API_KEY` | ✓ | ✓ |
+| `LOKI_URL_REMOTE` / `LOKI_REMOTE_AUTH` / `LOKI_USER` / `LOKI_API_KEY` | ✓ | |
 | `JOBRIGHT_EMAIL` / `JOBRIGHT_PASSWORD` | ✓ | |
 | `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` | ✓ | |
 | `INDEED_EMAIL` / `INDEED_PASSWORD` | ✓ | |

@@ -42,6 +42,10 @@ class TransportTests(unittest.TestCase):
             self.assertFalse(emitter.emit("test"))
         with patch.dict(os.environ, {"LOKI_URL_REMOTE": "http://example.com", "LOKI_REMOTE_AUTH": "Basic dGVzdDp0ZXN0"}):
             self.assertFalse(emitter.emit("test"))
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "******"}):
+            self.assertFalse(emitter.emit("test"))
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": "https://logs.example.grafana.net/loki/api/v1/push", "LOKI_REMOTE_AUTH": "Basic Zm9v"}):
+            self.assertFalse(emitter.emit("test"))
         self.assertIsNone(emitter._worker)
 
 class ASGITests(unittest.IsolatedAsyncioTestCase):
@@ -73,5 +77,19 @@ class ASGITests(unittest.IsolatedAsyncioTestCase):
             await send({"type": "lifespan.shutdown.complete"})
         await module.ObserveASGI(lifecycle, Emitter())({"type": "lifespan"}, None, output)
         self.assertEqual([event for event, _ in events][1:], ["service_started", "service_stopped", "flushed", "stopped"])
+
+    async def test_matched_route_template_is_emitted_not_raw_path(self):
+        events = []
+        class Emitter:
+            def emit(self, event, **fields): events.append((event, fields))
+        async def ok(scope, receive, send):
+            await send({"type": "http.response.start", "status": 204})
+        class Route:
+            path = "/candidate/{candidate_id}"
+        app = module.ObserveASGI(ok, Emitter())
+        async def output(message): pass
+        await app({"type": "http", "method": "GET", "path": "/candidate/private@example.com", "route": Route()}, None, output)
+        self.assertEqual(events[0][1]["route"], "/candidate/{candidate_id}")
+        self.assertNotIn("private@example.com", repr(events))
 
 if __name__ == "__main__": unittest.main()
