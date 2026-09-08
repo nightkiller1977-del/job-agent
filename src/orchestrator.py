@@ -28,6 +28,7 @@ from .sources.builtin import BuiltInScraper
 import logging
 
 from .sources.base import AuthFailedError, JobExpiredError
+from .job_expiry import check_job_alive
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats, record_reauth_event
 from .reauth import ReauthManager, AUTOMATED_SOURCES
 from .resume_helper import ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
@@ -135,6 +136,12 @@ class Orchestrator:
         """
         # Hydrate any manual external jobs first
         await self.hydrate_external_jobs()
+
+        # Periodic expiry sweep (throttled internally; non-fatal)
+        try:
+            await self.expiry_sweep()
+        except Exception as exc:
+            _log.warning("expiry.sweep.failed context=discover error=%s", exc)
 
         # ------ MCP file-based import mode ------
         if source == "mcp":
@@ -766,6 +773,14 @@ class Orchestrator:
         # Pull cloud-approved jobs into local SQLite first
         await self._pull_approved_from_cloud()
 
+        # Expire dead/stale postings before selecting the apply pool, so an
+        # approved-but-expired job is skipped (with a logged reason + status
+        # change) instead of burning a browser attempt. Throttled internally.
+        try:
+            await self.expiry_sweep()
+        except Exception as exc:
+            _log.warning("expiry.sweep.failed context=apply error=%s", exc)
+
         all_approved = self._filter_jobs(
             self.state.get_approved_unapplied(),
             job_id=job_id,
@@ -1054,10 +1069,22 @@ class Orchestrator:
                     skipped_count += 1
                     outcomes.append({"job": job, "status": "reauth_failed", "reason": auth_exc.detail})
             except JobExpiredError as exc:
-                self.state.set_status(job["job_id"], "expired")
-                console.print("[red]Job no longer active (expired). Removed from database.[/red]")
-                outcomes.append({"job": job, "status": "expired", "reason": str(exc)})
+                # Approved-but-expired: skip with a logged reason and surface
+                # the status change so the user sees why it wasn't applied to.
+                reason = str(exc) or "source reported posting closed"
+                _log.warning(
+                    "apply.skip.expired job_id=%s title=%r company=%r reason=%s",
+                    job["job_id"], job.get("title"), job.get("company"), reason,
+                )
+                self.state.record_apply_attempt(job["job_id"], "expired", reason[:400])
+                self.state.mark_expired(job["job_id"], reason=reason, signal="source")
+                console.print(
+                    f"[red]Job no longer active (expired) — skipped:[/red] {reason}"
+                )
+                skipped_count += 1
+                outcomes.append({"job": job, "status": "expired", "reason": reason})
                 await self._push_status_to_cloud(job["job_id"], "expired")
+                await self._push_apply_attempt_to_cloud(job["job_id"])
             except ATSReadabilityError as exc:
                 if isinstance(exc, KeywordCoverageError):
                     reason = f"Keyword coverage ({exc.result.coverage*100:.1f}%) is below 65% threshold. Doesn't meet criteria."
@@ -1127,6 +1154,128 @@ class Orchestrator:
                 f"0 submitted, {skipped_count} blocked, {len(blocked)} need session prep. "
                 f"Run: python src/main.py prepare-sessions",
             )
+
+    # ------------------------------------------------------------------
+    # Job expiry sweep
+    # ------------------------------------------------------------------
+
+    def _expiry_config(self) -> dict:
+        cfg = self.config.get("expiry", {}) if isinstance(self.config, dict) else {}
+        return {
+            "enabled": bool(cfg.get("enabled", True)),
+            "max_age_days": int(cfg.get("max_age_days", 30)),
+            "sweep_interval_hours": float(cfg.get("sweep_interval_hours", 24)),
+            # Probe is opt-in: a plain HTTP GET from a scheduled run can misread
+            # bot-blocks, so it only runs when config.json enables it.
+            "probe_enabled": bool(cfg.get("probe_enabled", False)),
+            "probe_limit": int(cfg.get("probe_limit", 15)),
+            "probe_timeout_s": float(cfg.get("probe_timeout_s", 10)),
+        }
+
+    @property
+    def _expiry_sweep_state_path(self) -> Path:
+        return self.state.db_path.parent / "expiry_sweep.json"
+
+    def _last_expiry_sweep_at(self) -> Optional[datetime]:
+        try:
+            data = json.loads(self._expiry_sweep_state_path.read_text())
+            return datetime.fromisoformat(data["last_sweep_at"])
+        except Exception:
+            return None
+
+    def _record_expiry_sweep(self) -> None:
+        try:
+            self._expiry_sweep_state_path.write_text(
+                json.dumps({"last_sweep_at": datetime.utcnow().isoformat()})
+            )
+        except Exception as exc:
+            _log.warning("expiry.sweep.state_write_failed error=%s", exc)
+
+    async def expiry_sweep(self, force: bool = False) -> dict:
+        """Periodic sweep: expire dead/stale postings out of the applyable pool.
+
+        Two passes, both config-driven via the "expiry" block:
+          1. TTL fallback — discovered/approved jobs older than max_age_days
+             are treated as expired (most postings close within 30 days).
+          2. URL probe — up to probe_limit approved jobs get a lightweight
+             check_job_alive() probe; only a definitive "gone" (404/410 or a
+             closed-posting banner) expires the job. "Can't tell" never does.
+
+        Runs at most once per sweep_interval_hours (persisted next to the DB)
+        so it can be wired into every discover/apply run without hammering
+        sources. Approved-but-expired jobs are logged loudly and their status
+        change is pushed to the dashboard so the user sees why they were
+        skipped. Non-fatal by design: callers wrap it in try/except.
+        """
+        cfg = self._expiry_config()
+        summary: dict = {"ran": False, "expired_ttl": 0, "expired_probe": 0, "probed": 0}
+        if not cfg["enabled"]:
+            return summary
+        if not force:
+            last = self._last_expiry_sweep_at()
+            if last is not None:
+                elapsed_h = (datetime.utcnow() - last).total_seconds() / 3600
+                if elapsed_h < cfg["sweep_interval_hours"]:
+                    _log.debug("expiry.sweep.throttled elapsed_h=%.1f", elapsed_h)
+                    return summary
+
+        summary["ran"] = True
+        _log.info("expiry.sweep.start max_age_days=%d probe=%s", cfg["max_age_days"], cfg["probe_enabled"])
+
+        # ── Pass 1: TTL fallback ────────────────────────────────────────────
+        stale = self.state.get_stale_jobs(max_age_days=cfg["max_age_days"])
+        for job in stale:
+            was_approved = job.get("status") == "approved"
+            reason = (
+                f"older than {cfg['max_age_days']} days "
+                f"(discovered {job.get('discovered_at', '?')[:10]})"
+            )
+            self.state.mark_expired(job["job_id"], reason=reason, signal="ttl")
+            summary["expired_ttl"] += 1
+            log = _log.warning if was_approved else _log.info
+            log(
+                "expiry.ttl%s job_id=%s title=%r company=%r reason=%s",
+                ".approved_skipped" if was_approved else "",
+                job["job_id"], job.get("title"), job.get("company"), reason,
+            )
+            if was_approved:
+                console.print(
+                    f"[yellow]Approved job expired (TTL) — removed from apply pool:[/yellow] "
+                    f"{job.get('title')} @ {job.get('company')} ({reason})"
+                )
+            await self._push_status_to_cloud(job["job_id"], "expired")
+
+        # ── Pass 2: probe approved jobs' URLs ───────────────────────────────
+        if cfg["probe_enabled"]:
+            approved = self.state.get_approved_unapplied()
+            for job in approved[: cfg["probe_limit"]]:
+                url = job.get("url") or ""
+                alive, reason = await check_job_alive(url, timeout_s=cfg["probe_timeout_s"])
+                summary["probed"] += 1
+                if alive is False:
+                    self.state.mark_expired(job["job_id"], reason=reason, signal="probe")
+                    summary["expired_probe"] += 1
+                    _log.warning(
+                        "expiry.probe.approved_skipped job_id=%s title=%r company=%r url=%s reason=%s",
+                        job["job_id"], job.get("title"), job.get("company"), url, reason,
+                    )
+                    console.print(
+                        f"[yellow]Approved job expired (posting gone) — removed from apply pool:[/yellow] "
+                        f"{job.get('title')} @ {job.get('company')} ({reason})"
+                    )
+                    await self._push_status_to_cloud(job["job_id"], "expired")
+
+        self._record_expiry_sweep()
+        _log.info(
+            "expiry.sweep.complete expired_ttl=%d expired_probe=%d probed=%d",
+            summary["expired_ttl"], summary["expired_probe"], summary["probed"],
+        )
+        if summary["expired_ttl"] or summary["expired_probe"]:
+            console.print(
+                f"[bold]Expiry sweep:[/bold] {summary['expired_ttl']} job(s) expired by age, "
+                f"{summary['expired_probe']} by dead-URL probe."
+            )
+        return summary
 
     def prune_stale_jobs(self, max_age_days: int = 30, dry_run: bool = False) -> dict:
         """Archive jobs that have been sitting in discovered/approved status
