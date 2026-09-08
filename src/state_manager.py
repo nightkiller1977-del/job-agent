@@ -12,6 +12,52 @@ from typing import Optional, Any
 
 _log = logging.getLogger(__name__)
 
+# Columns that exist on the cloud dashboard's Postgres `jobs` table but not in
+# the local SQLite schema. When a row pulled from the dashboard is passed back
+# into upsert_job(), these must never be treated as job "extras" — that is how
+# extra_json ended up double-nested ({"updated_at": ..., "extra_json": "<json>"}).
+_SYNC_META_KEYS = {"extra_json", "updated_at", "created_at", "confirmation_status"}
+
+
+def parse_extra_json(raw: Any) -> dict:
+    """Parse an extra_json column value into a flat dict — tolerantly.
+
+    Heals the legacy double-nesting produced by round-tripping rows through the
+    cloud dashboard: {"updated_at": ..., "extra_json": "{\"has_easy_apply\": ...}"}
+    is flattened so consumers see the real keys again. Never raises.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        extra = dict(raw)
+    else:
+        try:
+            extra = json.loads(raw)
+        except (ValueError, TypeError):
+            _log.warning("state.extra_json_unparseable value=%.120r", raw)
+            return {}
+        if not isinstance(extra, dict):
+            return {}
+    # Unwrap nested extra_json wrappers (bounded, in case of deep corruption).
+    for _ in range(5):
+        inner_raw = extra.get("extra_json")
+        if not isinstance(inner_raw, str):
+            break
+        try:
+            inner = json.loads(inner_raw)
+        except (ValueError, TypeError):
+            break
+        if not isinstance(inner, dict):
+            break
+        extra.pop("extra_json", None)
+        extra.pop("updated_at", None)  # dashboard row metadata, not job data
+        # Inner (older, real) data first; outer keys win only if inner lacks them.
+        merged = dict(inner)
+        merged.update(extra)
+        extra = merged
+    extra.pop("extra_json", None)
+    return extra
+
 
 DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -141,12 +187,18 @@ class StateManager:
         Returns True if this is a newly discovered job, False if it already existed.
         """
         now = datetime.utcnow().isoformat()
-        extra = {k: v for k, v in job.items() if k not in {
+        extra = {k: v for k, v in job.items() if k not in ({
             "job_id", "source", "title", "company", "location",
             "salary_raw", "remote_type", "url", "description",
             "score", "score_reason", "flags", "status",
             "discovered_at", "reviewed_at", "applied_at",
-        }}
+        } | _SYNC_META_KEYS)}
+        # A job dict built from a DB/dashboard row carries its extras as a JSON
+        # string under "extra_json" — merge them flat instead of nesting them.
+        if job.get("extra_json"):
+            carried = parse_extra_json(job["extra_json"])
+            carried.update(extra)  # explicit keys on the dict win
+            extra = carried
         with self._connect() as conn:
             existing = conn.execute(
                 "SELECT job_id FROM jobs WHERE job_id = ?", (job["job_id"],)
@@ -492,10 +544,7 @@ class StateManager:
             ).fetchone()
             extra: dict = {}
             if row and row["extra_json"]:
-                try:
-                    extra = json.loads(row["extra_json"])
-                except Exception:
-                    pass
+                extra = parse_extra_json(row["extra_json"])
             extra["apply_last_attempt"] = now
             extra["apply_last_status"]  = status
             extra["apply_last_detail"]  = (detail or "")[:500]
@@ -550,10 +599,7 @@ class StateManager:
                 return
             extra: dict = {}
             if row["extra_json"]:
-                try:
-                    extra = json.loads(row["extra_json"])
-                except Exception:
-                    pass
+                extra = parse_extra_json(row["extra_json"])
             extra["session_prepared_at"] = now
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
@@ -578,10 +624,7 @@ class StateManager:
                 return
             extra: dict = {}
             if row["extra_json"]:
-                try:
-                    extra = json.loads(row["extra_json"])
-                except Exception:
-                    pass
+                extra = parse_extra_json(row["extra_json"])
             extra["preflight_readiness"] = readiness
             extra["preflight_block_reason"] = (reason or "")[:500]
             extra["preflight_blocked_at"] = now
@@ -602,10 +645,7 @@ class StateManager:
             ).fetchone()
             extra: dict = {}
             if row and row["extra_json"]:
-                try:
-                    extra = json.loads(row["extra_json"])
-                except Exception:
-                    pass
+                extra = parse_extra_json(row["extra_json"])
             extra["circuit_broken"] = True
             extra["circuit_class"] = blocker_class
             extra["circuit_reason"] = (reason or "")[:300]
@@ -625,10 +665,7 @@ class StateManager:
             ).fetchone()
             extra: dict = {}
             if row and row["extra_json"]:
-                try:
-                    extra = json.loads(row["extra_json"])
-                except Exception:
-                    pass
+                extra = parse_extra_json(row["extra_json"])
             extra.update(analytics)
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
@@ -754,7 +791,7 @@ class StateManager:
         for r in rows:
             status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
             try:
-                extra = json.loads(r["extra_json"]) if r["extra_json"] else {}
+                extra = parse_extra_json(r["extra_json"])
             except Exception:
                 extra = {}
             last = extra.get("apply_last_status")
@@ -817,12 +854,7 @@ class StateManager:
             ).fetchall()
 
             for row in rows:
-                extra: dict = {}
-                if row["extra_json"]:
-                    try:
-                        extra = json.loads(row["extra_json"])
-                    except Exception:
-                        extra = {}
+                extra = parse_extra_json(row["extra_json"])
                 metrics = extra.get("apply_validation_metrics") or {}
                 detail = str(extra.get("apply_last_detail") or "")
                 status = str(extra.get("apply_last_status") or "")

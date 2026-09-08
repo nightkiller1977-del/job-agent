@@ -94,15 +94,11 @@ class ProfileEnricher:
                 max_tokens=500
             )
 
-            # Clean response
-            raw_response = re.sub(r"<think>.*?</think>\s*", "", raw_response, flags=re.DOTALL)
-            raw_response = re.sub(r"^```[a-z]*\n?", "", raw_response.strip())
-            raw_response = re.sub(r"\n?```$", "", raw_response)
-            m = re.search(r"\[.*\]", raw_response, re.DOTALL)
-            if m:
-                raw_response = m.group()
-
-            extracted_skills = json.loads(raw_response)
+            from .json_utils import extract_json
+            extracted_skills = extract_json(raw_response, expect="array")
+            if extracted_skills is None:
+                console.print("[red]Failed to extract skills: model returned no parseable JSON list.[/red]")
+                return
         except Exception as e:
             console.print(f"[red]Failed to extract skills using AI model:[/red] {e}")
             return

@@ -10,7 +10,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from .state_manager import StateManager
+from .state_manager import StateManager, parse_extra_json
 from .notifier import _load_status, notify_info, notify_error
 from .model_client import ModelClient, ModelCascadeError
 from .browser_pipeline_lock import pipeline_lock, BROWSER_PIPELINE_LOCK
@@ -129,7 +129,7 @@ class AgentCommander:
                 raw_extra = job.get("extra_json")
                 if raw_extra:
                     try:
-                        extra_data = json.loads(raw_extra) if isinstance(raw_extra, str) else raw_extra
+                        extra_data = parse_extra_json(raw_extra)
                         extra = str(extra_data.get("error", extra_data))[:120]
                     except Exception:
                         extra = str(raw_extra)[:120]
@@ -474,7 +474,7 @@ class AgentCommander:
                 raw_extra = j.get("extra_json")
                 if raw_extra:
                     try:
-                        extra_data = json.loads(raw_extra) if isinstance(raw_extra, str) else raw_extra
+                        extra_data = parse_extra_json(raw_extra)
                         detail = str(extra_data.get("error", extra_data))[:200]
                     except Exception:
                         detail = str(raw_extra)[:200]
