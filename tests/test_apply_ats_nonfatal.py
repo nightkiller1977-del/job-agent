@@ -13,7 +13,7 @@ from src.resume_helper import ATSReadabilityError, ATSValidationResult, PDFTextL
 
 
 @pytest.mark.asyncio
-async def test_pdf_text_layer_error_pauses_the_batch():
+async def test_pdf_text_layer_error_pauses_the_batch(tmp_path):
     """Regression: an unreadable/corrupt generated PDF means the resume-compilation
     pipeline itself is broken, not just one job. A scraper that raises
     PDFTextLayerError must halt the apply loop for self-healing instead of the
@@ -21,7 +21,9 @@ async def test_pdf_text_layer_error_pauses_the_batch():
     PDF generation path (see PR #42 review — jobright.py previously swallowed
     this into a per-job False outcome instead of letting it propagate here)."""
     orch = Orchestrator.__new__(Orchestrator)
-    orch.config = {}
+    resume_pdf = tmp_path / "resume.pdf"
+    resume_pdf.write_text("real resume")
+    orch.config = {"local_resume_path": str(resume_pdf)}
 
     job1 = {"job_id": "j1", "title": "Dir Eng", "company": "Acme", "source": "jobright"}
     job2 = {"job_id": "j2", "title": "VP IT", "company": "Globex", "source": "jobright"}
@@ -59,9 +61,11 @@ async def test_pdf_text_layer_error_pauses_the_batch():
 
 
 @pytest.mark.asyncio
-async def test_ats_readability_error_does_not_abort_batch():
+async def test_ats_readability_error_does_not_abort_batch(tmp_path):
     orch = Orchestrator.__new__(Orchestrator)  # skip __init__ side effects
-    orch.config = {}
+    resume_pdf = tmp_path / "resume.pdf"
+    resume_pdf.write_text("real resume")
+    orch.config = {"local_resume_path": str(resume_pdf)}
 
     job1 = {"job_id": "j1", "title": "Dir Eng", "company": "Acme", "source": "jobright"}
     job2 = {"job_id": "j2", "title": "VP IT", "company": "Globex", "source": "jobright"}
