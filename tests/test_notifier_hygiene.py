@@ -74,6 +74,11 @@ def test_home_redaction_accepts_non_path_delimiters_without_matching_prefixes():
     assert f"{home}, backup/file" in notifier._sanitize_notification_text(f"Path('{home}, backup/file')")
     escaped_path = f"PosixPath('{home} backup\\'s \"archive\"/file')"
     assert f"{home} backup\\'s \"archive\"/file" in notifier._sanitize_notification_text(escaped_path)
+    # Even-length backslash run: the two backslashes escape each other, so the
+    # quote after them is a real closer — repr(PosixPath('/root backup\\'))
+    # renders exactly this shape and must keep its spaced path intact.
+    even_escaped_path = f"PosixPath('{home} backup\\\\')"
+    assert f"{home} backup\\\\" in notifier._sanitize_notification_text(even_escaped_path)
     assert home not in notifier._sanitize_notification_text(f"Home {home} is distinct from /tmp/config")
     assert home not in notifier._sanitize_notification_text(f"Inspect {home} then check /tmp/config")
     assert home not in notifier._sanitize_notification_text(f"Inspect {home} then set TMP=/tmp/config")

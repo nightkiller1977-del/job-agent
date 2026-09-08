@@ -1,14 +1,6 @@
 """Auto-generated regression tests — written by ReauthManager on each successful self-heal."""
 import pytest
 
-
-@pytest.fixture(autouse=True)
-def _disable_regression_test_generation(monkeypatch):
-    from src import reauth
-
-    monkeypatch.setattr(reauth.ReauthManager, "_write_regression_test", lambda *args, **kwargs: None)
-
-
 @pytest.mark.asyncio
 async def test_regression_jobright_20260626_214734():
     """Auto-generated regression: jobright — _auto_login returned True after session expiry — corrected 2026-06-26 21:47:34 UTC"""
@@ -2460,7 +2452,18 @@ async def test_regression_session_expiry_reauth_routing_20260903(
     assert reason in str(exc)
 
     mgr = ReauthManager(config={})
-    with patch.object(mgr, handler_name, new_callable=AsyncMock, return_value=True) as mock:
-        result = await mgr.handle(source, reason)
-        mock.assert_called_once()
+    if expected_pool == "human":
+        # ACES-283/286: usajobs is automated-first with the human path as
+        # fallback — the automated attempt must be patched to fail (mirroring
+        # main's routing tests) so handle() reaches the human handler without
+        # a real stored-credential login attempt.
+        with patch.object(mgr, "_reauth_automated", new_callable=AsyncMock, return_value=False) as mock_auto, \
+             patch.object(mgr, handler_name, new_callable=AsyncMock, return_value=True) as mock:
+            result = await mgr.handle(source, reason)
+            mock_auto.assert_called_once_with(source, escalate=False)
+            mock.assert_called_once()
+    else:
+        with patch.object(mgr, handler_name, new_callable=AsyncMock, return_value=True) as mock:
+            result = await mgr.handle(source, reason)
+            mock.assert_called_once()
     assert result is True
