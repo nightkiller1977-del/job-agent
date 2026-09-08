@@ -357,14 +357,8 @@ Respond ONLY with valid JSON matching this structure:
 
     def _clean_json_response(self, text: str) -> dict:
         """Parse JSON response from LLM. Raises json.JSONDecodeError on malformed output."""
-        text_clean = text.strip()
-        if text_clean.startswith("```json"):
-            text_clean = text_clean[7:]
-        elif text_clean.startswith("```"):
-            text_clean = text_clean[3:]
-        if text_clean.endswith("```"):
-            text_clean = text_clean[:-3]
-        return json.loads(text_clean.strip())
+        from src.json_utils import clean_model_json
+        return clean_model_json(text)
 
     async def _get_interactive_elements(self, page: Page) -> List[Dict[str, Any]]:
         """Extract interactive elements from page."""

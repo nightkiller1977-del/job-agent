@@ -17,6 +17,7 @@ import re
 from typing import Optional
 
 from src.model_client import ModelClient
+from src.json_utils import extract_json
 
 # ---------------------------------------------------------------------------
 # Default profile (used only when config is absent — never hardcoded in prod)
@@ -304,21 +305,13 @@ class JobScorer:
 
     def _parse_response(self, raw: str) -> tuple[int, str, str, str]:
         """Parse a JSON scoring response into (score, reason, flags, action)."""
-        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-        raw = re.sub(r"\s*```$", "", raw)
-        raw = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL)
+        data = extract_json(raw, expect="object")
+        if data is None:
+            return 50, "Could not parse model response", "FLAG_FOR_REVIEW", "review"
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", raw, re.DOTALL)
-            if m:
-                try:
-                    data = json.loads(m.group())
-                except json.JSONDecodeError:
-                    return 50, "Could not parse model response", "FLAG_FOR_REVIEW", "review"
-            else:
-                return 50, "Could not parse model response", "FLAG_FOR_REVIEW", "review"
-        score = max(0, min(100, int(data.get("score", 50))))
+            score = max(0, min(100, int(float(data.get("score", 50)))))
+        except (TypeError, ValueError):
+            score = 50
         return (
             score,
             data.get("reason", ""),

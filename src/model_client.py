@@ -54,10 +54,14 @@ ANTHROPIC_MAX_TOKENS = 2048
 # AI-OpenRouter Gateway Configuration (Port 3848 default)
 OPENROUTER_GATEWAY_URL = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
 OPENROUTER_TIMEOUT = int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "30"))
+# NOTE: keep these pointing at models the provider still serves. The previous
+# defaults ("anthropic/claude-3.5-sonnet" / "anthropic/claude-3.5-haiku") were
+# retired by Anthropic (Oct 2025 / Feb 2026), so every gateway call failed with
+# a model-not-found error and the cascade silently burned a tier on each request.
 OPENROUTER_TASK_MODELS: dict[str, str] = {
     "coding": os.environ.get("JOB_AGENT_OPENROUTER_CODING_MODEL", "qwen/qwen-2.5-coder-32b-instruct"),
-    "reasoning": os.environ.get("JOB_AGENT_OPENROUTER_REASONING_MODEL", "anthropic/claude-3.5-sonnet"),
-    "general": os.environ.get("JOB_AGENT_OPENROUTER_GENERAL_MODEL", "anthropic/claude-3.5-haiku"),
+    "reasoning": os.environ.get("JOB_AGENT_OPENROUTER_REASONING_MODEL", "anthropic/claude-sonnet-4.5"),
+    "general": os.environ.get("JOB_AGENT_OPENROUTER_GENERAL_MODEL", "anthropic/claude-haiku-4.5"),
     "monitoring": os.environ.get("JOB_AGENT_OPENROUTER_MONITORING_MODEL", "meta-llama/llama-3.3-70b-instruct"),
 }
 
@@ -532,6 +536,14 @@ class ModelClient:
                     raise BudgetExceededError(f"AI-OpenRouter Gateway budget authority unavailable (HTTP 503): {resp.text}")
                 resp.raise_for_status()
 
+            if resp.status_code in (400, 404) and "model" in resp.text.lower():
+                # Misconfigured / retired model name — surface it clearly instead of
+                # a bare HTTPStatusError so the log names the actual root cause.
+                raise RuntimeError(
+                    f"OpenRouter Gateway rejected model '{model_name}' "
+                    f"(HTTP {resp.status_code}): {resp.text[:300]} — "
+                    "check JOB_AGENT_OPENROUTER_*_MODEL configuration."
+                )
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, dict):
