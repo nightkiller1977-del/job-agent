@@ -281,14 +281,15 @@ class JobrightScraper(BaseScraper):
         # Expose the portal URL for the orchestrator to persist (extra_json.ats_url)
         # so prepare-sessions can reopen this portal directly for any-origin jobs.
         self.last_apply_ats_url = external_url
-        # Go-live (flag-gated): route through the new adapter registry instead of the
-        # legacy body when USE_ADAPTER_REGISTRY is truthy. Default OFF, so the proven
-        # path runs unless explicitly opted in for live verification. All external
-        # call sites (LinkedIn :1266, Indeed :397, and the "external" source via
-        # JobrightScraper.apply :1521) funnel here, so this one branch flips them all —
+        # Adapter registry is the DEFAULT external-apply path: ExternalApplySession
+        # owns the SubmissionLedger, idempotency, receipt verification, and vendor
+        # adapters, so it is the production route. Set USE_ADAPTER_REGISTRY=0 to
+        # fall back to the legacy body if a regression needs bisecting. All external
+        # call sites (LinkedIn, Indeed, and the "external" source via
+        # JobrightScraper.apply) funnel here, so this one branch flips them all —
         # and none pre-launch a browser before this point, so there's no jobright
         # profile-lock collision with ExternalApplySession.
-        if os.environ.get("USE_ADAPTER_REGISTRY", "").strip().lower() in ("1", "true", "yes", "on"):
+        if os.environ.get("USE_ADAPTER_REGISTRY", "1").strip().lower() not in ("0", "false", "no", "off"):
             from .adapters.session import ExternalApplySession
             from .adapters.runtime import get_run_log, get_dispatcher, get_reauth_router
             console.print("[cyan]apply_external_ats_job:[/cyan] routing via adapter registry (USE_ADAPTER_REGISTRY=1)")
