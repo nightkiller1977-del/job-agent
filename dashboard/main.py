@@ -1,9 +1,8 @@
-"""
-Job Agent Dashboard — FastAPI app for Render.com deployment.
+"""Job Agent Dashboard — FastAPI review/control surface.
 
-Cloud persistence is MongoDB Atlas. The local job-agent may continue to use
-SQLite as its zero-cost offline/journal state; the dashboard no longer needs
-Render Postgres.
+MongoDB Atlas is the cloud persistence backend. Local Job Agent SQLite remains
+an offline/journal store. During the one-time cutover, legacy Render Postgres is
+read only at startup when MIGRATE_LEGACY_POSTGRES=true; it is never written.
 """
 from __future__ import annotations
 
@@ -22,12 +21,10 @@ from pydantic import BaseModel
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 
 load_dotenv()
-
 app = FastAPI(title="Job Agent Dashboard")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
-
 _static_dir = os.path.join(BASE_DIR, "static")
 if os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
@@ -36,7 +33,8 @@ MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
 JOB_AGENT_DB = os.environ.get("JOB_AGENT_DB", "job_agent").strip() or "job_agent"
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "")
 CREDENTIAL_ENCRYPTION_KEY = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
-
+MIGRATE_LEGACY_POSTGRES = os.environ.get("MIGRATE_LEGACY_POSTGRES", "").strip().lower() in {"1", "true", "yes"}
+LEGACY_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 _client: MongoClient | None = None
 
 
@@ -48,9 +46,8 @@ def _parse_dt(value, default: datetime | None = None) -> datetime | None:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     if isinstance(value, str) and value.strip():
-        text = value.strip().replace("Z", "+00:00")
         try:
-            dt = datetime.fromisoformat(text)
+            dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except ValueError:
             return default
@@ -81,7 +78,6 @@ def get_db():
 
 
 def init_db() -> None:
-    """Create indexes used by dashboard queries and graph-style relationships."""
     if not MONGODB_URI:
         return
     db = get_db()
@@ -94,6 +90,68 @@ def init_db() -> None:
     db.credentials.create_index([("platform", ASCENDING)], unique=True, name="uq_credentials_platform")
     db.job_relationships.create_index([("from_id", ASCENDING), ("type", ASCENDING)], name="idx_relationships_from")
     db.job_relationships.create_index([("to_id", ASCENDING), ("type", ASCENDING)], name="idx_relationships_to")
+
+
+def migrate_legacy_postgres() -> None:
+    """Idempotently copy legacy dashboard state into Atlas before Postgres retirement."""
+    if not MIGRATE_LEGACY_POSTGRES or not LEGACY_DATABASE_URL or not MONGODB_URI:
+        return
+    db = get_db()
+    marker_id = "render-postgres-v1"
+    if db.migration_state.find_one({"_id": marker_id, "status": "complete"}):
+        return
+
+    pg = None
+    try:
+        import psycopg2
+        import psycopg2.extras
+
+        pg = psycopg2.connect(LEGACY_DATABASE_URL, sslmode="require", connect_timeout=10)
+        with pg.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM jobs")
+            jobs = [dict(row) for row in cur.fetchall()]
+            cur.execute("SELECT * FROM sync_log ORDER BY id")
+            sync_rows = [dict(row) for row in cur.fetchall()]
+
+        for row in jobs:
+            if row.get("job_id"):
+                db.jobs.update_one({"job_id": row["job_id"]}, {"$set": row}, upsert=True)
+
+        for row in sync_rows:
+            legacy_id = row.pop("id", None)
+            if legacy_id is not None:
+                db.sync_events.update_one(
+                    {"legacy_postgres_id": legacy_id},
+                    {"$set": {**row, "legacy_postgres_id": legacy_id}},
+                    upsert=True,
+                )
+
+        db.migration_state.update_one(
+            {"_id": marker_id},
+            {"$set": {
+                "status": "complete",
+                "completed_at": _utcnow(),
+                "jobs": len(jobs),
+                "sync_events": len(sync_rows),
+                "credentials_migrated": False,
+                "note": "Cloud credential fetch is retired; credentials remain in the secret-store path.",
+            }},
+            upsert=True,
+        )
+        print(f"[migration] Postgres -> MongoDB complete: jobs={len(jobs)} sync_events={len(sync_rows)}")
+    except Exception as exc:
+        print(f"[migration] Postgres -> MongoDB failed: {type(exc).__name__}: {exc}")
+        try:
+            db.migration_state.update_one(
+                {"_id": marker_id},
+                {"$set": {"status": "failed", "failed_at": _utcnow(), "error_type": type(exc).__name__}},
+                upsert=True,
+            )
+        except Exception:
+            pass
+    finally:
+        if pg is not None:
+            pg.close()
 
 
 def _get_cipher():
@@ -109,32 +167,14 @@ def _get_cipher():
 def _encrypt_password(plain: str) -> str:
     cipher = _get_cipher()
     if cipher is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Credential storage disabled until CREDENTIAL_ENCRYPTION_KEY is configured",
-        )
+        raise HTTPException(status_code=503, detail="Credential storage disabled until CREDENTIAL_ENCRYPTION_KEY is configured")
     return cipher.encrypt(plain.encode()).decode()
 
 
 @app.on_event("startup")
 def on_startup():
     init_db()
-
-
-class JobRecord(BaseModel):
-    job_id: str
-    source: Optional[str] = None
-    title: Optional[str] = None
-    company: Optional[str] = None
-    location: Optional[str] = None
-    salary_raw: Optional[str] = None
-    remote_type: Optional[str] = None
-    url: Optional[str] = None
-    score: Optional[int] = None
-    score_reason: Optional[str] = None
-    flags: Optional[str] = None
-    status: Optional[str] = "discovered"
-    discovered_at: Optional[str] = None
+    migrate_legacy_postgres()
 
 
 class ActionRequest(BaseModel):
@@ -153,8 +193,7 @@ class CredentialsRequest(BaseModel):
 
 
 def _stats(db) -> dict:
-    rows = db.jobs.aggregate([{"$group": {"_id": "$status", "cnt": {"$sum": 1}}}])
-    stats = {(r.get("_id") or "unknown"): r["cnt"] for r in rows}
+    stats = {(r.get("_id") or "unknown"): r["cnt"] for r in db.jobs.aggregate([{"$group": {"_id": "$status", "cnt": {"$sum": 1}}}])}
     now = _utcnow()
     day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
     stats["today"] = db.jobs.count_documents({"discovered_at": {"$gte": day_start}})
@@ -170,8 +209,10 @@ async def health():
     if not MONGODB_URI:
         return {"ok": False, "database": "unconfigured", "backend": "mongodb"}
     try:
-        get_db().command("ping")
-        return {"ok": True, "database": "ok", "backend": "mongodb"}
+        db = get_db()
+        db.command("ping")
+        marker = db.migration_state.find_one({"_id": "render-postgres-v1"}, {"status": 1})
+        return {"ok": True, "database": "ok", "backend": "mongodb", "legacy_migration": marker.get("status") if marker else "not-run"}
     except Exception:
         return {"ok": False, "database": "unavailable", "backend": "mongodb"}
 
@@ -184,11 +225,7 @@ async def head_index():
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     if not MONGODB_URI:
-        return HTMLResponse(
-            "<h1>Dashboard not configured</h1><p>Set <code>MONGODB_URI</code>.</p>",
-            status_code=503,
-        )
-
+        return HTMLResponse("<h1>Dashboard not configured</h1><p>Set <code>MONGODB_URI</code>.</p>", status_code=503)
     try:
         db = get_db()
         stats = _stats(db)
@@ -198,40 +235,32 @@ async def index(request: Request):
         sync_log = list(db.sync_events.find({}).sort("synced_at", DESCENDING).limit(5))
         latest_sync = db.sync_events.find_one({}, sort=[("synced_at", DESCENDING)])
         last_sync = latest_sync.get("synced_at") if latest_sync else None
-
-        credentials = {}
-        for row in db.credentials.find({}, {"_id": 0, "platform": 1, "email": 1, "password": 1}):
-            credentials[row["platform"]] = {
-                "email": row.get("email", ""),
-                "password_set": bool(row.get("password")),
-            }
+        credentials = {
+            row["platform"]: {"email": row.get("email", ""), "password_set": bool(row.get("password"))}
+            for row in db.credentials.find({}, {"_id": 0, "platform": 1, "email": 1, "password": 1})
+        }
     except Exception as exc:
         return HTMLResponse(f"<h1>Database error</h1><pre>{exc}</pre>", status_code=500)
 
     needs_prep = {
-        "workday_session_expired", "brassring_login_required",
-        "microsoft_login_required", "linkedin_authwall",
-        "linkedin_login_required", "needs-session", "needs-portal-login",
+        "workday_session_expired", "brassring_login_required", "microsoft_login_required",
+        "linkedin_authwall", "linkedin_login_required", "needs-session", "needs-portal-login",
     }
     needs_you = {
-        "workday_account_required", "brassring_registration_required",
-        "required_field_unanswered", "linkedin_stuck_on_required_field",
-        "needs-answer", "needs-review", "needs-hydration",
+        "workday_account_required", "brassring_registration_required", "required_field_unanswered",
+        "linkedin_stuck_on_required_field", "needs-answer", "needs-review", "needs-hydration",
         "needs_resume_review", "dummy_resume_blocked",
     }
-
     approved_ready, approved_needs_prep, approved_needs_you = [], [], []
     for row in approved:
         d = _public_doc(row)
         extra_raw = d.get("extra_json")
-        extra = {}
-        if isinstance(extra_raw, dict):
-            extra = extra_raw
-        elif extra_raw:
+        extra = extra_raw if isinstance(extra_raw, dict) else {}
+        if extra_raw and not isinstance(extra_raw, dict):
             try:
                 extra = json.loads(extra_raw)
             except Exception:
-                pass
+                extra = {}
         d["apply_last_status"] = extra.get("apply_last_status", "")
         d["apply_last_detail"] = extra.get("apply_last_detail", "")
         d["apply_attempt_count"] = extra.get("apply_attempt_count", 0)
@@ -243,7 +272,6 @@ async def index(request: Request):
             approved_needs_you.append(d)
         else:
             approved_ready.append(d)
-
     approved_ready.sort(key=lambda j: -(j.get("score") or 0))
 
     return templates.TemplateResponse(
@@ -268,71 +296,43 @@ async def index(request: Request):
 async def sync_jobs(request: Request, x_sync_secret: Optional[str] = Header(default=None)):
     if SYNC_SECRET and x_sync_secret != SYNC_SECRET:
         raise HTTPException(status_code=403, detail="Invalid sync secret")
-    if not MONGODB_URI:
-        raise HTTPException(status_code=503, detail="MONGODB_URI not configured")
-
     body = await request.json()
     if not isinstance(body, list):
         raise HTTPException(status_code=400, detail="Expected a JSON array of jobs")
-
-    db = get_db()
-    now = _utcnow()
-    upserted = 0
-    errors: list[str] = []
-
+    db, now, upserted, errors = get_db(), _utcnow(), 0, []
     for raw in body:
         if not isinstance(raw, dict) or not raw.get("job_id"):
             continue
-        discovered_at = _parse_dt(raw.get("discovered_at"), now)
         payload = {
-            "job_id": raw.get("job_id"),
-            "source": raw.get("source", ""),
-            "title": raw.get("title", ""),
-            "company": raw.get("company", ""),
-            "location": raw.get("location", ""),
-            "salary_raw": raw.get("salary_raw", ""),
-            "remote_type": raw.get("remote_type", ""),
-            "url": raw.get("url", ""),
-            "score": raw.get("score"),
-            "score_reason": raw.get("score_reason", ""),
-            "flags": raw.get("flags", ""),
-            "extra_json": raw.get("extra_json"),
-            "discovered_at": discovered_at,
-            "updated_at": now,
+            "job_id": raw["job_id"], "source": raw.get("source", ""), "title": raw.get("title", ""),
+            "company": raw.get("company", ""), "location": raw.get("location", ""),
+            "salary_raw": raw.get("salary_raw", ""), "remote_type": raw.get("remote_type", ""),
+            "url": raw.get("url", ""), "score": raw.get("score"), "score_reason": raw.get("score_reason", ""),
+            "flags": raw.get("flags", ""), "extra_json": raw.get("extra_json"),
+            "discovered_at": _parse_dt(raw.get("discovered_at"), now), "updated_at": now,
         }
         try:
             db.jobs.update_one(
-                {"job_id": payload["job_id"]},
+                {"job_id": raw["job_id"]},
                 {"$set": payload, "$setOnInsert": {"status": raw.get("status", "discovered")}},
                 upsert=True,
             )
             upserted += 1
-        except Exception as row_exc:
-            errors.append(str(row_exc))
-
-    source_names = sorted({j.get("source", "") for j in body if isinstance(j, dict) and j.get("source")})
-    db.sync_events.insert_one({
-        "synced_at": now,
-        "job_count": upserted,
-        "source": ", ".join(source_names),
-        "notes": f"{len(errors)} errors" if errors else None,
-    })
-
+        except Exception as exc:
+            errors.append(str(exc))
+    sources = sorted({j.get("source", "") for j in body if isinstance(j, dict) and j.get("source")})
+    db.sync_events.insert_one({"synced_at": now, "job_count": upserted, "source": ", ".join(sources), "notes": f"{len(errors)} errors" if errors else None})
     return {"ok": True, "upserted": upserted, "errors": errors}
 
 
 @app.post("/api/action")
 async def job_action(body: ActionRequest):
-    valid_actions = {"approved", "skipped", "bookmarked", "applied", "expired", "archive"}
-    if body.action not in valid_actions:
-        raise HTTPException(status_code=400, detail=f"action must be one of {valid_actions}")
-    if not MONGODB_URI:
-        raise HTTPException(status_code=503, detail="MONGODB_URI not configured")
-
+    valid = {"approved", "skipped", "bookmarked", "applied", "expired", "archive"}
+    if body.action not in valid:
+        raise HTTPException(status_code=400, detail=f"action must be one of {valid}")
     status = "skipped" if body.action == "archive" else body.action
     result = get_db().jobs.find_one_and_update(
-        {"job_id": body.job_id},
-        {"$set": {"status": status, "updated_at": _utcnow()}},
+        {"job_id": body.job_id}, {"$set": {"status": status, "updated_at": _utcnow()}},
         return_document=ReturnDocument.AFTER,
     )
     if not result:
@@ -345,34 +345,14 @@ async def add_external_job(body: ExternalJobRequest):
     url = body.url.strip()
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
-    if not MONGODB_URI:
-        raise HTTPException(status_code=503, detail="MONGODB_URI not configured")
-
     job_id = hashlib.md5(url.encode()).hexdigest()[:16]
-    source = "external"
     lower = url.lower()
-    if "linkedin.com" in lower:
-        source = "linkedin"
-    elif "usajobs.gov" in lower:
-        source = "usajobs"
-    elif "jobright.ai" in lower:
-        source = "jobright"
-
+    source = "linkedin" if "linkedin.com" in lower else "usajobs" if "usajobs.gov" in lower else "jobright" if "jobright.ai" in lower else "external"
     db = get_db()
     if db.jobs.find_one({"job_id": job_id}, {"_id": 1}):
         raise HTTPException(status_code=400, detail="Job already exists in queue")
     now = _utcnow()
-    db.jobs.insert_one({
-        "job_id": job_id,
-        "source": source,
-        "title": "Importing...",
-        "company": "Pending local agent sync",
-        "url": url,
-        "status": "discovered",
-        "flags": "needs_hydration",
-        "discovered_at": now,
-        "updated_at": now,
-    })
+    db.jobs.insert_one({"job_id": job_id, "source": source, "title": "Importing...", "company": "Pending local agent sync", "url": url, "status": "discovered", "flags": "needs_hydration", "discovered_at": now, "updated_at": now})
     return {"ok": True, "job_id": job_id, "url": url}
 
 
@@ -380,37 +360,27 @@ async def add_external_job(body: ExternalJobRequest):
 async def get_unhydrated(x_sync_secret: Optional[str] = Header(default=None)):
     if SYNC_SECRET and x_sync_secret != SYNC_SECRET:
         raise HTTPException(status_code=403, detail="Invalid sync secret")
-    rows = get_db().jobs.find(
-        {"flags": {"$regex": "needs_hydration"}},
-        {"_id": 0, "job_id": 1, "url": 1, "source": 1},
-    )
-    return list(rows)
+    return list(get_db().jobs.find({"flags": {"$regex": "needs_hydration"}}, {"_id": 0, "job_id": 1, "url": 1, "source": 1}))
 
 
 @app.get("/api/status")
 async def api_status():
-    if not MONGODB_URI:
-        return {"error": "MONGODB_URI not configured"}
     try:
         db = get_db()
-        stats = _stats(db)
         latest = db.sync_events.find_one({}, sort=[("synced_at", DESCENDING)])
-        last_sync = latest.get("synced_at").isoformat() if latest and latest.get("synced_at") else None
-        return {"stats": stats, "last_sync": last_sync}
+        return {"stats": _stats(db), "last_sync": latest.get("synced_at").isoformat() if latest and latest.get("synced_at") else None}
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.get("/api/jobs/pending")
 async def get_pending():
-    rows = _sort_score_then_date(get_db().jobs.find({"status": "discovered"}), "discovered_at")
-    return [_public_doc(r) for r in rows]
+    return [_public_doc(r) for r in _sort_score_then_date(get_db().jobs.find({"status": "discovered"}), "discovered_at")]
 
 
 @app.get("/api/jobs/approved")
 async def get_approved():
-    rows = _sort_score_then_date(get_db().jobs.find({"status": "approved"}), "updated_at")
-    return [_public_doc(r) for r in rows]
+    return [_public_doc(r) for r in _sort_score_then_date(get_db().jobs.find({"status": "approved"}), "updated_at")]
 
 
 @app.get("/api/errors")
@@ -421,21 +391,12 @@ async def get_errors():
 
 @app.post("/api/credentials")
 async def save_credentials(body: CredentialsRequest):
-    """Keep dashboard compatibility while never storing credential secrets plaintext."""
     platform = body.platform.strip().lower()
-    valid_platforms = {"indeed", "linkedin", "jobright"}
-    if platform not in valid_platforms:
-        raise HTTPException(status_code=400, detail=f"platform must be one of {sorted(valid_platforms)}")
-
-    now = _utcnow()
-    update = {"email": body.email.strip(), "updated_at": now}
-    new_pw = body.password.strip()
-    if new_pw:
-        update["password"] = _encrypt_password(new_pw)
-
-    get_db().credentials.update_one(
-        {"platform": platform},
-        {"$set": update, "$setOnInsert": {"platform": platform}},
-        upsert=True,
-    )
+    valid = {"indeed", "linkedin", "jobright"}
+    if platform not in valid:
+        raise HTTPException(status_code=400, detail=f"platform must be one of {sorted(valid)}")
+    update = {"email": body.email.strip(), "updated_at": _utcnow()}
+    if body.password.strip():
+        update["password"] = _encrypt_password(body.password.strip())
+    get_db().credentials.update_one({"platform": platform}, {"$set": update, "$setOnInsert": {"platform": platform}}, upsert=True)
     return {"ok": True, "platform": platform}
