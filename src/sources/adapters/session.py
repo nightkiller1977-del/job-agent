@@ -33,7 +33,7 @@ from .registry import AtsAdapterRegistry
 from .generic import GenericAtsAdapter, detect_vendor
 from .attempt import AttemptPhase
 from .policy import AutoSubmitPolicy, SubmissionPolicy
-from .idempotency import SubmissionLedger, canonical_key
+from .idempotency import SubmissionLedger, canonical_key, LedgerUnreadableError
 from .profile_lock import ProfileLock, ProfileLockError
 from .auth_routing import directive_for
 
@@ -193,13 +193,26 @@ class ExternalApplySession(BaseScraper):
         _event("attempt_started", AttemptPhase.STARTED, auto_submit=auto_submit)
 
         # --- 0.2 pre-flight duplicate/interrupted checks (before launching Chrome) ---
-        if key and self.ledger.already_applied(key):
+        try:
+            already_applied = key and self.ledger.already_applied(key)
+            in_progress = key and self.ledger.in_progress(key)
+            needs_reconciliation = key and self.ledger.needs_reconciliation(key)
+        except LedgerUnreadableError as exc:
+            # History we can't read must never be treated as "no prior submission" —
+            # that would let a duplicate-application check silently pass through.
+            _event("ledger_unreadable_blocked", AttemptPhase.UNKNOWN, outcome="ledger_unreadable")
+            return AtsApplyResult.blocked(
+                "ledger_unreadable",
+                f"submission ledger could not be read ({exc}) — refusing to submit until fixed",
+                attempt_id=attempt_id,
+            )
+        if already_applied:
             _event("duplicate_prevented", AttemptPhase.UNKNOWN, outcome="duplicate_application_prevented")
             return AtsApplyResult.blocked(
                 "duplicate_application_prevented",
                 f"already applied to {key} — not resubmitting", attempt_id=attempt_id,
             )
-        if key and self.ledger.in_progress(key):
+        if in_progress:
             stale = self.ledger.is_stale_in_progress(key)
             _event("submit_in_progress_blocked", AttemptPhase.UNKNOWN,
                    outcome="submit_in_progress", stale=stale)
@@ -213,7 +226,7 @@ class ExternalApplySession(BaseScraper):
                 f"({'stale/crashed' if stale else 'in flight'}) — not resubmitting blindly",
                 attempt_id=attempt_id,
             )
-        if key and self.ledger.needs_reconciliation(key):
+        if needs_reconciliation:
             # A prior attempt clicked submit but no receipt was confirmed — resubmitting
             # blindly risks a duplicate. Hold until reconciled (human/receipt re-check).
             _event("submit_unverified_blocked", AttemptPhase.UNKNOWN,
