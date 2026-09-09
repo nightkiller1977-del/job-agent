@@ -94,83 +94,10 @@ async def test_session_adopts_unverified_recovery_result():
 
 
 # ─── LLM loop exits ─────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_llm_done_without_receipt_after_submit_click_is_unverified():
-    """Full loop: LLM clicks a submit control, then declares done with no
-    receipt → result must be submission_unverified, not review_ready."""
-    r = _recovery()
-
-    class _LoopCfg:
-        max_steps = 5
-        body_text_snippet_len = 100
-        post_action_delay_ms = 0
-        skill_replay_delay_ms = 0
-        step_timeout_ms = 1
-
-        class loop_detection:
-            enabled = False
-
-    class _Telemetry:
-        track_step_efficiency = False
-        track_loop_events = False
-
-    class _Prompting:
-        model_task = "general"
-        temperature = 0.0
-
-    class _Cfg:
-        telemetry = _Telemetry()
-        llm_prompting = _Prompting()
-
-    r.browser_config = _LoopCfg()
-    r.config = _Cfg()
-    r._load_skills = lambda domain: []
-    r._save_skills = lambda domain, steps: None
-    r._build_system_prompt = lambda pc: "s"
-    r._build_user_prompt = lambda sd, ctx, pc: "u"
-
-    responses = iter([
-        '{"action": "click", "selector": "button[type=submit]", "value": null, "explanation": "submit"}',
-        '{"action": "done", "selector": null, "value": null, "explanation": "finished"}',
-    ])
-
-    class _MC:
-        async def complete(self, **kw):
-            return next(responses)
-
-    r.mc = _MC()
-    r._clean_json_response = lambda t: __import__("json").loads(t)
-
-    async def _exec(page, action, selector, val, resume):
-        return True
-
-    r._execute_action = _exec
-
-    page = AsyncMock()
-    page.url = "https://jobs.example.com/apply"
-    page.title = AsyncMock(return_value="Apply")
-    page.evaluate = AsyncMock(return_value="body text")
-
-    class _Ctx:
-        resume_path = None
-
-    _Ctx.page = page
-
-    with patch(
-        "src.sources.adapters.recovery_browseruse_refactored.verify_receipt",
-        new=AsyncMock(return_value=(False, "")),
-    ), patch.object(BrowserUseRecoveryRefactored, "_extract_interactive_elements",
-                    new=AsyncMock(return_value=[]), create=True):
-        # Drive only the loop portion via apply() would need full ctx/config;
-        # instead pin each exit path's translation at the unit level:
-        pass
-
-    # Unit-level exit translations (the loop body sets possible_submit then hits
-    # each exit): verify unverified() carries the invariant fields.
-    res = AtsApplyResult.unverified("x")
-    assert res.status == "submission_unverified"
-    assert res.submitted is False and res.verified is False
+# The full-loop behavioral proofs (done-without-receipt, timeout-after-dispatch,
+# neutral-selector submit, fence, session+ledger integration) live in
+# tests/test_recovery_submit_dispatch_truth.py, which drives the REAL
+# BrowserUseRecoveryRefactored.apply() and ExternalApplySession.apply().
 
 
 def test_all_recovery_exit_paths_guard_possible_submit():

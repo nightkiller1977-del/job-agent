@@ -237,8 +237,24 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                     )
                 return AtsApplyResult.blocked(status="submit_not_found", detail=f"LLM failed: {action_data.get('explanation')}")
 
-            # Execute selected action
-            success = await self._execute_action(ctx.page, action, selector, val, ctx.resume_path)
+            # Execute selected action. Uncertainty is tracked from dispatch, not
+            # success, and a second submit-like click is fenced while a prior
+            # possible submission is unresolved.
+            success, may_submit, fenced = await self._guarded_execute(
+                ctx.page, action, selector, val, ctx.resume_path,
+                fence_active=possible_submit,
+            )
+            if fenced:
+                logger.warning(
+                    f"Submission fence: refusing to dispatch a second submit-like "
+                    f"click ({selector}) while a prior submit is unconfirmed."
+                )
+                return AtsApplyResult.unverified(
+                    detail="A further submit-like action was requested while a prior "
+                           "submit was unconfirmed; stopped instead of re-submitting."
+                )
+            if may_submit:
+                possible_submit = True
 
             # Record action for progress tracking
             progress_tracker.record_action(
@@ -250,8 +266,6 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
             )
 
             if success:
-                if self._is_submit_like(action, selector, val):
-                    possible_submit = True
                 steps_recorded.append({
                     "action": action,
                     "selector": selector,
@@ -499,6 +513,71 @@ Respond ONLY with valid JSON matching this structure:
         text = f"{selector or ''} {value or ''}".lower()
         return bool(re.search(r"submit|apply|send[_\- ]?application", text))
 
+    # DOM-evidence probe for a click target. Keyword matching on the selector
+    # misses a submitting control with a neutral name (button#finalize), so the
+    # matched element's actual form semantics are checked: <input type=submit|image>,
+    # <button type=submit>, or a <button> with no explicit type inside a form
+    # (HTML defaults it to submit).
+    _PROBE_JS = """(sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return "absent";
+        const tag = el.tagName.toLowerCase();
+        const type = (el.getAttribute("type") || "").toLowerCase();
+        const inForm = !!el.closest("form");
+        if (tag === "button") return (type ? type === "submit" : inForm) ? "submit" : "other";
+        if (tag === "input") return (type === "submit" || type === "image") ? "submit" : "other";
+        return "other";
+    }"""
+
+    async def _probe_click_target(self, page: Page, selector: str) -> str:
+        """Classify a click target: "absent" | "submit" | "other" | "unknown".
+
+        "absent" is the only result that PROVES a click cannot dispatch; any
+        probe failure (non-CSS selector syntax, evaluate error) is "unknown" —
+        never treated as proof of no side effect."""
+        try:
+            res = await page.evaluate(self._PROBE_JS, selector)
+            return res if res in ("absent", "submit", "other") else "unknown"
+        except Exception:
+            return "unknown"
+
+    async def _guarded_execute(
+        self, page: Page, action: str, selector: str, value: Any,
+        resume_path: Optional[str], fence_active: bool = False,
+    ) -> tuple[bool, bool, bool]:
+        """Execute one action with submission-truth semantics.
+
+        Returns (success, may_have_submitted, fenced).
+
+        Uncertainty starts at DISPATCH, not at success: Playwright's click
+        includes post-click waiting (actionability, initiated navigation), so a
+        timeout does not prove the click never happened. A submit-like click is
+        therefore presumed possibly-dispatched unless the target provably does
+        not exist ("absent" probe) — a failure after that point keeps
+        may_have_submitted=True.
+
+        fence_active: a prior possible submission is unresolved. A further
+        submit-like click is NOT executed (fenced=True) — only reconciliation
+        may resolve the pending uncertainty, never a second submit.
+        """
+        if action != "click":
+            return await self._execute_action(page, action, selector, value, resume_path), False, False
+
+        probe = await self._probe_click_target(page, selector)
+        submit_like = self._is_submit_like(action, selector, value) or probe == "submit"
+        if not submit_like:
+            return await self._execute_action(page, action, selector, value, resume_path), False, False
+
+        if fence_active:
+            return False, False, True
+
+        success = await self._execute_action(page, action, selector, value, resume_path)
+        if probe == "absent" and not success:
+            # Provable pre-dispatch failure: the element did not exist and the
+            # click also failed — nothing was submitted, stay retryable.
+            return False, False, False
+        return success, True, False
+
     async def _execute_action(self, page: Page, action: str, selector: str, value: Any, resume_path: Optional[str]) -> bool:
         """Execute a single action on the page."""
         try:
@@ -530,8 +609,11 @@ Respond ONLY with valid JSON matching this structure:
         """Replay recorded domain skills.
 
         Returns (success, possible_submit). possible_submit is True once a
-        submit-like click has EXECUTED, regardless of later failure — the caller
-        must not re-drive the form or discard that ambiguity after this point.
+        submit-like click may have DISPATCHED (not merely once it succeeded) —
+        the caller must not re-drive the form or discard that ambiguity after
+        this point. A recorded sequence containing a second submit-like action
+        after a possible submission is fenced: the second submit is never
+        dispatched while the first is unresolved.
         """
         delay_s = self.browser_config.skill_replay_delay_ms / 1000
         timeout_ms = self.browser_config.step_timeout_ms
@@ -545,11 +627,27 @@ Respond ONLY with valid JSON matching this structure:
 
             try:
                 await page.wait_for_selector(selector, timeout=timeout_ms)
-                success = await self._execute_action(page, action, selector, val, resume_path)
+            except Exception as e:
+                # The pre-wait never dispatches the action, so this failure is
+                # provably pre-submit for THIS step; earlier uncertainty stands.
+                logger.error(f"Skill replay failed waiting for step {idx + 1}: {e}")
+                return False, possible_submit
+
+            try:
+                success, may_submit, fenced = await self._guarded_execute(
+                    page, action, selector, val, resume_path,
+                    fence_active=possible_submit,
+                )
+                if fenced:
+                    logger.warning(
+                        f"Submission fence: skill step {idx + 1} ({selector}) is a "
+                        f"second submit-like action after an unresolved submit — stopping replay."
+                    )
+                    return False, True
+                if may_submit:
+                    possible_submit = True
                 if not success:
                     return False, possible_submit
-                if self._is_submit_like(action, selector, val):
-                    possible_submit = True
                 await asyncio.sleep(delay_s)
             except Exception as e:
                 logger.error(f"Skill replay failed at step {idx + 1}: {e}")
