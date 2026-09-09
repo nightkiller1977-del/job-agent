@@ -89,7 +89,8 @@ class ExternalApplySession(BaseScraper):
                  ledger: SubmissionLedger | None = None,
                  run_log: RunLog | None = None,
                  dispatcher=None,
-                 reauth_router=None):
+                 reauth_router=None,
+                 state_manager=None):
         super().__init__(config)
         self.registry = registry or self._create_default_registry()
         # Optional policy override; when None a per-call AutoSubmitPolicy is used so
@@ -102,6 +103,9 @@ class ExternalApplySession(BaseScraper):
         self.dispatcher = dispatcher
         # Optional Phase 3 re-auth router; None = auth outcomes are surfaced but not acted on.
         self.reauth_router = reauth_router
+        # Optional StateManager for persisting coordinator repair bindings; when
+        # None a default instance is created lazily (and defensively) at report time.
+        self.state_manager = state_manager
 
     async def _route_auth(self, res: AtsApplyResult, job: dict, attempt_id: str) -> None:
         """If an adapter reported an auth wall, surface it and hand to re-auth routing."""
@@ -254,12 +258,16 @@ class ExternalApplySession(BaseScraper):
             )
 
         marked = False
+        nav_status: int | None = None
         try:
             page = await self._start_browser(
                 load_extensions=hints["load_extensions"],
                 disable_extensions=hints.get("disable_extensions", False),
             )
-            await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
+            resp = await page.goto(external_url, wait_until="domcontentloaded", timeout=45000)
+            # keep the navigation HTTP status for failure evidence (defensive:
+            # goto can return None on same-document navigations / stub pages).
+            nav_status = getattr(resp, "status", None)
             # a company/external URL may redirect to the real ATS — re-derive the vendor
             # from the navigated URL so post-nav events aren't mislabeled 'generic'.
             vendor = detect_vendor(getattr(page, "url", "") or external_url) or vendor
@@ -326,6 +334,17 @@ class ExternalApplySession(BaseScraper):
             self._maybe_notify("attempt_finished", res.status,
                                f"{vendor}: {res.status}", res.detail,
                                key=f"{key or attempt_id}:{res.status}")
+            if not res.submitted and not res.verified:
+                # Coordinator incident reporting is strictly best-effort — it must
+                # never change the apply result or break the flow.
+                try:
+                    self._maybe_report_incident(
+                        job, res, vendor=vendor, host=_host(external_url),
+                        adapter_name=getattr(adapter, "name", "unknown"),
+                        key=key, nav_status=nav_status,
+                    )
+                except Exception:
+                    pass
             await self._route_auth(res, job, attempt_id)
             return res
         except Exception as exc:
@@ -346,6 +365,64 @@ class ExternalApplySession(BaseScraper):
                 pass
             finally:
                 lock.release()
+
+    def _maybe_report_incident(self, job: dict, res: AtsApplyResult, *, vendor: str,
+                               host: str, adapter_name: str, key: str,
+                               nav_status: int | None) -> None:
+        """Report a repair-worthy failure to the AICC Coordinator (fail-open).
+
+        Only PERMANENT/UNKNOWN blocker classes and 'submission_unverified' are
+        reported (failure_evidence.should_report); transient/auth/needs-human
+        failures have their own recovery routes. On a successful report the
+        (job → repair operation) binding is persisted into extra_json so
+        repair_resume can pick the job back up when the repair lands.
+        """
+        from ... import incident_reporter
+        from ...failure_evidence import build_failure_evidence, should_report
+
+        if not incident_reporter.is_configured() or not should_report(res):
+            return
+
+        ledger_phase = None
+        if key:
+            try:
+                rec = self.ledger.record(key)
+                ledger_phase = rec.get("phase") if rec else None
+            except Exception:
+                ledger_phase = None
+
+        http_status = nav_status if isinstance(nav_status, int) else None
+        evidence = build_failure_evidence(
+            job, res, run_id=self.run_log.run_id, vendor=vendor, host=host,
+            adapter_name=adapter_name, ledger_phase=ledger_phase,
+            http_status=http_status,
+        )
+        response = incident_reporter.report_failure(evidence)
+        self.run_log.emit(
+            "incident_reported", attempt_id=res.attempt_id, job_id=evidence.job_id,
+            vendor=vendor, host=host, outcome=res.status,
+            incident_id=evidence.incident_id,
+            operation_id=(response or {}).get("id"),
+            reported=bool(response),
+        )
+        if response and response.get("id") and evidence.job_id:
+            # Persist the repair binding. record_apply_attempt needs the jobs DB —
+            # guard defensively so environments without one (tests) still pass.
+            try:
+                sm = self.state_manager
+                if sm is None:
+                    from ...state_manager import StateManager
+                    sm = StateManager()
+                sm.record_apply_attempt(
+                    evidence.job_id, res.status, detail=res.detail,
+                    metadata={
+                        "repair_operation_id": response.get("id"),
+                        "repair_incident_id": evidence.incident_id,
+                        "repair_reported_at": time.time(),
+                    },
+                )
+            except Exception as exc:
+                console.print(f"[dim]repair binding persist failed (non-fatal): {exc}[/dim]")
 
     @staticmethod
     def _enforce_authorization(res: AtsApplyResult, ctx: AtsApplyContext,
