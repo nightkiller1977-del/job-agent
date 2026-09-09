@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument, UpdateOne
 
 load_dotenv()
 app = FastAPI(title="Job Agent Dashboard")
@@ -92,6 +92,12 @@ def init_db() -> None:
     db.job_relationships.create_index([("to_id", ASCENDING), ("type", ASCENDING)], name="idx_relationships_to")
 
 
+def _bulk_write(collection, operations, batch_size: int = 500) -> None:
+    """Bound migration latency/memory while retaining unordered idempotent upserts."""
+    for start in range(0, len(operations), batch_size):
+        collection.bulk_write(operations[start:start + batch_size], ordered=False)
+
+
 def migrate_legacy_postgres() -> None:
     """Idempotently copy legacy dashboard state into Atlas before Postgres retirement."""
     if not MIGRATE_LEGACY_POSTGRES or not LEGACY_DATABASE_URL or not MONGODB_URI:
@@ -100,6 +106,12 @@ def migrate_legacy_postgres() -> None:
     marker_id = "render-postgres-v1"
     if db.migration_state.find_one({"_id": marker_id, "status": "complete"}):
         return
+
+    db.migration_state.update_one(
+        {"_id": marker_id},
+        {"$set": {"status": "running", "started_at": _utcnow()}},
+        upsert=True,
+    )
 
     pg = None
     try:
@@ -113,32 +125,41 @@ def migrate_legacy_postgres() -> None:
             cur.execute("SELECT * FROM sync_log ORDER BY id")
             sync_rows = [dict(row) for row in cur.fetchall()]
 
-        for row in jobs:
-            if row.get("job_id"):
-                db.jobs.update_one({"job_id": row["job_id"]}, {"$set": row}, upsert=True)
+        job_ops = [
+            UpdateOne({"job_id": row["job_id"]}, {"$set": row}, upsert=True)
+            for row in jobs if row.get("job_id")
+        ]
+        if job_ops:
+            _bulk_write(db.jobs, job_ops)
 
-        for row in sync_rows:
+        sync_ops = []
+        for source_row in sync_rows:
+            row = dict(source_row)
             legacy_id = row.pop("id", None)
-            if legacy_id is not None:
-                db.sync_events.update_one(
-                    {"legacy_postgres_id": legacy_id},
-                    {"$set": {**row, "legacy_postgres_id": legacy_id}},
-                    upsert=True,
-                )
+            if legacy_id is None:
+                continue
+            sync_ops.append(UpdateOne(
+                {"legacy_postgres_id": legacy_id},
+                {"$set": {**row, "legacy_postgres_id": legacy_id}},
+                upsert=True,
+            ))
+        if sync_ops:
+            _bulk_write(db.sync_events, sync_ops)
 
+        db.sync_events.create_index([("legacy_postgres_id", ASCENDING)], unique=True, sparse=True, name="uq_sync_legacy_postgres_id")
         db.migration_state.update_one(
             {"_id": marker_id},
             {"$set": {
                 "status": "complete",
                 "completed_at": _utcnow(),
-                "jobs": len(jobs),
-                "sync_events": len(sync_rows),
+                "jobs": len(job_ops),
+                "sync_events": len(sync_ops),
                 "credentials_migrated": False,
                 "note": "Cloud credential fetch is retired; credentials remain in the secret-store path.",
-            }},
+            }, "$unset": {"failed_at": "", "error_type": ""}},
             upsert=True,
         )
-        print(f"[migration] Postgres -> MongoDB complete: jobs={len(jobs)} sync_events={len(sync_rows)}")
+        print(f"[migration] Postgres -> MongoDB complete: jobs={len(job_ops)} sync_events={len(sync_ops)}")
     except Exception as exc:
         print(f"[migration] Postgres -> MongoDB failed: {type(exc).__name__}: {exc}")
         try:
