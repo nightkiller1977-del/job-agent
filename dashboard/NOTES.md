@@ -1,1 +1,0 @@
-MongoDB consolidation work is intentionally isolated on a feature branch until production data is backfilled and parity-checked. Do not delete the Render Postgres database before cutover validation succeeds.
