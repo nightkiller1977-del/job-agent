@@ -89,3 +89,28 @@ def test_clean_model_json_parses_fenced():
 
 def test_strip_model_noise():
     assert strip_model_noise("<think>hmm</think>```json\n{}\n```") == "{}"
+
+
+def test_extract_json_repairs_raw_newlines_inside_strings():
+    """Prose-wrapped JSON whose string value contains literal newlines (the
+    exact resume-tailor failure observed live) must still parse."""
+    from src.json_utils import extract_json
+
+    raw = (
+        "Here is the rewritten resume in Markdown format:\n\n"
+        '{\n  "resume_markdown": "\n# Resume\n\n## Work Experience\n- Director",\n'
+        '  "notes": "kept\tfacts"\n}'
+    )
+    value = extract_json(raw, expect="object")
+    assert value is not None
+    assert value["resume_markdown"].startswith("\n# Resume")
+    assert "Director" in value["resume_markdown"]
+    assert value["notes"] == "kept\tfacts"
+
+
+def test_extract_json_does_not_mangle_valid_escapes():
+    from src.json_utils import extract_json
+
+    raw = '{"a": "line1\\nline2", "b": "quote \\" inside"}'
+    value = extract_json(raw, expect="object")
+    assert value == {"a": "line1\nline2", "b": 'quote " inside'}
