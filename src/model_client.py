@@ -289,6 +289,18 @@ class SystemPerformanceGate:
         except ImportError:
             total_gb = _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
             free_gb = total_gb * 0.4  # conservative fallback
+            if platform.system() == "Linux":
+                # /proc/meminfo MemAvailable is the kernel's own estimate of what a
+                # new workload can claim without swapping — far more accurate than
+                # the 40% guess, and psutil is often absent from the runtime venv.
+                try:
+                    with open("/proc/meminfo") as f:
+                        for line in f:
+                            if line.startswith("MemAvailable:"):
+                                free_gb = int(line.split()[1]) / (1024 ** 2)
+                                break
+                except OSError:
+                    pass
 
         swap_gb = 0.0
         if platform.system() == "Darwin":
@@ -315,6 +327,15 @@ class SystemPerformanceGate:
 
         eco_mode = False
         throttle_reason = None
+
+        # Bound by memory that is actually free right now, not just installed RAM.
+        # Field failure: 30.5GB laptop with ~14GB available produced cap=26.5GB,
+        # so the 18GB-min devstral model was selected and the kernel OOM-killed
+        # ollama on every load (systemd restart loop) instead of routing to a
+        # smaller model that fit.
+        if mem["free_gb"] > 0 and mem["free_gb"] < cap_gb:
+            throttle_reason = "low_free_memory"
+            cap_gb = max(2.0, mem["free_gb"])
 
         if on_battery:
             eco_mode = True

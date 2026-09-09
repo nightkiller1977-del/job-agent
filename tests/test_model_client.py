@@ -269,3 +269,41 @@ def test_query_model_timeout_cancellation(monkeypatch):
         query_model("test question", timeout=0.1)
 
 
+
+
+def test_optimal_cap_bounded_by_available_memory(monkeypatch):
+    """cap_gb must not exceed currently-available memory (OOM regression).
+
+    Field failure: 30.5GB total / ~14GB available produced cap=26.5GB, so the
+    18GB-min devstral model was selected and ollama was OOM-killed on load.
+    """
+    from src.model_client import SystemPerformanceGate
+
+    monkeypatch.setattr(SystemPerformanceGate, "is_on_battery", classmethod(lambda cls: False))
+    monkeypatch.setattr(SystemPerformanceGate, "get_thermal_level", classmethod(lambda cls: 0))
+    monkeypatch.setattr(
+        SystemPerformanceGate,
+        "get_memory_status",
+        classmethod(lambda cls: {"total_gb": 30.5, "free_gb": 14.0, "swap_gb": 0.0}),
+    )
+
+    gate = SystemPerformanceGate.get_optimal_cap()
+    assert gate["cap_gb"] <= 14.0
+    assert gate["throttle_reason"] == "low_free_memory"
+
+
+def test_optimal_cap_unchanged_when_memory_is_free(monkeypatch):
+    """When available memory exceeds total-headroom, the original cap stands."""
+    from src.model_client import SystemPerformanceGate
+
+    monkeypatch.setattr(SystemPerformanceGate, "is_on_battery", classmethod(lambda cls: False))
+    monkeypatch.setattr(SystemPerformanceGate, "get_thermal_level", classmethod(lambda cls: 0))
+    monkeypatch.setattr(
+        SystemPerformanceGate,
+        "get_memory_status",
+        classmethod(lambda cls: {"total_gb": 32.0, "free_gb": 30.0, "swap_gb": 0.0}),
+    )
+
+    gate = SystemPerformanceGate.get_optimal_cap()
+    assert gate["cap_gb"] == 28.0
+    assert gate["throttle_reason"] is None
