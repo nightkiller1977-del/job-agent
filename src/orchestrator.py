@@ -24,6 +24,7 @@ from .sources.indeed import IndeedScraper
 from .sources.jobspy_scraper import JobSpyScraper
 from .sources.themuse import TheMuseScraper
 from .sources.builtin import BuiltInScraper
+from .sources.ats_api import AtsApiScraper
 
 import logging
 
@@ -53,13 +54,22 @@ SOURCE_MAP = {
     "google":   JobrightScraper,
     "themuse":  TheMuseScraper,
     "builtin":  BuiltInScraper,
+    "ats":      AtsApiScraper,     # Greenhouse/Lever/Ashby public APIs (no browser)
+    # Jobs discovered by the "ats" source carry their vendor as `source`, and
+    # apply through the external-ATS flow (which owns the vendor adapters):
+    "greenhouse": JobrightScraper,
+    "lever":      JobrightScraper,
+    "ashby":      JobrightScraper,
 }
 
 # Sources fanned out by default discovery (no --source given). Deliberately
 # excludes "external", which resolves to JobrightScraper and is only meant for
 # explicitly hydrating manually-pasted non-source URLs — including it here would
 # scrape Jobright twice per run.
-DEFAULT_DISCOVERY_SOURCES = ["jobright", "linkedin", "usajobs", "indeed", "jobspy", "themuse", "builtin"]
+# "ats" runs first: public APIs are the cheapest, most reliable source (no
+# browser, no session), so their canonical postings land before browser sources
+# rediscover the same jobs behind aggregator URLs.
+DEFAULT_DISCOVERY_SOURCES = ["ats", "jobright", "linkedin", "usajobs", "indeed", "jobspy", "themuse", "builtin"]
 
 # Apply statuses meaning "<source>'s OWN login session was the blocker" — a successful
 # reauth of that source makes such jobs attemptable again (see

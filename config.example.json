@@ -25,6 +25,12 @@
     "federal_ses":       { "action": "always_apply" },
     "contract_remote":   { "min_comp": 100000 }
   },
+  "ats_boards": {
+    "title_include": ["manager", "director", "vp", "vice president", "head of", "chief"],
+    "greenhouse": ["stripe", { "token": "reddit", "company": "Reddit" }],
+    "lever": [],
+    "ashby": []
+  },
   "search_settings": {
     "keywords": "Software Engineer",
     "location": "Remote",
