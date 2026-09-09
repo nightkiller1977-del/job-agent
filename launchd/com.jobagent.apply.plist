@@ -8,7 +8,9 @@
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>cd __PROJECT_DIR__ &amp;&amp; .venv/bin/python3 src/main.py apply --auto-submit</string>
+        <!-- run-scheduled.sh refuses (fail-closed) if the checkout is not on
+             the branch captured at install time (JOBAGENT_RUNTIME_BRANCH). -->
+        <string>__PROJECT_DIR__/scripts/run-scheduled.sh apply</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -18,6 +20,8 @@
         <string>__SOPS_AGE_KEY_FILE__</string>
         <key>AICC_SECRETS_DIR</key>
         <string>__AICC_SECRETS_DIR__</string>
+        <key>JOBAGENT_RUNTIME_BRANCH</key>
+        <string>__RUNTIME_BRANCH__</string>
     </dict>
     <key>StartCalendarInterval</key>
     <dict>
