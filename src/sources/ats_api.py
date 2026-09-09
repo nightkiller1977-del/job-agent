@@ -31,10 +31,14 @@ from datetime import datetime
 
 from rich.console import Console
 
+# Re-exported (import ... as ...): these names are only referenced dynamically,
+# via getattr() in _fetcher_for() below and via mock.patch("src.sources.ats_api.
+# fetch_*_jobs") in tests/test_ats_api_source.py, so static analysis can't see
+# the usage — ruff would otherwise flag them as unused (F401).
 from src.discovery.ats_api import (
-    fetch_greenhouse_jobs,
-    fetch_lever_jobs,
-    fetch_ashby_jobs,
+    fetch_greenhouse_jobs as fetch_greenhouse_jobs,
+    fetch_lever_jobs as fetch_lever_jobs,
+    fetch_ashby_jobs as fetch_ashby_jobs,
 )
 from .base import BaseScraper
 
