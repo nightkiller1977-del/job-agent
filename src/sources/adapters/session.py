@@ -285,7 +285,16 @@ class ExternalApplySession(BaseScraper):
                 recovery_res = self._enforce_authorization(
                     await BrowserUseRecoveryRefactored().apply(ctx), ctx, policy
                 )
-                if recovery_res.submitted:
+                # Adopt a verified submit — AND an ambiguous one. unverified() sets
+                # submitted=False, so adopting only on `submitted` silently discarded
+                # a recovery run that clicked submit without receipt confirmation:
+                # `res` stayed the earlier pre-submit failure, the marker block below
+                # released the ledger marker, and the job was freed for a blind
+                # retry — the duplicate-submission scenario the ledger exists to
+                # prevent. Keeping the unverified result routes it to
+                # ledger.complete(verified=False) instead, preserving the ambiguity
+                # for reconciliation.
+                if recovery_res.submitted or recovery_res.status == "submission_unverified":
                     res = recovery_res
 
             res.attempt_id = attempt_id
