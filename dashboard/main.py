@@ -1,8 +1,8 @@
 """Job Agent Dashboard — FastAPI review/control surface.
 
-MongoDB Atlas is the cloud persistence backend. Local Job Agent SQLite remains
-an offline/journal store. During the one-time cutover, legacy Render Postgres is
-read only at startup when MIGRATE_LEGACY_POSTGRES=true; it is never written.
+MongoDB Atlas is the dashboard's cloud persistence backend. Local Job Agent
+SQLite remains a zero-cost offline/journal store; the dashboard has no runtime
+Postgres dependency.
 """
 from __future__ import annotations
 
@@ -33,8 +33,6 @@ MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
 JOB_AGENT_DB = os.environ.get("JOB_AGENT_DB", "job_agent").strip() or "job_agent"
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "")
 CREDENTIAL_ENCRYPTION_KEY = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
-MIGRATE_LEGACY_POSTGRES = os.environ.get("MIGRATE_LEGACY_POSTGRES", "").strip().lower() in {"1", "true", "yes"}
-LEGACY_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 _client: MongoClient | None = None
 
 
@@ -87,71 +85,10 @@ def init_db() -> None:
     db.jobs.create_index([("discovered_at", DESCENDING)], name="idx_jobs_discovered")
     db.jobs.create_index([("updated_at", DESCENDING)], name="idx_jobs_updated")
     db.sync_events.create_index([("synced_at", DESCENDING)], name="idx_sync_events_synced")
+    db.sync_events.create_index([("legacy_postgres_id", ASCENDING)], unique=True, sparse=True, name="uq_sync_legacy_postgres_id")
     db.credentials.create_index([("platform", ASCENDING)], unique=True, name="uq_credentials_platform")
     db.job_relationships.create_index([("from_id", ASCENDING), ("type", ASCENDING)], name="idx_relationships_from")
     db.job_relationships.create_index([("to_id", ASCENDING), ("type", ASCENDING)], name="idx_relationships_to")
-
-
-def migrate_legacy_postgres() -> None:
-    """Idempotently copy legacy dashboard state into Atlas before Postgres retirement."""
-    if not MIGRATE_LEGACY_POSTGRES or not LEGACY_DATABASE_URL or not MONGODB_URI:
-        return
-    db = get_db()
-    marker_id = "render-postgres-v1"
-    if db.migration_state.find_one({"_id": marker_id, "status": "complete"}):
-        return
-
-    pg = None
-    try:
-        import psycopg2
-        import psycopg2.extras
-
-        pg = psycopg2.connect(LEGACY_DATABASE_URL, sslmode="require", connect_timeout=10)
-        with pg.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM jobs")
-            jobs = [dict(row) for row in cur.fetchall()]
-            cur.execute("SELECT * FROM sync_log ORDER BY id")
-            sync_rows = [dict(row) for row in cur.fetchall()]
-
-        for row in jobs:
-            if row.get("job_id"):
-                db.jobs.update_one({"job_id": row["job_id"]}, {"$set": row}, upsert=True)
-
-        for row in sync_rows:
-            legacy_id = row.pop("id", None)
-            if legacy_id is not None:
-                db.sync_events.update_one(
-                    {"legacy_postgres_id": legacy_id},
-                    {"$set": {**row, "legacy_postgres_id": legacy_id}},
-                    upsert=True,
-                )
-
-        db.migration_state.update_one(
-            {"_id": marker_id},
-            {"$set": {
-                "status": "complete",
-                "completed_at": _utcnow(),
-                "jobs": len(jobs),
-                "sync_events": len(sync_rows),
-                "credentials_migrated": False,
-                "note": "Cloud credential fetch is retired; credentials remain in the secret-store path.",
-            }},
-            upsert=True,
-        )
-        print(f"[migration] Postgres -> MongoDB complete: jobs={len(jobs)} sync_events={len(sync_rows)}")
-    except Exception as exc:
-        print(f"[migration] Postgres -> MongoDB failed: {type(exc).__name__}: {exc}")
-        try:
-            db.migration_state.update_one(
-                {"_id": marker_id},
-                {"$set": {"status": "failed", "failed_at": _utcnow(), "error_type": type(exc).__name__}},
-                upsert=True,
-            )
-        except Exception:
-            pass
-    finally:
-        if pg is not None:
-            pg.close()
 
 
 def _get_cipher():
@@ -174,7 +111,6 @@ def _encrypt_password(plain: str) -> str:
 @app.on_event("startup")
 def on_startup():
     init_db()
-    migrate_legacy_postgres()
 
 
 class ActionRequest(BaseModel):
@@ -211,8 +147,13 @@ async def health():
     try:
         db = get_db()
         db.command("ping")
-        marker = db.migration_state.find_one({"_id": "render-postgres-v1"}, {"status": 1})
-        return {"ok": True, "database": "ok", "backend": "mongodb", "legacy_migration": marker.get("status") if marker else "not-run"}
+        marker = db.migration_state.find_one({"_id": "render-postgres-v1"}, {"status": 1, "jobs": 1, "sync_events": 1})
+        return {
+            "ok": True,
+            "database": "ok",
+            "backend": "mongodb",
+            "legacy_migration": marker.get("status") if marker else "not-run",
+        }
     except Exception:
         return {"ok": False, "database": "unavailable", "backend": "mongodb"}
 
