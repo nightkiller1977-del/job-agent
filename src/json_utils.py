@@ -49,6 +49,39 @@ def _candidates(text: str, open_ch: str, close_ch: str):
         end = text.rfind(close_ch, start, end)
 
 
+_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _escape_control_chars_in_strings(text: str) -> str:
+    """Escape raw newlines/tabs that appear inside JSON string literals.
+
+    Local models asked for {"resume_markdown": "<multiline document>"} routinely
+    emit the document with literal newlines inside the quoted string, which is
+    invalid JSON and unrecoverable by span-trimming alone (observed live: all 3
+    resume-tailor iterations discarded as "no usable draft"). Walk the text with
+    a minimal string-literal state machine and escape bare control characters
+    only when inside a string.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            elif ch in _CONTROL_ESCAPES:
+                out.append(_CONTROL_ESCAPES[ch])
+                continue
+        elif ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out)
+
+
 def extract_json(text: str, expect: str = "any") -> Any:
     """Best-effort extraction of a JSON object/array from model output.
 
@@ -71,14 +104,15 @@ def extract_json(text: str, expect: str = "any") -> Any:
     delims = {"object": [("{", "}")], "array": [("[", "]")]}.get(
         expect, [("{", "}"), ("[", "]")]
     )
-    for open_ch, close_ch in delims:
-        for candidate in _candidates(cleaned, open_ch, close_ch):
-            try:
-                value = json.loads(candidate)
-            except (ValueError, TypeError):
-                continue
-            if _matches(value, expect):
-                return value
+    for source in (cleaned, _escape_control_chars_in_strings(cleaned)):
+        for open_ch, close_ch in delims:
+            for candidate in _candidates(source, open_ch, close_ch):
+                try:
+                    value = json.loads(candidate)
+                except (ValueError, TypeError):
+                    continue
+                if _matches(value, expect):
+                    return value
     _log.warning(
         "json_utils.extract_json: no parseable JSON in model output (len=%d): %.120r",
         len(text),
