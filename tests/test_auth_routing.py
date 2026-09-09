@@ -592,20 +592,31 @@ def test_clear_session_block_resets_status_so_readiness_becomes_ready(tmp_path):
     assert readiness == "ready"
 
 
-def test_usajobs_prepared_session_becomes_ready(tmp_path):
+def test_usajobs_prepared_session_becomes_ready(tmp_path, monkeypatch):
     """Codex #57 P1: USAJobs returns needs-session at a source-specific early return
     before any status logic. The session-prepared marker must be honored ahead of
     that return, or a prepared USAJobs job can never be made retryable (its blocked
     path would then drop the marker, locking it forever)."""
     from src.orchestrator import Orchestrator
 
+    # The needs-session block fires only when no saved USAJobs session file
+    # exists (ACES-283). Point SESSIONS_DIR at an empty tmp dir so the test is
+    # hermetic — on a dev machine with a real state/sessions/usajobs_chromium.json
+    # the unprepared job would otherwise classify as ready.
+    monkeypatch.setattr("src.sources.base.SESSIONS_DIR", tmp_path)
+
     o = Orchestrator.__new__(Orchestrator)
 
     base = {"job_id": "u1", "source": "usajobs", "title": "T", "company": "C",
             "url": "https://www.usajobs.gov/job/1"}
-    # Unprepared: blocked as needs-session.
+    # Unprepared (no saved session): blocked as needs-session.
     readiness, _ = o._classify_apply_readiness(base)
     assert readiness == "needs-session"
+    # With a saved session file present, a stale session is attempted rather
+    # than human-gated (the apply loop's reauth path recovers it).
+    (tmp_path / "usajobs_chromium.json").write_text("{}")
+    readiness, _ = o._classify_apply_readiness(base)
+    assert readiness == "ready"
     # After prepare-sessions stamps the marker: ready to retry.
     prepared = {**base, "extra_json": '{"session_prepared_at": "2026-07-19T00:00:00"}'}
     readiness, _ = o._classify_apply_readiness(prepared)
