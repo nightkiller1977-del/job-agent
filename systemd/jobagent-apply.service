@@ -8,8 +8,12 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=__PROJECT_DIR__
-ExecStart=__PROJECT_DIR__/.venv/bin/python3 src/main.py apply --auto-submit
+# run-scheduled.sh refuses (fail-closed) if the checkout is not on the branch
+# captured at install time — an unattended auto-submit never executes a stray
+# dev branch.
+ExecStart=__PROJECT_DIR__/scripts/run-scheduled.sh apply
 Environment=SOPS_AGE_KEY_FILE=__SOPS_AGE_KEY_FILE__
 Environment=AICC_SECRETS_DIR=__AICC_SECRETS_DIR__
+Environment=JOBAGENT_RUNTIME_BRANCH=__RUNTIME_BRANCH__
 StandardOutput=append:__PROJECT_DIR__/state/apply.log
 StandardError=append:__PROJECT_DIR__/state/apply.err

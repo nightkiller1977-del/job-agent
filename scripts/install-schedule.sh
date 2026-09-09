@@ -40,6 +40,11 @@ if [ -z "$SECRETS_DIR" ] && [ -d "$REPO_DIR/../aicc-secrets" ]; then
   SECRETS_DIR="$(cd "$REPO_DIR/../aicc-secrets" && pwd)"
 fi
 
+# Pin scheduled runs to the branch checked out at install time (override with
+# an exported JOBAGENT_RUNTIME_BRANCH). scripts/run-scheduled.sh fails closed
+# if the checkout drifts off this branch — dev work belongs in a worktree.
+RUNTIME_BRANCH="${JOBAGENT_RUNTIME_BRANCH:-$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")}"
+
 case "$action" in
   install)
     mkdir -p "$UNIT_DIR" "$REPO_DIR/state"
@@ -48,6 +53,7 @@ case "$action" in
         sed -e "s|__PROJECT_DIR__|$REPO_DIR|g" \
             -e "s|__SOPS_AGE_KEY_FILE__|$SOPS_KEY|g" \
             -e "s|__AICC_SECRETS_DIR__|$SECRETS_DIR|g" \
+            -e "s|__RUNTIME_BRANCH__|$RUNTIME_BRANCH|g" \
             "$REPO_DIR/systemd/$unit.$ext" > "$UNIT_DIR/$unit.$ext"
       done
     done
