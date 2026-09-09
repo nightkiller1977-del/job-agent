@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
 # Runs tests before every push. Exit non-zero to abort the push.
 
-set -euo pipefail
+set -uo pipefail
 
 echo "==> pre-push: running Python test suite..."
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
+
 if [ -x "$REPO_ROOT/.venv/bin/pytest" ]; then
-  "$REPO_ROOT/.venv/bin/pytest"
+  PYTEST=("$REPO_ROOT/.venv/bin/pytest")
 else
-  python3 -m pytest
+  PYTEST=(python3 -m pytest)
 fi
 
-echo "==> pre-push: all checks passed."
+if "${PYTEST[@]}"; then
+  echo "==> pre-push: all checks passed."
+else
+  status=$?
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+  detail="Test suite failed on $branch — push aborted"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -u critical "Job Agent: push blocked" "$detail"
+  elif command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$detail\" with title \"Job Agent\" subtitle \"push blocked\"" 2>/dev/null
+  fi
+  exit "$status"
+fi
