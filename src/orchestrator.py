@@ -781,6 +781,21 @@ class Orchestrator:
         is_interactive = bool(_sys.stdin and _sys.stdin.isatty())
 
         self._log_credential_presence()
+
+        # Resume jobs whose coordinator repair operation has completed (fail-open;
+        # only when incident reporting is configured — see src/incident_reporter.py).
+        try:
+            from .incident_reporter import is_configured as _reporting_configured
+            if _reporting_configured():
+                from .repair_resume import resume_repaired_jobs
+                resumed = resume_repaired_jobs(state=self.state)
+                if resumed:
+                    console.print(
+                        f"[cyan]Repair resume: {resumed} job(s) re-entered the apply pool.[/cyan]"
+                    )
+        except Exception as exc:
+            _log.warning("repair_resume.failed error=%s", exc)
+
         # Pull cloud-approved jobs into local SQLite first
         await self._pull_approved_from_cloud()
 
