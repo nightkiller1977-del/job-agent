@@ -37,6 +37,13 @@ PHASE_IN_PROGRESS = "submit_in_progress"
 PHASE_VERIFIED = "receipt_verified"
 PHASE_UNVERIFIED = "submission_unverified"
 
+
+class LedgerUnreadableError(Exception):
+    """The ledger file exists but could not be parsed (corrupt JSON, bad
+    permissions, etc). Distinct from a first-run missing file: history that
+    can't be read must never be treated as empty history, or a prior
+    unresolved/verified submission could be silently forgotten."""
+
 # An in-progress marker older than this (seconds) is treated as a crashed attempt,
 # not a live one — it still blocks a *blind* resubmit but is reported as stale.
 STALE_AFTER_S = 6 * 60 * 60
@@ -58,9 +65,15 @@ class SubmissionLedger:
     def _load(self) -> dict:
         try:
             with open(self.path, "r") as f:
-                return json.load(f)
-        except Exception:
+                raw = f.read()
+        except FileNotFoundError:
             return {}
+        except OSError as e:
+            raise LedgerUnreadableError(f"ledger at {self.path} could not be read: {e}") from e
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            raise LedgerUnreadableError(f"ledger at {self.path} is corrupt: {e}") from e
 
     def _save(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
