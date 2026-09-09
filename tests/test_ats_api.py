@@ -19,6 +19,10 @@ def test_canonicalize_url():
     assert canonicalize_url("https://jobs.lever.co/myco/abc-123/") == "https://jobs.lever.co/myco/abc-123"
     # Case insensitivity for params
     assert canonicalize_url("https://jobs.ashbyhq.com/myco/123?UTM_SOURCE=indeed") == "https://jobs.ashbyhq.com/myco/123"
+    # gh_jid is job IDENTITY on proxied Greenhouse careers pages, never stripped —
+    # stripping it collapsed all 617 Stripe postings into one job_id. gh_src (a
+    # true source tracker) still goes.
+    assert canonicalize_url("https://stripe.com/jobs/search?gh_jid=8172487&gh_src=abc") == "https://stripe.com/jobs/search?gh_jid=8172487"
 
 def test_infer_remote_type():
     assert _infer_remote_type("Software Engineer (Remote)", "San Francisco, CA", "Description here") == "remote"
