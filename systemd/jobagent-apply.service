@@ -1,0 +1,15 @@
+# Linux twin of launchd/com.jobagent.apply.plist — rendered and installed by
+# scripts/install-schedule.sh.
+[Unit]
+Description=job-agent: apply to approved jobs (auto-submit)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=__PROJECT_DIR__/.venv/bin/python3 src/main.py apply --auto-submit
+Environment=SOPS_AGE_KEY_FILE=__SOPS_AGE_KEY_FILE__
+Environment=AICC_SECRETS_DIR=__AICC_SECRETS_DIR__
+StandardOutput=append:__PROJECT_DIR__/state/apply.log
+StandardError=append:__PROJECT_DIR__/state/apply.err

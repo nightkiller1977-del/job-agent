@@ -1,0 +1,11 @@
+[Unit]
+Description=job-agent: daily 07:00 discover run (same schedule as launchd twin)
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+# Catch up after the machine was off/asleep at 07:00 — required for
+# "fully auto on any computer" (laptops included).
+Persistent=true
+
+[Install]
+WantedBy=timers.target
