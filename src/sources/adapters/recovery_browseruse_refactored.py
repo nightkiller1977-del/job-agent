@@ -12,6 +12,7 @@ Key improvements over the original:
 import asyncio
 import json
 import logging
+import re
 import urllib.parse
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -88,22 +89,36 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
         skills = self._load_skills(domain)
         if skills:
             logger.info(f"Replaying {len(skills)} recorded domain skills for {domain}...")
-            success = await self._replay_skills(ctx.page, skills, ctx.resume_path)
+            success, replay_possible_submit = await self._replay_skills(ctx.page, skills, ctx.resume_path)
             if success:
                 logger.info(f"Domain skills replay succeeded for {domain}!")
                 verified, signal = await verify_receipt(ctx.page)
                 if verified:
                     return AtsApplyResult.ok(detail=f"Application submitted via domain skills replay (receipt {signal}).")
+                if replay_possible_submit:
+                    # A submit-like click executed with no receipt confirmation —
+                    # ambiguous post-click state, never re-drivable (submission-truth
+                    # invariant). The session/ledger reconcile it.
+                    return AtsApplyResult.unverified(
+                        detail="Domain skills replay clicked a submit control but no receipt was confirmed."
+                    )
                 return AtsApplyResult.blocked(
                     status="review_ready",
                     detail="Domain skills completed, form ready for review (not confirmed submitted).",
                 )
 
+            if replay_possible_submit:
+                # Replay failed AFTER a submit-like click — falling through to the
+                # LLM loop would re-drive a form that may already be submitted.
+                return AtsApplyResult.unverified(
+                    detail="Skill replay failed after clicking a submit control; not re-driving the form."
+                )
             logger.warning(f"Replay failed for {domain}, falling back to LLM agent loop.")
 
         # 2. Run LLM-guided browser agent loop with progress tracking
         steps_recorded = []
         step = 0
+        possible_submit = False
 
         while step < self.browser_config.max_steps:
             step += 1
@@ -151,6 +166,10 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                         logger.warning(
                             f"loop_detected domain={domain} step={step} reason={loop_result.reason}"
                         )
+                    if possible_submit:
+                        return AtsApplyResult.unverified(
+                            detail=f"Loop detected after a submit-like click ({loop_result.reason}); submission unconfirmed."
+                        )
                     return AtsApplyResult.blocked(
                         status="form_not_reached",
                         detail=f"Loop detected: {loop_result.reason}. Agent not making progress toward submission."
@@ -184,6 +203,10 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 logger.info(f"LLM Action decision: {json.dumps(action_data)}")
             except Exception as e:
                 logger.error(f"Failed to get LLM action decision: {e}")
+                if possible_submit:
+                    return AtsApplyResult.unverified(
+                        detail=f"LLM decision failure after a submit-like click: {e}"
+                    )
                 return AtsApplyResult.blocked(status="external_ats_error", detail=f"LLM decision failure: {e}")
 
             action = action_data.get("action")
@@ -197,6 +220,10 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 verified, signal = await verify_receipt(ctx.page)
                 if verified:
                     return AtsApplyResult.ok(detail=f"Application submitted (receipt {signal}).")
+                if possible_submit:
+                    return AtsApplyResult.unverified(
+                        detail="LLM declared done after a submit-like click, but no receipt was confirmed."
+                    )
                 return AtsApplyResult.blocked(
                     status="review_ready",
                     detail="Form filled by LLM agent, ready for manual review (not confirmed submitted).",
@@ -204,6 +231,10 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
 
             elif action == "fail":
                 logger.warning(f"LLM declared failure: {action_data.get('explanation')}")
+                if possible_submit:
+                    return AtsApplyResult.unverified(
+                        detail=f"LLM declared failure after a submit-like click: {action_data.get('explanation')}"
+                    )
                 return AtsApplyResult.blocked(status="submit_not_found", detail=f"LLM failed: {action_data.get('explanation')}")
 
             # Execute selected action
@@ -219,6 +250,8 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
             )
 
             if success:
+                if self._is_submit_like(action, selector, val):
+                    possible_submit = True
                 steps_recorded.append({
                     "action": action,
                     "selector": selector,
@@ -243,6 +276,11 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
         summary = progress_tracker.get_summary()
         logger.error(f"Progress summary: {summary}")
 
+        if possible_submit:
+            return AtsApplyResult.unverified(
+                detail=f"Step limit reached after a submit-like click; submission unconfirmed "
+                       f"(progress {progress_tracker.last_progress_score:.2f}/1.0)."
+            )
         return AtsApplyResult.blocked(
             status="form_not_reached",
             detail=f"Browser Use recovery loop exceeded {self.browser_config.max_steps} steps. "
@@ -449,6 +487,18 @@ Respond ONLY with valid JSON matching this structure:
 
         return elements
 
+    @staticmethod
+    def _is_submit_like(action: str, selector: str, value: Any = None) -> bool:
+        """A click that may have submitted the application. Deliberately biased
+        toward false positives: wrongly flagging a click as a possible submit
+        costs one reconciliation pass, while missing a real submit frees the
+        ledger marker and risks a duplicate application (submission-truth
+        invariant, AtsApplyResult docstring)."""
+        if action != "click":
+            return False
+        text = f"{selector or ''} {value or ''}".lower()
+        return bool(re.search(r"submit|apply|send[_\- ]?application", text))
+
     async def _execute_action(self, page: Page, action: str, selector: str, value: Any, resume_path: Optional[str]) -> bool:
         """Execute a single action on the page."""
         try:
@@ -474,10 +524,18 @@ Respond ONLY with valid JSON matching this structure:
 
         return False
 
-    async def _replay_skills(self, page: Page, skills: List[Dict[str, Any]], resume_path: Optional[str]) -> bool:
-        """Replay recorded domain skills."""
+    async def _replay_skills(
+        self, page: Page, skills: List[Dict[str, Any]], resume_path: Optional[str]
+    ) -> tuple[bool, bool]:
+        """Replay recorded domain skills.
+
+        Returns (success, possible_submit). possible_submit is True once a
+        submit-like click has EXECUTED, regardless of later failure — the caller
+        must not re-drive the form or discard that ambiguity after this point.
+        """
         delay_s = self.browser_config.skill_replay_delay_ms / 1000
         timeout_ms = self.browser_config.step_timeout_ms
+        possible_submit = False
 
         for idx, step in enumerate(skills):
             action = step.get("action")
@@ -489,12 +547,14 @@ Respond ONLY with valid JSON matching this structure:
                 await page.wait_for_selector(selector, timeout=timeout_ms)
                 success = await self._execute_action(page, action, selector, val, resume_path)
                 if not success:
-                    return False
+                    return False, possible_submit
+                if self._is_submit_like(action, selector, val):
+                    possible_submit = True
                 await asyncio.sleep(delay_s)
             except Exception as e:
                 logger.error(f"Skill replay failed at step {idx + 1}: {e}")
-                return False
-        return True
+                return False, possible_submit
+        return True, possible_submit
 
     def _load_skills(self, domain: str) -> List[Dict[str, Any]]:
         """Load recorded domain skills if they exist."""
