@@ -17,10 +17,14 @@ def canonicalize_url(url: str) -> str:
         # Parse query parameters into a list of tuples
         query_params = urllib.parse.parse_qsl(parsed.query)
 
-        # Define tracking/source parameters to remove
+        # Define tracking/source parameters to remove. NOT gh_jid: companies that
+        # proxy Greenhouse through their own careers page (e.g. stripe.com/jobs/
+        # search?gh_jid=123) carry the job's IDENTITY in gh_jid — stripping it
+        # collapses every posting on the board to one URL/job_id. url_utils.py
+        # lists gh_jid among its essential_params for the same reason.
         params_to_strip = {
             "source", "utm_source", "utm_medium", "utm_campaign", "utm_content",
-            "ref", "lever-source", "gh_src", "gh_jid", "ashby_source", 
+            "ref", "lever-source", "gh_src", "ashby_source",
             "subscription_id", "s", "referred_by"
         }
 
