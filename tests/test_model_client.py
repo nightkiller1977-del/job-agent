@@ -93,6 +93,7 @@ async def test_gateway_budget_denial_fails_closed(monkeypatch):
     client = ModelClient(anthropic_api_key="sk-ant-test")
     monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result=None))
     monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-gateway-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
 
     claude_called = False
 
@@ -161,6 +162,7 @@ def test_check_inference_availability(monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", mock_urlopen_openrouter)
     monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "aicc-token")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
     avail, msg = check_inference_availability()
     assert avail is True
     assert msg == "AI-OpenRouter Gateway"
@@ -179,6 +181,7 @@ async def test_openrouter_gateway_parses_top_level_content_and_choices(monkeypat
     """Verifies that _call_openrouter_gateway parses native gateway {content: ...} and {choices: ...} contracts."""
     client = ModelClient()
     monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
 
     class MockResponse:
         def __init__(self, data, status_code=200):
@@ -218,6 +221,7 @@ async def test_gateway_distinguishes_unpriced_502_from_upstream_502(monkeypatch)
     client = ModelClient(anthropic_api_key="sk-ant-test")
     monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result=None))
     monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
 
     class Mock502Response:
         def __init__(self, text):

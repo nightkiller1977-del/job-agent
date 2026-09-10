@@ -51,8 +51,10 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))
 ANTHROPIC_MAX_TOKENS = 2048
 
-# AI-OpenRouter Gateway Configuration (Port 3848 default)
-OPENROUTER_GATEWAY_URL = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
+# AI-OpenRouter Gateway URL + auth key are STORE_AUTHORITATIVE_KEYS resolved
+# from aicc-secrets on every host (see secret_store.py). There is no local
+# default — a host without them cleanly reports "not configured" instead of
+# silently trying localhost that isn't there. The timeout is a plain tunable.
 OPENROUTER_TIMEOUT = int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "30"))
 # NOTE: keep these pointing at models the provider still serves. The previous
 # defaults ("anthropic/claude-3.5-sonnet" / "anthropic/claude-3.5-haiku") were
@@ -391,10 +393,16 @@ class ModelClient:
 
     @classmethod
     def get_gateway_config(cls) -> tuple[bool, str, str]:
-        """Returns (is_configured, gateway_url, api_key) requiring AICC_OPENROUTER_API_KEY."""
-        url = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
+        """Returns (is_configured, gateway_url, api_key). Both env vars must be
+        set for is_configured=True — no silent localhost default, so escalating
+        callers on a host without a real gateway URL cleanly skip instead of
+        timing out against 127.0.0.1:3848. Both keys are STORE_AUTHORITATIVE
+        (secret_store.py) and sourced from aicc-secrets on every host —
+        localhost dev boxes set OPENROUTER_GATEWAY_URL in .env or the shell.
+        """
+        url = (os.environ.get("OPENROUTER_GATEWAY_URL") or "").strip().rstrip("/")
         key = (os.environ.get("AICC_OPENROUTER_API_KEY") or "").strip()
-        is_configured = bool(key)
+        is_configured = bool(url) and bool(key)
         return is_configured, url, key
 
     def __init__(
@@ -538,12 +546,21 @@ class ModelClient:
             "temperature": temperature if temperature is not None else 0.2,
         }
 
-        headers = {"Content-Type": "application/json"}
-        api_key = os.environ.get("AICC_OPENROUTER_API_KEY", "")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        # Re-read (rather than use the module-level constant captured at import
+        # time) so a fresh SOPS-sourced OPENROUTER_GATEWAY_URL / rotated key
+        # takes effect without a process restart, and so hosts that only have
+        # AICC_OPENROUTER_API_KEY (no URL) fail loudly here rather than silently
+        # trying the module-level localhost fallback.
+        is_configured, gateway_url, api_key = self.get_gateway_config()
+        if not is_configured:
+            raise RuntimeError(
+                "AI-OpenRouter Gateway not configured: OPENROUTER_GATEWAY_URL and "
+                "AICC_OPENROUTER_API_KEY must both be set (source aicc-secrets on "
+                "this host, or export them explicitly for a local dev gateway)."
+            )
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
-        url = f"{OPENROUTER_GATEWAY_URL}/chat/completions"
+        url = f"{gateway_url}/chat/completions"
         async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
             resp = await client.post(url, json=payload, headers=headers)
 
