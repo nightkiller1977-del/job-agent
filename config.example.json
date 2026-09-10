@@ -53,7 +53,8 @@
     "baseline_path": "~/resume_baseline.md",
     "min_score": 90,
     "max_iterations": 3,
-    "output_dir": "state/resumes"
+    "output_dir": "state/resumes",
+    "allowPaidCloud": false
   },
   "local_resume_path": "~/resume.pdf",
   "state_db_path": "state/jobs.db"

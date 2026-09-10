@@ -418,15 +418,24 @@ class ModelClient:
         task_type: str = "general",
         max_tokens: int = ANTHROPIC_MAX_TOKENS,
         temperature: float | None = None,
+        force_provider: str | None = None,
     ) -> str:
         """Return the model response text.  Cascade: Ollama → OpenRouter Gateway → Claude → OpenAI.
 
         Pass temperature to override the default (0.2) for all backends.
+
+        Pass force_provider="openrouter" to skip Ollama and go straight to the
+        gateway — used by callers (e.g. resume tailor) that have already
+        exhausted local iterations without meeting a quality gate and want to
+        escalate deliberately, rather than wait for a local failure the cascade
+        would treat as recoverable.
         """
         last_error = ""
 
+        skip_ollama = force_provider == "openrouter"
+
         # Tier 1: Ollama with resource-aware model selection
-        ollama_model = await self._pick_ollama_model(task_type)
+        ollama_model = None if skip_ollama else await self._pick_ollama_model(task_type)
         if ollama_model:
             try:
                 with _model_span("ollama", ollama_model):

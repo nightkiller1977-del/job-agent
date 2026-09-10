@@ -76,7 +76,7 @@ class StubModelClient:
         self.responses = list(responses)
         self.calls = []
 
-    async def complete(self, messages, system="", task_type="general", max_tokens=1024, temperature=None):
+    async def complete(self, messages, system="", task_type="general", max_tokens=1024, temperature=None, force_provider=None):
         self.calls.append(messages[0]["content"])
         if not self.responses:
             raise AssertionError("StubModelClient ran out of responses")
@@ -84,6 +84,13 @@ class StubModelClient:
         if isinstance(resp, Exception):
             raise resp
         return resp
+
+    # Matches the real ModelClient shape so ResumeTailor can gate its
+    # gateway-escalation branch without needing to introspect the client.
+    # The stub reports "not configured" so tests exercise the local-only path
+    # unless a specific test overrides this.
+    def get_gateway_config(self):
+        return (False, "", "")
 
 
 def score_json(total, kw=30, title=30, exp=30, missing=None):
@@ -232,6 +239,72 @@ async def test_ensure_tailored_rejects_fabricated_draft(tmp_path, monkeypatch):
     assert result.status == "ready"
     assert result.score == 95
     assert "Google" not in Path(result.markdown_path).read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_gateway_escalation_only_fires_when_local_exhausted_and_opted_in(tmp_path, monkeypatch):
+    """When local iterations can't clear the gate and allowPaidCloud=true with a
+    configured gateway, one extra attempt runs via force_provider='openrouter'.
+    Without either signal, the gateway must NOT fire (spend/dependency safety).
+    """
+    # Scenario A: opt-in + configured gateway → escalation happens and clears the gate.
+    stub = StubModelClient(
+        [
+            score_json(60),      # baseline scores below gate
+            tailor_json(),       # local iter 1 draft (matches BASELINE_MD → passes integrity)
+            facts_json(),
+            score_json(70),      # local iter 1 still below gate
+            tailor_json(),       # local iter 2
+            facts_json(),
+            score_json(72),      # local iter 2 still below gate
+            tailor_json(),       # local iter 3
+            facts_json(),
+            score_json(75),      # local iter 3 still below gate — local exhausted
+            tailor_json(),       # gateway escalation draft
+            facts_json(),
+            score_json(95),      # gateway escalation clears the gate
+        ]
+    )
+    stub.get_gateway_config = lambda: (True, "https://ai-openrouter.onrender.com", "test-key")
+    tailor = ResumeTailor(
+        make_config(tmp_path, allowPaidCloud=True), model_client=stub
+    )
+    monkeypatch.setattr(ResumeTailor, "render_pdf", _passthrough_render)
+    result = await tailor.ensure_tailored(make_job())
+    assert result.status == "ready"
+    assert result.score == 95
+
+    # Scenario B: opt-in but gateway NOT configured → escalation skipped (no extra call).
+    stub_no_gw = StubModelClient(
+        [
+            score_json(60),
+            tailor_json(), facts_json(), score_json(75),  # iter 1
+            tailor_json(), facts_json(), score_json(75),  # iter 2
+            tailor_json(), facts_json(), score_json(75),  # iter 3 — exhausted
+        ]
+    )
+    stub_no_gw.get_gateway_config = lambda: (False, "", "")
+    tailor_no_gw = ResumeTailor(
+        make_config(tmp_path, allowPaidCloud=True), model_client=stub_no_gw
+    )
+    result = await tailor_no_gw.ensure_tailored(make_job(job_id="job-2"))
+    assert result.status == "below_threshold"
+
+    # Scenario C: gateway configured but allowPaidCloud=false → escalation skipped.
+    stub_no_opt = StubModelClient(
+        [
+            score_json(60),
+            tailor_json(), facts_json(), score_json(75),
+            tailor_json(), facts_json(), score_json(75),
+            tailor_json(), facts_json(), score_json(75),
+        ]
+    )
+    stub_no_opt.get_gateway_config = lambda: (True, "https://ai-openrouter.onrender.com", "test-key")
+    tailor_no_opt = ResumeTailor(
+        make_config(tmp_path), model_client=stub_no_opt  # default allowPaidCloud=False
+    )
+    result = await tailor_no_opt.ensure_tailored(make_job(job_id="job-3"))
+    assert result.status == "below_threshold"
 
 
 # ---------------------------------------------------------------------------
