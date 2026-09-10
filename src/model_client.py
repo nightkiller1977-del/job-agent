@@ -51,8 +51,10 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))
 ANTHROPIC_MAX_TOKENS = 2048
 
-# AI-OpenRouter Gateway Configuration (Port 3848 default)
-OPENROUTER_GATEWAY_URL = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
+# AI-OpenRouter Gateway URL + auth key are STORE_AUTHORITATIVE_KEYS resolved
+# from aicc-secrets on every host (see secret_store.py). There is no local
+# default — a host without them cleanly reports "not configured" instead of
+# silently trying localhost that isn't there. The timeout is a plain tunable.
 OPENROUTER_TIMEOUT = int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "30"))
 # NOTE: keep these pointing at models the provider still serves. The previous
 # defaults ("anthropic/claude-3.5-sonnet" / "anthropic/claude-3.5-haiku") were
@@ -391,10 +393,16 @@ class ModelClient:
 
     @classmethod
     def get_gateway_config(cls) -> tuple[bool, str, str]:
-        """Returns (is_configured, gateway_url, api_key) requiring AICC_OPENROUTER_API_KEY."""
-        url = os.environ.get("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848").rstrip("/")
+        """Returns (is_configured, gateway_url, api_key). Both env vars must be
+        set for is_configured=True — no silent localhost default, so escalating
+        callers on a host without a real gateway URL cleanly skip instead of
+        timing out against 127.0.0.1:3848. Both keys are STORE_AUTHORITATIVE
+        (secret_store.py) and sourced from aicc-secrets on every host —
+        localhost dev boxes set OPENROUTER_GATEWAY_URL in .env or the shell.
+        """
+        url = (os.environ.get("OPENROUTER_GATEWAY_URL") or "").strip().rstrip("/")
         key = (os.environ.get("AICC_OPENROUTER_API_KEY") or "").strip()
-        is_configured = bool(key)
+        is_configured = bool(url) and bool(key)
         return is_configured, url, key
 
     def __init__(
@@ -418,15 +426,24 @@ class ModelClient:
         task_type: str = "general",
         max_tokens: int = ANTHROPIC_MAX_TOKENS,
         temperature: float | None = None,
+        force_provider: str | None = None,
     ) -> str:
         """Return the model response text.  Cascade: Ollama → OpenRouter Gateway → Claude → OpenAI.
 
         Pass temperature to override the default (0.2) for all backends.
+
+        Pass force_provider="openrouter" to skip Ollama and go straight to the
+        gateway — used by callers (e.g. resume tailor) that have already
+        exhausted local iterations without meeting a quality gate and want to
+        escalate deliberately, rather than wait for a local failure the cascade
+        would treat as recoverable.
         """
         last_error = ""
 
+        skip_ollama = force_provider == "openrouter"
+
         # Tier 1: Ollama with resource-aware model selection
-        ollama_model = await self._pick_ollama_model(task_type)
+        ollama_model = None if skip_ollama else await self._pick_ollama_model(task_type)
         if ollama_model:
             try:
                 with _model_span("ollama", ollama_model):
@@ -464,6 +481,23 @@ class ModelClient:
                 _log.warning("ModelClient: OpenRouter Gateway failed (%s) — escalating to Direct Claude", exc)
         else:
             _log.info("ModelClient: no AICC_OPENROUTER_API_KEY — skipping OpenRouter Gateway")
+
+        # force_provider="openrouter" is a deliberate escalation for callers
+        # that specifically want gateway-mediated (budget-capped) spend — e.g.
+        # resume tailoring after local iterations couldn't clear the gate.
+        # If the gateway then returns empty, is unreachable, or otherwise
+        # errors, tiers 3/4 (direct Claude/OpenAI) would bypass the gateway's
+        # budget caps and rack up direct charges the caller never opted into
+        # (Codex P1 on PR #113). Bail here instead — the caller sees an empty
+        # string and reports "escalation failed", not a silent direct-provider
+        # bill.
+        if force_provider == "openrouter":
+            _log.warning(
+                "ModelClient: force_provider='openrouter' set — refusing to "
+                "fall through to direct Claude/OpenAI after gateway failure "
+                "(last_error=%s)", last_error
+            )
+            return ""
 
         # Tier 3: Direct Claude
         if self._api_key:
@@ -529,12 +563,21 @@ class ModelClient:
             "temperature": temperature if temperature is not None else 0.2,
         }
 
-        headers = {"Content-Type": "application/json"}
-        api_key = os.environ.get("AICC_OPENROUTER_API_KEY", "")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        # Re-read (rather than use the module-level constant captured at import
+        # time) so a fresh SOPS-sourced OPENROUTER_GATEWAY_URL / rotated key
+        # takes effect without a process restart, and so hosts that only have
+        # AICC_OPENROUTER_API_KEY (no URL) fail loudly here rather than silently
+        # trying the module-level localhost fallback.
+        is_configured, gateway_url, api_key = self.get_gateway_config()
+        if not is_configured:
+            raise RuntimeError(
+                "AI-OpenRouter Gateway not configured: OPENROUTER_GATEWAY_URL and "
+                "AICC_OPENROUTER_API_KEY must both be set (source aicc-secrets on "
+                "this host, or export them explicitly for a local dev gateway)."
+            )
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
-        url = f"{OPENROUTER_GATEWAY_URL}/chat/completions"
+        url = f"{gateway_url}/chat/completions"
         async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
             resp = await client.post(url, json=payload, headers=headers)
 

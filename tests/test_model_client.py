@@ -93,6 +93,7 @@ async def test_gateway_budget_denial_fails_closed(monkeypatch):
     client = ModelClient(anthropic_api_key="sk-ant-test")
     monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result=None))
     monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-gateway-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
 
     claude_called = False
 
@@ -161,6 +162,7 @@ def test_check_inference_availability(monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", mock_urlopen_openrouter)
     monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "aicc-token")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
     avail, msg = check_inference_availability()
     assert avail is True
     assert msg == "AI-OpenRouter Gateway"
@@ -179,6 +181,7 @@ async def test_openrouter_gateway_parses_top_level_content_and_choices(monkeypat
     """Verifies that _call_openrouter_gateway parses native gateway {content: ...} and {choices: ...} contracts."""
     client = ModelClient()
     monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
 
     class MockResponse:
         def __init__(self, data, status_code=200):
@@ -218,6 +221,7 @@ async def test_gateway_distinguishes_unpriced_502_from_upstream_502(monkeypatch)
     client = ModelClient(anthropic_api_key="sk-ant-test")
     monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result=None))
     monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
 
     class Mock502Response:
         def __init__(self, text):
@@ -307,3 +311,50 @@ def test_optimal_cap_unchanged_when_memory_is_free(monkeypatch):
     gate = SystemPerformanceGate.get_optimal_cap()
     assert gate["cap_gb"] == 28.0
     assert gate["throttle_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_force_provider_openrouter_does_not_fall_through_on_gateway_failure(monkeypatch):
+    """When a caller explicitly escalates to the gateway (e.g. resume tailor
+    after local exhausted), a gateway error MUST NOT let tiers 3/4 (direct
+    Claude / OpenAI) burn spend that bypasses the gateway's budget caps.
+    """
+    import httpx
+
+    monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stub-anthropic-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "stub-openai-key")
+
+    client = ModelClient(anthropic_api_key="stub-anthropic-key")
+
+    async def gateway_errors(self, url, json=None, headers=None):
+        raise httpx.ConnectError("gateway unreachable")
+
+    monkeypatch.setattr("httpx.AsyncClient.post", gateway_errors)
+
+    claude_called = False
+    openai_called = False
+
+    async def fake_claude(*args, **kwargs):
+        nonlocal claude_called
+        claude_called = True
+        return "SHOULD_NOT_APPEAR"
+
+    async def fake_openai(*args, **kwargs):
+        nonlocal openai_called
+        openai_called = True
+        return "SHOULD_NOT_APPEAR"
+
+    monkeypatch.setattr(client, "_call_claude", fake_claude)
+    monkeypatch.setattr(client, "_call_openai", fake_openai)
+
+    result = await client.complete(
+        messages=[{"role": "user", "content": "test"}],
+        task_type="reasoning",
+        force_provider="openrouter",
+    )
+
+    assert result == "", "forced-gateway call must return empty on gateway failure"
+    assert not claude_called, "direct Claude MUST NOT be called when force_provider='openrouter'"
+    assert not openai_called, "direct OpenAI MUST NOT be called when force_provider='openrouter'"

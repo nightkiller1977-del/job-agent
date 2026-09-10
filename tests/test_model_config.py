@@ -43,6 +43,8 @@ def test_anthropic_defaults_do_not_use_retired_models():
 async def test_gateway_model_not_found_raises_clear_error(monkeypatch):
     """A 404/400 naming the model must surface a config-pointing error (and
     therefore escalate the cascade) instead of an opaque HTTPStatusError."""
+    monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
     client = ModelClient()
 
     async def fake_post(self, url, json=None, headers=None):

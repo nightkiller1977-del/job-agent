@@ -413,7 +413,9 @@ class ResumeTailor:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16] if text else ""
 
     # -- model steps -------------------------------------------------------
-    async def score_resume_against_job(self, resume_text: str, job: dict) -> Optional[ResumeScore]:
+    async def score_resume_against_job(
+        self, resume_text: str, job: dict, force_provider: str | None = None
+    ) -> Optional[ResumeScore]:
         """Score resume vs job (0-100 with subscores). None on parse failure."""
         prompt = SCORE_PROMPT_TEMPLATE.format(
             title=job.get("title", ""),
@@ -426,6 +428,7 @@ class ResumeTailor:
             task_type="reasoning",
             max_tokens=700,
             temperature=0.0,
+            force_provider=force_provider,
         )
         return self.parse_score_response(raw)
 
@@ -464,7 +467,12 @@ class ResumeTailor:
         )
 
     async def _tailor_once(
-        self, baseline_text: str, resume_text: str, job: dict, score: ResumeScore
+        self,
+        baseline_text: str,
+        resume_text: str,
+        job: dict,
+        score: ResumeScore,
+        force_provider: str | None = None,
     ) -> str:
         prompt = TAILOR_PROMPT_TEMPLATE.format(
             score=score.total,
@@ -480,6 +488,7 @@ class ResumeTailor:
             task_type="reasoning",
             max_tokens=2500,
             temperature=0.2,
+            force_provider=force_provider,
         )
         if not raw or raw.startswith("No model available"):
             return ""
@@ -657,6 +666,52 @@ class ResumeTailor:
             current = draft
             if score.total > best_score.total:
                 best_text, best_score = draft, score
+
+        # Local tier exhausted iterations without clearing the gate — escalate
+        # ONE final attempt through the AI-OpenRouter gateway if it's configured
+        # and the caller opted in via allowPaidCloud. The gateway's own budget
+        # cap is what actually bounds spend; this gate just ensures we don't
+        # silently start racking up cloud spend by default. Local-first behavior
+        # is preserved: we only ever call the gateway after the free local tier
+        # genuinely couldn't hit the gate.
+        rcfg = self.config.get("resume") or {}
+        allow_paid = bool(rcfg.get("allowPaidCloud"))
+        gateway_configured, _, _ = self._model_client.get_gateway_config()
+        if (
+            best_score.total < self.min_score
+            and allow_paid
+            and gateway_configured
+        ):
+            console.print(
+                f"[yellow]ResumeTailor:[/yellow] local exhausted at {best_score.total}/100 — "
+                f"escalating one attempt to AI-OpenRouter gateway"
+            )
+            try:
+                draft = await self._tailor_once(
+                    baseline, current, job, best_score, force_provider="openrouter"
+                )
+                if draft:
+                    ok, violations = await self.verify_integrity(draft, baseline)
+                    if ok:
+                        gw_score = await self.score_resume_against_job(
+                            draft, job, force_provider="openrouter"
+                        )
+                        if gw_score is not None:
+                            iterations += 1
+                            console.print(
+                                f"[cyan]ResumeTailor:[/cyan] gateway escalation: "
+                                f"score {gw_score.total}/100"
+                            )
+                            if gw_score.total > best_score.total:
+                                best_text, best_score = draft, gw_score
+                    else:
+                        console.print(
+                            f"[red]ResumeTailor:[/red] gateway draft REJECTED — integrity: "
+                            + "; ".join(violations[:5])
+                        )
+            except Exception as exc:
+                # Escalation is best-effort — failure keeps the local best draft.
+                console.print(f"[yellow]ResumeTailor:[/yellow] gateway escalation failed: {exc}")
 
         pdf_path, md_path = self._write_artifacts(job, best_text, best_score, iterations)
 
