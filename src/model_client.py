@@ -482,6 +482,23 @@ class ModelClient:
         else:
             _log.info("ModelClient: no AICC_OPENROUTER_API_KEY — skipping OpenRouter Gateway")
 
+        # force_provider="openrouter" is a deliberate escalation for callers
+        # that specifically want gateway-mediated (budget-capped) spend — e.g.
+        # resume tailoring after local iterations couldn't clear the gate.
+        # If the gateway then returns empty, is unreachable, or otherwise
+        # errors, tiers 3/4 (direct Claude/OpenAI) would bypass the gateway's
+        # budget caps and rack up direct charges the caller never opted into
+        # (Codex P1 on PR #113). Bail here instead — the caller sees an empty
+        # string and reports "escalation failed", not a silent direct-provider
+        # bill.
+        if force_provider == "openrouter":
+            _log.warning(
+                "ModelClient: force_provider='openrouter' set — refusing to "
+                "fall through to direct Claude/OpenAI after gateway failure "
+                "(last_error=%s)", last_error
+            )
+            return ""
+
         # Tier 3: Direct Claude
         if self._api_key:
             try:
