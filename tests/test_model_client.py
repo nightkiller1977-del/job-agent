@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -114,22 +115,25 @@ async def test_gateway_budget_denial_fails_closed(monkeypatch):
     assert claude_called is False
 
 
+class MockHttpResp:
+    def __init__(self, status=200):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def read(self):
+        return b'{"status": "ok", "models": ["llama3"]}'
+
+
 def test_check_inference_availability(monkeypatch):
     """check_inference_availability correctly identifies ready providers."""
-    from src.model_client import check_inference_availability
+    from src.model_client import check_inference_availability, reset_provider_status
 
-    class MockHttpResp:
-        def __init__(self, status=200):
-            self.status = status
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def read(self):
-            return b'{"status": "ok", "models": ["llama3"]}'
+    reset_provider_status()
 
     def mock_urlopen(req, timeout=2):
         return MockHttpResp(200)
@@ -165,13 +169,104 @@ def test_check_inference_availability(monkeypatch):
     assert avail is True
     assert msg == "AI-OpenRouter Gateway"
 
-    # 3. Direct Anthropic available (Ollama & Gateway offline)
-    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen_unreachable)
+    # 3. Direct Anthropic available — Ollama/Gateway offline, but the live
+    # /v1/models probe against the Anthropic key succeeds (ACES-282: this is a
+    # real authenticated call now, not just "the env var is non-empty").
+    def mock_urlopen_anthropic_ok(req, timeout=2):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "api.anthropic.com" in url:
+            return MockHttpResp(200)
+        raise ConnectionRefusedError("Offline")
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen_anthropic_ok)
     monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-xxx")
     avail, msg = check_inference_availability()
     assert avail is True
     assert msg == "Direct Anthropic (Claude)"
+
+
+def test_check_inference_availability_rejects_401_anthropic_key_and_falls_through(monkeypatch):
+    """ACES-282: a 401'ing ANTHROPIC_API_KEY must not pass preflight — it should be
+    marked unavailable for the run (alerted once) and the check should fall through
+    to the next provider instead of reporting a dead key as available."""
+    import urllib.error
+
+    from src.model_client import check_inference_availability, reset_provider_status
+
+    reset_provider_status()
+    monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-bad")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-good")
+
+    def mock_urlopen(req, timeout=2):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "api.anthropic.com" in url:
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
+        if "api.openai.com" in url:
+            return MockHttpResp(200)
+        raise ConnectionRefusedError("Ollama offline")
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+
+    with patch("src.model_client._notify_error") as mock_notify:
+        avail, msg = check_inference_availability()
+        assert avail is True
+        assert msg == "Direct OpenAI"
+        assert mock_notify.call_count == 1
+        assert "anthropic" in mock_notify.call_args[0][0]
+
+        # A second call in the same run must NOT re-probe Anthropic or re-alert —
+        # this is the "alert once, not per job" half of the ticket.
+        avail, msg = check_inference_availability()
+        assert mock_notify.call_count == 1
+
+    reset_provider_status()
+
+
+@pytest.mark.asyncio
+async def test_cascade_skips_and_marks_provider_after_live_401(monkeypatch):
+    """ACES-282: when Claude fails with a real 401 mid-run, complete() should mark
+    it unavailable and skip straight past it on the next call in the same run,
+    instead of re-attempting (and re-failing) it for every subsequent job."""
+    from src.model_client import reset_provider_status
+
+    reset_provider_status()
+    monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
+
+    client = ModelClient(anthropic_api_key="sk-ant-bad")
+    monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result=None))
+
+    claude_calls = 0
+
+    async def failing_claude(*args, **kwargs):
+        nonlocal claude_calls
+        claude_calls += 1
+
+        class FakeAuthError(Exception):
+            status_code = 401
+
+        raise FakeAuthError("invalid x-api-key")
+
+    async def ok_openai(*args, **kwargs):
+        return "openai response"
+
+    monkeypatch.setattr(client, "_call_claude", failing_claude)
+    monkeypatch.setattr(client, "_call_openai", ok_openai)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-good")
+
+    with patch("src.model_client._notify_error") as mock_notify:
+        res1 = await client.complete([{"role": "user", "content": "hi"}])
+        res2 = await client.complete([{"role": "user", "content": "hi again"}])
+
+    assert res1 == "openai response"
+    assert res2 == "openai response"
+    # Claude should only have been attempted once — the second complete() call
+    # must skip it because it's already marked unavailable for this run.
+    assert claude_calls == 1
+    assert mock_notify.call_count == 1
+
+    reset_provider_status()
 
 
 @pytest.mark.asyncio
