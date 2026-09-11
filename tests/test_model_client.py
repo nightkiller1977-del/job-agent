@@ -224,6 +224,40 @@ def test_check_inference_availability_rejects_401_anthropic_key_and_falls_throug
     reset_provider_status()
 
 
+def test_check_inference_availability_treats_transient_probe_failure_as_available(monkeypatch):
+    """A network blip (timeout/DNS/5xx) hitting the Anthropic probe is NOT proof the
+    key is bad — unlike a 401. check_inference_availability() gates whether the run
+    starts at all (see check_api_key() in main.py): failing closed on an inconclusive
+    probe would abort a run over nothing, with no later call to recover on, since the
+    run never started. Only a confirmed 401 should count as unavailable; anything
+    else should be treated as available and left to complete()'s own retry/escalation
+    once the run is actually underway."""
+    from src.model_client import check_inference_availability, reset_provider_status
+
+    reset_provider_status()
+    monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-maybe-fine")
+
+    def mock_urlopen(req, timeout=2):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "api.anthropic.com" in url:
+            raise TimeoutError("probe timed out")
+        raise ConnectionRefusedError("Ollama offline")
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+
+    with patch("src.model_client._notify_error") as mock_notify:
+        avail, msg = check_inference_availability()
+
+    assert avail is True
+    assert msg == "Direct Anthropic (Claude)"
+    # A timeout must not be treated as a confirmed-bad key — no alert, no caching.
+    mock_notify.assert_not_called()
+
+    reset_provider_status()
+
+
 @pytest.mark.asyncio
 async def test_cascade_skips_and_marks_provider_after_live_401(monkeypatch):
     """ACES-282: when Claude fails with a real 401 mid-run, complete() should mark

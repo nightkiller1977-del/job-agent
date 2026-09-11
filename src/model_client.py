@@ -866,18 +866,26 @@ def check_inference_availability() -> tuple[bool, str]:
     # presence check. A 401'ing key used to pass this preflight and only fail
     # mid-run (ACES-282); now it's caught here, marked unavailable for the run,
     # and alerted exactly once instead of on every subsequent job.
+    #
+    # Only a definitive 401 counts as "unavailable" here. A timeout/5xx/DNS
+    # failure is inconclusive, not proof the key is bad — and this function's
+    # result gates whether the run starts at all (see check_api_key() in
+    # main.py), so failing closed on a network blip would abort a run over
+    # nothing, with no later attempt to recover from (there is no "next call"
+    # if the run never starts). Treat an inconclusive probe as available and
+    # let the real complete() cascade's own retry/escalation handle it.
     anthropic_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if anthropic_key and anthropic_key != "your_key_here" and "anthropic" not in _RUN_PROVIDER_UNAVAILABLE:
         ok, status, err = _probe_provider_key(
             "https://api.anthropic.com/v1/models",
             {"x-api-key": anthropic_key, "anthropic-version": "2023-06-01"},
         )
-        if ok:
-            return True, "Direct Anthropic (Claude)"
         if status == 401:
             _mark_provider_unavailable("anthropic", f"ANTHROPIC_API_KEY rejected with 401: {err}")
         else:
-            _log.warning("ModelClient: Anthropic preflight probe failed (%s) — not caching, may be transient", err)
+            if not ok:
+                _log.warning("ModelClient: Anthropic preflight probe inconclusive (%s) — assuming available", err)
+            return True, "Direct Anthropic (Claude)"
 
     # 4. Direct OpenAI — same live-probe treatment
     openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
@@ -886,12 +894,12 @@ def check_inference_availability() -> tuple[bool, str]:
             "https://api.openai.com/v1/models",
             {"Authorization": f"Bearer {openai_key}"},
         )
-        if ok:
-            return True, "Direct OpenAI"
         if status == 401:
             _mark_provider_unavailable("openai", f"OPENAI_API_KEY rejected with 401: {err}")
         else:
-            _log.warning("ModelClient: OpenAI preflight probe failed (%s) — not caching, may be transient", err)
+            if not ok:
+                _log.warning("ModelClient: OpenAI preflight probe inconclusive (%s) — assuming available", err)
+            return True, "Direct OpenAI"
 
     return False, "No inference provider available (Ollama unreachable, OpenRouter Gateway offline, no direct cloud keys)"
 
