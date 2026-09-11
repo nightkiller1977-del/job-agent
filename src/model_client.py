@@ -21,6 +21,7 @@ import os
 import platform
 import subprocess
 import threading
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from typing import Any
@@ -466,7 +467,7 @@ class ModelClient:
             _log.info("ModelClient: no AICC_OPENROUTER_API_KEY — skipping OpenRouter Gateway")
 
         # Tier 3: Direct Claude
-        if self._api_key:
+        if self._api_key and "anthropic" not in _RUN_PROVIDER_UNAVAILABLE:
             try:
                 with _model_span("anthropic", self._anthropic_model):
                     text = await self._call_claude(messages, system, max_tokens, temperature=temperature)
@@ -476,13 +477,17 @@ class ModelClient:
                 _log.warning("ModelClient: Claude returned empty — escalating to OpenAI")
             except Exception as exc:
                 last_error = str(exc)
+                if getattr(exc, "status_code", None) == 401:
+                    _mark_provider_unavailable("anthropic", f"ANTHROPIC_API_KEY rejected with 401: {exc}")
                 _log.warning("ModelClient: Claude failed (%s) — escalating to OpenAI", exc)
+        elif "anthropic" in _RUN_PROVIDER_UNAVAILABLE:
+            _log.debug("ModelClient: skipping Claude — already marked unavailable for this run")
         else:
             _log.info("ModelClient: no ANTHROPIC_API_KEY — skipping Claude")
 
         # Tier 4: Direct OpenAI
         openai_key = os.environ.get("OPENAI_API_KEY", "")
-        if openai_key:
+        if openai_key and "openai" not in _RUN_PROVIDER_UNAVAILABLE:
             try:
                 with _model_span("openai", OPENAI_MODEL):
                     text = await self._call_openai(messages, system, max_tokens, temperature=temperature)
@@ -490,7 +495,11 @@ class ModelClient:
                 return text
             except Exception as exc:
                 last_error = str(exc)
+                if getattr(exc, "status_code", None) == 401:
+                    _mark_provider_unavailable("openai", f"OPENAI_API_KEY rejected with 401: {exc}")
                 _log.error("ModelClient: OpenAI also failed: %s", exc)
+        elif "openai" in _RUN_PROVIDER_UNAVAILABLE:
+            _log.debug("ModelClient: skipping OpenAI — already marked unavailable for this run")
 
         # All tiers exhausted
         degraded = (
@@ -501,11 +510,22 @@ class ModelClient:
             "ModelClient: all inference tiers failed last_error=%s", last_error,
             extra={"tags": {"level": "error", "alert": "true"}},
         )
-        if _notify_error is not None:
-            _notify_error(
-                "Model cascade total failure",
-                f"All tiers failed (Ollama + OpenRouter + Claude + OpenAI). Scoring degraded. Last error: {last_error}",
-            )
+        # This notification is itself subject to per-run dedup (like the
+        # provider-unavailable alerts above): once a run has already reported
+        # total cascade failure, every subsequent call that also exhausts all
+        # tiers — often for the exact same reason, e.g. a cached-bad Claude key
+        # with no other configured fallback — would otherwise re-fire this
+        # alert per job, which is the alert storm ACES-282 asked to eliminate.
+        global _CASCADE_TOTAL_FAILURE_ALERTED
+        if _notify_error is not None and not _CASCADE_TOTAL_FAILURE_ALERTED:
+            _CASCADE_TOTAL_FAILURE_ALERTED = True
+            try:
+                _notify_error(
+                    "Model cascade total failure",
+                    f"All tiers failed (Ollama + OpenRouter + Claude + OpenAI). Scoring degraded. Last error: {last_error}",
+                )
+            except Exception as exc:
+                _log.warning("ModelClient: notify_error failed for cascade total failure (%s) — continuing anyway", exc)
         raise ModelCascadeError(degraded)
 
     async def _call_openrouter_gateway(
@@ -777,6 +797,67 @@ class ModelClient:
         return response.choices[0].message.content or ""
 
 
+# ---------------------------------------------------------------------------
+# Per-run provider-availability cache (ACES-282)
+#
+# A direct-cloud API key that fails auth (401) is a misconfiguration for the
+# whole run, not a transient per-call failure — probing it again on every
+# subsequent job just re-burns the same 401 and (without this) re-triggers a
+# fresh "cascade failed" alert per job. Once a provider is confirmed bad here,
+# it's skipped for the rest of this process's lifetime (= one job-agent run)
+# and the alert fires exactly once.
+# ---------------------------------------------------------------------------
+_RUN_PROVIDER_UNAVAILABLE: dict[str, str] = {}
+
+# Separate from the per-provider cache above: even with a provider correctly
+# cached as unavailable, complete()'s cascade can still exhaust every
+# remaining tier (e.g. Claude is cached-bad and no other tier is configured)
+# on every single call. Without this, the bottom-of-cascade "total failure"
+# notification would fire once per job regardless of the per-provider cache.
+_CASCADE_TOTAL_FAILURE_ALERTED = False
+
+
+def reset_provider_status() -> None:
+    """Test helper — clears all per-run alert/availability state."""
+    global _CASCADE_TOTAL_FAILURE_ALERTED
+    _RUN_PROVIDER_UNAVAILABLE.clear()
+    _CASCADE_TOTAL_FAILURE_ALERTED = False
+
+
+def _mark_provider_unavailable(provider: str, reason: str) -> None:
+    """Record *provider* as unavailable for this run and alert exactly once.
+
+    The provider is marked unavailable unconditionally, before attempting the
+    alert — a failure in notify_error() (e.g. the status file can't be
+    written) must never prevent the cascade from skipping this provider and
+    falling through to the next tier, or crash preflight instead of letting
+    it try the next provider.
+    """
+    if provider in _RUN_PROVIDER_UNAVAILABLE:
+        return
+    _RUN_PROVIDER_UNAVAILABLE[provider] = reason
+    _log.error("ModelClient: %s marked unavailable for this run: %s", provider, reason)
+    if _notify_error is not None:
+        try:
+            _notify_error(f"{provider} unavailable for this run", reason)
+        except Exception as exc:
+            _log.warning("ModelClient: notify_error failed for %s (%s) — continuing anyway", provider, exc)
+
+
+def _probe_provider_key(url: str, headers: dict[str, str], timeout: float = 3) -> tuple[bool, int | None, str]:
+    """One cheap authenticated GET (e.g. a provider's /models list). Never sends a
+    chat/completion request, so this costs nothing regardless of outcome.
+    Returns (ok, http_status_or_None, error_text)."""
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200, r.status, ""
+    except urllib.error.HTTPError as exc:
+        return False, exc.code, str(exc)
+    except Exception as exc:
+        return False, None, str(exc)
+
+
 def check_inference_availability() -> tuple[bool, str]:
     """Checks if at least one inference provider is available by probing live endpoints."""
     # 1. Local Ollama — probe /api/tags
@@ -811,15 +892,44 @@ def check_inference_availability() -> tuple[bool, str]:
             except Exception:
                 pass
 
-    # 3. Direct Anthropic (Claude)
+    # 3. Direct Anthropic (Claude) — one cheap authenticated call, not just a
+    # presence check. A 401'ing key used to pass this preflight and only fail
+    # mid-run (ACES-282); now it's caught here, marked unavailable for the run,
+    # and alerted exactly once instead of on every subsequent job.
+    #
+    # Only a definitive 401 counts as "unavailable" here. A timeout/5xx/DNS
+    # failure is inconclusive, not proof the key is bad — and this function's
+    # result gates whether the run starts at all (see check_api_key() in
+    # main.py), so failing closed on a network blip would abort a run over
+    # nothing, with no later attempt to recover from (there is no "next call"
+    # if the run never starts). Treat an inconclusive probe as available and
+    # let the real complete() cascade's own retry/escalation handle it.
     anthropic_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-    if anthropic_key and anthropic_key != "your_key_here":
-        return True, "Direct Anthropic (Claude)"
+    if anthropic_key and anthropic_key != "your_key_here" and "anthropic" not in _RUN_PROVIDER_UNAVAILABLE:
+        ok, status, err = _probe_provider_key(
+            "https://api.anthropic.com/v1/models",
+            {"x-api-key": anthropic_key, "anthropic-version": "2023-06-01"},
+        )
+        if status == 401:
+            _mark_provider_unavailable("anthropic", f"ANTHROPIC_API_KEY rejected with 401: {err}")
+        else:
+            if not ok:
+                _log.warning("ModelClient: Anthropic preflight probe inconclusive (%s) — assuming available", err)
+            return True, "Direct Anthropic (Claude)"
 
-    # 4. Direct OpenAI
+    # 4. Direct OpenAI — same live-probe treatment
     openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    if openai_key and openai_key != "your_key_here":
-        return True, "Direct OpenAI"
+    if openai_key and openai_key != "your_key_here" and "openai" not in _RUN_PROVIDER_UNAVAILABLE:
+        ok, status, err = _probe_provider_key(
+            "https://api.openai.com/v1/models",
+            {"Authorization": f"Bearer {openai_key}"},
+        )
+        if status == 401:
+            _mark_provider_unavailable("openai", f"OPENAI_API_KEY rejected with 401: {err}")
+        else:
+            if not ok:
+                _log.warning("ModelClient: OpenAI preflight probe inconclusive (%s) — assuming available", err)
+            return True, "Direct OpenAI"
 
     return False, "No inference provider available (Ollama unreachable, OpenRouter Gateway offline, no direct cloud keys)"
 
