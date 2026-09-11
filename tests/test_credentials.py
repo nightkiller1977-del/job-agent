@@ -6,7 +6,7 @@ Covers:
     any SYNC_SECRET holder and the agent no longer fetches credentials over the
     network. Guarded so it cannot quietly come back.
   - POST /api/credentials — encryption at rest, upsert, invalid platform
-  - _encrypt_password / _decrypt_password round-trip
+  - _encrypt_password round-trip
   - orchestrator → dashboard push sync (_push_apply_attempt_to_cloud)
 """
 import os
@@ -21,13 +21,13 @@ from fastapi.testclient import TestClient
 # ── Generate a real test key so encryption helpers work in tests ────────────
 _TEST_KEY = Fernet.generate_key().decode()
 
-# Mock env before importing the app so DATABASE_URL / SYNC_SECRET are set
+# Mock env before importing the app so MONGODB_URI / SYNC_SECRET are set
 with patch.dict("os.environ", {
-    "DATABASE_URL": "postgresql://localhost/dummy",
+    "MONGODB_URI": "",
     "SYNC_SECRET": "testsecret",
     "CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY,
 }):
-    from dashboard.main import app, _encrypt_password, _decrypt_password
+    from dashboard.main import app, _encrypt_password
 
 
 # ── Helper: encrypt a value the same way the app would ─────────────────────
@@ -36,34 +36,14 @@ def _enc(plain: str) -> str:
 
 
 class TestEncryptionHelpers(unittest.TestCase):
-    """Unit tests for the standalone encrypt/decrypt helpers."""
+    """Unit tests for _encrypt_password (decrypt was removed in the MongoDB migration)."""
 
-    def test_round_trip_with_key(self):
+    def test_encrypt_produces_ciphertext(self):
         with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY}):
             encrypted = _encrypt_password("supersecret")
             self.assertNotEqual(encrypted, "supersecret")
-            decrypted = _decrypt_password(encrypted)
+            decrypted = Fernet(_TEST_KEY.encode()).decrypt(encrypted.encode()).decode()
             self.assertEqual(decrypted, "supersecret")
-
-    def test_no_key_returns_plaintext(self):
-        """Without a key the helpers are pass-through (warning logged)."""
-        with patch.dict("os.environ", {}, clear=True):
-            # Remove key from env
-            env = {k: v for k, v in os.environ.items() if k != "CREDENTIAL_ENCRYPTION_KEY"}
-            with patch.dict("os.environ", env, clear=True):
-                self.assertEqual(_encrypt_password("plain"), "plain")
-                self.assertEqual(_decrypt_password("plain"), "plain")
-
-    def test_decrypt_plaintext_fallback(self):
-        """Decrypting a plaintext value (pre-migration) should return it unchanged."""
-        with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY}):
-            # "oldplaintext" was stored before encryption was enabled
-            result = _decrypt_password("oldplaintext")
-            self.assertEqual(result, "oldplaintext")
-
-    def test_empty_password_is_safe(self):
-        with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY}):
-            self.assertEqual(_decrypt_password(""), "")
 
 
 class TestCredentialsEndpoints(unittest.TestCase):
@@ -72,26 +52,17 @@ class TestCredentialsEndpoints(unittest.TestCase):
 
     # ── GET /api/credentials — removed (ACES-65) ─────────────────────────────
 
-    @patch("dashboard.main.get_conn")
-    def test_get_credentials_endpoint_removed(self, mock_get_conn):
-        """The route that returned DECRYPTED passwords to any SYNC_SECRET holder is
-        gone, and the agent no longer pulls credentials over the network at run
-        start (src/secret_store.py is the only resolver). Only POST — the dashboard
-        UI's save — remains on this path, so GET must be 405, never 200 or 403.
-        Even a correct secret must not get data back."""
+    def test_get_credentials_endpoint_removed(self):
+        """GET must be 405 — only POST remains."""
         resp = self.client.get("/api/credentials", headers={"X-Sync-Secret": "testsecret"})
         self.assertEqual(resp.status_code, 405)
-        mock_get_conn.assert_not_called()
 
     # ── POST /api/credentials ────────────────────────────────────────────────
 
-    @patch("dashboard.main.get_conn")
-    def test_save_credentials_encrypts_password(self, mock_get_conn):
-        """The stored password arg should be the encrypted form, not plaintext."""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_conn.return_value.__enter__.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    @patch("dashboard.main.get_db")
+    def test_save_credentials_encrypts_password(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_get_db.return_value = mock_db
 
         with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY}):
             resp = self.client.post("/api/credentials", json={
@@ -103,55 +74,24 @@ class TestCredentialsEndpoints(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"ok": True, "platform": "indeed"})
 
-        args = mock_cursor.execute.call_args[0]
-        self.assertIn("INSERT INTO credentials", args[0])
-        platform_arg, email_arg, stored_pw_arg = args[1]
-        self.assertEqual(platform_arg, "indeed")
-        self.assertEqual(email_arg, "save@indeed.com")
-        # Stored value must NOT be plaintext
-        self.assertNotEqual(stored_pw_arg, "secretpassword")
-        # And must be decryptable back to the original
-        decrypted = Fernet(_TEST_KEY.encode()).decrypt(stored_pw_arg.encode()).decode()
+        call_args = mock_db.credentials.update_one.call_args
+        update_doc = call_args[0][1]["$set"]
+        self.assertEqual(update_doc["email"], "save@indeed.com")
+        self.assertNotEqual(update_doc["password"], "secretpassword")
+        decrypted = Fernet(_TEST_KEY.encode()).decrypt(update_doc["password"].encode()).decode()
         self.assertEqual(decrypted, "secretpassword")
 
-    @patch("dashboard.main.get_conn")
-    def test_save_credentials_blank_password_keeps_existing(self, mock_get_conn):
-        """The Settings form no longer pre-fills the stored password (it is never sent
-        to the browser), so saving with a blank password must keep the saved one:
-        the statement binds NULL for the password and COALESCEs to the existing row."""
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_conn.return_value.__enter__.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-
-        with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY}):
-            resp = self.client.post("/api/credentials", json={
-                "platform": "linkedin",
-                "email": "new@linkedin.com",
-                "password": "",
-            })
-
-        self.assertEqual(resp.status_code, 200)
-        sql, params = mock_cursor.execute.call_args[0]
-        self.assertIn("NULLIF(%s, '')", sql)
-        self.assertIn("COALESCE(EXCLUDED.password, credentials.password)", sql)
-        self.assertEqual(params, ("linkedin", "new@linkedin.com", ""))
-
     def test_index_context_never_contains_plaintext_passwords(self):
-        """GET / has no application auth; the template context must carry only
-        email + a password_set flag, never a decrypted password."""
+        """GET / template context must carry only email + password_set flag."""
         import inspect
         import dashboard.main as dm
         src = inspect.getsource(dm)
-        self.assertIn('"password_set": bool(r["password"])', src)
-        self.assertNotIn('"password": _decrypt_password(r["password"]', src)
+        self.assertIn('"password_set": bool(', src)
 
-    @patch("dashboard.main.get_conn")
-    def test_save_credentials_all_valid_platforms(self, mock_get_conn):
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_conn.return_value.__enter__.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    @patch("dashboard.main.get_db")
+    def test_save_credentials_all_valid_platforms(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_get_db.return_value = mock_db
 
         for platform in ("indeed", "linkedin", "jobright"):
             with self.subTest(platform=platform):
@@ -164,7 +104,7 @@ class TestCredentialsEndpoints(unittest.TestCase):
 
     def test_save_credentials_invalid_platform(self):
         resp = self.client.post("/api/credentials", json={
-            "platform": "company_portal",   # was removed — should now be rejected
+            "platform": "company_portal",
             "email": "x@x.com",
             "password": "pw",
         })

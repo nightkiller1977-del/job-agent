@@ -6,16 +6,13 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn observed:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: job-agent-db
-          property: connectionString
+      - key: MONGODB_URI
+        sync: false
+      - key: JOB_AGENT_DB
+        value: job_agent
       - key: SYNC_SECRET
         generateValue: true
+      - key: CREDENTIAL_ENCRYPTION_KEY
+        sync: false
       - key: PYTHON_VERSION
         value: 3.11.0
-
-databases:
-  - name: job-agent-db
-    databaseName: jobagent
-    plan: free

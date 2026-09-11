@@ -50,6 +50,7 @@ jobs:
                  tests/test_linkedin_screening_answers.py \
                  tests/test_commander_config_fallback.py \
                  tests/test_orchestrator_config_missing.py \
+                 tests/test_dashboard_mongodb_config.py \
                  -q --tb=short --asyncio-mode=auto
 
   lint:
