@@ -61,6 +61,7 @@ email-agent `src/lib/secrets.js`, the desktop app) is expected to apply the same
 | `IMAP_PASSWORD` / `ICLOUD_APP_PASSWORD_PERSONAL` / `ICLOUD_APP_PASSWORD` / `ICLOUD_APP_PASSWORD_ICLOUD` / `ICLOUD_APP_PASSWORD_MAC` / `EMAIL_2FA_ADDRESS` / `IMAP_USER` — IMAP *app-specific* password (+ address) for email-code 2FA and confirmation tracking; resolved by `email_helper.resolve_imap_credentials`, which never falls back to a site login password | ✓ | |
 | `COMPANY_EMAIL(_ALT)` / `COMPANY_PASSWORD(_ALT)` | ✓ | |
 | `DASHBOARD_URL` / `SYNC_SECRET` / `CREDENTIAL_ENCRYPTION_KEY` | ✓ | |
+| `COORDINATOR_URL` / `AICC_JOB_AGENT_SERVICE_TOKEN` (store-authoritative, shared with aicc-coordinator) / `JOB_AGENT_REPOSITORY_SLUG` — coordinator incident intake for adaptive recovery | ✓ | |
 | `NOTIFY_PHONE` / `TWILIO_*` / `APPROVAL_*` | ✓ | |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | | ✓ |
 | `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` / `MICROSOFT_TENANT_ID` | | ✓ |

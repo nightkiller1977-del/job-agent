@@ -82,6 +82,10 @@ CANONICAL_KEYS: tuple[str, ...] = (
     "COMPANY_EMAIL", "COMPANY_PASSWORD",
     "COMPANY_EMAIL_ALT", "COMPANY_PASSWORD_ALT",
     "DASHBOARD_URL", "SYNC_SECRET", "CREDENTIAL_ENCRYPTION_KEY",
+    # Coordinator incident intake (adaptive recovery): where to report
+    # FailureEvidence, the bearer token for it, and which registered repository
+    # the resulting repair operation targets.
+    "COORDINATOR_URL", "AICC_JOB_AGENT_SERVICE_TOKEN", "JOB_AGENT_REPOSITORY_SLUG",
     "NOTIFY_PHONE",
     "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER",
     "APPROVAL_SEND_EMAIL", "APPROVAL_SEND_PASSWORD", "APPROVAL_NOTIFY_EMAIL",
@@ -104,6 +108,10 @@ STORE_AUTHORITATIVE_KEYS: tuple[str, ...] = (
     "OPENAI_API_KEY",
     "AICC_OPENROUTER_API_KEY",
     "OPENROUTER_GATEWAY_URL",
+    # Shared with the coordinator (Render) and rotated in aicc-secrets — a
+    # stale local copy is a misconfiguration, not a fallback (same ACES-282
+    # reasoning as the AI-service keys above).
+    "AICC_JOB_AGENT_SERVICE_TOKEN",
 )
 
 

@@ -647,6 +647,42 @@ class StateManager:
                 (json.dumps(extra), job_id),
             )
 
+    def merge_job_extra(self, job_id: str, updates: dict) -> None:
+        """Merge fields into a job's extra_json without touching apply attempt
+        counters or apply_last_* (unlike record_apply_attempt). Used by the
+        repair-resume flow to stamp repair_completed_at / repair_pr_url."""
+        if not updates:
+            return
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return
+            extra = parse_extra_json(row["extra_json"])
+            extra.update(updates)
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+
+    def list_jobs_awaiting_repair(self) -> list[dict]:
+        """Jobs bound to a coordinator repair operation that has not yet been
+        marked complete: extra_json carries repair_operation_id but no
+        repair_completed_at. The LIKE filter narrows in SQL; the parsed
+        extra_json is the authority."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE extra_json LIKE '%repair_operation_id%'"
+            ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            job = dict(r)
+            extra = parse_extra_json(job.get("extra_json"))
+            if extra.get("repair_operation_id") and not extra.get("repair_completed_at"):
+                out.append(job)
+        return out
+
     def record_preflight_block(self, job_id: str, readiness: str, reason: str) -> None:
         """Persist a preflight-only block without replacing the real apply outcome.
 

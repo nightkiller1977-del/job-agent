@@ -72,16 +72,23 @@ case "$action" in
     # gives meaning to there (`&` = whole match, `|` = our delimiter, `\`) so a
     # path like /tmp/a&b or one containing `|` is written verbatim (Codex, PR #87).
     sed_escape() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+    # Pin scheduled runs to the branch checked out at install time (override
+    # with an exported JOBAGENT_RUNTIME_BRANCH). scripts/run-scheduled.sh
+    # fails closed if the checkout drifts off this branch.
+    runtime_branch="${JOBAGENT_RUNTIME_BRANCH:-$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")}"
     esc_repo="$(sed_escape "$REPO_DIR")"
     esc_agekey="$(sed_escape "$HOME/.config/aicc/age.key")"
     esc_secrets="$(sed_escape "$local_secrets_dir")"
+    esc_branch="$(sed_escape "$runtime_branch")"
     sed -e "s|__PROJECT_DIR__|$esc_repo|g" \
         -e "s|__SOPS_AGE_KEY_FILE__|$esc_agekey|g" \
         -e "s|__AICC_SECRETS_DIR__|$esc_secrets|g" \
+        -e "s|__RUNTIME_BRANCH__|$esc_branch|g" \
         "$REPO_DIR/launchd/$DISCOVER_PLIST" > "$LAUNCHD_DIR/$DISCOVER_PLIST"
     sed -e "s|__PROJECT_DIR__|$esc_repo|g" \
         -e "s|__SOPS_AGE_KEY_FILE__|$esc_agekey|g" \
         -e "s|__AICC_SECRETS_DIR__|$esc_secrets|g" \
+        -e "s|__RUNTIME_BRANCH__|$esc_branch|g" \
         "$REPO_DIR/launchd/$APPLY_PLIST" > "$LAUNCHD_DIR/$APPLY_PLIST"
 
     # launchd does not re-read a plist for a job that is already loaded — a plain

@@ -1,0 +1,9 @@
+[Unit]
+Description=job-agent: daily 23:00 apply run (same schedule as launchd twin)
+
+[Timer]
+OnCalendar=*-*-* 23:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

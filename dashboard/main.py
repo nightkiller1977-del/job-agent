@@ -255,13 +255,24 @@ async def sync_jobs(request: Request, x_sync_secret: Optional[str] = Header(defa
             "company": raw.get("company", ""), "location": raw.get("location", ""),
             "salary_raw": raw.get("salary_raw", ""), "remote_type": raw.get("remote_type", ""),
             "url": raw.get("url", ""), "score": raw.get("score"), "score_reason": raw.get("score_reason", ""),
-            "flags": raw.get("flags", ""), "extra_json": raw.get("extra_json"),
-            "discovered_at": _parse_dt(raw.get("discovered_at"), now), "updated_at": now,
+            "flags": raw.get("flags", ""), "extra_json": raw.get("extra_json"), "updated_at": now,
         }
         try:
+            # discovered_at is insert-only, matching both the old Postgres
+            # ON CONFLICT clause (which never listed it in DO UPDATE SET) and
+            # local SQLite's upsert_job: a re-sync of an already-known job
+            # (e.g. orchestrator.py's hydrate_external_jobs, which sends no
+            # discovered_at at all) must not overwrite the original discovery
+            # date with $parse_dt's `now` fallback.
             db.jobs.update_one(
                 {"job_id": raw["job_id"]},
-                {"$set": payload, "$setOnInsert": {"status": raw.get("status", "discovered")}},
+                {
+                    "$set": payload,
+                    "$setOnInsert": {
+                        "status": raw.get("status", "discovered"),
+                        "discovered_at": _parse_dt(raw.get("discovered_at"), now),
+                    },
+                },
                 upsert=True,
             )
             upserted += 1
@@ -299,7 +310,13 @@ async def add_external_job(body: ExternalJobRequest):
     if db.jobs.find_one({"job_id": job_id}, {"_id": 1}):
         raise HTTPException(status_code=400, detail="Job already exists in queue")
     now = _utcnow()
-    db.jobs.insert_one({"job_id": job_id, "source": source, "title": "Importing...", "company": "Pending local agent sync", "url": url, "status": "discovered", "flags": "needs_hydration", "discovered_at": now, "updated_at": now})
+    # score=None matches Postgres's implicit-NULL behavior for an unset
+    # INTEGER column — MongoDB has no schema to fall back on, and templates
+    # like index.html do `{% if job.score is not none %}{% if job.score >=
+    # 80 %}`: a genuinely absent key renders as Jinja2 Undefined, which
+    # passes `is not none` but raises UndefinedError on `>=`, crashing the
+    # whole page render for every visitor until this job is hydrated/scored.
+    db.jobs.insert_one({"job_id": job_id, "source": source, "title": "Importing...", "company": "Pending local agent sync", "url": url, "status": "discovered", "flags": "needs_hydration", "score": None, "discovered_at": now, "updated_at": now})
     return {"ok": True, "job_id": job_id, "url": url}
 
 

@@ -1,0 +1,20 @@
+# Linux twin of launchd/com.jobagent.discover.plist — rendered and installed by
+# scripts/install-schedule.sh (placeholders substituted the same way
+# manage-autopilot.sh renders the plists; see SECRETS.md Phase 2 for why the
+# SOPS/AICC env vars must be set explicitly in unit env rather than inherited).
+[Unit]
+Description=job-agent: discover + score new jobs across all sources
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__PROJECT_DIR__
+# run-scheduled.sh refuses (fail-closed) if the checkout is not on the branch
+# captured at install time — a scheduled run never executes a stray dev branch.
+ExecStart=__PROJECT_DIR__/scripts/run-scheduled.sh discover
+Environment=SOPS_AGE_KEY_FILE=__SOPS_AGE_KEY_FILE__
+Environment=AICC_SECRETS_DIR=__AICC_SECRETS_DIR__
+Environment=JOBAGENT_RUNTIME_BRANCH=__RUNTIME_BRANCH__
+StandardOutput=append:__PROJECT_DIR__/state/discover.log
+StandardError=append:__PROJECT_DIR__/state/discover.err
