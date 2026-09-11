@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.model_client import ModelClient
+from src.model_client import ModelCascadeError, ModelClient
 
 
 @pytest.mark.asyncio
@@ -299,6 +299,120 @@ async def test_cascade_skips_and_marks_provider_after_live_401(monkeypatch):
     # must skip it because it's already marked unavailable for this run.
     assert claude_calls == 1
     assert mock_notify.call_count == 1
+
+    reset_provider_status()
+
+
+def test_check_inference_availability_rejects_401_openai_key(monkeypatch):
+    """Mirror of the Anthropic 401 preflight test: a 401'ing OPENAI_API_KEY with
+    no other provider configured must be marked unavailable and reported as no
+    provider available, not silently pass preflight."""
+    import urllib.error
+
+    from src.model_client import check_inference_availability, reset_provider_status
+
+    reset_provider_status()
+    monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-bad")
+
+    def mock_urlopen(req, timeout=2):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "api.openai.com" in url:
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
+        raise ConnectionRefusedError("Ollama offline")
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+
+    with patch("src.model_client._notify_error") as mock_notify:
+        avail, msg = check_inference_availability()
+
+    assert avail is False
+    assert "No inference provider available" in msg
+    assert mock_notify.call_count == 1
+    assert "openai" in mock_notify.call_args[0][0]
+
+    reset_provider_status()
+
+
+@pytest.mark.asyncio
+async def test_cascade_skips_and_marks_openai_after_live_401(monkeypatch):
+    """Mirror of test_cascade_skips_and_marks_provider_after_live_401 for OpenAI:
+    a live 401 from OpenAI should mark it unavailable and be skipped (not
+    re-attempted or re-alerted) on the next call in the same run."""
+    from src.model_client import reset_provider_status
+
+    reset_provider_status()
+    monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-bad")
+
+    client = ModelClient()
+    monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result=None))
+
+    openai_calls = 0
+
+    async def failing_openai(*args, **kwargs):
+        nonlocal openai_calls
+        openai_calls += 1
+
+        class FakeAuthError(Exception):
+            status_code = 401
+
+        raise FakeAuthError("invalid api key")
+
+    monkeypatch.setattr(client, "_call_openai", failing_openai)
+
+    with patch("src.model_client._notify_error") as mock_notify:
+        with pytest.raises(ModelCascadeError):
+            await client.complete([{"role": "user", "content": "hi"}])
+        with pytest.raises(ModelCascadeError):
+            await client.complete([{"role": "user", "content": "hi again"}])
+
+    # OpenAI should only have been attempted once.
+    assert openai_calls == 1
+    # Two distinct alerts on the FIRST call are expected (provider-unavailable +
+    # cascade-total-failure, since there's no fallback tier at all here) — but
+    # the second call, with everything already cached, must add zero more.
+    assert mock_notify.call_count == 2
+
+    reset_provider_status()
+
+
+@pytest.mark.asyncio
+async def test_cascade_total_failure_alert_fires_once_with_no_fallback(monkeypatch):
+    """Codex review finding: when the only configured provider is cached-bad and
+    there's no fallback tier, the bottom-of-cascade 'Model cascade total failure'
+    notification must not re-fire on every subsequent job — it's the same alert
+    storm ACES-282 asked to eliminate, just via a different code path than the
+    per-provider cache."""
+    from src.model_client import reset_provider_status
+
+    reset_provider_status()
+    monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    client = ModelClient(anthropic_api_key="sk-ant-bad")
+    monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result=None))
+
+    async def failing_claude(*args, **kwargs):
+        class FakeAuthError(Exception):
+            status_code = 401
+
+        raise FakeAuthError("invalid x-api-key")
+
+    monkeypatch.setattr(client, "_call_claude", failing_claude)
+
+    with patch("src.model_client._notify_error") as mock_notify:
+        for _ in range(3):
+            with pytest.raises(ModelCascadeError):
+                await client.complete([{"role": "user", "content": "hi"}])
+
+    # First call: one "anthropic unavailable" alert + one "cascade total
+    # failure" alert. The next two calls must add nothing further.
+    assert mock_notify.call_count == 2
+
+    reset_provider_status()
 
     reset_provider_status()
 

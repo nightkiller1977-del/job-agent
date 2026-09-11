@@ -510,7 +510,15 @@ class ModelClient:
             "ModelClient: all inference tiers failed last_error=%s", last_error,
             extra={"tags": {"level": "error", "alert": "true"}},
         )
-        if _notify_error is not None:
+        # This notification is itself subject to per-run dedup (like the
+        # provider-unavailable alerts above): once a run has already reported
+        # total cascade failure, every subsequent call that also exhausts all
+        # tiers — often for the exact same reason, e.g. a cached-bad Claude key
+        # with no other configured fallback — would otherwise re-fire this
+        # alert per job, which is the alert storm ACES-282 asked to eliminate.
+        global _CASCADE_TOTAL_FAILURE_ALERTED
+        if _notify_error is not None and not _CASCADE_TOTAL_FAILURE_ALERTED:
+            _CASCADE_TOTAL_FAILURE_ALERTED = True
             _notify_error(
                 "Model cascade total failure",
                 f"All tiers failed (Ollama + OpenRouter + Claude + OpenAI). Scoring degraded. Last error: {last_error}",
@@ -798,10 +806,19 @@ class ModelClient:
 # ---------------------------------------------------------------------------
 _RUN_PROVIDER_UNAVAILABLE: dict[str, str] = {}
 
+# Separate from the per-provider cache above: even with a provider correctly
+# cached as unavailable, complete()'s cascade can still exhaust every
+# remaining tier (e.g. Claude is cached-bad and no other tier is configured)
+# on every single call. Without this, the bottom-of-cascade "total failure"
+# notification would fire once per job regardless of the per-provider cache.
+_CASCADE_TOTAL_FAILURE_ALERTED = False
+
 
 def reset_provider_status() -> None:
-    """Test helper — clears the per-run provider-unavailable cache."""
+    """Test helper — clears all per-run alert/availability state."""
+    global _CASCADE_TOTAL_FAILURE_ALERTED
     _RUN_PROVIDER_UNAVAILABLE.clear()
+    _CASCADE_TOTAL_FAILURE_ALERTED = False
 
 
 def _mark_provider_unavailable(provider: str, reason: str) -> None:
