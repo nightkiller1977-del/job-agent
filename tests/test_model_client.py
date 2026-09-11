@@ -414,6 +414,41 @@ async def test_cascade_total_failure_alert_fires_once_with_no_fallback(monkeypat
 
     reset_provider_status()
 
+
+@pytest.mark.asyncio
+async def test_notify_error_failure_does_not_break_provider_fallback(monkeypatch):
+    """Codex review finding: if notify_error() itself raises (e.g. the status
+    file can't be written — read-only disk, out of space), that must not
+    escape _mark_provider_unavailable() and abort the cascade before it can
+    fall through to the next provider. Alert delivery is best-effort; routing
+    is not allowed to depend on it succeeding."""
+    from src.model_client import reset_provider_status
+
+    reset_provider_status()
+    monkeypatch.delenv("AICC_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-good")
+
+    client = ModelClient(anthropic_api_key="sk-ant-bad")
+    monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result=None))
+
+    async def failing_claude(*args, **kwargs):
+        class FakeAuthError(Exception):
+            status_code = 401
+
+        raise FakeAuthError("invalid x-api-key")
+
+    async def ok_openai(*args, **kwargs):
+        return "openai response"
+
+    monkeypatch.setattr(client, "_call_claude", failing_claude)
+    monkeypatch.setattr(client, "_call_openai", ok_openai)
+
+    with patch("src.model_client._notify_error", side_effect=OSError("disk full")):
+        # Must still reach OpenAI and return successfully, despite the alert
+        # for the cached Anthropic failure raising internally.
+        result = await client.complete([{"role": "user", "content": "hi"}])
+
+    assert result == "openai response"
     reset_provider_status()
 
 

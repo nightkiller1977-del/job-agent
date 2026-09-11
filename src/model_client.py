@@ -519,10 +519,13 @@ class ModelClient:
         global _CASCADE_TOTAL_FAILURE_ALERTED
         if _notify_error is not None and not _CASCADE_TOTAL_FAILURE_ALERTED:
             _CASCADE_TOTAL_FAILURE_ALERTED = True
-            _notify_error(
-                "Model cascade total failure",
-                f"All tiers failed (Ollama + OpenRouter + Claude + OpenAI). Scoring degraded. Last error: {last_error}",
-            )
+            try:
+                _notify_error(
+                    "Model cascade total failure",
+                    f"All tiers failed (Ollama + OpenRouter + Claude + OpenAI). Scoring degraded. Last error: {last_error}",
+                )
+            except Exception as exc:
+                _log.warning("ModelClient: notify_error failed for cascade total failure (%s) — continuing anyway", exc)
         raise ModelCascadeError(degraded)
 
     async def _call_openrouter_gateway(
@@ -822,13 +825,23 @@ def reset_provider_status() -> None:
 
 
 def _mark_provider_unavailable(provider: str, reason: str) -> None:
-    """Record *provider* as unavailable for this run and alert exactly once."""
+    """Record *provider* as unavailable for this run and alert exactly once.
+
+    The provider is marked unavailable unconditionally, before attempting the
+    alert — a failure in notify_error() (e.g. the status file can't be
+    written) must never prevent the cascade from skipping this provider and
+    falling through to the next tier, or crash preflight instead of letting
+    it try the next provider.
+    """
     if provider in _RUN_PROVIDER_UNAVAILABLE:
         return
     _RUN_PROVIDER_UNAVAILABLE[provider] = reason
     _log.error("ModelClient: %s marked unavailable for this run: %s", provider, reason)
     if _notify_error is not None:
-        _notify_error(f"{provider} unavailable for this run", reason)
+        try:
+            _notify_error(f"{provider} unavailable for this run", reason)
+        except Exception as exc:
+            _log.warning("ModelClient: notify_error failed for %s (%s) — continuing anyway", provider, exc)
 
 
 def _probe_provider_key(url: str, headers: dict[str, str], timeout: float = 3) -> tuple[bool, int | None, str]:
