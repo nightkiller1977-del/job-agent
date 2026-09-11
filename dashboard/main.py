@@ -14,9 +14,10 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 
@@ -156,6 +157,11 @@ async def health():
         }
     except Exception:
         return {"ok": False, "database": "unavailable", "backend": "mongodb"}
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.head("/")
