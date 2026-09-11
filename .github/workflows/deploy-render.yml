@@ -23,7 +23,7 @@ jobs:
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | head -1)
           echo "HTTP $HTTP_CODE: $BODY"
-          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" ]]; then
+          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" && "$HTTP_CODE" != "202" ]]; then
             echo "Deploy trigger failed with HTTP $HTTP_CODE"
             exit 1
           fi
