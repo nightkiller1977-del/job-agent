@@ -310,7 +310,13 @@ async def add_external_job(body: ExternalJobRequest):
     if db.jobs.find_one({"job_id": job_id}, {"_id": 1}):
         raise HTTPException(status_code=400, detail="Job already exists in queue")
     now = _utcnow()
-    db.jobs.insert_one({"job_id": job_id, "source": source, "title": "Importing...", "company": "Pending local agent sync", "url": url, "status": "discovered", "flags": "needs_hydration", "discovered_at": now, "updated_at": now})
+    # score=None matches Postgres's implicit-NULL behavior for an unset
+    # INTEGER column — MongoDB has no schema to fall back on, and templates
+    # like index.html do `{% if job.score is not none %}{% if job.score >=
+    # 80 %}`: a genuinely absent key renders as Jinja2 Undefined, which
+    # passes `is not none` but raises UndefinedError on `>=`, crashing the
+    # whole page render for every visitor until this job is hydrated/scored.
+    db.jobs.insert_one({"job_id": job_id, "source": source, "title": "Importing...", "company": "Pending local agent sync", "url": url, "status": "discovered", "flags": "needs_hydration", "score": None, "discovered_at": now, "updated_at": now})
     return {"ok": True, "job_id": job_id, "url": url}
 
 
