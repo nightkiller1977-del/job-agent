@@ -21,11 +21,25 @@ _log = logging.getLogger(__name__)
 # — which the old code did — can only ever produce AUTHENTICATIONFAILED, and then
 # burned the whole 2FA window retrying that same doomed login every 10 s (ACES-283).
 _IMAP_ADDRESS_KEYS = ("EMAIL_2FA_ADDRESS", "USAJOBS_EMAIL", "IMAP_USER")
-# Only IMAP_PASSWORD is provider-neutral. Every ICLOUD_* name is scoped to the iCloud
-# domains: handing an iCloud app password to Gmail/Yahoo/Outlook can only fail auth,
-# and a clear "no IMAP password configured" beats a misleading AUTHENTICATIONFAILED.
+# Only IMAP_PASSWORD is provider-neutral. Every ICLOUD_*/APPLE_* name is scoped to the
+# iCloud domains: handing an iCloud app password to Gmail/Yahoo/Outlook can only fail
+# auth, and a clear "no IMAP password configured" beats a misleading AUTHENTICATIONFAILED.
 _IMAP_PASSWORD_KEYS_GENERIC = ("IMAP_PASSWORD",)
-_ICLOUD_KEYS_COMMON = ("ICLOUD_APP_PASSWORD_PERSONAL", "ICLOUD_APP_PASSWORD")
+# Every name the central store (aicc-secrets) or a project .env has shipped this
+# credential under. Apple itself calls the value an "app-specific password" but the
+# central store has historically named it as an API key too — accept both spellings
+# so a rotation there doesn't silently fall out of reach because the local name list
+# was stale.
+_ICLOUD_KEYS_COMMON = (
+    "ICLOUD_APP_PASSWORD_PERSONAL",
+    "ICLOUD_APP_PASSWORD",
+    "ICLOUD_API_KEY",
+    "ICLOUD_IMAP_PASSWORD",
+    "APPLE_APP_PASSWORD",
+    "APPLE_APP_SPECIFIC_PASSWORD",
+    "APPLE_ID_APP_PASSWORD",
+    "APPLE_API_KEY",
+)
 _IMAP_PASSWORD_KEYS_BY_DOMAIN = {
     "@icloud.com": _ICLOUD_KEYS_COMMON + ("ICLOUD_APP_PASSWORD_ICLOUD", "ICLOUD_APP_PASSWORD_MAC"),
     "@me.com":     _ICLOUD_KEYS_COMMON + ("ICLOUD_APP_PASSWORD_MAC", "ICLOUD_APP_PASSWORD_ICLOUD"),
@@ -57,21 +71,31 @@ def resolve_imap_credentials(email_addr: str = "", password: str = "") -> tuple[
     """Return ``(address, app_password)`` for IMAP access, or ``("", "")`` parts when
     unresolved. Explicit arguments win; otherwise the address comes from
     EMAIL_2FA_ADDRESS / USAJOBS_EMAIL / IMAP_USER and the password from
-    :func:`imap_password_candidates`. Shared by the USAJobs email-2FA reader and the
-    employer-confirmation tracker so both accept the same key names and neither can
-    drift back to a site-login password."""
-    import os
+    :func:`imap_password_candidates`. Every lookup goes through
+    :func:`src.secret_store.resolve_secret`, so a value stored ONLY in the central
+    aicc-secrets store (never copied into the process env or the project .env) is
+    still found — one rotation there covers every scraper without per-project
+    duplication. Shared by the USAJobs email-2FA reader, the employer-confirmation
+    tracker, and every BaseScraper._try_email_otp caller so all of them accept the
+    same key names and none can drift back to a site-login password."""
+    try:
+        from src.secret_store import resolve_secret as _resolve
+    except Exception:  # noqa: BLE001 — a broken secret store must not break IMAP
+        import os as _os
+        def _resolve(name: str):
+            return (_os.environ.get(name) or "").strip() or None
+
     addr = (email_addr or "").strip()
     if not addr:
         for key in _IMAP_ADDRESS_KEYS:
-            val = (os.environ.get(key) or "").strip()
+            val = (_resolve(key) or "").strip()
             if val:
                 addr = val
                 break
     pwd = (password or "").strip()
     if not pwd and addr:
         for key in imap_password_candidates(addr):
-            val = (os.environ.get(key) or "").strip()
+            val = (_resolve(key) or "").strip()
             if val:
                 pwd = val
                 break

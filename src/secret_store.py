@@ -79,6 +79,12 @@ CANONICAL_KEYS: tuple[str, ...] = (
     "EMAIL_2FA_ADDRESS", "IMAP_USER", "IMAP_PASSWORD",
     "ICLOUD_APP_PASSWORD_PERSONAL", "ICLOUD_APP_PASSWORD",
     "ICLOUD_APP_PASSWORD_ICLOUD", "ICLOUD_APP_PASSWORD_MAC",
+    # Alternative names the central store has shipped this credential under.
+    # email_helper.imap_password_candidates() reads all of these and treats
+    # them as interchangeable — accept whichever the store rotated to.
+    "ICLOUD_API_KEY", "ICLOUD_IMAP_PASSWORD",
+    "APPLE_APP_PASSWORD", "APPLE_APP_SPECIFIC_PASSWORD",
+    "APPLE_ID_APP_PASSWORD", "APPLE_API_KEY",
     "COMPANY_EMAIL", "COMPANY_PASSWORD",
     "COMPANY_EMAIL_ALT", "COMPANY_PASSWORD_ALT",
     "DASHBOARD_URL", "SYNC_SECRET", "CREDENTIAL_ENCRYPTION_KEY",
