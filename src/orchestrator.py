@@ -782,6 +782,17 @@ class Orchestrator:
 
         self._log_credential_presence()
 
+        # Feed the persisted per-(source, status) funnel into the model-backed
+        # blocker classifier: (1) stores an adaptive-cap snapshot readable by
+        # sync should_attempt() calls in this run, (2) schedules a background
+        # model classification for any status the static map doesn't cover.
+        # Never blocks: a failing refresh degrades to the static-map behavior.
+        try:
+            from .blocker_intelligence import refresh_from_funnel_background
+            refresh_from_funnel_background(self.state.get_apply_funnel())
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("apply.blocker_intelligence_refresh_failed error=%s", exc)
+
         # Resume jobs whose coordinator repair operation has completed (fail-open;
         # only when incident reporting is configured — see src/incident_reporter.py).
         try:
@@ -964,7 +975,7 @@ class Orchestrator:
             # intact for telemetry, which is exactly why these gates can't see the
             # prep on their own.
             _session_prepared = bool(_extra.get("session_prepared_at"))
-            _ok, _skip_reason = should_attempt(_last, _attempts)
+            _ok, _skip_reason = should_attempt(_last, _attempts, source=job.get("source", ""))
             if not _ok and not _session_prepared:
                 _cls = classify(_last).value
                 console.print(f"[dim]⛔ Circuit breaker: skipping — {_skip_reason}[/dim]")
