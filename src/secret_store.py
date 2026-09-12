@@ -79,6 +79,12 @@ CANONICAL_KEYS: tuple[str, ...] = (
     "EMAIL_2FA_ADDRESS", "IMAP_USER", "IMAP_PASSWORD",
     "ICLOUD_APP_PASSWORD_PERSONAL", "ICLOUD_APP_PASSWORD",
     "ICLOUD_APP_PASSWORD_ICLOUD", "ICLOUD_APP_PASSWORD_MAC",
+    # Alternative names the central store has shipped this credential under.
+    # email_helper.imap_password_candidates() reads all of these and treats
+    # them as interchangeable — accept whichever the store rotated to.
+    "ICLOUD_API_KEY", "ICLOUD_IMAP_PASSWORD",
+    "APPLE_APP_PASSWORD", "APPLE_APP_SPECIFIC_PASSWORD",
+    "APPLE_ID_APP_PASSWORD", "APPLE_API_KEY",
     "COMPANY_EMAIL", "COMPANY_PASSWORD",
     "COMPANY_EMAIL_ALT", "COMPANY_PASSWORD_ALT",
     "DASHBOARD_URL", "SYNC_SECRET", "CREDENTIAL_ENCRYPTION_KEY",
@@ -298,9 +304,145 @@ def fill_missing(names: tuple[str, ...] | list[str] | None = None) -> list[str]:
     if filled:
         _log.info("secrets: filled %d key(s) from central store: %s", len(filled), ", ".join(filled))
     apply_store_authoritative([k for k in keys if k in STORE_AUTHORITATIVE_KEYS])
+    # Warm the model-backed classifier cache in the background so the next
+    # discover_by_purpose call ranks unknown store names correctly. Never
+    # blocks fill_missing — if no loop is running (sync caller), skip.
+    try:
+        from src.secret_classifier import refresh_purpose_cache_background
+        refresh_purpose_cache_background()
+    except Exception:  # noqa: BLE001
+        pass
     return filled
 
 
 def clear_cache() -> None:
     """Drop the cached store read (tests / after the store is rewritten)."""
     _read_store.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Purpose-based key discovery
+# ---------------------------------------------------------------------------
+#
+# Every credential in the store has a purpose (IMAP inbox password, an
+# LLM API key, a source-site login, …) but not always a name we recognize.
+# CANONICAL_KEYS lets fill_missing() hydrate a fixed list into os.environ,
+# but a rotation that renames the key — or a store the user set up with
+# a different naming convention — falls out of reach silently. discover_by_purpose
+# scans EVERY key visible in the store, classifies it by regex against its name,
+# and returns the candidates in priority order.
+#
+# Add a purpose here (not in every caller) and every scraper picks it up.
+import re as _re
+
+_PURPOSE_PATTERNS: dict[str, tuple[_re.Pattern, ...]] = {
+    # IMAP inbox app-specific passwords. Ordered: explicit IMAP names, then
+    # iCloud/Apple app-password variants, then anything that looks like an
+    # app password / API key for mail. Patterns use .search() so a suffix
+    # like _MAC, _PERSONAL, _ICLOUD after PASSWORD is honored.
+    "imap_password": (
+        _re.compile(r"^IMAP.*PASSWORD", _re.IGNORECASE),
+        _re.compile(r"^IMAP.*(TOKEN|KEY)", _re.IGNORECASE),
+        _re.compile(r"^(ICLOUD|APPLE).*APP.*(PASSWORD|SPECIFIC)", _re.IGNORECASE),
+        _re.compile(r"^(ICLOUD|APPLE).*(IMAP|MAIL).*PASSWORD", _re.IGNORECASE),
+        _re.compile(r"^(ICLOUD|APPLE).*(API_KEY|KEY|TOKEN)", _re.IGNORECASE),
+        _re.compile(r"^MAIL.*(PASSWORD|APP.*PASSWORD)", _re.IGNORECASE),
+    ),
+    "imap_address": (
+        _re.compile(r"^EMAIL.*2FA.*ADDRESS", _re.IGNORECASE),
+        _re.compile(r"^IMAP.*(USER|EMAIL|ADDRESS)", _re.IGNORECASE),
+        _re.compile(r"^(NOTIFY|APPROVAL).*EMAIL", _re.IGNORECASE),
+    ),
+}
+
+
+def _all_store_keys() -> list[str]:
+    """Every key visible in the central store (plaintext .env + SOPS-decrypted, plus
+    the aicc-secrets CLI's `list` output if it supports one). Deduplicated, in a
+    stable order. Values are not returned here — callers use resolve_secret() to
+    read them so the CLI/SOPS access rules stay in one place."""
+    names: dict[str, None] = {}  # dict preserves insertion order → stable
+    if shutil.which("aicc-secrets"):
+        for sub in (["list"], ["list", "--names"], ["keys"]):
+            try:
+                res = subprocess.run(
+                    ["aicc-secrets", *sub],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except Exception:
+                continue
+            if res.returncode != 0:
+                continue
+            for line in res.stdout.splitlines():
+                # Accept plain names or `NAME=value` — take the name half.
+                token = line.strip().split("=", 1)[0].strip()
+                if token and _re.fullmatch(r"[A-Z0-9_]+", token):
+                    names[token] = None
+            if names:
+                break
+    for name in _read_store().keys():
+        names[name] = None
+    return list(names.keys())
+
+
+def discover_by_purpose(
+    purpose: str,
+    *,
+    filter_regex: str | None = None,
+    max_candidates: int = 8,
+) -> list[str]:
+    """Return names of secrets in the central store that serve *purpose*.
+
+    Order of authority:
+      1. Model-backed classification from :mod:`secret_classifier`, when
+         a cached ranking exists for the current candidate set — this
+         catches names that don't match any regex convention (freeform
+         names the user chose, like ``mail_bot_key_v2``).
+      2. Regex patterns declared in _PURPOSE_PATTERNS, tried in order.
+
+    Model results are additive: any regex hits the model missed are
+    appended after the model ranking so a fast path always exists even
+    when the classifier has never run.
+
+    filter_regex lets a caller narrow further (e.g. addresses matching an
+    iCloud domain). It's applied to the KEY NAME, not the value — the caller
+    is expected to resolve() the value itself.
+    """
+    patterns = _PURPOSE_PATTERNS.get(purpose, ())
+    keys = _all_store_keys()
+    if not patterns and not keys:
+        return []
+    narrow = _re.compile(filter_regex) if filter_regex else None
+
+    ranked: list[str] = []
+    seen: set[str] = set()
+
+    # 1. Model-classified cache (never calls the model here — this is sync).
+    try:
+        from src.secret_classifier import classified_keys as _classified
+        for name in _classified(purpose, keys):
+            if name in seen:
+                continue
+            if narrow and not narrow.search(name):
+                continue
+            ranked.append(name)
+            seen.add(name)
+            if len(ranked) >= max_candidates:
+                return ranked
+    except Exception:  # noqa: BLE001 — classifier is best-effort
+        pass
+
+    # 2. Regex fallback in declared priority order.
+    for pat in patterns:
+        for name in keys:
+            if name in seen:
+                continue
+            if not pat.search(name):
+                continue
+            if narrow and not narrow.search(name):
+                continue
+            ranked.append(name)
+            seen.add(name)
+            if len(ranked) >= max_candidates:
+                return ranked
+    return ranked

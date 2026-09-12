@@ -6,6 +6,7 @@ Handles multi-step Easy Apply forms.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from datetime import datetime
@@ -17,6 +18,8 @@ from rich.console import Console
 
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.resume_helper import resolve_resume_path, PDFTextLayerError
+
+_log = logging.getLogger(__name__)
 
 console = Console()
 
@@ -61,7 +64,17 @@ class LinkedInScraper(BaseScraper):
             await self._delay(2, 3)
 
             # Check login — attempt auto-login from .env if not authenticated
-            if await self._needs_login(page):
+            needs_login = await self._needs_login(page)
+            if not needs_login:
+                # Persist rotated cookies right after confirming we're
+                # authenticated. Without this, a scrape that errors later
+                # loses the JSESSIONID that LinkedIn just rotated for us,
+                # and the next run sees a stale cookie flagged expired.
+                try:
+                    await self._save_session()
+                except Exception as exc:
+                    _log.warning("LinkedIn: early save_session failed: %s", exc)
+            if needs_login:
                 email = os.environ.get("LINKEDIN_EMAIL", "")
                 password = os.environ.get("LINKEDIN_PASSWORD", "")
                 if email and password:
@@ -331,6 +344,27 @@ class LinkedInScraper(BaseScraper):
                     await self._save_session()
                     return True
                 if "checkpoint" in cur or "challenge" in cur:
+                    # LinkedIn's most common challenge is a 6-digit code
+                    # emailed to the account. Try to pull it from IMAP
+                    # before giving up on manual intervention.
+                    otp = await self._try_email_otp(
+                        page,
+                        sender_pattern="security-noreply@linkedin.com",
+                        subject_pattern="verification code",
+                        imap_timeout=90,
+                    )
+                    if otp:
+                        console.print("[green]LinkedIn: ✓ Submitted emailed OTP; waiting for redirect…[/green]")
+                        # Give LinkedIn a moment to redirect off the challenge page
+                        for _ in range(15):
+                            await asyncio.sleep(2)
+                            after = page.url
+                            if any(m in after for m in ("/feed", "/jobs", "/mynetwork")):
+                                console.print("[green]LinkedIn: ✓ Auto-login successful! Session saved.[/green]")
+                                await self._save_session()
+                                return True
+                            if "checkpoint" not in after and "challenge" not in after:
+                                break
                     console.print("[yellow]LinkedIn: Security checkpoint detected — manual action needed.[/yellow]")
                     return False
 
@@ -659,6 +693,12 @@ class LinkedInScraper(BaseScraper):
                     "linkedin_login_required",
                     "LinkedIn redirected to login/authwall. Run prepare-sessions --source linkedin and sign in once.",
                 )
+            # Session is good — persist rotated JSESSIONID before the apply
+            # flow does anything that might error out and lose it.
+            try:
+                await self._save_session()
+            except Exception as exc:
+                _log.warning("LinkedIn apply: early save_session failed: %s", exc)
 
             # Check if job is expired/closed
             page_text = await self._safe_evaluate(page, "document.body.innerText", default="")

@@ -242,17 +242,33 @@ def notify_error(title: str, detail: str = "") -> None:
     _desktop_notify(f"🔴 {title}", detail or title, subtitle="Job Agent ERROR")
 
 
-def notify_warning(title: str, detail: str = "", *, desktop: bool = True) -> None:
-    """Signal something degraded but not fatal — login retry, skipped job."""
+def notify_warning(
+    title: str,
+    detail: str = "",
+    *,
+    desktop: bool = True,
+    dedupe_key: str | None = None,
+    dedupe_seconds: int = 900,
+) -> None:
+    """Signal something degraded but not fatal — login retry, skipped job.
+
+    dedupe_key: when set, throttles repeat Telegram sends by this key instead
+    of by (title, detail). Use a stable key for warnings whose detail changes
+    every run (counts, timestamps) to avoid flooding the same user with the
+    same actionable message dozens of times.
+    """
     title = _sanitize_notification_text(title)
     detail = _sanitize_notification_text(detail)
     _add_alert("warning", title, detail)
 
     # Send to Telegram (rate limited by caching key)
     now = time.time()
-    cache_key = f"tg:warn:{title}:{detail}"
+    if dedupe_key:
+        cache_key = f"tg:warn:{dedupe_key}"
+    else:
+        cache_key = f"tg:warn:{title}:{detail}"
     last_time = _last_notification_times.get(cache_key, 0)
-    if now - last_time >= 900:
+    if now - last_time >= dedupe_seconds:
         _last_notification_times[cache_key] = now
         _send_telegram(f"⚠️ [Job Agent WARNING] {title}\nDetail: {detail}")
 

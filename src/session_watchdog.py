@@ -141,23 +141,33 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
     return results
 
 
-def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
-    """Extract the earliest LinkedIn cookie expiry from the session JSON.
+_LINKEDIN_AUTH_COOKIES = {"li_at", "liap", "li_rm"}
 
-    Returns hours until expiry (can be negative if already expired),
-    or None if parsing fails.
+
+def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
+    """Return hours until the LinkedIn AUTH session expires, or None if unknown.
+
+    Only the login cookies (li_at / liap / li_rm) count: LinkedIn also sets a
+    grab-bag of short-lived tracking cookies (lidc ~24h, UserMatchHistory,
+    AnalyticsSyncHistory, ...) that expire well before any real auth issue.
+    Taking min() across *all* linkedin.com cookies made a session look expired
+    minutes after a fresh prepare-sessions login — because a tracking cookie's
+    30-minute lifetime outvoted li_at's year-long one. Filtering to the auth
+    set makes this actually reflect whether the user is still logged in.
     """
     try:
         data = json.loads(session_path.read_text())
         cookies = data.get("cookies", [])
-        li_cookies = [c for c in cookies if "linkedin" in c.get("domain", "")]
-        if not li_cookies:
+        auth_cookies = [
+            c for c in cookies
+            if "linkedin" in c.get("domain", "")
+            and c.get("name") in _LINKEDIN_AUTH_COOKIES
+            and c.get("expires", -1) > 0
+        ]
+        if not auth_cookies:
             return None
         now = time.time()
-        expiries = [c["expires"] for c in li_cookies if c.get("expires", -1) > 0]
-        if not expiries:
-            return None
-        earliest = min(expiries)
+        earliest = min(c["expires"] for c in auth_cookies)
         return (earliest - now) / 3600  # hours until expiry (negative = already expired)
     except Exception:
         return None
@@ -452,6 +462,64 @@ def preflight_session_check(sources: list[str]) -> dict[str, SessionHealth]:
     user can act while other jobs are being processed.
     """
     health_map = {h.source: h for h in check_session_health(sources)}
+    for src, h in health_map.items():
+        if h.status in {"expired", "missing"}:
+            _send_deep_link_notification(
+                src,
+                f"[Job Agent] {src.capitalize()} session {h.status} — apply will skip {src} jobs. Tap to fix:",
+            )
+    return health_map
+
+
+async def preflight_session_check_with_reauth(
+    sources: list[str], config: dict | None = None
+) -> dict[str, SessionHealth]:
+    """Async preflight: attempt automated reauth for expired sources before
+    notifying the user.
+
+    On a background run an expired LinkedIn/Indeed/Jobright session with
+    stored credentials can self-heal — dropping straight to a deep-link
+    notification wastes a whole cycle waiting for a human. This runs
+    ReauthManager._reauth_automated for each expired source that has an
+    automated path, then re-checks health and only notifies for the ones
+    that are still expired/missing.
+
+    Every source in AUTOMATED_SOURCES with stored credentials gets one
+    reauth attempt (usajobs included — it exposes an automated path even
+    though it also has a human fallback). Sources without stored
+    credentials, and anything still expired after the attempt, fall
+    through to the same deep-link notification as before.
+    """
+    from .reauth import ReauthManager, AUTOMATED_SOURCES
+    from .secret_store import resolve_secret
+
+    cfg = config or {}
+    health_map = {h.source: h for h in check_session_health(sources)}
+    expired = [
+        src for src, h in health_map.items()
+        if h.status in {"expired", "missing"} and src in AUTOMATED_SOURCES
+    ]
+
+    if expired:
+        mgr = ReauthManager(cfg)
+        for src in expired:
+            email = resolve_secret(f"{src.upper()}_EMAIL") or ""
+            password = resolve_secret(f"{src.upper()}_PASSWORD") or ""
+            if not email or not password:
+                _log.info("preflight.reauth.skip source=%s reason=no_credentials", src)
+                continue
+            _log.info("preflight.reauth.attempt source=%s", src)
+            try:
+                refreshed = await mgr._reauth_automated(src, escalate=False)
+            except Exception as exc:
+                _log.warning("preflight.reauth.error source=%s error=%s", src, exc)
+                refreshed = False
+            if refreshed:
+                _log.info("preflight.reauth.success source=%s", src)
+        # Re-check after reauth attempts so freshly-refreshed sessions no
+        # longer trip the notification path below.
+        health_map = {h.source: h for h in check_session_health(sources)}
+
     for src, h in health_map.items():
         if h.status in {"expired", "missing"}:
             _send_deep_link_notification(

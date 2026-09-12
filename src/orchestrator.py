@@ -35,7 +35,7 @@ from .reauth import ReauthManager, AUTOMATED_SOURCES
 from .resume_helper import ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
 from .blocker_classifier import should_attempt, classify, needs_preflight_reauth, preflight_reauth_viable
 from .resume_tailor import evaluate_resume_gate, ResumeTailor
-from .session_watchdog import preflight_session_check
+from .session_watchdog import preflight_session_check, preflight_session_check_with_reauth
 
 console = Console()
 _log = logging.getLogger(__name__)
@@ -782,6 +782,17 @@ class Orchestrator:
 
         self._log_credential_presence()
 
+        # Feed the persisted per-(source, status) funnel into the model-backed
+        # blocker classifier: (1) stores an adaptive-cap snapshot readable by
+        # sync should_attempt() calls in this run, (2) schedules a background
+        # model classification for any status the static map doesn't cover.
+        # Never blocks: a failing refresh degrades to the static-map behavior.
+        try:
+            from .blocker_intelligence import refresh_from_funnel_background
+            refresh_from_funnel_background(self.state.get_apply_funnel())
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("apply.blocker_intelligence_refresh_failed error=%s", exc)
+
         # Resume jobs whose coordinator repair operation has completed (fail-open;
         # only when incident reporting is configured — see src/incident_reporter.py).
         try:
@@ -856,6 +867,47 @@ class Orchestrator:
         console.print(f"  ✅ Will attempt  : {len(ready)}")
         console.print(f"  \U0001f512 Session needed: {len(blocked)}")
 
+        # preflight_session_check_with_reauth also emits the deep-link
+        # notification for sources that stay expired after reauth, so track
+        # whether we already ran it and skip the second synchronous call
+        # below (otherwise every non-interactive run would enter the
+        # notification path twice — masked today only by the 12h Telegram
+        # rate-limit inside _send_deep_link_notification).
+        reauth_preflight_ran = False
+        if blocked:
+            # Background self-heal: before we record blocks and notify the
+            # human, try automated reauth on any expired source that has
+            # stored credentials. If it succeeds, re-classify — jobs that
+            # were only blocked by the stale session move back to `ready`
+            # and get applied in this same run instead of waiting for the
+            # next scheduled cycle.
+            named_blocked_sources = {
+                s for s in (bj.get("source", "") for bj, _, _ in blocked) if s
+            }
+            if not is_interactive and named_blocked_sources:
+                try:
+                    await preflight_session_check_with_reauth(
+                        list(named_blocked_sources), self.config
+                    )
+                    reauth_preflight_ran = True
+                except Exception as exc:
+                    _log.warning("apply.preflight_reauth_error error=%s", exc)
+                # Re-classify blocked jobs after reauth so anything
+                # newly-unblocked joins the ready set for this run.
+                still_blocked: list[tuple] = []
+                for bj, readiness, reason in blocked:
+                    new_readiness, new_reason = self._classify_apply_readiness(bj)
+                    if new_readiness in BLOCKED_READINESS:
+                        still_blocked.append((bj, new_readiness, new_reason))
+                    else:
+                        ready.append(bj)
+                if len(still_blocked) != len(blocked):
+                    console.print(
+                        f"[green]Preflight reauth recovered "
+                        f"{len(blocked) - len(still_blocked)} job(s).[/green]"
+                    )
+                blocked = still_blocked
+
         if blocked:
             console.print("\n[yellow]Session-blocked (skipping in this run):[/yellow]")
             blocked_sources = set()
@@ -875,8 +927,10 @@ class Orchestrator:
                 else:
                     self.state.record_apply_attempt(bj["job_id"], readiness, reason)
                 await self._push_apply_attempt_to_cloud(bj["job_id"])
-            # Emit deep-link notifications for each blocked source
-            if not is_interactive and blocked_sources:
+            # Emit deep-link notifications only if the reauth-aware preflight
+            # above didn't already run (it emits the same notifications for
+            # anything still expired after reauth).
+            if not is_interactive and blocked_sources and not reauth_preflight_ran:
                 preflight_session_check(list(blocked_sources))
             if not is_interactive:
                 console.print(
@@ -921,7 +975,7 @@ class Orchestrator:
             # intact for telemetry, which is exactly why these gates can't see the
             # prep on their own.
             _session_prepared = bool(_extra.get("session_prepared_at"))
-            _ok, _skip_reason = should_attempt(_last, _attempts)
+            _ok, _skip_reason = should_attempt(_last, _attempts, source=job.get("source", ""))
             if not _ok and not _session_prepared:
                 _cls = classify(_last).value
                 console.print(f"[dim]⛔ Circuit breaker: skipping — {_skip_reason}[/dim]")
@@ -1213,6 +1267,12 @@ class Orchestrator:
                 "Apply run: nothing submitted",
                 f"0 submitted, {skipped_count} blocked, {len(blocked)} need session prep. "
                 f"Run: python src/main.py prepare-sessions",
+                # Throttle this to once every 6h: the message is actionable but
+                # identical every run while sessions are expired — the count
+                # changes but the fix does not, so per-detail dedup floods the
+                # user with the same alert every scheduled cycle.
+                dedupe_key="apply.nothing_submitted",
+                dedupe_seconds=6 * 3600,
             )
 
     # ------------------------------------------------------------------
