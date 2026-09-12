@@ -115,6 +115,8 @@ VALID_CONFIRMATIONS = [
     ("your_app_was_submitted", "Your application was submitted."),
     ("thank_you_for_applying", "Thank you for applying to our team."),
     ("your_app_was_sent", "Your application was sent."),
+    ("we_have_received_no_contraction",
+     "We have received your application and will be in touch."),
     ("reference_id_fallback",
      "Thanks. Confirmation number: ABC12345. Keep this for your records."),
 ]
@@ -126,11 +128,23 @@ def test_valid_confirmation_wording_is_recognized(label, body):
 
     A failure here means an application acceptance would be reported as
     `submission_unverified` — a false negative that stalls real submissions.
+
+    Asserts the SIGNAL PREFIX (`t:` for a text match, `ref:` for the reference-id
+    fallback) so an accidental match via the wrong path doesn't make a text
+    test look correct — the reference_id_fallback case in particular MUST
+    fire through the ref path, not the text patterns, and text cases MUST NOT
+    accidentally succeed via the reference-id regex on a stray "id" token.
     """
     signal = _run_receipt_js(body)
     assert signal is not None and signal != "", (
         f"[{label}] valid confirmation body was not recognized: {body!r}\n"
         f"This is a false negative — the applier would drop a real acceptance."
+    )
+    expected_prefix = "ref:" if label == "reference_id_fallback" else "t:"
+    assert signal.startswith(expected_prefix), (
+        f"[{label}] recognized via wrong path — expected prefix {expected_prefix!r} "
+        f"but got signal {signal!r}. If a text case only matches via the ref-id "
+        f"path (or vice versa), the corpus is not exercising what it claims."
     )
 
 
@@ -160,6 +174,22 @@ FALSE_POSITIVE_TRAPS = [
      "You will help ensure every application received is reviewed within 48 hours."),
     ("posting_body_success_word",
      "Successfully submitted candidates receive an offer letter within two weeks."),
+    # Explicit negations around the verbs the matcher keys on.
+    ("negated_we_have_not_received",
+     "We have not received your application. Please check that you clicked submit."),
+    ("negated_no_application_received",
+     "No application received for this job. If you completed the form, please retry."),
+    # Form-page labels and headers that share vocabulary with success screens.
+    ("form_field_label_application_received",
+     "Application received date: (leave blank for auto-fill)"),
+    ("history_panel_previously_submitted",
+     "Previously submitted applications appear in your candidate dashboard."),
+    # Instructional/conditional wording that reads like success but describes the future.
+    ("instructional_application_can_be_submitted",
+     "Your application can be submitted after all required questions are answered."),
+    # False-positive risk from bare 'thank you for applying' as a partial phrase.
+    ("thank_you_for_applying_these_filters",
+     "Thank you for applying these filters. Showing 12 matching roles."),
 ]
 
 
