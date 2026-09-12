@@ -141,23 +141,33 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
     return results
 
 
-def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
-    """Extract the earliest LinkedIn cookie expiry from the session JSON.
+_LINKEDIN_AUTH_COOKIES = {"li_at", "liap", "li_rm"}
 
-    Returns hours until expiry (can be negative if already expired),
-    or None if parsing fails.
+
+def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
+    """Return hours until the LinkedIn AUTH session expires, or None if unknown.
+
+    Only the login cookies (li_at / liap / li_rm) count: LinkedIn also sets a
+    grab-bag of short-lived tracking cookies (lidc ~24h, UserMatchHistory,
+    AnalyticsSyncHistory, ...) that expire well before any real auth issue.
+    Taking min() across *all* linkedin.com cookies made a session look expired
+    minutes after a fresh prepare-sessions login — because a tracking cookie's
+    30-minute lifetime outvoted li_at's year-long one. Filtering to the auth
+    set makes this actually reflect whether the user is still logged in.
     """
     try:
         data = json.loads(session_path.read_text())
         cookies = data.get("cookies", [])
-        li_cookies = [c for c in cookies if "linkedin" in c.get("domain", "")]
-        if not li_cookies:
+        auth_cookies = [
+            c for c in cookies
+            if "linkedin" in c.get("domain", "")
+            and c.get("name") in _LINKEDIN_AUTH_COOKIES
+            and c.get("expires", -1) > 0
+        ]
+        if not auth_cookies:
             return None
         now = time.time()
-        expiries = [c["expires"] for c in li_cookies if c.get("expires", -1) > 0]
-        if not expiries:
-            return None
-        earliest = min(expiries)
+        earliest = min(c["expires"] for c in auth_cookies)
         return (earliest - now) / 3600  # hours until expiry (negative = already expired)
     except Exception:
         return None
