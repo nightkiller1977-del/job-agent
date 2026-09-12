@@ -6,6 +6,7 @@ Handles multi-step Easy Apply forms.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from datetime import datetime
@@ -17,6 +18,8 @@ from rich.console import Console
 
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.resume_helper import resolve_resume_path, PDFTextLayerError
+
+_log = logging.getLogger(__name__)
 
 console = Console()
 
@@ -61,6 +64,15 @@ class LinkedInScraper(BaseScraper):
             await self._delay(2, 3)
 
             # Check login — attempt auto-login from .env if not authenticated
+            if not await self._needs_login(page):
+                # Persist rotated cookies right after confirming we're
+                # authenticated. Without this, a scrape that errors later
+                # loses the JSESSIONID that LinkedIn just rotated for us,
+                # and the next run sees a stale cookie flagged expired.
+                try:
+                    await self._save_session()
+                except Exception as exc:
+                    _log.warning("LinkedIn: early save_session failed: %s", exc)
             if await self._needs_login(page):
                 email = os.environ.get("LINKEDIN_EMAIL", "")
                 password = os.environ.get("LINKEDIN_PASSWORD", "")
@@ -659,6 +671,12 @@ class LinkedInScraper(BaseScraper):
                     "linkedin_login_required",
                     "LinkedIn redirected to login/authwall. Run prepare-sessions --source linkedin and sign in once.",
                 )
+            # Session is good — persist rotated JSESSIONID before the apply
+            # flow does anything that might error out and lose it.
+            try:
+                await self._save_session()
+            except Exception as exc:
+                _log.warning("LinkedIn apply: early save_session failed: %s", exc)
 
             # Check if job is expired/closed
             page_text = await self._safe_evaluate(page, "document.body.innerText", default="")

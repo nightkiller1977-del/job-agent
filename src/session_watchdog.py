@@ -459,3 +459,58 @@ def preflight_session_check(sources: list[str]) -> dict[str, SessionHealth]:
                 f"[Job Agent] {src.capitalize()} session {h.status} — apply will skip {src} jobs. Tap to fix:",
             )
     return health_map
+
+
+async def preflight_session_check_with_reauth(
+    sources: list[str], config: dict | None = None
+) -> dict[str, SessionHealth]:
+    """Async preflight: attempt automated reauth for expired sources before
+    notifying the user.
+
+    On a background run an expired LinkedIn/Indeed/Jobright session with
+    stored credentials can self-heal — dropping straight to a deep-link
+    notification wastes a whole cycle waiting for a human. This runs
+    ReauthManager._reauth_automated for each expired source that has an
+    automated path, then re-checks health and only notifies for the ones
+    that are still expired/missing.
+
+    Sources that require a human (usajobs, or any without stored credentials)
+    fall through to the same deep-link notification as before.
+    """
+    from .reauth import ReauthManager, AUTOMATED_SOURCES
+    from .secret_store import resolve_secret
+
+    cfg = config or {}
+    health_map = {h.source: h for h in check_session_health(sources)}
+    expired = [
+        src for src, h in health_map.items()
+        if h.status in {"expired", "missing"} and src in AUTOMATED_SOURCES
+    ]
+
+    if expired:
+        mgr = ReauthManager(cfg)
+        for src in expired:
+            email = resolve_secret(f"{src.upper()}_EMAIL") or ""
+            password = resolve_secret(f"{src.upper()}_PASSWORD") or ""
+            if not email or not password:
+                _log.info("preflight.reauth.skip source=%s reason=no_credentials", src)
+                continue
+            _log.info("preflight.reauth.attempt source=%s", src)
+            try:
+                refreshed = await mgr._reauth_automated(src, escalate=False)
+            except Exception as exc:
+                _log.warning("preflight.reauth.error source=%s error=%s", src, exc)
+                refreshed = False
+            if refreshed:
+                _log.info("preflight.reauth.success source=%s", src)
+        # Re-check after reauth attempts so freshly-refreshed sessions no
+        # longer trip the notification path below.
+        health_map = {h.source: h for h in check_session_health(sources)}
+
+    for src, h in health_map.items():
+        if h.status in {"expired", "missing"}:
+            _send_deep_link_notification(
+                src,
+                f"[Job Agent] {src.capitalize()} session {h.status} — apply will skip {src} jobs. Tap to fix:",
+            )
+    return health_map

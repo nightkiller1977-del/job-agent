@@ -35,7 +35,7 @@ from .reauth import ReauthManager, AUTOMATED_SOURCES
 from .resume_helper import ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
 from .blocker_classifier import should_attempt, classify, needs_preflight_reauth, preflight_reauth_viable
 from .resume_tailor import evaluate_resume_gate, ResumeTailor
-from .session_watchdog import preflight_session_check
+from .session_watchdog import preflight_session_check, preflight_session_check_with_reauth
 
 console = Console()
 _log = logging.getLogger(__name__)
@@ -857,6 +857,37 @@ class Orchestrator:
         console.print(f"  \U0001f512 Session needed: {len(blocked)}")
 
         if blocked:
+            # Background self-heal: before we record blocks and notify the
+            # human, try automated reauth on any expired source that has
+            # stored credentials. If it succeeds, re-classify — jobs that
+            # were only blocked by the stale session move back to `ready`
+            # and get applied in this same run instead of waiting for the
+            # next scheduled cycle.
+            blocked_sources_initial = {bj.get("source", "") for bj, _, _ in blocked}
+            if not is_interactive and blocked_sources_initial:
+                try:
+                    await preflight_session_check_with_reauth(
+                        [s for s in blocked_sources_initial if s], self.config
+                    )
+                except Exception as exc:
+                    _log.warning("apply.preflight_reauth_error error=%s", exc)
+                # Re-classify blocked jobs after reauth so anything
+                # newly-unblocked joins the ready set for this run.
+                still_blocked: list[tuple] = []
+                for bj, readiness, reason in blocked:
+                    new_readiness, new_reason = self._classify_apply_readiness(bj)
+                    if new_readiness in BLOCKED_READINESS:
+                        still_blocked.append((bj, new_readiness, new_reason))
+                    else:
+                        ready.append(bj)
+                if len(still_blocked) != len(blocked):
+                    console.print(
+                        f"[green]Preflight reauth recovered "
+                        f"{len(blocked) - len(still_blocked)} job(s).[/green]"
+                    )
+                blocked = still_blocked
+
+        if blocked:
             console.print("\n[yellow]Session-blocked (skipping in this run):[/yellow]")
             blocked_sources = set()
             for bj, readiness, reason in blocked:
@@ -875,7 +906,8 @@ class Orchestrator:
                 else:
                     self.state.record_apply_attempt(bj["job_id"], readiness, reason)
                 await self._push_apply_attempt_to_cloud(bj["job_id"])
-            # Emit deep-link notifications for each blocked source
+            # Emit deep-link notifications for each blocked source (reauth
+            # above already ran; anything still here needs a human).
             if not is_interactive and blocked_sources:
                 preflight_session_check(list(blocked_sources))
             if not is_interactive:
@@ -1213,6 +1245,12 @@ class Orchestrator:
                 "Apply run: nothing submitted",
                 f"0 submitted, {skipped_count} blocked, {len(blocked)} need session prep. "
                 f"Run: python src/main.py prepare-sessions",
+                # Throttle this to once every 6h: the message is actionable but
+                # identical every run while sessions are expired — the count
+                # changes but the fix does not, so per-detail dedup floods the
+                # user with the same alert every scheduled cycle.
+                dedupe_key="apply.nothing_submitted",
+                dedupe_seconds=6 * 3600,
             )
 
     # ------------------------------------------------------------------
