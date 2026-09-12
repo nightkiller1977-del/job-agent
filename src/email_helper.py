@@ -79,11 +79,16 @@ def resolve_imap_credentials(email_addr: str = "", password: str = "") -> tuple[
     tracker, and every BaseScraper._try_email_otp caller so all of them accept the
     same key names and none can drift back to a site-login password."""
     try:
-        from src.secret_store import resolve_secret as _resolve
+        from src.secret_store import (
+            resolve_secret as _resolve,
+            discover_by_purpose as _discover,
+        )
     except Exception:  # noqa: BLE001 — a broken secret store must not break IMAP
         import os as _os
         def _resolve(name: str):
             return (_os.environ.get(name) or "").strip() or None
+        def _discover(purpose: str, **_kw):
+            return []
 
     addr = (email_addr or "").strip()
     if not addr:
@@ -92,6 +97,16 @@ def resolve_imap_credentials(email_addr: str = "", password: str = "") -> tuple[
             if val:
                 addr = val
                 break
+        # Last-resort discovery: scan the store for any key whose NAME
+        # looks like an inbox address (EMAIL_2FA_ADDRESS variants,
+        # IMAP_EMAIL, NOTIFY_EMAIL, ...).
+        if not addr:
+            for key in _discover("imap_address"):
+                val = (_resolve(key) or "").strip()
+                if val and "@" in val:
+                    _log.info("mail.resolve.discovered_address key=%s", key)
+                    addr = val
+                    break
     pwd = (password or "").strip()
     if not pwd and addr:
         for key in imap_password_candidates(addr):
@@ -99,6 +114,24 @@ def resolve_imap_credentials(email_addr: str = "", password: str = "") -> tuple[
             if val:
                 pwd = val
                 break
+        # Last-resort discovery: scan the store for any key whose NAME
+        # looks like an IMAP/iCloud/Apple app password or API key, ordered
+        # by how good the name match is. Same rotation-safety benefit as
+        # the address branch: a store that shipped ICLOUD_APP_PASSWORD
+        # under a new name is still found without a code change.
+        if not pwd:
+            addr_lower = addr.lower()
+            is_apple_domain = any(d in addr_lower for d in ("@icloud.com", "@me.com", "@mac.com"))
+            # For Apple inboxes accept anything remotely apple-ish. For
+            # other providers keep it to the generic IMAP/MAIL names so
+            # we don't hand an Apple app password to Gmail.
+            filter_re = None if is_apple_domain else r"^(IMAP|MAIL)_"
+            for key in _discover("imap_password", filter_regex=filter_re):
+                val = (_resolve(key) or "").strip()
+                if val:
+                    _log.info("mail.resolve.discovered_password key=%s", key)
+                    pwd = val
+                    break
     return addr, pwd
 
 
