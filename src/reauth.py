@@ -245,11 +245,17 @@ class ReauthManager:
                 record_reauth_event(source, "automated", "failed", "_auto_login returned False")
                 _log.warning("reauth.failed source=%s mode=automated reason=login_returned_false", source)
                 if escalate:
-                    notify_warning(
+                    # One notification, not two: the deep-link is the
+                    # actionable one (it carries the fix command). A
+                    # separate notify_warning with the same info pings the
+                    # phone twice in the same second. The dashboard alert
+                    # is still recorded via _add_alert directly.
+                    from .notifier import _add_alert
+                    _add_alert(
+                        "warning",
                         f"{source} automated reauth failed",
                         "Login returned False — may need human assist or CAPTCHA",
                     )
-                    # Escalate: send a one-tap deep-link so user can fix from phone
                     try:
                         from .session_watchdog import _send_deep_link_notification
                         _send_deep_link_notification(
@@ -263,7 +269,15 @@ class ReauthManager:
             record_reauth_event(source, "automated", "failed", str(exc)[:300])
             _log.error("reauth.error source=%s mode=automated error=%s", source, exc)
             if escalate:
-                notify_error(f"{source} automated reauth error", str(exc)[:200])
+                # Same rationale as the auto_login==False path above: skip
+                # the Telegram notify_error and let the deep-link be the
+                # single actionable phone alert.
+                from .notifier import _add_alert
+                _add_alert(
+                    "error",
+                    f"{source} automated reauth error",
+                    str(exc)[:200],
+                )
                 try:
                     from .session_watchdog import _send_deep_link_notification
                     _send_deep_link_notification(
