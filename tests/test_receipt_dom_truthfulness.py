@@ -76,15 +76,11 @@ async def _run(case):
     from playwright.async_api import async_playwright
     from src.sources.adapters.receipt import verify_receipt
 
+    scenario = case.get("scenario", "verify_once")
     initial_html = case["initial_html"]
     base_url = case["base_url"]
     retries = int(case.get("retries", 0))
     delay = float(case.get("delay", 0.05))
-    # Optional: after N ms, swap the DOM to `mutated_html`. Used for the
-    # delayed-acceptance test — the mutation is scheduled by a real timer
-    # so verify_receipt's polling loop absorbs a genuine async DOM change.
-    mutate_after_ms = case.get("mutate_after_ms")
-    mutated_html = case.get("mutated_html")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -103,18 +99,60 @@ async def _run(case):
             page = await ctx.new_page()
             await page.goto(base_url)
 
-            if mutate_after_ms is not None and mutated_html is not None:
-                # Schedule the DOM swap with a real browser-side timer so the
-                # polling loop observes an actual async change (not a scripted
-                # value swap). setTimeout runs in the page's event loop.
-                await page.evaluate(
-                    "(args) => { setTimeout(() => { document.open(); "
-                    "document.write(args.html); document.close(); }, args.ms); }",
-                    {"html": mutated_html, "ms": int(mutate_after_ms)},
-                )
+            if scenario == "verify_once":
+                ok, sig = await verify_receipt(page, retries=retries, delay=delay)
+                return {"ok": bool(ok), "sig": str(sig or "")}
 
-            ok, sig = await verify_receipt(page, retries=retries, delay=delay)
-            return {"ok": bool(ok), "sig": str(sig or "")}
+            if scenario == "delayed_appendchild":
+                # Real SPA-shaped mutation: setTimeout inserts a NEW element via
+                # DOM API (appendChild), rather than document.write which would
+                # replace the whole document and is not representative of
+                # React/Vue/Angular acceptance patterns.
+                append_after_ms = int(case["append_after_ms"])
+                append_html = case["append_html"]
+                await page.evaluate(
+                    "(args) => { setTimeout(() => { "
+                    "const div = document.createElement('div'); "
+                    "div.innerHTML = args.html; "
+                    "document.body.appendChild(div); "
+                    "}, args.ms); }",
+                    {"html": append_html, "ms": append_after_ms},
+                )
+                ok, sig = await verify_receipt(page, retries=retries, delay=delay)
+                return {"ok": bool(ok), "sig": str(sig or "")}
+
+            if scenario == "freshness_baseline_then_verify":
+                # 1. Capture baseline BEFORE the (simulated) submit — this is the
+                #    receipt state that already exists on the pre-submit form page.
+                # 2. Optionally mutate the DOM to represent what post-submit renders.
+                # 3. Call verify_receipt WITH the baseline; the invariant is that
+                #    only evidence NEW or CHANGED relative to the baseline may
+                #    count as an accepted receipt.
+                #
+                # The current verify_receipt signature does not accept `baseline`,
+                # so this scenario is expected to fail with TypeError until the
+                # fix adds freshness-aware evidence to the API. That is the RED
+                # signal that forces the design.
+                baseline_ok, baseline_sig = await verify_receipt(page, retries=0)
+                mutate_to = case.get("mutate_to")
+                if mutate_to is not None:
+                    # Real DOM mutation: set body innerHTML to the post-submit shape.
+                    # No document.write — a DOM update in place, like an SPA render.
+                    await page.evaluate(
+                        "(html) => { document.body.innerHTML = html; }",
+                        mutate_to,
+                    )
+                ok, sig = await verify_receipt(
+                    page, retries=retries, delay=delay,
+                    baseline=(baseline_ok, baseline_sig),
+                )
+                return {
+                    "ok": bool(ok), "sig": str(sig or ""),
+                    "baseline_ok": bool(baseline_ok),
+                    "baseline_sig": str(baseline_sig or ""),
+                }
+
+            raise ValueError(f"unknown scenario: {scenario!r}")
         finally:
             await browser.close()
 
@@ -291,29 +329,32 @@ def test_visibly_rendered_stale_copy_must_not_verify():
 # 4. Delayed acceptance across polls (real browser timer + real DOM mutation)
 # --------------------------------------------------------------------------- #
 def test_delayed_acceptance_verifies_within_retries():
-    """The page shows a form initially, then a REAL browser timer swaps in the
-    acceptance panel via `document.write`. verify_receipt's polling loop must
-    absorb the async change and succeed.
+    """The page shows a form initially, then a REAL browser timer inserts an
+    acceptance element via DOM APIs (appendChild) — the shape a real SPA
+    (React/Vue/etc.) actually produces on a successful submit. verify_receipt's
+    polling loop must absorb the async change and succeed.
 
-    Retries=8 × delay=0.05s ≈ 400ms budget; mutation fires at 100ms.
+    Not document.write: writing to an already-loaded document REPLACES the
+    document and creates behavior unlike a normal SPA render. appendChild
+    inserts alongside the existing form, which mirrors what a real thank-you
+    banner does.
+
+    Retries=8 × delay=0.05s ≈ 400ms budget; append fires at 100ms.
     """
     initial = """
     <html><body>
       <form id="apply"><input name="name"/><button type="submit">Submit</button></form>
     </body></html>
     """
-    mutated = """
-    <html><body>
-      <div class="thank-you"><h1>Application submitted.</h1></div>
-    </body></html>
-    """
+    append_html = '<div class="thank-you"><h1>Application submitted.</h1></div>'
     r = _run_dom_case(
-        initial_html=initial, mutated_html=mutated, mutate_after_ms=100,
+        scenario="delayed_appendchild",
+        initial_html=initial, append_html=append_html, append_after_ms=100,
         base_url=BASE_FORM_URL, retries=8, delay=0.05,
     )
     assert r["ok"], (
         f"delayed acceptance should verify within retries; got {r!r}. "
-        f"Polling budget was 400ms; mutation scheduled at 100ms."
+        f"Polling budget was 400ms; append scheduled at 100ms."
     )
     assert r["sig"].startswith("t:")
 
@@ -350,3 +391,91 @@ def test_unchanged_ashby_url_no_text_does_not_verify():
     assert r["ok"] is False and r["sig"] == "", (
         f"Ashby SPA with no acceptance copy must NOT verify; got {r!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 7 & 8. FRESHNESS invariant — the semantic boundary
+#
+# The fundamental defect visible-stale exposed: a whole-page scan after submit
+# cannot tell whether "Application submitted" was already there or appeared
+# because of THIS attempt. Tightening regex wording alone cannot establish
+# causality — the verifier needs a baseline captured before the submit boundary
+# and must only accept evidence NEW or CHANGED relative to that baseline.
+#
+# These two tests define that boundary as the concrete contract the fix must
+# meet. They currently fail with TypeError (verify_receipt does not accept a
+# `baseline` kwarg), which IS the RED signal — the fix must add the freshness-
+# aware evidence path. The exact type/API is implementation-driven; the tests
+# only pin down the observable behavior.
+# --------------------------------------------------------------------------- #
+def test_prior_visible_confirmation_does_not_verify_new_attempt():
+    """RED against baseline. Page loads with confirmation copy ALREADY visible
+    (a dashboard widget, a previous-application notice, a stale panel that
+    happens to be visible). Baseline captures that. Simulated submit does NOT
+    change the DOM. verify_receipt with the baseline MUST report unverified —
+    nothing new appeared; there is no attestation this attempt was accepted.
+    """
+    # Same page state before AND after — no mutation.
+    html = """
+    <html><body>
+      <aside class="stale-banner">
+        <h1>Application submitted.</h1>
+        <p>Your application was received. Confirmation number: XYZ99.</p>
+      </aside>
+      <form id="apply"><input name="name"/><button type="submit">Submit</button></form>
+    </body></html>
+    """
+    r = _run_dom_case(
+        scenario="freshness_baseline_then_verify",
+        initial_html=html, base_url=BASE_FORM_URL, retries=0, delay=0.05,
+        # No mutate_to → the DOM is identical before and after the notional submit.
+    )
+    # Baseline sanity: the stale panel DOES currently fire the matcher, so the
+    # baseline captured a truthy signal. That is why freshness is needed —
+    # without it, the same signal fires again after submit as a false receipt.
+    assert r.get("baseline_ok") is True, (
+        f"corpus assumption broken — the stale panel was expected to fire the "
+        f"baseline matcher (that is the reason freshness is required); got {r!r}"
+    )
+    assert r["ok"] is False, (
+        f"pre-existing visible confirmation must NOT verify a new attempt; got {r!r}. "
+        f"Baseline signal was {r.get('baseline_sig')!r}; the post-submit call returned "
+        f"the SAME evidence unchanged. Verifier must reject unchanged evidence as "
+        f"non-attributable to this attempt."
+    )
+
+
+def test_confirmation_appearing_post_submit_verifies():
+    """Positive counterpart. Page starts WITHOUT confirmation. Baseline captures
+    an empty state. Simulated submit mutates the DOM to add confirmation copy.
+    verify_receipt with the baseline MUST report verified — the evidence is
+    new relative to baseline, so it is attributable to this attempt.
+
+    This test guards against a fix that overcorrects — freshness enforcement
+    must still accept genuine fresh evidence.
+    """
+    initial = """
+    <html><body>
+      <form id="apply"><input name="name"/><button type="submit">Submit</button></form>
+    </body></html>
+    """
+    after = """
+      <div class="thank-you">
+        <h1>Application submitted.</h1>
+        <p>Thank you for applying to Acme.</p>
+      </div>
+    """
+    r = _run_dom_case(
+        scenario="freshness_baseline_then_verify",
+        initial_html=initial, base_url=BASE_FORM_URL, retries=0, delay=0.05,
+        mutate_to=after,
+    )
+    assert r.get("baseline_ok") is False, (
+        f"corpus assumption broken — baseline was expected to be empty; got {r!r}"
+    )
+    assert r["ok"] is True, (
+        f"fresh confirmation appearing post-submit MUST verify; got {r!r}. "
+        f"If this fails, the freshness gate is too strict and would reject "
+        f"real acceptances alongside stale ones."
+    )
+    assert r["sig"].startswith("t:")
