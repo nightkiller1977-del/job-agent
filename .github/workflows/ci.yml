@@ -22,8 +22,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: "pip"
 
+      # Node is required by the receipt-matcher regression tests, which shell out to
+      # `node -e` with the production _RECEIPT_JS to prove browser-JS matching truthfully
+      # (not via a Python re-implementation). If setup-node fails or `node` is missing,
+      # the tests must fail loudly — never silently skip a safety check.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
+
+      # Playwright chromium is required by the DOM-aware receipt tests
+      # (test_receipt_dom_truthfulness.py). Uses synthetic HTML via page.set_content()
+      # with network blocked — no employer sites contacted, no credentials needed.
+      - name: Install Playwright chromium
+        run: python -m playwright install --with-deps chromium
 
       - name: Run tests
         env:
@@ -52,6 +67,9 @@ jobs:
                  tests/test_commander_config_fallback.py \
                  tests/test_orchestrator_config_missing.py \
                  tests/test_dashboard_mongodb_config.py \
+                 tests/test_receipt_regex_truthfulness.py \
+                 tests/test_receipt_dom_truthfulness.py \
+                 tests/test_generic_submit_dispatch_truth.py \
                  -q --tb=short --asyncio-mode=auto
 
   lint:
