@@ -856,6 +856,13 @@ class Orchestrator:
         console.print(f"  ✅ Will attempt  : {len(ready)}")
         console.print(f"  \U0001f512 Session needed: {len(blocked)}")
 
+        # preflight_session_check_with_reauth also emits the deep-link
+        # notification for sources that stay expired after reauth, so track
+        # whether we already ran it and skip the second synchronous call
+        # below (otherwise every non-interactive run would enter the
+        # notification path twice — masked today only by the 12h Telegram
+        # rate-limit inside _send_deep_link_notification).
+        reauth_preflight_ran = False
         if blocked:
             # Background self-heal: before we record blocks and notify the
             # human, try automated reauth on any expired source that has
@@ -863,12 +870,15 @@ class Orchestrator:
             # were only blocked by the stale session move back to `ready`
             # and get applied in this same run instead of waiting for the
             # next scheduled cycle.
-            blocked_sources_initial = {bj.get("source", "") for bj, _, _ in blocked}
-            if not is_interactive and blocked_sources_initial:
+            named_blocked_sources = {
+                s for s in (bj.get("source", "") for bj, _, _ in blocked) if s
+            }
+            if not is_interactive and named_blocked_sources:
                 try:
                     await preflight_session_check_with_reauth(
-                        [s for s in blocked_sources_initial if s], self.config
+                        list(named_blocked_sources), self.config
                     )
+                    reauth_preflight_ran = True
                 except Exception as exc:
                     _log.warning("apply.preflight_reauth_error error=%s", exc)
                 # Re-classify blocked jobs after reauth so anything
@@ -906,9 +916,10 @@ class Orchestrator:
                 else:
                     self.state.record_apply_attempt(bj["job_id"], readiness, reason)
                 await self._push_apply_attempt_to_cloud(bj["job_id"])
-            # Emit deep-link notifications for each blocked source (reauth
-            # above already ran; anything still here needs a human).
-            if not is_interactive and blocked_sources:
+            # Emit deep-link notifications only if the reauth-aware preflight
+            # above didn't already run (it emits the same notifications for
+            # anything still expired after reauth).
+            if not is_interactive and blocked_sources and not reauth_preflight_ran:
                 preflight_session_check(list(blocked_sources))
             if not is_interactive:
                 console.print(

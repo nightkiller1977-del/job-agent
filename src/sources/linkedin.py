@@ -64,7 +64,8 @@ class LinkedInScraper(BaseScraper):
             await self._delay(2, 3)
 
             # Check login — attempt auto-login from .env if not authenticated
-            if not await self._needs_login(page):
+            needs_login = await self._needs_login(page)
+            if not needs_login:
                 # Persist rotated cookies right after confirming we're
                 # authenticated. Without this, a scrape that errors later
                 # loses the JSESSIONID that LinkedIn just rotated for us,
@@ -73,7 +74,7 @@ class LinkedInScraper(BaseScraper):
                     await self._save_session()
                 except Exception as exc:
                     _log.warning("LinkedIn: early save_session failed: %s", exc)
-            if await self._needs_login(page):
+            if needs_login:
                 email = os.environ.get("LINKEDIN_EMAIL", "")
                 password = os.environ.get("LINKEDIN_PASSWORD", "")
                 if email and password:

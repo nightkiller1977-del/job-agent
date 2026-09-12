@@ -484,8 +484,11 @@ async def preflight_session_check_with_reauth(
     automated path, then re-checks health and only notifies for the ones
     that are still expired/missing.
 
-    Sources that require a human (usajobs, or any without stored credentials)
-    fall through to the same deep-link notification as before.
+    Every source in AUTOMATED_SOURCES with stored credentials gets one
+    reauth attempt (usajobs included — it exposes an automated path even
+    though it also has a human fallback). Sources without stored
+    credentials, and anything still expired after the attempt, fall
+    through to the same deep-link notification as before.
     """
     from .reauth import ReauthManager, AUTOMATED_SOURCES
     from .secret_store import resolve_secret
