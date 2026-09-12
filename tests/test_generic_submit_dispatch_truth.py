@@ -446,25 +446,24 @@ async def test_policy_deny_produces_zero_submit_clicks(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Scenario F — restart safety: PHASE_UNVERIFIED persists across a fresh Python
-# process. Reads the ledger file, attempts a new apply, asserts no dispatch.
+# Scenario F1 — PERSISTENCE proof: fresh Python process reads the same ledger
+# file and confirms PHASE_UNVERIFIED survives across process boundary.
+#
+# This proves the ledger file format is stable across interpreters and that
+# needs_reconciliation() (the primitive the session preflight uses) returns
+# True on the fresh side. Full session-level enforcement is proved separately
+# in Scenario F2 — this test alone is not enough.
 # --------------------------------------------------------------------------- #
-@pytest.mark.asyncio
-async def test_unverified_ledger_survives_fresh_python_subprocess(tmp_path, monkeypatch):
-    """Restart safety: after PHASE_UNVERIFIED is persisted, a FRESH Python
-    process (not just a new session object in the same interpreter) must see
-    the same reconciliation hold and refuse a new apply.
-
-    Uses a subprocess so any in-memory caches, module-level state, or open
-    file handles in the current process are not carrying the assertion."""
-    # Set up the unverified ledger in this process.
+def test_unverified_ledger_persistence_across_fresh_python_process(tmp_path):
+    """Persistence proof only — a fresh Python interpreter can read the
+    ledger file and observe PHASE_UNVERIFIED. Does NOT prove session refuses
+    to click; that's Scenario F2."""
     key = canonical_key(JOB)
     ledger_path = tmp_path / "ledger.json"
     ledger = SubmissionLedger(ledger_path)
     ledger.complete(key, "attempt-id-from-prior-process", verified=False)
     assert ledger.record(key)["phase"] == PHASE_UNVERIFIED  # sanity
 
-    # Fresh Python subprocess: read the ledger and verify the phase persists.
     child_script = textwrap.dedent(f"""
         import json, sys
         from pathlib import Path
@@ -478,8 +477,6 @@ async def test_unverified_ledger_survives_fresh_python_subprocess(tmp_path, monk
         if rec.get("phase") != "submission_unverified":
             print(f"FAIL: phase changed across process boundary: {{rec}}", file=sys.stderr)
             sys.exit(1)
-        # Now import the ledger from the fresh interpreter and run the
-        # `needs_reconciliation` check that the session preflight uses.
         from src.sources.adapters.idempotency import SubmissionLedger
         fresh = SubmissionLedger(LEDGER)
         if not fresh.needs_reconciliation({key!r}):
@@ -490,12 +487,9 @@ async def test_unverified_ledger_survives_fresh_python_subprocess(tmp_path, monk
     """)
 
     repo_root = os.fspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    result = subprocess.run(  # noqa: S603 — arguments controlled, no shell
+    result = subprocess.run(  # noqa: S603
         [sys.executable, "-c", child_script],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
+        capture_output=True, text=True, timeout=30, check=False,
         env={**os.environ, "PYTHONPATH": repo_root},
     )
     assert result.returncode == 0, (
@@ -503,6 +497,126 @@ async def test_unverified_ledger_survives_fresh_python_subprocess(tmp_path, monk
         f"  stdout: {result.stdout!r}\n  stderr: {result.stderr!r}"
     )
     assert "OK" in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# Scenario F2 — ENFORCEMENT proof: fresh Python process spawns a real
+# ExternalApplySession against the persisted ledger file and confirms the
+# session preflight refuses to reach the submit boundary — no browser launch,
+# no click dispatch, ledger untouched.
+#
+# This closes the gap Scenario F1 leaves: persistence alone does not prove
+# the session actually enforces reconciliation on restart.
+# --------------------------------------------------------------------------- #
+def test_unverified_ledger_blocks_session_in_fresh_python_process(tmp_path):
+    """Enforcement proof — a fresh Python interpreter constructs a real
+    ExternalApplySession pointed at the persisted ledger, calls session.apply,
+    and asserts that the session refused to reach the submit boundary."""
+    key = canonical_key(JOB)
+    ledger_path = tmp_path / "ledger.json"
+    ledger = SubmissionLedger(ledger_path)
+    ledger.complete(key, "attempt-id-from-prior-process", verified=False)
+    assert ledger.record(key)["phase"] == PHASE_UNVERIFIED  # sanity
+
+    prof_dir = tmp_path / "jobright_profile"
+    prof_dir.mkdir(exist_ok=True)
+    runs_dir = tmp_path / "runs"
+
+    # The child constructs a real session, faking ONLY the browser boundary
+    # (start/close + profile dir), runs the same JOB, and prints a JSON
+    # result the parent asserts against. If the session's preflight worked,
+    # no click ever dispatched — the counter stays at 0.
+    child_script = textwrap.dedent(f"""
+        import asyncio, json, sys
+        from pathlib import Path
+
+        from src.events import RunLog
+        from src.sources.adapters.session import ExternalApplySession
+        from src.sources.adapters.registry import AtsAdapterRegistry
+        from src.sources.adapters.generic import GenericAtsAdapter
+        from src.sources.adapters.idempotency import SubmissionLedger
+
+        LEDGER = Path({str(ledger_path)!r})
+        PROF = Path({str(prof_dir)!r})
+        RUNS = Path({str(runs_dir)!r})
+        JOB = {JOB!r}
+
+        # Track every attempted browser-boundary call. If preflight enforcement
+        # works, browser_started must stay False.
+        events = {{"browser_started": False, "clicks": 0}}
+
+        class Page:
+            url = "https://never.reached/"
+            frames = []
+            async def title(self): return "never"
+            async def goto(self, *a, **kw):
+                events["browser_started"] = True
+                return None
+            async def query_selector(self, sel):
+                events["clicks"] += 1
+                return None
+            async def evaluate(self, js, *a):
+                return None
+            async def set_input_files(self, sel, path):
+                return None
+
+        async def go():
+            sess = ExternalApplySession(
+                {{}}, registry=AtsAdapterRegistry(fallback=GenericAtsAdapter()),
+                ledger=SubmissionLedger(LEDGER),
+                run_log=RunLog(agent="child", runs_dir=RUNS),
+            )
+            sess._closed = False
+            async def _start(load_extensions=False, disable_extensions=False):
+                events["browser_started"] = True
+                return Page()
+            async def _close(save_session=True):
+                sess._closed = True
+            sess._start_browser = _start
+            sess._close_browser = _close
+            type(sess)._profile_dir = property(lambda self: PROF)
+
+            res = await sess.apply(JOB, auto_submit=True)
+            return {{
+                "status": res.status,
+                "browser_started": events["browser_started"],
+                "clicks": events["clicks"],
+            }}
+
+        out = asyncio.run(go())
+        sys.stdout.write(json.dumps(out))
+    """)
+
+    repo_root = os.fspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    proc = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", child_script],
+        capture_output=True, text=True, timeout=60, check=False,
+        env={**os.environ, "PYTHONPATH": repo_root},
+    )
+    if proc.returncode != 0:
+        pytest.fail(
+            f"child process failed:\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+    try:
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError) as exc:
+        pytest.fail(f"child stdout not JSON: {exc}\nstdout={proc.stdout!r}")
+
+    assert out["status"] == "submit_unverified_unresolved", (
+        f"fresh session must refuse the resubmit; got status={out['status']!r}"
+    )
+    assert out["browser_started"] is False, (
+        f"session must NOT launch the browser on a reconciliation hold; "
+        f"got browser_started={out['browser_started']}"
+    )
+    assert out["clicks"] == 0, (
+        f"no submit clicks may fire; got clicks={out['clicks']}"
+    )
+    # Ledger must not have been mutated by the refused attempt.
+    rec = SubmissionLedger(ledger_path).record(key)
+    assert rec is not None and rec.get("phase") == PHASE_UNVERIFIED, (
+        f"ledger must remain PHASE_UNVERIFIED after refusal; got {rec!r}"
+    )
 
 
 # --------------------------------------------------------------------------- #
