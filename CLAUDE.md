@@ -33,3 +33,9 @@ Each scraper gets an isolated profile under `state/sessions/<name>_profile/`.
 ## Branch protection
 Never push directly to `main`. Always use a feature branch.
 Never use `--no-verify` to skip pre-commit hooks.
+
+## Source verification before quoting
+
+When a subagent, tool, or external report cites a `file:line` claim about this repo, verify it against the actual source before presenting or acting on it. Read the referenced file, run the referenced grep, or execute the referenced test yourself. Quoting a claim you have not verified — especially regex behavior, control-flow assertions, or "this pattern already matches X" — is exactly how false-confidence proposals ("just tighten the regex") get past review. If verification is skipped due to time or scope, say so explicitly.
+
+Applies equally to: subagent investigation reports (Explore, general-purpose), Codex/OpenHands reviews, static-analysis output, and any AI-authored suggestion that would land in a PR. Regression tests derived from a real observed failure are the only durable check; adopted-without-verification claims are not.
