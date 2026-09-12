@@ -101,15 +101,46 @@ _MAX_ATTEMPTS: dict[BlockerClass, int] = {
 
 
 def classify(status: str | None) -> BlockerClass:
-    """Map an apply-outcome status string to its control-flow class."""
+    """Map an apply-outcome status string to its control-flow class.
+
+    Static _STATUS_TO_CLASS is authoritative. For statuses it doesn't
+    cover, we consult the model-backed cache in
+    :mod:`blocker_intelligence` — populated in the background from the
+    per-source funnel history — before falling back to UNKNOWN.
+    """
     if not status:
         return BlockerClass.UNKNOWN
-    return _STATUS_TO_CLASS.get(status.strip(), BlockerClass.UNKNOWN)
+    key = status.strip()
+    static = _STATUS_TO_CLASS.get(key)
+    if static is not None:
+        return static
+    # Fall back to the model-classified cache (sync read; never blocks).
+    try:
+        from src.blocker_intelligence import classified_status
+        verdict = classified_status(key, [])
+        if verdict:
+            return BlockerClass(verdict)
+    except Exception:
+        pass
+    return BlockerClass.UNKNOWN
 
 
-def max_attempts(status: str | None) -> int:
-    """Retry cap for the given status's class."""
-    return _MAX_ATTEMPTS[classify(status)]
+def max_attempts(status: str | None, source: str = "") -> int:
+    """Retry cap for the given status's class.
+
+    When *source* is provided and the (source, status) pair has proven
+    doomed in the persisted funnel (0 successes over ≥5 attempts), the
+    cap is lowered adaptively — never raised above the static ceiling.
+    """
+    static = _MAX_ATTEMPTS[classify(status)]
+    if not source or not status:
+        return static
+    try:
+        from src.blocker_intelligence import adaptive_cap
+        adjusted, _reason = adaptive_cap(source, status.strip(), static)
+        return adjusted
+    except Exception:
+        return static
 
 
 def needs_preflight_reauth(
@@ -146,11 +177,19 @@ def preflight_reauth_viable(source: str) -> tuple[bool, str]:
     return True, ""
 
 
-def should_attempt(last_status: str | None, attempt_count: int) -> tuple[bool, str]:
+def should_attempt(
+    last_status: str | None,
+    attempt_count: int,
+    source: str = "",
+) -> tuple[bool, str]:
     """Decide whether to attempt a job given its last outcome and attempt count.
 
     Returns (attempt, skip_reason). skip_reason is empty when attempt is True.
     A job never attempted (no last_status) is always attempted.
+
+    *source* enables the adaptive cap in :func:`max_attempts` — a
+    (source, status) pair proven doomed in the persisted funnel history
+    has its cap lowered so unwinnable jobs stop consuming attempts.
     """
     if not last_status:
         return True, ""  # never tried — always attempt
@@ -159,9 +198,13 @@ def should_attempt(last_status: str | None, attempt_count: int) -> tuple[bool, s
     if cls is BlockerClass.SUCCESS:
         return False, "already applied"
 
-    cap = _MAX_ATTEMPTS[cls]
+    cap = max_attempts(last_status, source=source)
     if cap == 0:
         return False, f"{cls.value} blocker — will not retry: {last_status}"
     if attempt_count >= cap:
-        return False, f"{cls.value} retry cap reached ({attempt_count}/{cap}): {last_status}"
+        # Include an adaptive-cap note when the effective cap was lowered
+        # below the static ceiling, so the log shows *why* the retry stopped.
+        static = _MAX_ATTEMPTS[cls]
+        suffix = f" [adaptive; static={static}]" if cap < static else ""
+        return False, f"{cls.value} retry cap reached ({attempt_count}/{cap}){suffix}: {last_status}"
     return True, ""

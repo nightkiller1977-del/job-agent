@@ -864,6 +864,10 @@ class StateManager:
         failure_hist: dict = {}
         cluster_hist: dict = {}
         per_source: dict = {}
+        # {source: {status: {"attempts": N, "submitted": M, "sample_reasons": [..≤5]}}}
+        # Feeds :mod:`blocker_intelligence` — the model classifier reasons
+        # over per-status success rates rather than static per-class caps.
+        per_source_status: dict = {}
 
         for r in rows:
             status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
@@ -880,10 +884,18 @@ class StateManager:
             src = r["source"] or "unknown"
             ps = per_source.setdefault(src, {"attempts": 0, "submitted": 0})
             ps["attempts"] += 1
+            pss = per_source_status.setdefault(src, {}).setdefault(
+                str(last), {"attempts": 0, "submitted": 0, "sample_reasons": []}
+            )
+            pss["attempts"] += 1
+            reason_text = extra.get("apply_last_detail") or extra.get("apply_last_reason") or ""
+            if reason_text and len(pss["sample_reasons"]) < 5 and reason_text not in pss["sample_reasons"]:
+                pss["sample_reasons"].append(reason_text)
 
             if was_submitted:
                 submitted += 1
                 ps["submitted"] += 1
+                pss["submitted"] += 1
             else:
                 failure_hist[last] = failure_hist.get(last, 0) + 1
                 cluster = self._cluster_for(last)
@@ -893,6 +905,9 @@ class StateManager:
 
         for ps in per_source.values():
             ps["rate"] = (ps["submitted"] / ps["attempts"]) if ps["attempts"] else 0.0
+        for src_map in per_source_status.values():
+            for pss in src_map.values():
+                pss["rate"] = (pss["submitted"] / pss["attempts"]) if pss["attempts"] else 0.0
 
         return {
             "total_jobs": total,
@@ -903,6 +918,7 @@ class StateManager:
             "failure_histogram": dict(sorted(failure_hist.items(), key=lambda x: -x[1])),
             "failure_clusters": dict(sorted(cluster_hist.items(), key=lambda x: -x[1])),
             "per_source": per_source,
+            "per_source_status": per_source_status,
             "wasted_retries": wasted_retries,
         }
 
