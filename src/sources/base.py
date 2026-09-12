@@ -528,6 +528,118 @@ class BaseScraper(ABC):
         """Returns True if the page URL contains the expected domain."""
         return expected_domain in page.url
 
+    async def _try_email_otp(
+        self,
+        page,
+        sender_pattern: str,
+        subject_pattern: str,
+        code_input_selectors: Optional[list[str]] = None,
+        submit_selectors: Optional[list[str]] = None,
+        imap_timeout: int = 90,
+    ) -> Optional[str]:
+        """Look for a 6-digit OTP input on *page*, pull the code from the
+        IMAP mailbox configured for this account, and fill/submit it.
+
+        Returns the code that was submitted, or None if the OTP input
+        wasn't found, IMAP isn't configured, or the code never arrived.
+        Uses the same resolver USAJobs uses (EMAIL_2FA_ADDRESS →
+        <SRC>_EMAIL → IMAP_USER for the address, IMAP_PASSWORD +
+        ICLOUD_APP_PASSWORD_* for the app-specific password) so one
+        rotation covers every scraper without per-source config.
+        """
+        import asyncio
+        from src.email_helper import resolve_imap_credentials, retrieve_email_2fa_code
+
+        code_selectors = code_input_selectors or [
+            'input[autocomplete="one-time-code"]',
+            'input[name="code"]',
+            'input[name="pin"]',
+            'input[name="verification-code"]',
+            'input[name="verificationCode"]',
+            '#code',
+            'input[name*="code" i][type="text"]',
+            'input[id*="code" i][type="text"]',
+            'input[name*="otp" i]',
+            'input[id*="otp" i]',
+            'input[inputmode="numeric"][maxlength="6"]',
+        ]
+        submit_sels = submit_selectors or [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Submit")',
+            'button:has-text("Verify")',
+            'button:has-text("Continue")',
+        ]
+
+        code_input = None
+        for sel in code_selectors:
+            try:
+                el = await page.wait_for_selector(sel, timeout=2000)
+                if el and await el.is_visible():
+                    code_input = el
+                    break
+            except Exception:
+                continue
+        if not code_input:
+            return None
+
+        email_addr, imap_password = resolve_imap_credentials()
+        if not email_addr or not imap_password:
+            console.print(
+                f"[yellow]{self.name.capitalize()}:[/yellow] OTP field detected but no "
+                f"IMAP app password configured (IMAP_PASSWORD or ICLOUD_APP_PASSWORD_*) — "
+                f"can't auto-pull the emailed code."
+            )
+            return None
+
+        console.print(
+            f"[cyan]{self.name.capitalize()}:[/cyan] OTP field detected — polling "
+            f"{email_addr} for the emailed code…"
+        )
+        loop = asyncio.get_running_loop()
+        code = await loop.run_in_executor(
+            None,
+            retrieve_email_2fa_code,
+            email_addr,
+            imap_password,
+            sender_pattern,
+            subject_pattern,
+            "",
+            imap_timeout,
+        )
+        if not code:
+            console.print(
+                f"[yellow]{self.name.capitalize()}:[/yellow] No matching OTP email "
+                f"(from *{sender_pattern}*, subject *{subject_pattern}*) within "
+                f"{imap_timeout}s."
+            )
+            return None
+
+        try:
+            await code_input.fill(code)
+            await self._delay(0.5, 1)
+            for sub_sel in submit_sels:
+                try:
+                    btn = await page.query_selector(sub_sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        break
+                except Exception:
+                    continue
+            else:
+                # No submit button clicked — try Enter on the field itself.
+                try:
+                    await code_input.press("Enter")
+                except Exception:
+                    pass
+            await self._delay(2, 3)
+            return code
+        except Exception as exc:
+            console.print(
+                f"[yellow]{self.name.capitalize()}:[/yellow] Failed to submit OTP: {exc}"
+            )
+            return None
+
     @abstractmethod
     async def scrape(self) -> list[dict]:
         """

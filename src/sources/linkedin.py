@@ -344,6 +344,27 @@ class LinkedInScraper(BaseScraper):
                     await self._save_session()
                     return True
                 if "checkpoint" in cur or "challenge" in cur:
+                    # LinkedIn's most common challenge is a 6-digit code
+                    # emailed to the account. Try to pull it from IMAP
+                    # before giving up on manual intervention.
+                    otp = await self._try_email_otp(
+                        page,
+                        sender_pattern="security-noreply@linkedin.com",
+                        subject_pattern="verification code",
+                        imap_timeout=90,
+                    )
+                    if otp:
+                        console.print("[green]LinkedIn: ✓ Submitted emailed OTP; waiting for redirect…[/green]")
+                        # Give LinkedIn a moment to redirect off the challenge page
+                        for _ in range(15):
+                            await asyncio.sleep(2)
+                            after = page.url
+                            if any(m in after for m in ("/feed", "/jobs", "/mynetwork")):
+                                console.print("[green]LinkedIn: ✓ Auto-login successful! Session saved.[/green]")
+                                await self._save_session()
+                                return True
+                            if "checkpoint" not in after and "challenge" not in after:
+                                break
                     console.print("[yellow]LinkedIn: Security checkpoint detected — manual action needed.[/yellow]")
                     return False
 

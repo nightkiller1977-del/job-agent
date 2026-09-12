@@ -1364,6 +1364,7 @@ class JobrightScraper(BaseScraper):
 
             # Step 5: Wait for redirect to jobs page (up to 30s)
             console.print("[magenta]Jobright:[/magenta] Waiting for login to complete…")
+            otp_tried = False
             for attempt in range(15):
                 await asyncio.sleep(2)
                 cur = page.url
@@ -1376,6 +1377,19 @@ class JobrightScraper(BaseScraper):
                 # Only log on first check and halfway through to avoid spamming output
                 if attempt == 0 or attempt == 7:
                     console.print(f"[dim]  Still waiting ({attempt * 2}s)… URL: {cur}[/dim]")
+                # After the first few seconds try the emailed-OTP path exactly
+                # once — Jobright often lands on a "check your email" step
+                # rather than a redirect.
+                if not otp_tried and attempt >= 2:
+                    otp_tried = True
+                    otp = await self._try_email_otp(
+                        page,
+                        sender_pattern="jobright.ai",
+                        subject_pattern="verification code",
+                        imap_timeout=90,
+                    )
+                    if otp:
+                        console.print("[green]Jobright: ✓ Submitted emailed OTP; waiting for redirect…[/green]")
 
             console.print(f"[red]Jobright: Login redirect timed out after 30s. URL: {page.url}[/red]")
             return False
