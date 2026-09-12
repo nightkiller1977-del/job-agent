@@ -29,7 +29,11 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Pin explicitly (not `lts`) so HP local runs (node v24.x) and CI
+          # exercise the SAME JavaScript runtime for the _RECEIPT_JS harness.
+          # A drift here silently changes regex-engine behavior on some
+          # newer syntax; pinning removes that surface.
+          node-version: "24"
 
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
