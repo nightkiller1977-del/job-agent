@@ -1329,7 +1329,25 @@ class JobrightScraper(BaseScraper):
             await email_input.fill(email)
             await self._delay(0.5, 1)
 
-            pwd_input = await page.wait_for_selector('input[type="password"]', timeout=5000)
+            # Some login flows are 2-step (email → Continue → password),
+            # so if the password field isn't immediately visible, try to
+            # click a Continue/Next button first.
+            pwd_input = await page.query_selector('input[type="password"]')
+            if not pwd_input or not await pwd_input.is_visible():
+                for step1_sel in [
+                    'button:has-text("Continue")',
+                    'button:has-text("Next")',
+                    'button[type="submit"]',
+                ]:
+                    try:
+                        btn = await page.query_selector(step1_sel)
+                        if btn and await btn.is_visible():
+                            await btn.click()
+                            await self._delay(1, 2)
+                            break
+                    except Exception:
+                        continue
+                pwd_input = await page.wait_for_selector('input[type="password"]', timeout=5000)
             if not pwd_input:
                 console.print("[red]Jobright:[/red] Could not find password input.")
                 return False
@@ -1362,23 +1380,49 @@ class JobrightScraper(BaseScraper):
                 # Try pressing Enter on the password field
                 await pwd_input.press("Enter")
 
-            # Step 5: Wait for redirect to jobs page (up to 30s)
+            # Step 5: Wait for redirect off the login page (up to 30s).
+            # Jobright rewrites its post-login landing spot fairly often
+            # (/jobs, /dashboard, /home, /matched, /onboard, /profile, /),
+            # so accept ANY jobright.ai URL that isn't a login/signup page
+            # AND has a DOM signal that the user is authenticated (no
+            # visible Sign In button, or a user-menu / avatar element).
             console.print("[magenta]Jobright:[/magenta] Waiting for login to complete…")
             otp_tried = False
+            login_url_markers = ("/login", "/signin", "/signup", "/register")
             for attempt in range(15):
                 await asyncio.sleep(2)
                 cur = page.url
-                if "jobright.ai/jobs" in cur or "jobright.ai/dashboard" in cur or "jobright.ai/home" in cur:
-                    console.print("[green]Jobright: ✓ Auto-login successful! Session saved.[/green]")
-                    await self._save_session()
-                    await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=20000)
-                    await self._delay(2, 3)
-                    return True
+                on_jobright = "jobright.ai" in cur
+                off_login_page = not any(m in cur for m in login_url_markers)
+                if on_jobright and off_login_page:
+                    # DOM probe: a logged-out page still shows a "Sign In"
+                    # button in the header; a logged-in one does not.
+                    still_logged_out = await self._safe_evaluate(
+                        page,
+                        """
+                        () => {
+                            const buttons = Array.from(document.querySelectorAll('button, a'));
+                            return buttons.some(el => {
+                                const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                return t === 'sign in' || t === 'log in' || t === 'sign up';
+                            });
+                        }
+                        """,
+                        default=False,
+                    )
+                    if not still_logged_out:
+                        console.print(
+                            f"[green]Jobright: ✓ Auto-login successful (landed on {cur}). Session saved.[/green]"
+                        )
+                        await self._save_session()
+                        await page.goto(JOBRIGHT_MATCHED_URL, wait_until="domcontentloaded", timeout=20000)
+                        await self._delay(2, 3)
+                        return True
                 # Only log on first check and halfway through to avoid spamming output
                 if attempt == 0 or attempt == 7:
                     console.print(f"[dim]  Still waiting ({attempt * 2}s)… URL: {cur}[/dim]")
                 # After the first few seconds try the emailed-OTP path exactly
-                # once — Jobright often lands on a "check your email" step
+                # once — Jobright sometimes lands on a "check your email" step
                 # rather than a redirect.
                 if not otp_tried and attempt >= 2:
                     otp_tried = True
