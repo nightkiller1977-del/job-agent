@@ -310,3 +310,106 @@ def fill_missing(names: tuple[str, ...] | list[str] | None = None) -> list[str]:
 def clear_cache() -> None:
     """Drop the cached store read (tests / after the store is rewritten)."""
     _read_store.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Purpose-based key discovery
+# ---------------------------------------------------------------------------
+#
+# Every credential in the store has a purpose (IMAP inbox password, an
+# LLM API key, a source-site login, …) but not always a name we recognize.
+# CANONICAL_KEYS lets fill_missing() hydrate a fixed list into os.environ,
+# but a rotation that renames the key — or a store the user set up with
+# a different naming convention — falls out of reach silently. discover_by_purpose
+# scans EVERY key visible in the store, classifies it by regex against its name,
+# and returns the candidates in priority order.
+#
+# Add a purpose here (not in every caller) and every scraper picks it up.
+import re as _re
+
+_PURPOSE_PATTERNS: dict[str, tuple[_re.Pattern, ...]] = {
+    # IMAP inbox app-specific passwords. Ordered: explicit IMAP names, then
+    # iCloud/Apple app-password variants, then anything that looks like an
+    # app password / API key for mail. Patterns use .search() so a suffix
+    # like _MAC, _PERSONAL, _ICLOUD after PASSWORD is honored.
+    "imap_password": (
+        _re.compile(r"^IMAP.*PASSWORD", _re.IGNORECASE),
+        _re.compile(r"^IMAP.*(TOKEN|KEY)", _re.IGNORECASE),
+        _re.compile(r"^(ICLOUD|APPLE).*APP.*(PASSWORD|SPECIFIC)", _re.IGNORECASE),
+        _re.compile(r"^(ICLOUD|APPLE).*(IMAP|MAIL).*PASSWORD", _re.IGNORECASE),
+        _re.compile(r"^(ICLOUD|APPLE).*(API_KEY|KEY|TOKEN)", _re.IGNORECASE),
+        _re.compile(r"^MAIL.*(PASSWORD|APP.*PASSWORD)", _re.IGNORECASE),
+    ),
+    "imap_address": (
+        _re.compile(r"^EMAIL.*2FA.*ADDRESS", _re.IGNORECASE),
+        _re.compile(r"^IMAP.*(USER|EMAIL|ADDRESS)", _re.IGNORECASE),
+        _re.compile(r"^(NOTIFY|APPROVAL).*EMAIL", _re.IGNORECASE),
+    ),
+}
+
+
+def _all_store_keys() -> list[str]:
+    """Every key visible in the central store (plaintext .env + SOPS-decrypted, plus
+    the aicc-secrets CLI's `list` output if it supports one). Deduplicated, in a
+    stable order. Values are not returned here — callers use resolve_secret() to
+    read them so the CLI/SOPS access rules stay in one place."""
+    names: dict[str, None] = {}  # dict preserves insertion order → stable
+    if shutil.which("aicc-secrets"):
+        for sub in (["list"], ["list", "--names"], ["keys"]):
+            try:
+                res = subprocess.run(
+                    ["aicc-secrets", *sub],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except Exception:
+                continue
+            if res.returncode != 0:
+                continue
+            for line in res.stdout.splitlines():
+                # Accept plain names or `NAME=value` — take the name half.
+                token = line.strip().split("=", 1)[0].strip()
+                if token and _re.fullmatch(r"[A-Z0-9_]+", token):
+                    names[token] = None
+            if names:
+                break
+    for name in _read_store().keys():
+        names[name] = None
+    return list(names.keys())
+
+
+def discover_by_purpose(
+    purpose: str,
+    *,
+    filter_regex: str | None = None,
+    max_candidates: int = 8,
+) -> list[str]:
+    """Return names of secrets in the central store whose NAMES match *purpose*.
+
+    Ordering: patterns are tried in the order declared in _PURPOSE_PATTERNS,
+    and within a pattern the store's own key order is preserved. Duplicates
+    are removed so an early pattern always wins.
+
+    filter_regex lets a caller narrow further (e.g. addresses matching an
+    iCloud domain). It's applied to the KEY NAME, not the value — the caller
+    is expected to resolve() the value itself.
+    """
+    patterns = _PURPOSE_PATTERNS.get(purpose, ())
+    if not patterns:
+        return []
+    keys = _all_store_keys()
+    narrow = _re.compile(filter_regex) if filter_regex else None
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for pat in patterns:
+        for name in keys:
+            if name in seen:
+                continue
+            if not pat.search(name):
+                continue
+            if narrow and not narrow.search(name):
+                continue
+            ranked.append(name)
+            seen.add(name)
+            if len(ranked) >= max_candidates:
+                return ranked
+    return ranked
