@@ -14,7 +14,7 @@ from rich.console import Console
 
 from .base import AtsAdapter
 from .context import AtsApplyContext, AtsApplyResult
-from .receipt import verify_receipt
+from .receipt import capture_receipt_evidence, verify_receipt
 
 console = Console()
 
@@ -165,11 +165,14 @@ class GenericAtsAdapter(AtsAdapter):
 
     async def _gated_submit(self, page, ctx: AtsApplyContext, submit_selectors,
                             ev, vendor: str) -> AtsApplyResult:
-        """Policy-gated submit + receipt verification, reused by every adapter.
+        """Policy-gated submit + attempt-scoped receipt verification.
 
-        Never auto-submits unless auto_submit AND the policy approves; a submit
-        *click* is only reported as success (`applied`) when a receipt is verified,
-        otherwise `submission_unverified` (Phase 0.1/0.3)."""
+        Never auto-submits unless auto_submit AND policy approves. `_submit`
+        returns a 3-state outcome: absent / dispatched / uncertain. Uncertain
+        means click() raised after the action may already have reached the page
+        or network; it is never downgraded to submit_not_found and never sent to
+        recovery for a blind second click.
+        """
         if not ctx.auto_submit:
             return AtsApplyResult.blocked(
                 "review_ready",
@@ -184,25 +187,38 @@ class GenericAtsAdapter(AtsAdapter):
                     evidence=ev_to_dict(ev),
                 )
 
-        clicked = await self._submit(page, submit_selectors)
-        if not clicked:
+        # Immutable Python-owned snapshot captured before dispatch. It survives
+        # navigation/body replacement and lets receipt.py distinguish stale page
+        # content from evidence attributable to this attempt.
+        baseline = await capture_receipt_evidence(page)
+
+        outcome = await self._submit(page, submit_selectors)
+        if outcome == "absent":
             ev.blocker_detected = "submit_not_found"
             return AtsApplyResult.blocked(
                 "submit_not_found", f"{vendor}: no submit control matched",
                 evidence=ev_to_dict(ev),
             )
 
-        # A click is not an application (Phase 0.1) — require a receipt before success.
-        # poll briefly — the ATS may confirm asynchronously after the click returns
-        verified, signal = await verify_receipt(page, retries=3, delay=0.4)
+        # Both dispatched and uncertain mean the submission MAY have gone out.
+        # Poll for fresh receipt evidence; stale evidence never ends the polling
+        # window early.
+        verified, signal = await verify_receipt(
+            page, retries=3, delay=0.4, baseline=baseline,
+        )
         if verified:
             return AtsApplyResult.ok(
                 f"{vendor}: submitted with {len(ev.fields_filled)} field(s); receipt {signal}",
                 evidence=ev_to_dict(ev), vendor=vendor, receipt=signal,
             )
+
+        detail = (
+            f"{vendor}: submit clicked (post-click wait failed); no fresh receipt observed"
+            if outcome == "uncertain"
+            else f"{vendor}: submit clicked but no fresh receipt confirmation observed"
+        )
         return AtsApplyResult.unverified(
-            f"{vendor}: submit clicked but no receipt confirmation observed",
-            evidence=ev_to_dict(ev), vendor=vendor,
+            detail, evidence=ev_to_dict(ev), vendor=vendor,
         )
 
     # ---- sub-steps -----------------------------------------------------------
@@ -229,17 +245,20 @@ class GenericAtsAdapter(AtsAdapter):
         except Exception:
             return False
 
-    async def _submit(self, page, submit_selectors) -> bool:
+    async def _submit(self, page, submit_selectors) -> str:
+        """Return absent / dispatched / uncertain for one submit control."""
         if not submit_selectors:
-            return False
+            return "absent"
         sel, el = await self._first_selector(page, submit_selectors)
         if not el:
-            return False
+            return "absent"
         try:
             await el.click()
-            return True
+            return "dispatched"
         except Exception:
-            return False
+            # Playwright click includes post-click waits; an exception does not
+            # prove that the click did not dispatch. Preserve uncertainty.
+            return "uncertain"
 
     async def _answer_questions(self, page, ctx: AtsApplyContext) -> list[str]:
         """Best-effort: read visible question labels, resolve via AnswerBank, fill.

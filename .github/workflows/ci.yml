@@ -8,6 +8,9 @@ on:
 
 jobs:
   test:
+    # Ordinary Python unit tests. Runs the same explicit file list under both
+    # supported Python versions. The receipt/submit truthfulness suites live in
+    # the separate `receipt-truthfulness` job so Chromium is installed once.
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -28,10 +31,6 @@ jobs:
       - name: Run tests
         env:
           PYTHONPATH: ${{ github.workspace }}
-        # Scope to unit tests that have no infrastructure dependencies.
-        # test_credentials and test_email_2fa need fastapi/imap — excluded.
-        # Functional/browser tests need playwright install + live creds — excluded.
-        # test_drafter_reviewer needs full JobrightScraper instantiation — excluded.
         run: |
           pytest tests/test_scorer.py \
                  tests/test_resume_tailor.py \
@@ -54,6 +53,63 @@ jobs:
                  tests/test_dashboard_mongodb_config.py \
                  -q --tb=short --asyncio-mode=auto
 
+  receipt-truthfulness:
+    # Heavyweight safety verification: exact Node matcher harness, real Chromium
+    # DOM fixtures, generic submit/ledger invariants, and active BrowserUse
+    # recovery freshness. After those focused checks pass, reuse the same runner
+    # (and installed browser) for the complete test suite so the PR cannot go
+    # green by only satisfying its own new tests.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install full-suite dependencies
+        # The full regression imports dashboard.main, whose runtime dependency
+        # set is intentionally kept in dashboard/requirements.txt. Install both
+        # dependency manifests here rather than duplicating dashboard packages
+        # into the root dev requirements.
+        run: pip install -r requirements-dev.txt -r dashboard/requirements.txt
+
+      - name: Install Playwright chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run receipt & submit truthfulness suites
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          pytest tests/test_receipt_regex_truthfulness.py \
+                 tests/test_receipt_dom_truthfulness.py \
+                 tests/test_receipt_freshness_edge_cases.py \
+                 tests/test_generic_submit_dispatch_truth.py \
+                 tests/test_recovery_receipt_freshness.py \
+                 tests/test_recovery_submit_dispatch_truth.py \
+                 tests/test_possible_submit_preservation.py \
+                 tests/test_adapter_reliability.py \
+                 tests/test_ats_generic_adapter.py \
+                 tests/test_ats_vendor_adapters.py \
+                 tests/test_vendor_cta_adapters.py \
+                 tests/test_workday_adapter.py \
+                 -q --tb=short --asyncio-mode=auto
+
+      - name: Run full regression suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        # Two profile-lock ownership tests intentionally launch headed persistent
+        # Chrome. GitHub-hosted Linux runners have no DISPLAY, so provide a virtual
+        # X server instead of changing production browser behavior to headless.
+        run: xvfb-run -a pytest tests/ -q --tb=short --asyncio-mode=auto
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -63,9 +119,6 @@ jobs:
           python-version: "3.12"
           cache: "pip"
       - run: pip install ruff
-      # E402: module-level imports after sys.path.insert (pre-existing pattern in main.py)
-      # E741: ambiguous variable name (pre-existing in email_helper.py)
-      # F841/F541: pre-existing unused variable / f-string in orchestrator.py
       - run: ruff check src/ --select=E,W,F --ignore=E501,W291,E402,E741,F841,F541
 
   secrets:

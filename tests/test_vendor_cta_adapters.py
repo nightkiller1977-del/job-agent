@@ -27,6 +27,7 @@ class _El:
 
     async def click(self):
         self.page.clicks.append(self.sel)
+        self.page._submit_dispatched = True
 
 
 class FakePage:
@@ -40,6 +41,7 @@ class FakePage:
         self.present = set(present)
         self.goto_urls = []
         self.filled, self.clicks = {}, []
+        self._submit_dispatched = False
 
     async def goto(self, url, **kw):
         self.goto_urls.append(url)
@@ -56,8 +58,13 @@ class FakePage:
             return None
         if "label" in script:              # generic questions
             return []
-        if "thank you for" in script:      # receipt
-            return self.receipt
+        visible_receipt = self.receipt if self._submit_dispatched else None
+        if "sentinel: acceptance-matcher harness" in script:  # _RECEIPT_JS
+            return visible_receipt
+        if "thank you for" in script:      # legacy detector
+            return visible_receipt
+        if "sentinel: acceptance-count harness" in script:  # _COUNT_JS
+            return 1 if visible_receipt else 0
         return None
 
     async def query_selector(self, sel):
@@ -137,7 +144,7 @@ async def test_reaches_form_then_defers_to_generic(vendor, cls):
 @pytest.mark.asyncio
 async def test_auto_submits_with_selectors_and_receipt(vendor, cls):
     """With vendor field/submit selectors present, a reached form auto-submits and,
-    given a receipt, resolves to `applied`."""
+    given a receipt that appears after the submit click, resolves to `applied`."""
     from src.adapters_patterns.ats_selectors import SELECTORS
     submit_sels = set(SELECTORS[vendor]["submit_button"])
     page = FakePage(URLS[vendor], cta_clicked=True, has_form=True, present=submit_sels,

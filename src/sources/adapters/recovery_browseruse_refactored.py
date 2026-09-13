@@ -23,7 +23,7 @@ from src.agent_config import get_config
 from src.progress_tracker import ProgressTracker
 from .base import AtsAdapter
 from .context import AtsApplyContext, AtsApplyResult
-from .receipt import verify_receipt
+from .receipt import ReceiptEvidence, capture_receipt_evidence, verify_receipt
 
 logger = logging.getLogger("job-agent.adapters.recovery_browseruse")
 
@@ -32,7 +32,6 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
     """Fallback LLM browser agent with integrated loop detection and progress tracking."""
 
     name = "browser_use_recovery_refactored"
-    # Path is resolved relative to the project root (4 levels up from this file).
     SKILLS_FILE = Path(__file__).parent.parent.parent.parent / "state" / "browseruse_skills.json"
 
     def __init__(self):
@@ -43,19 +42,15 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
         self.browser_config = self.config.browser_recovery
 
     async def can_handle(self, ctx: AtsApplyContext) -> float:
-        # Lowest priority routing (0.05) — only picked as explicit fallback
         return 0.05
 
     async def apply(self, ctx: AtsApplyContext) -> AtsApplyResult:
-        # Honour the enabled flag — allow callers to disable recovery via config.
         if not self.browser_config.enabled:
             return AtsApplyResult.blocked(
                 status="form_not_reached",
                 detail="Browser Use recovery is disabled via configuration.",
             )
 
-        # Policy gate: an LLM agent that can click submit MUST be authorized
-        # before it starts. No LLM path submits outside this check.
         policy = getattr(ctx, "policy", None)
         allow_submit = False
         if policy is not None:
@@ -73,7 +68,6 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
         logger.info(f"Initiating Browser Use recovery for job URL: {ctx.url}")
         domain = urllib.parse.urlparse(ctx.url).netloc.lower()
 
-        # Initialize progress tracker with config
         pm = self.browser_config.progress_metrics
         progress_tracker = ProgressTracker(
             max_repeated_states=self.browser_config.loop_detection.max_repeated_states,
@@ -85,22 +79,25 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
             state_change_target_ratio=pm.state_change_target_ratio,
         )
 
-        # 1. Attempt to replay existing domain skills if recorded
+        # Replay recorded skills first. Receipt evidence is only eligible after a
+        # submit-like action may have dispatched, and is compared with the exact
+        # snapshot captured immediately before that action.
         skills = self._load_skills(domain)
         if skills:
             logger.info(f"Replaying {len(skills)} recorded domain skills for {domain}...")
-            success, replay_possible_submit = await self._replay_skills(ctx.page, skills, ctx.resume_path)
+            success, replay_possible_submit, replay_baseline = await self._replay_skills(
+                ctx.page, skills, ctx.resume_path
+            )
             if success:
                 logger.info(f"Domain skills replay succeeded for {domain}!")
-                verified, signal = await verify_receipt(ctx.page)
-                if verified:
-                    return AtsApplyResult.ok(detail=f"Application submitted via domain skills replay (receipt {signal}).")
-                if replay_possible_submit:
-                    # A submit-like click executed with no receipt confirmation —
-                    # ambiguous post-click state, never re-drivable (submission-truth
-                    # invariant). The session/ledger reconcile it.
+                if replay_possible_submit and replay_baseline is not None:
+                    verified, signal = await verify_receipt(ctx.page, baseline=replay_baseline)
+                    if verified:
+                        return AtsApplyResult.ok(
+                            detail=f"Application submitted via domain skills replay (receipt {signal})."
+                        )
                     return AtsApplyResult.unverified(
-                        detail="Domain skills replay clicked a submit control but no receipt was confirmed."
+                        detail="Domain skills replay clicked a submit control but no fresh receipt was confirmed."
                     )
                 return AtsApplyResult.blocked(
                     status="review_ready",
@@ -108,32 +105,25 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 )
 
             if replay_possible_submit:
-                # Replay failed AFTER a submit-like click — falling through to the
-                # LLM loop would re-drive a form that may already be submitted.
                 return AtsApplyResult.unverified(
                     detail="Skill replay failed after clicking a submit control; not re-driving the form."
                 )
             logger.warning(f"Replay failed for {domain}, falling back to LLM agent loop.")
 
-        # 2. Run LLM-guided browser agent loop with progress tracking
         steps_recorded = []
         step = 0
         possible_submit = False
+        receipt_baseline: ReceiptEvidence | None = None
 
         while step < self.browser_config.max_steps:
             step += 1
             logger.info(f"Running LLM agent step {step}/{self.browser_config.max_steps}...")
 
-            # Gather page state
             elements = await self._get_interactive_elements(ctx.page)
             body_text = await ctx.page.locator("body").inner_text()
             title = await ctx.page.title()
-            # Incorporate current input values into the snapshot so that
-            # filling a field (which doesn't change body text) still
-            # produces a new hash and is not classified as a repeated state.
             page_snapshot = body_text + "|inputs:" + await self._get_input_values_snapshot(ctx.page)
 
-            # Record state for progress tracking
             progress_tracker.record_state(
                 body_text=page_snapshot,
                 title=title,
@@ -142,19 +132,20 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 has_submit=any(e["tag"] == "button" and "submit" in e.get("text", "").lower() for e in elements),
             )
 
-            # Check for a verified receipt (URL-based or confirmation copy).
-            # verify_receipt() uses specific patterns that are resistant to false
-            # positives from form label text such as "Email confirmation".
-            verified, signal = await verify_receipt(ctx.page)
-            if verified:
-                logger.info(f"Receipt verified at step {step}: {signal}")
-                if steps_recorded:
-                    self._save_skills(domain, steps_recorded)
-                if self.config.telemetry.track_step_efficiency:
-                    logger.info(f"Loop completed successfully in {step} steps")
-                return AtsApplyResult.ok(detail=f"Application submitted (receipt {signal}).")
+            # Never trust a receipt that predates this recovery attempt's submit.
+            # Before possible_submit becomes true, a confirmation-looking banner is
+            # merely page state. After dispatch, only evidence fresh relative to the
+            # pre-submit snapshot can complete the application.
+            if possible_submit and receipt_baseline is not None:
+                verified, signal = await verify_receipt(ctx.page, baseline=receipt_baseline)
+                if verified:
+                    logger.info(f"Fresh receipt verified at step {step}: {signal}")
+                    if steps_recorded:
+                        self._save_skills(domain, steps_recorded)
+                    if self.config.telemetry.track_step_efficiency:
+                        logger.info(f"Loop completed successfully in {step} steps")
+                    return AtsApplyResult.ok(detail=f"Application submitted (receipt {signal}).")
 
-            # Check for loops BEFORE exceeding max_steps
             if self.browser_config.loop_detection.enabled:
                 loop_result = progress_tracker.detect_loop()
                 if loop_result.is_looping:
@@ -175,7 +166,6 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                         detail=f"Loop detected: {loop_result.reason}. Agent not making progress toward submission."
                     )
 
-            # Build improved LLM prompt with progress context
             state_desc = {
                 "url": ctx.page.url,
                 "title": title,
@@ -183,13 +173,9 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 "interactive_elements": elements
             }
 
-            # Get progress context for the LLM
             progress_context = progress_tracker.get_progress_context()
-
-            # Build enhanced system and user prompts
             system_prompt = self._build_system_prompt(progress_context)
             user_prompt = self._build_user_prompt(state_desc, ctx, progress_context)
-
             messages = [{"role": "user", "content": user_prompt}]
 
             try:
@@ -217,12 +203,12 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 logger.info("LLM declared form filling complete.")
                 if steps_recorded:
                     self._save_skills(domain, steps_recorded)
-                verified, signal = await verify_receipt(ctx.page)
-                if verified:
-                    return AtsApplyResult.ok(detail=f"Application submitted (receipt {signal}).")
-                if possible_submit:
+                if possible_submit and receipt_baseline is not None:
+                    verified, signal = await verify_receipt(ctx.page, baseline=receipt_baseline)
+                    if verified:
+                        return AtsApplyResult.ok(detail=f"Application submitted (receipt {signal}).")
                     return AtsApplyResult.unverified(
-                        detail="LLM declared done after a submit-like click, but no receipt was confirmed."
+                        detail="LLM declared done after a submit-like click, but no fresh receipt was confirmed."
                     )
                 return AtsApplyResult.blocked(
                     status="review_ready",
@@ -237,9 +223,10 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                     )
                 return AtsApplyResult.blocked(status="submit_not_found", detail=f"LLM failed: {action_data.get('explanation')}")
 
-            # Execute selected action. Uncertainty is tracked from dispatch, not
-            # success, and a second submit-like click is fenced while a prior
-            # possible submission is unresolved.
+            # Capture immediately before every action. If _guarded_execute reports
+            # that this action may have submitted, this exact snapshot becomes the
+            # immutable attempt baseline. Non-submit snapshots are discarded.
+            pre_action_baseline = await capture_receipt_evidence(ctx.page)
             success, may_submit, fenced = await self._guarded_execute(
                 ctx.page, action, selector, val, ctx.resume_path,
                 fence_active=possible_submit,
@@ -254,9 +241,10 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                            "submit was unconfirmed; stopped instead of re-submitting."
                 )
             if may_submit:
+                if not possible_submit:
+                    receipt_baseline = pre_action_baseline
                 possible_submit = True
 
-            # Record action for progress tracking
             progress_tracker.record_action(
                 step=step,
                 action=action,
@@ -275,7 +263,6 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
             else:
                 logger.warning(f"Failed to execute action {action} on selector {selector}.")
 
-        # Exceeded step limit without success
         logger.error(
             f"Browser Use recovery loop exceeded step limit {self.browser_config.max_steps} "
             f"without reaching submission"
@@ -286,7 +273,6 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
                 f"progress={progress_tracker.last_progress_score:.2f}"
             )
 
-        # Log summary for debugging
         summary = progress_tracker.get_summary()
         logger.error(f"Progress summary: {summary}")
 
@@ -303,16 +289,10 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
         )
 
     def _check_success_indicators(self, body_text: str) -> bool:
-        """Check if page contains success indicators from configuration."""
         lowered = body_text.lower()
         return any(indicator in lowered for indicator in self.browser_config.success_indicators)
 
     async def _get_input_values_snapshot(self, page: Page) -> str:
-        """Return a string encoding current values of all visible form controls.
-        This is concatenated with body text before hashing so that filling a
-        field (which doesn't change visible body text) still produces a new
-        state hash and is not mis-classified as a repeated state.
-        """
         try:
             values = await page.evaluate(
                 """() => {
@@ -330,7 +310,6 @@ class BrowserUseRecoveryRefactored(AtsAdapter):
             return ""
 
     def _build_system_prompt(self, progress_context: dict) -> str:
-        """Build system prompt with progress guidance and loop warnings."""
         return f"""You are an autonomous browser agent filling out a job application form.
 Your goal is to populate required fields, upload the resume, and progress or submit the form.
 Understand the page state and select the best action from the interactive elements provided.
@@ -362,7 +341,6 @@ Respond ONLY with valid JSON matching this structure:
         ctx: AtsApplyContext,
         progress_context: dict,
     ) -> str:
-        """Build user prompt with detailed progress visualization."""
         recent_actions = progress_context.get("action_history_recent", [])
         most_used = progress_context.get("most_used_selectors", [])
 
@@ -378,7 +356,6 @@ Respond ONLY with valid JSON matching this structure:
             "",
         ]
 
-        # Add progress visualization
         if recent_actions:
             window = self.browser_config.progress_metrics.recent_action_window
             prompt_parts.append(f"Recent Actions (last {window} steps):")
@@ -408,15 +385,12 @@ Respond ONLY with valid JSON matching this structure:
         return "\n".join(prompt_parts)
 
     def _clean_json_response(self, text: str) -> dict:
-        """Parse JSON response from LLM. Raises json.JSONDecodeError on malformed output."""
         from src.json_utils import clean_model_json
         return clean_model_json(text)
 
     async def _get_interactive_elements(self, page: Page) -> List[Dict[str, Any]]:
-        """Extract interactive elements from page."""
         elements = []
         try:
-            # Inputs
             inputs = await page.query_selector_all('input:not([type="hidden"]):not([type="submit"]):not([type="file"])')
             for el in inputs[:self.browser_config.max_input_elements]:
                 name = await el.get_attribute("name") or ""
@@ -441,7 +415,6 @@ Respond ONLY with valid JSON matching this structure:
                     "selector": selector
                 })
 
-            # File inputs
             file_inputs = await page.query_selector_all('input[type="file"]')
             for el in file_inputs[:self.browser_config.max_file_input_elements]:
                 name = await el.get_attribute("name") or ""
@@ -458,7 +431,6 @@ Respond ONLY with valid JSON matching this structure:
                     "selector": selector
                 })
 
-            # Dropdowns
             selects = await page.query_selector_all("select")
             for el in selects:
                 name = await el.get_attribute("name") or ""
@@ -475,7 +447,6 @@ Respond ONLY with valid JSON matching this structure:
                     "selector": selector
                 })
 
-            # Buttons
             buttons = await page.query_selector_all('button, input[type="submit"], [role="button"]')
             for el in buttons[:self.browser_config.max_button_elements]:
                 text = (await el.inner_text() or "").strip()
@@ -503,21 +474,11 @@ Respond ONLY with valid JSON matching this structure:
 
     @staticmethod
     def _is_submit_like(action: str, selector: str, value: Any = None) -> bool:
-        """A click that may have submitted the application. Deliberately biased
-        toward false positives: wrongly flagging a click as a possible submit
-        costs one reconciliation pass, while missing a real submit frees the
-        ledger marker and risks a duplicate application (submission-truth
-        invariant, AtsApplyResult docstring)."""
         if action != "click":
             return False
         text = f"{selector or ''} {value or ''}".lower()
         return bool(re.search(r"submit|apply|send[_\- ]?application", text))
 
-    # DOM-evidence probe for a click target. Keyword matching on the selector
-    # misses a submitting control with a neutral name (button#finalize), so the
-    # matched element's actual form semantics are checked: <input type=submit|image>,
-    # <button type=submit>, or a <button> with no explicit type inside a form
-    # (HTML defaults it to submit).
     _PROBE_JS = """(sel) => {
         const el = document.querySelector(sel);
         if (!el) return "absent";
@@ -530,11 +491,6 @@ Respond ONLY with valid JSON matching this structure:
     }"""
 
     async def _probe_click_target(self, page: Page, selector: str) -> str:
-        """Classify a click target: "absent" | "submit" | "other" | "unknown".
-
-        "absent" is the only result that PROVES a click cannot dispatch; any
-        probe failure (non-CSS selector syntax, evaluate error) is "unknown" —
-        never treated as proof of no side effect."""
         try:
             res = await page.evaluate(self._PROBE_JS, selector)
             return res if res in ("absent", "submit", "other") else "unknown"
@@ -545,21 +501,6 @@ Respond ONLY with valid JSON matching this structure:
         self, page: Page, action: str, selector: str, value: Any,
         resume_path: Optional[str], fence_active: bool = False,
     ) -> tuple[bool, bool, bool]:
-        """Execute one action with submission-truth semantics.
-
-        Returns (success, may_have_submitted, fenced).
-
-        Uncertainty starts at DISPATCH, not at success: Playwright's click
-        includes post-click waiting (actionability, initiated navigation), so a
-        timeout does not prove the click never happened. A submit-like click is
-        therefore presumed possibly-dispatched unless the target provably does
-        not exist ("absent" probe) — a failure after that point keeps
-        may_have_submitted=True.
-
-        fence_active: a prior possible submission is unresolved. A further
-        submit-like click is NOT executed (fenced=True) — only reconciliation
-        may resolve the pending uncertainty, never a second submit.
-        """
         if action != "click":
             return await self._execute_action(page, action, selector, value, resume_path), False, False
 
@@ -573,13 +514,10 @@ Respond ONLY with valid JSON matching this structure:
 
         success = await self._execute_action(page, action, selector, value, resume_path)
         if probe == "absent" and not success:
-            # Provable pre-dispatch failure: the element did not exist and the
-            # click also failed — nothing was submitted, stay retryable.
             return False, False, False
         return success, True, False
 
     async def _execute_action(self, page: Page, action: str, selector: str, value: Any, resume_path: Optional[str]) -> bool:
-        """Execute a single action on the page."""
         try:
             if action == "fill":
                 await page.fill(selector, str(value))
@@ -605,19 +543,17 @@ Respond ONLY with valid JSON matching this structure:
 
     async def _replay_skills(
         self, page: Page, skills: List[Dict[str, Any]], resume_path: Optional[str]
-    ) -> tuple[bool, bool]:
-        """Replay recorded domain skills.
+    ) -> tuple[bool, bool, Optional[ReceiptEvidence]]:
+        """Replay recorded domain skills with attempt-scoped receipt evidence.
 
-        Returns (success, possible_submit). possible_submit is True once a
-        submit-like click may have DISPATCHED (not merely once it succeeded) —
-        the caller must not re-drive the form or discard that ambiguity after
-        this point. A recorded sequence containing a second submit-like action
-        after a possible submission is fenced: the second submit is never
-        dispatched while the first is unresolved.
+        Returns (success, possible_submit, receipt_baseline). The baseline is the
+        immutable snapshot captured immediately before the first action that may
+        have submitted. A second submit-like action remains fenced.
         """
         delay_s = self.browser_config.skill_replay_delay_ms / 1000
         timeout_ms = self.browser_config.step_timeout_ms
         possible_submit = False
+        receipt_baseline: ReceiptEvidence | None = None
 
         for idx, step in enumerate(skills):
             action = step.get("action")
@@ -628,12 +564,11 @@ Respond ONLY with valid JSON matching this structure:
             try:
                 await page.wait_for_selector(selector, timeout=timeout_ms)
             except Exception as e:
-                # The pre-wait never dispatches the action, so this failure is
-                # provably pre-submit for THIS step; earlier uncertainty stands.
                 logger.error(f"Skill replay failed waiting for step {idx + 1}: {e}")
-                return False, possible_submit
+                return False, possible_submit, receipt_baseline
 
             try:
+                pre_action_baseline = await capture_receipt_evidence(page)
                 success, may_submit, fenced = await self._guarded_execute(
                     page, action, selector, val, resume_path,
                     fence_active=possible_submit,
@@ -643,19 +578,20 @@ Respond ONLY with valid JSON matching this structure:
                         f"Submission fence: skill step {idx + 1} ({selector}) is a "
                         f"second submit-like action after an unresolved submit — stopping replay."
                     )
-                    return False, True
+                    return False, True, receipt_baseline
                 if may_submit:
+                    if not possible_submit:
+                        receipt_baseline = pre_action_baseline
                     possible_submit = True
                 if not success:
-                    return False, possible_submit
+                    return False, possible_submit, receipt_baseline
                 await asyncio.sleep(delay_s)
             except Exception as e:
                 logger.error(f"Skill replay failed at step {idx + 1}: {e}")
-                return False, possible_submit
-        return True, possible_submit
+                return False, possible_submit, receipt_baseline
+        return True, possible_submit, receipt_baseline
 
     def _load_skills(self, domain: str) -> List[Dict[str, Any]]:
-        """Load recorded domain skills if they exist."""
         if not self.SKILLS_FILE.exists():
             return []
         try:
@@ -667,7 +603,6 @@ Respond ONLY with valid JSON matching this structure:
             return []
 
     def _save_skills(self, domain: str, steps: List[Dict[str, Any]]):
-        """Save recorded domain skills for future reuse."""
         data = {}
         if self.SKILLS_FILE.exists():
             try:

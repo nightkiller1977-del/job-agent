@@ -21,6 +21,11 @@ class _El:
 
     async def click(self):
         self.page.clicks.append(self.sel)
+        # Final Workday submit is either an explicit submit control or, on the
+        # review page, the gated Next control. Ordinary wizard Next clicks do
+        # not create a receipt.
+        if self.sel in _SUBMIT_SELECTORS or (self.page.review and self.sel in _NEXT_SELECTORS):
+            self.page._submit_dispatched = True
         if self.sel in _NEXT_SELECTORS:
             self.page.step += 1
 
@@ -36,6 +41,7 @@ class FakeWorkdayPage:
         self.stuck = stuck
         self.review = review
         self.filled, self.clicks, self.uploaded = {}, [], {}
+        self._submit_dispatched = False
 
     async def goto(self, url, **kw):
         self.url = url
@@ -45,8 +51,13 @@ class FakeWorkdayPage:
             return True
         if "create account" in script:  # login-gate probe
             return self.login_gate
-        if "thank you for" in script:    # receipt probe
-            return self.receipt
+        visible_receipt = self.receipt if self._submit_dispatched else None
+        if "sentinel: acceptance-matcher harness" in script:  # _RECEIPT_JS
+            return visible_receipt
+        if "thank you for" in script:    # legacy detector
+            return visible_receipt
+        if "sentinel: acceptance-count harness" in script:  # _COUNT_JS
+            return 1 if visible_receipt else 0
         if "review your application" in script:  # review-page probe
             return self.review
         return None
