@@ -86,6 +86,7 @@ class ReauthPreflightResult:
     health: dict[str, SessionHealth]
     refreshed_sources: frozenset[str]
     notified_sources: frozenset[str]
+    attempted_sources: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +135,13 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
         else:
             cookie_expiry_hours = None
 
-        is_expired = (age_hours >= _EXPIRED_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 0)
+        if src == "linkedin":
+            # LinkedIn login validity is determined by auth-bearing cookies, not
+            # by the export file's mtime. File age still makes the session stale
+            # so heartbeat can refresh it proactively.
+            is_expired = cookie_expiry_hours is not None and cookie_expiry_hours <= 0
+        else:
+            is_expired = age_hours >= _EXPIRED_HOURS
         is_stale = (age_hours >= _STALE_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 4)
 
         if is_expired:
@@ -505,12 +512,14 @@ async def preflight_session_check_with_reauth(
         )
     }
     manager = ReauthManager(config or {})
+    attempted: set[str] = set()
     refreshed: set[str] = set()
     failed_forced: set[str] = set()
 
     for source in ordered_sources:
         if source not in candidates:
             continue
+        attempted.add(source)
         success = False
         try:
             success = await manager.attempt_automated(source)
@@ -523,6 +532,16 @@ async def preflight_session_check_with_reauth(
 
     if candidates:
         health = {item.source: item for item in check_session_health(ordered_sources)}
+        # An automated login is not a verified refresh until its durable session
+        # state survives the post-attempt health check. Export failures are
+        # intentionally non-fatal in BaseScraper, so the boolean alone is not
+        # sufficient evidence. A stale session is still usable; missing/expired is not.
+        refreshed = {
+            source
+            for source in refreshed
+            if (item := health.get(source)) is not None
+            and item.status not in {"expired", "missing"}
+        }
 
     notified: set[str] = set()
     for source in ordered_sources:
@@ -544,4 +563,5 @@ async def preflight_session_check_with_reauth(
         health=health,
         refreshed_sources=frozenset(refreshed),
         notified_sources=frozenset(notified),
+        attempted_sources=frozenset(attempted),
     )

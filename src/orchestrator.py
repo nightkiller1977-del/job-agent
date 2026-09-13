@@ -859,6 +859,8 @@ class Orchestrator:
         console.print(f"  ✅ Will attempt  : {len(ready)}")
         console.print(f"  \U0001f512 Session needed: {len(blocked)}")
 
+        preflight_attempted_sources: set[str] = set()
+
         if blocked:
             console.print("\n[yellow]Session-blocked (skipping in this run):[/yellow]")
             blocked_sources: set[str] = set()
@@ -903,8 +905,18 @@ class Orchestrator:
                         self.config,
                         force_reauth=force_reauth_sources,
                     )
+                    preflight_attempted_sources.update(preflight_result.attempted_sources)
                     for refreshed_source in preflight_result.refreshed_sources:
                         self._unblock_session_jobs_after_reauth(refreshed_source)
+                    if preflight_result.refreshed_sources:
+                        # Source unblocking mutates durable rows for both the blocked
+                        # set and jobs that were already classified ready. Reload the
+                        # existing ready set so the one-shot session_prepared marker
+                        # is visible to the later circuit/preflight guards.
+                        ready = [
+                            self.state.get_job(job["job_id"]) or job
+                            for job in ready
+                        ]
                 except Exception as exc:
                     # Preserve the old notification-only behavior if the new
                     # automated preflight itself fails. This fallback owns the
@@ -946,7 +958,7 @@ class Orchestrator:
         failed_count   = 0
         skipped_count  = 0
         outcomes: list[dict] = []
-        reauthed_this_run: set[str] = set()  # P3: reauth each source at most once per run
+        reauthed_this_run: set[str] = set(preflight_attempted_sources)  # includes unattended preflight ownership
         apply_reauth_mgr = ReauthManager(self.config)
         # One tailor per run so the baseline is loaded/hashed once, not per job.
         resume_tailor = ResumeTailor(self.config)
@@ -1260,6 +1272,8 @@ class Orchestrator:
                 "Apply run: nothing submitted",
                 f"0 submitted, {skipped_count} blocked, {len(blocked)} need session prep. "
                 f"Run: python src/main.py prepare-sessions",
+                dedupe_key="apply_nothing_submitted",
+                dedupe_seconds=21600,
             )
 
     # ------------------------------------------------------------------

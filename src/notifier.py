@@ -303,10 +303,9 @@ def notify_warning(
     key = f"warn:{dedupe_key}" if dedupe_key else f"warn:{title}:{detail}"
     if not notification_dedupe_active(key, dedupe_seconds):
         _send_telegram(f"⚠️ [Job Agent WARNING] {title}\nDetail: {detail}")
+        if desktop:
+            _desktop_notify(f"🟡 {title}", detail or title, subtitle="Job Agent WARNING")
         record_notification_dedupe(key)
-
-    if desktop:
-        _desktop_notify(f"🟡 {title}", detail or title, subtitle="Job Agent WARNING")
 
 
 def notify_success(title: str, detail: str = "") -> None:
