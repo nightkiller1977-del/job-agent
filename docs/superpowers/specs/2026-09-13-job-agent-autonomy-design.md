@@ -46,6 +46,8 @@ PR #121 is merged to `main` and establishes submission-truth invariants:
 
 PR #123 is test-only follow-up coverage for same-text occurrence freshness and is not on the production-autonomy critical path.
 
+PR #120 is an **input for selective porting only**, not a merge candidate for autonomy. Its branch is based on pre-#121 `main`, is currently non-mergeable against the new baseline, and mixes session work with unrelated blocker-intelligence/adaptive-retry changes. Session Autonomy must start from current `main` and port only behavior explicitly required by PR A below. `blocker_intelligence.py`, model-backed blocker classification, and adaptive retry-cap work from #120 are excluded from PR A.
+
 The remaining production autonomy gaps are concentrated in session recovery, scheduler durability, run-state recovery, and repair/model routing.
 
 ## 3. Architecture boundaries
@@ -62,7 +64,7 @@ Implementation is split into three independently reviewable PRs. Each PR must st
 - `src/orchestrator.py`
 - `src/notifier.py`
 - `src/sources/linkedin.py` where session persistence requires it
-- existing reauth/state helpers as needed
+- existing reauth/state helpers needed to clear/reload source-auth state
 - focused tests under `tests/`
 
 **Required behavior:**
@@ -77,6 +79,7 @@ Implementation is split into three independently reviewable PRs. Each PR must st
 5. Deep-link/human notifications are emitted by one path only. A failed automated reauth may fall through to one human notification, never two.
 6. Warning dedupe must persist across scheduled Python processes. A stable dedupe key and timestamp are stored in the existing durable agent-status/state area; process-local dictionaries may remain only as an optimization.
 7. Session refresh/save occurs immediately after authentication is known good so later failures do not discard rotated cookies/session state.
+8. PR A must not introduce model-backed blocker classification, adaptive retry policy, or unrelated scoring/model behavior from PR #120.
 
 **Acceptance tests:**
 
@@ -112,7 +115,7 @@ Implementation is split into three independently reviewable PRs. Each PR must st
    - `quarantined` after bounded retries;
    - `skipped_by_policy` / already applied.
 3. A single job exception must be caught at the job boundary, recorded, and the batch must continue unless the failure indicates a global unsafe condition.
-4. Retry counters and blocker classes are durable. Retry caps may be lowered by proven history but never raised beyond the static safety ceiling without an explicit future design.
+4. Retry counters and blocker classes are durable. Retry caps may be lowered by proven persisted history but never raised beyond the static safety ceiling without an explicit future design. PR B should prefer existing static blocker classification and existing retry interfaces; model-backed blocker classification is not required for autonomy.
 5. Ambiguous submit outcomes never re-enter ordinary retry/recovery; they remain held until reconciliation.
 6. Restart recovery loads durable state and resumes only jobs eligible for another attempt. Jobs already verified, held, quarantined, or policy-blocked do not re-dispatch.
 7. Scheduled launcher branch pinning remains fail-closed.
@@ -156,7 +159,7 @@ Implementation is split into three independently reviewable PRs. Each PR must st
 4. Model selection is capacity-aware:
    - prefer feasible local models and approved zero-cost routes;
    - never repeatedly load a model that exceeds current worker capacity;
-   - when no safe model is feasible, return an explicit `MODEL_CAPACITY_UNAVAILABLE`-style result and defer repair rather than crash the run;
+   - when no safe model is feasible, return the exact status `MODEL_CAPACITY_UNAVAILABLE` and defer repair rather than crash the run;
    - model failure must not change submission ledger state.
 5. Expensive/paid remote fallback remains disabled unless explicitly permitted by configuration/policy.
 
@@ -164,7 +167,7 @@ Implementation is split into three independently reviewable PRs. Each PR must st
 
 - unknown synthetic ATS failure produces a repair evidence bundle and draft PR without touching live employers;
 - repair PR cannot self-merge through the Job Agent path;
-- insufficient local capacity selects a smaller feasible model or cleanly defers;
+- insufficient local capacity selects a smaller feasible model or returns `MODEL_CAPACITY_UNAVAILABLE` cleanly;
 - model/provider outage does not change job submission/reconciliation state;
 - repair failure leaves original job quarantined/paused, not blindly retried.
 
