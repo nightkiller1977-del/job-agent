@@ -102,6 +102,7 @@ jobs:
         run: |
           pytest tests/test_receipt_regex_truthfulness.py \
                  tests/test_receipt_dom_truthfulness.py \
+                 tests/test_receipt_freshness_edge_cases.py \
                  tests/test_generic_submit_dispatch_truth.py \
                  -q --tb=short --asyncio-mode=auto
 
