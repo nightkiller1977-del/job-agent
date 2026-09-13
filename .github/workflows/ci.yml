@@ -54,10 +54,11 @@ jobs:
                  -q --tb=short --asyncio-mode=auto
 
   receipt-truthfulness:
-    # Heavyweight receipt/submit truthfulness suites: Node harness for
-    # _RECEIPT_JS + Playwright chromium for DOM behavior + full-stack
-    # session/ledger and BrowserUse recovery regressions. Runs once on
-    # Python 3.12 + Node 24.
+    # Heavyweight safety verification: exact Node matcher harness, real Chromium
+    # DOM fixtures, generic submit/ledger invariants, and active BrowserUse
+    # recovery freshness. After those focused checks pass, reuse the same runner
+    # (and installed browser) for the complete test suite so the PR cannot go
+    # green by only satisfying its own new tests.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,7 +89,19 @@ jobs:
                  tests/test_receipt_freshness_edge_cases.py \
                  tests/test_generic_submit_dispatch_truth.py \
                  tests/test_recovery_receipt_freshness.py \
+                 tests/test_recovery_submit_dispatch_truth.py \
+                 tests/test_possible_submit_preservation.py \
+                 tests/test_adapter_reliability.py \
+                 tests/test_ats_generic_adapter.py \
+                 tests/test_ats_vendor_adapters.py \
+                 tests/test_vendor_cta_adapters.py \
+                 tests/test_workday_adapter.py \
                  -q --tb=short --asyncio-mode=auto
+
+      - name: Run full regression suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: pytest tests/ -q --tb=short --asyncio-mode=auto
 
   lint:
     runs-on: ubuntu-latest
