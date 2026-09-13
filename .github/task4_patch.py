@@ -1,0 +1,101 @@
+from pathlib import Path
+
+path = Path("src/orchestrator.py")
+text = path.read_text()
+
+old_import = "from .session_watchdog import preflight_session_check\n"
+new_import = (
+    "from .session_watchdog import (\n"
+    "    preflight_session_check,\n"
+    "    preflight_session_check_with_reauth,\n"
+    ")\n"
+)
+if text.count(old_import) != 1:
+    raise SystemExit(f"expected exactly one watchdog import, found {text.count(old_import)}")
+text = text.replace(old_import, new_import, 1)
+
+start_marker = "        if blocked:\n"
+end_marker = "\n        if not ready:\n"
+apply_start = text.find("    async def apply_approved(")
+start = text.find(start_marker, apply_start)
+if start < 0:
+    raise SystemExit("Task 4 blocked-section start marker not found")
+end = text.find(end_marker, start)
+if end < 0:
+    raise SystemExit("Task 4 blocked-section end marker not found")
+
+new_block = '''        if blocked:
+            console.print("\\n[yellow]Session-blocked (skipping in this run):[/yellow]")
+            blocked_sources: set[str] = set()
+            force_reauth_sources: set[str] = set()
+
+            for bj, readiness, reason in blocked:
+                console.print(
+                    f"  • {readiness}: {bj.get('title','?')[:50]} @ {bj.get('company','?')}"
+                )
+                console.print(f"    [dim]{reason}[/dim]")
+                bj_source = str(bj.get("source") or "").lower()
+                if bj_source:
+                    blocked_sources.add(bj_source)
+
+                # Only the discovery source's OWN auth statuses may force source
+                # reauth. External ATS walls (Workday/Microsoft/BrassRing/etc.)
+                # must survive even when the discovery-source session refreshes.
+                bj_extra = parse_extra_json(bj.get("extra_json"))
+                bj_last_status = str(bj_extra.get("apply_last_status") or "")
+                own_statuses = _OWN_SESSION_STATUSES_ANY | _OWN_SESSION_STATUSES.get(
+                    bj_source, set()
+                )
+                if (
+                    bj_source in AUTOMATED_SOURCES
+                    and bj_last_status in own_statuses
+                ):
+                    force_reauth_sources.add(bj_source)
+
+                # A preflight block is not an application attempt. Preserve any
+                # concrete portal status so prepare-sessions can still route the
+                # job if unattended source reauth cannot make it ready.
+                if readiness in {"needs-session", "needs-portal-login", "needs-review"}:
+                    self.state.record_preflight_block(bj["job_id"], readiness, reason)
+                else:
+                    self.state.record_apply_attempt(bj["job_id"], readiness, reason)
+                await self._push_apply_attempt_to_cloud(bj["job_id"])
+
+            if not is_interactive and blocked_sources:
+                try:
+                    preflight_result = await preflight_session_check_with_reauth(
+                        list(blocked_sources),
+                        self.config,
+                        force_reauth=force_reauth_sources,
+                    )
+                    for refreshed_source in preflight_result.refreshed_sources:
+                        self._unblock_session_jobs_after_reauth(refreshed_source)
+                except Exception as exc:
+                    # Preserve the old notification-only behavior if the new
+                    # automated preflight itself fails. This fallback owns the
+                    # human escalation exactly once for this path.
+                    _log.warning("apply.preflight_reauth_error error=%s", exc)
+                    preflight_session_check(list(blocked_sources))
+
+                # Re-read durable state after reauth/unblock mutations. Using the
+                # stale in-memory job would keep a just-recovered job blocked until
+                # the next scheduler cycle.
+                still_blocked: list[tuple] = []
+                for old_job, _old_readiness, _old_reason in blocked:
+                    fresh_job = self.state.get_job(old_job["job_id"]) or old_job
+                    new_readiness, new_reason = self._classify_apply_readiness(fresh_job)
+                    if new_readiness in BLOCKED_READINESS:
+                        still_blocked.append((fresh_job, new_readiness, new_reason))
+                    else:
+                        ready.append(fresh_job)
+                blocked = still_blocked
+
+            if not is_interactive and blocked:
+                console.print(
+                    "\\n[cyan]To fix:[/cyan] Run  python src/main.py prepare-sessions\\n"
+                    "         then re-run apply to process the session-blocked jobs."
+                )
+'''
+
+text = text[:start] + new_block + text[end:]
+path.write_text(text)
