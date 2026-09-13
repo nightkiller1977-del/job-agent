@@ -135,12 +135,22 @@ async def _run(case):
                 # signal that forces the design.
                 baseline_ok, baseline_sig = await verify_receipt(page, retries=0)
                 mutate_to = case.get("mutate_to")
+                mutate_append = case.get("mutate_append")
                 if mutate_to is not None:
                     # Real DOM mutation: set body innerHTML to the post-submit shape.
                     # No document.write — a DOM update in place, like an SPA render.
                     await page.evaluate(
                         "(html) => { document.body.innerHTML = html; }",
                         mutate_to,
+                    )
+                elif mutate_append is not None:
+                    # Preserve the pre-existing DOM and APPEND a new element.
+                    # Used to prove that an additional fresh element with the
+                    # SAME text as a stale one still counts as new evidence —
+                    # freshness must be by element occurrence, not text identity.
+                    await page.evaluate(
+                        "(html) => { document.body.insertAdjacentHTML('beforeend', html); }",
+                        mutate_append,
                     )
                 ok, sig = await verify_receipt(
                     page, retries=retries, delay=delay,
@@ -477,5 +487,61 @@ def test_confirmation_appearing_post_submit_verifies():
         f"fresh confirmation appearing post-submit MUST verify; got {r!r}. "
         f"If this fails, the freshness gate is too strict and would reject "
         f"real acceptances alongside stale ones."
+    )
+    assert r["sig"].startswith("t:")
+
+
+def test_additional_fresh_confirmation_alongside_stale_verifies():
+    """The identity-not-text case. A stale confirmation ("Application submitted.")
+    is visible before submit. After submit, an ADDITIONAL element with the SAME
+    text appears — a fresh thank-you banner rendered by the SPA in response to
+    this attempt. verify_receipt MUST report verified.
+
+    A naive freshness gate that just compares text signals (`after_sig !=
+    baseline_sig`) would fail this: both signals stringify to the same
+    't:application submitted' and the gate would report unchanged. But the
+    DOM did change — a new element carrying the same acceptance meaning
+    appeared. The invariant is freshness by element/state occurrence, not
+    text identity.
+
+    This case forces the fix's baseline representation to track evidence
+    occurrence — e.g. a set of matched element fingerprints, DOM snapshot
+    hashes, or the count of matching visible elements — not a single string.
+
+    Currently RED via `TypeError: baseline` — same as the sibling freshness
+    tests. When the fix adds `baseline=`, this test additionally proves the
+    baseline data model is expressive enough to distinguish two visible
+    elements from one.
+    """
+    initial = """
+    <html><body>
+      <aside class="stale-banner">
+        <p>Application submitted.</p>
+      </aside>
+      <form id="apply"><input name="name"/><button type="submit">Submit</button></form>
+    </body></html>
+    """
+    # Appended (not replacing) — the stale banner remains, and a new thank-you
+    # element appears alongside it. Both contain the same acceptance text.
+    appended = """
+      <div class="thank-you-fresh">
+        <h1>Application submitted.</h1>
+        <p>Thank you for applying to Acme (attempt-specific banner).</p>
+      </div>
+    """
+    r = _run_dom_case(
+        scenario="freshness_baseline_then_verify",
+        initial_html=initial, base_url=BASE_FORM_URL, retries=0, delay=0.05,
+        mutate_append=appended,
+    )
+    assert r.get("baseline_ok") is True, (
+        f"corpus assumption broken — the stale banner should have fired the "
+        f"baseline matcher (that is the setup for this test); got {r!r}"
+    )
+    assert r["ok"] is True, (
+        f"a NEW confirmation element (identical text) appearing alongside a "
+        f"stale one MUST verify — the DOM did change, and the change is "
+        f"attributable to this attempt. Got {r!r}. If freshness compares "
+        f"only text signals, this fails and real acceptances get dropped."
     )
     assert r["sig"].startswith("t:")
