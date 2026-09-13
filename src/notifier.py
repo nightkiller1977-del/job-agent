@@ -37,6 +37,49 @@ import time
 _last_notification_times: dict[str, float] = {}
 
 
+def notification_dedupe_active(
+    key: str,
+    dedupe_seconds: int,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Return True when a notification key is still inside its dedupe window.
+
+    The in-memory cache keeps hot-path checks cheap while the status file makes
+    the throttle survive launchd/cron starting a fresh Python interpreter.
+    """
+    timestamp = time.time() if now is None else now
+    cache_key = f"notification:{key}"
+    memory_value = float(_last_notification_times.get(cache_key, 0) or 0)
+    if timestamp - memory_value < dedupe_seconds:
+        return True
+
+    status = _load_status()
+    durable_value = float(status.get("notification_dedupe", {}).get(cache_key, 0) or 0)
+    if timestamp - durable_value < dedupe_seconds:
+        _last_notification_times[cache_key] = durable_value
+        return True
+    return False
+
+
+def record_notification_dedupe(key: str, *, now: float | None = None) -> None:
+    """Persist the last successful notification time for *key*."""
+    timestamp = time.time() if now is None else now
+    cache_key = f"notification:{key}"
+    status = _load_status()
+    dedupe = status.setdefault("notification_dedupe", {})
+    dedupe[cache_key] = timestamp
+    if len(dedupe) > 200:
+        newest = sorted(
+            dedupe.items(),
+            key=lambda item: float(item[1] or 0),
+            reverse=True,
+        )[:200]
+        status["notification_dedupe"] = dict(newest)
+    _save_status(status)
+    _last_notification_times[cache_key] = timestamp
+
+
 def _sanitize_notification_text(value: str) -> str:
     text = str(value or "")
     home = str(Path.home())
@@ -117,6 +160,7 @@ def _sanitize_notification_text(value: str) -> str:
     )
     return text
 
+
 def _load_telegram_config() -> tuple[str, str]:
     """Load Telegram bot token and chat ID.
 
@@ -174,6 +218,7 @@ def _send_telegram(message: str) -> None:
             pass
     except Exception:
         pass
+
 
 def _desktop_notify(title: str, message: str, subtitle: str = "Job Agent") -> None:
     """Fire a native desktop notification with rate limiting (macOS and Linux)."""
@@ -242,19 +287,23 @@ def notify_error(title: str, detail: str = "") -> None:
     _desktop_notify(f"🔴 {title}", detail or title, subtitle="Job Agent ERROR")
 
 
-def notify_warning(title: str, detail: str = "", *, desktop: bool = True) -> None:
+def notify_warning(
+    title: str,
+    detail: str = "",
+    *,
+    desktop: bool = True,
+    dedupe_key: str | None = None,
+    dedupe_seconds: int = 900,
+) -> None:
     """Signal something degraded but not fatal — login retry, skipped job."""
     title = _sanitize_notification_text(title)
     detail = _sanitize_notification_text(detail)
     _add_alert("warning", title, detail)
 
-    # Send to Telegram (rate limited by caching key)
-    now = time.time()
-    cache_key = f"tg:warn:{title}:{detail}"
-    last_time = _last_notification_times.get(cache_key, 0)
-    if now - last_time >= 900:
-        _last_notification_times[cache_key] = now
+    key = f"warn:{dedupe_key}" if dedupe_key else f"warn:{title}:{detail}"
+    if not notification_dedupe_active(key, dedupe_seconds):
         _send_telegram(f"⚠️ [Job Agent WARNING] {title}\nDetail: {detail}")
+        record_notification_dedupe(key)
 
     if desktop:
         _desktop_notify(f"🟡 {title}", detail or title, subtitle="Job Agent WARNING")
