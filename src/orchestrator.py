@@ -35,7 +35,10 @@ from .reauth import ReauthManager, AUTOMATED_SOURCES
 from .resume_helper import ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
 from .blocker_classifier import should_attempt, classify, needs_preflight_reauth, preflight_reauth_viable
 from .resume_tailor import evaluate_resume_gate, ResumeTailor
-from .session_watchdog import preflight_session_check
+from .session_watchdog import (
+    preflight_session_check,
+    preflight_session_check_with_reauth,
+)
 
 console = Console()
 _log = logging.getLogger(__name__)
@@ -858,27 +861,71 @@ class Orchestrator:
 
         if blocked:
             console.print("\n[yellow]Session-blocked (skipping in this run):[/yellow]")
-            blocked_sources = set()
+            blocked_sources: set[str] = set()
+            force_reauth_sources: set[str] = set()
+
             for bj, readiness, reason in blocked:
                 console.print(
                     f"  • {readiness}: {bj.get('title','?')[:50]} @ {bj.get('company','?')}"
                 )
                 console.print(f"    [dim]{reason}[/dim]")
-                blocked_sources.add(bj.get("source", ""))
+                bj_source = str(bj.get("source") or "").lower()
+                if bj_source:
+                    blocked_sources.add(bj_source)
+
+                # Only the discovery source's OWN auth statuses may force source
+                # reauth. External ATS walls (Workday/Microsoft/BrassRing/etc.)
+                # must survive even when the discovery-source session refreshes.
+                bj_extra = parse_extra_json(bj.get("extra_json"))
+                bj_last_status = str(bj_extra.get("apply_last_status") or "")
+                own_statuses = _OWN_SESSION_STATUSES_ANY | _OWN_SESSION_STATUSES.get(
+                    bj_source, set()
+                )
+                if (
+                    bj_source in AUTOMATED_SOURCES
+                    and bj_last_status in own_statuses
+                ):
+                    force_reauth_sources.add(bj_source)
+
                 # A preflight block is not an application attempt. Preserve any
-                # concrete portal status (for example workday_session_expired) so
-                # prepare-sessions can still select and route this job on the next
-                # run; replacing it with the generic readiness label strands the
-                # recovery flow before a browser is opened.
+                # concrete portal status so prepare-sessions can still route the
+                # job if unattended source reauth cannot make it ready.
                 if readiness in {"needs-session", "needs-portal-login", "needs-review"}:
                     self.state.record_preflight_block(bj["job_id"], readiness, reason)
                 else:
                     self.state.record_apply_attempt(bj["job_id"], readiness, reason)
                 await self._push_apply_attempt_to_cloud(bj["job_id"])
-            # Emit deep-link notifications for each blocked source
+
             if not is_interactive and blocked_sources:
-                preflight_session_check(list(blocked_sources))
-            if not is_interactive:
+                try:
+                    preflight_result = await preflight_session_check_with_reauth(
+                        list(blocked_sources),
+                        self.config,
+                        force_reauth=force_reauth_sources,
+                    )
+                    for refreshed_source in preflight_result.refreshed_sources:
+                        self._unblock_session_jobs_after_reauth(refreshed_source)
+                except Exception as exc:
+                    # Preserve the old notification-only behavior if the new
+                    # automated preflight itself fails. This fallback owns the
+                    # human escalation exactly once for this path.
+                    _log.warning("apply.preflight_reauth_error error=%s", exc)
+                    preflight_session_check(list(blocked_sources))
+
+                # Re-read durable state after reauth/unblock mutations. Using the
+                # stale in-memory job would keep a just-recovered job blocked until
+                # the next scheduler cycle.
+                still_blocked: list[tuple] = []
+                for old_job, _old_readiness, _old_reason in blocked:
+                    fresh_job = self.state.get_job(old_job["job_id"]) or old_job
+                    new_readiness, new_reason = self._classify_apply_readiness(fresh_job)
+                    if new_readiness in BLOCKED_READINESS:
+                        still_blocked.append((fresh_job, new_readiness, new_reason))
+                    else:
+                        ready.append(fresh_job)
+                blocked = still_blocked
+
+            if not is_interactive and blocked:
                 console.print(
                     "\n[cyan]To fix:[/cyan] Run  python src/main.py prepare-sessions\n"
                     "         then re-run apply to process the session-blocked jobs."
