@@ -56,8 +56,12 @@ class FakePage:
             return None
         if "label" in script:              # generic questions
             return []
-        if "thank you for" in script:      # receipt
+        if "sentinel: acceptance-matcher harness" in script:  # _RECEIPT_JS
             return self.receipt
+        if "thank you for" in script:      # legacy detector
+            return self.receipt
+        if "sentinel: acceptance-count harness" in script:  # _COUNT_JS
+            return 1 if self.receipt else 0
         return None
 
     async def query_selector(self, sel):

@@ -45,8 +45,12 @@ class FakeWorkdayPage:
             return True
         if "create account" in script:  # login-gate probe
             return self.login_gate
-        if "thank you for" in script:    # receipt probe
+        if "sentinel: acceptance-matcher harness" in script:  # _RECEIPT_JS
             return self.receipt
+        if "thank you for" in script:    # legacy detector
+            return self.receipt
+        if "sentinel: acceptance-count harness" in script:  # _COUNT_JS
+            return 1 if self.receipt else 0
         if "review your application" in script:  # review-page probe
             return self.review
         return None

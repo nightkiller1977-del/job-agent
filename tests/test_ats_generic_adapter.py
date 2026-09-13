@@ -39,15 +39,21 @@ class FakePage:
             raise RuntimeError("no file input")
         self.uploaded[sel] = path
 
-    async def evaluate(self, script):
+    async def evaluate(self, script, *args):
         # blocker detection (captcha), questions (label), and the post-submit
-        # receipt check (thank-you copy) are distinguished by script signature.
+        # receipt check are distinguished by script signature. _RECEIPT_JS and
+        # _COUNT_JS carry sentinel comments so the fake keeps working even
+        # when the underlying regex patterns change.
         if "captcha" in script:
             return self._evaluate_result if not isinstance(self._evaluate_result, list) else None
         if "label" in script:
             return self._evaluate_result if isinstance(self._evaluate_result, list) else []
-        if "thank you for" in script:
+        if "sentinel: acceptance-matcher harness" in script:  # _RECEIPT_JS
             return self._receipt_result
+        if "thank you for" in script:  # legacy detector
+            return self._receipt_result
+        if "sentinel: acceptance-count harness" in script:  # _COUNT_JS
+            return 1 if self._receipt_result else 0
         return None
 
 

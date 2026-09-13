@@ -29,9 +29,18 @@ class _FakePage:
         self.goto_called = True
         self.url = url
 
-    async def evaluate(self, script):
+    async def evaluate(self, script, *args):
+        # _RECEIPT_JS carries a sentinel comment so we can recognize it even
+        # when the underlying patterns change.
+        if "sentinel: acceptance-matcher harness" in script:
+            return self._receipt
+        # Legacy detector — retained for any older _RECEIPT_JS shape.
         if "thank you for" in script:
             return self._receipt
+        # _COUNT_JS (freshness gate) — count 1 if a receipt is currently set.
+        if "sentinel: acceptance-count harness" in script:
+            return 1 if self._receipt else 0
+        # _STORE_COUNT_JS / _READ_COUNT_JS — no-op (no baseline used in these tests).
         return None
 
 
