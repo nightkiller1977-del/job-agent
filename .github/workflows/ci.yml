@@ -105,7 +105,10 @@ jobs:
       - name: Run full regression suite
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: pytest tests/ -q --tb=short --asyncio-mode=auto
+        # Two profile-lock ownership tests intentionally launch headed persistent
+        # Chrome. GitHub-hosted Linux runners have no DISPLAY, so provide a virtual
+        # X server instead of changing production browser behavior to headless.
+        run: xvfb-run -a pytest tests/ -q --tb=short --asyncio-mode=auto
 
   lint:
     runs-on: ubuntu-latest
