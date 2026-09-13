@@ -19,6 +19,7 @@ class FakeElement:
 
     async def click(self):
         self._page.clicked.append(self._selector)
+        self._page._submit_dispatched = True
 
 
 class FakePage:
@@ -29,7 +30,8 @@ class FakePage:
         self.uploaded = {}
         self.url = "https://boards.greenhouse.io/acme/jobs/1"
         self._evaluate_result = evaluate_result
-        self._receipt_result = receipt_result  # signal returned by the receipt check
+        self._receipt_result = receipt_result  # receipt that appears after submit
+        self._submit_dispatched = False
 
     async def query_selector(self, sel):
         return FakeElement(self, sel) if sel in self._present else None
@@ -48,12 +50,13 @@ class FakePage:
             return self._evaluate_result if not isinstance(self._evaluate_result, list) else None
         if "label" in script:
             return self._evaluate_result if isinstance(self._evaluate_result, list) else []
+        visible_receipt = self._receipt_result if self._submit_dispatched else None
         if "sentinel: acceptance-matcher harness" in script:  # _RECEIPT_JS
-            return self._receipt_result
+            return visible_receipt
         if "thank you for" in script:  # legacy detector
-            return self._receipt_result
+            return visible_receipt
         if "sentinel: acceptance-count harness" in script:  # _COUNT_JS
-            return 1 if self._receipt_result else 0
+            return 1 if visible_receipt else 0
         return None
 
 
@@ -116,7 +119,7 @@ async def test_click_without_receipt_is_unverified_not_applied():
 
 @pytest.mark.asyncio
 async def test_applied_only_with_verified_receipt():
-    """Phase 0.1: applied requires an observed receipt/confirmation."""
+    """Phase 0.1: applied requires a receipt that appears after submit."""
     page = FakePage(present_selectors={
         "input[name*='email' i], input[id*='email' i]",
         "#submit_app",
