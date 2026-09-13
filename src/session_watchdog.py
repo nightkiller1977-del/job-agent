@@ -91,7 +91,6 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
     results: list[SessionHealth] = []
 
     for src in all_sources:
-        # Prefer the chromium export (used by background runs)
         paths = [
             SESSIONS_DIR / f"{src}_chromium.json",
             SESSIONS_DIR / f"{src}.json",
@@ -290,7 +289,6 @@ async def _heartbeat_source(source: str, config: dict) -> bool:
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(2)
 
-            # Export refreshed cookies back to session file
             state = await ctx.storage_state()
             tmp = session_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(state))
@@ -450,11 +448,7 @@ def _send_deep_link_notification(source: str, message: str) -> None:
             return
 
         _send_telegram(full_msg)
-        _desktop_notify(
-            f"🔐 {source.capitalize()} session needs attention",
-            message,
-            subtitle="Job Agent",
-        )
+        _desktop_notify(f"{source} session needs refresh", message)
         record_notification_dedupe(key)
     except Exception as exc:
         _log.warning("session_watchdog.notify_failed source=%s error=%s", source, exc)
