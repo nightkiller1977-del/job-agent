@@ -255,6 +255,7 @@ class ReauthManager:
                         f"{source} automated reauth failed",
                         "Login returned False — may need human assist or CAPTCHA",
                     )
+                    # Escalate: send a one-tap deep-link so user can fix from phone
                     try:
                         from .session_watchdog import _send_deep_link_notification
                         _send_deep_link_notification(
@@ -311,6 +312,7 @@ class ReauthManager:
             f"{retry_line}"
         )
         _send_imessage(self.notify_phone, msg)
+        # Also send via Telegram for the clickable deep-link
         try:
             from .session_watchdog import _send_deep_link_notification
             _send_deep_link_notification(
@@ -325,6 +327,12 @@ class ReauthManager:
         )
         record_reauth_event(source, "human_notified", "waiting", detail)
 
+        # Non-interactive (launchd/cron/background): we cannot block for a human to
+        # complete an interactive login. Blocking would freeze the run up to
+        # `timeout_minutes` PER blocked source — several sources could stall the run
+        # for close to an hour until it's killed, applying to nothing. So notify and
+        # skip immediately; the orchestrator moves on to other sources, and the
+        # refreshed session is picked up on the next scheduled run.
         if not interactive:
             record_reauth_event(
                 source, "human", "skipped_noninteractive",
@@ -386,6 +394,8 @@ class ReauthManager:
 
         safe_detail = re.sub(r"[^\w\s.,:;'()/-]", "", detail)[:120]
 
+        # Both strategies are patched: a human-fallback source runs the automated path
+        # first, and an unpatched strategy would launch a real browser from a unit test.
         test_body = f'''
 @pytest.mark.asyncio
 async def test_regression_{source}_{ts_slug}():
@@ -394,12 +404,16 @@ async def test_regression_{source}_{ts_slug}():
     from src.reauth import ReauthManager, AUTOMATED_SOURCES, HUMAN_SOURCES
     from unittest.mock import patch, AsyncMock
 
+    # Verify source routing hasn't regressed
     assert "{source}" in {set_name}
 
+    # Verify AuthFailedError carries correct attributes for this scenario
     exc = AuthFailedError("{source}", "{safe_detail}")
     assert exc.source == "{source}"
     assert "{safe_detail}" in str(exc)
 
+    # Verify ReauthManager reaches the strategy that healed this (the other one is
+    # patched to fail so nothing real runs and the fallback order is exercised)
     mgr = ReauthManager(config={{}})
     with patch.object(mgr, "{strategy}", new_callable=AsyncMock, return_value=True) as mock, \\
          patch.object(mgr, "{other}", new_callable=AsyncMock, return_value=False):
@@ -449,6 +463,7 @@ def _send_imessage(phone: str, message: str) -> None:
         )
         return
 
+    # Escape for AppleScript string literal
     safe_msg = message.replace('"', '\\"').replace("\n", "\\n")
     script = (
         f'tell application "Messages"\n'
@@ -469,6 +484,8 @@ async def _dom_says_logged_in(scraper, page) -> bool:
     this only ever *adds* a rejection on top of the URL heuristic; it never blesses a
     session the URL check already refused."""
     probe = getattr(scraper, "_is_logged_in", None)
+    # asyncio's check (not inspect's) so both real `async def` methods and AsyncMock
+    # test doubles count as probes; a non-awaitable attribute is not a probe at all.
     if probe is None or not asyncio.iscoroutinefunction(probe):
         return True
     try:
