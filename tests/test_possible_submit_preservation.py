@@ -35,7 +35,9 @@ def _recovery():
 @pytest.mark.asyncio
 async def test_replay_reports_possible_submit_on_midway_failure():
     """A replay that clicks submit then fails a later step must report the
-    possible submit — the caller must not re-drive the form."""
+    possible submit — the caller must not re-drive the form. It must also
+    preserve the immutable pre-submit receipt snapshot used for reconciliation.
+    """
     r = _recovery()
 
     class _Cfg:
@@ -45,7 +47,9 @@ async def test_replay_reports_possible_submit_on_midway_failure():
     r.browser_config = _Cfg()
 
     page = AsyncMock()
+    page.url = "https://jobs.example.com/apply"
     page.wait_for_selector = AsyncMock()
+    page.evaluate = AsyncMock(return_value=None)
 
     calls = []
 
@@ -59,9 +63,10 @@ async def test_replay_reports_possible_submit_on_midway_failure():
         {"action": "click", "selector": "button[type=submit]", "value": None},
         {"action": "click", "selector": "#broken", "value": None},
     ]
-    success, possible_submit = await r._replay_skills(page, skills, None)
+    success, possible_submit, receipt_baseline = await r._replay_skills(page, skills, None)
     assert success is False
     assert possible_submit is True
+    assert receipt_baseline is not None
 
 
 # ─── session adoption ───────────────────────────────────────────────────────
