@@ -44,6 +44,7 @@ jobs:
                  tests/test_question_bank.py \
                  tests/test_reauth_regressions.py \
                  tests/test_reauth_feature.py \
+                 tests/test_session_autonomy_review_fixes.py \
                  tests/test_auth_routing.py \
                  tests/test_ats_checker.py \
                  tests/test_latex_compiler.py \
