@@ -1,0 +1,37 @@
+name: Session Autonomy Review Patch
+
+on:
+  push:
+    branches: ["feat/session-autonomy"]
+    paths: [".github/workflows/session-autonomy-review-patch.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/session-autonomy
+          fetch-depth: 0
+
+      - name: Apply exact review fixes
+        run: |
+          python .github/session_autonomy_review_patch.py
+          python -m py_compile src/session_watchdog.py src/notifier.py src/orchestrator.py
+          git diff --check
+          git diff -- src/session_watchdog.py src/notifier.py src/orchestrator.py
+
+      - name: Commit and push production fixes
+        run: |
+          if git diff --quiet -- src/session_watchdog.py src/notifier.py src/orchestrator.py; then
+            echo "No production changes to commit"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/session_watchdog.py src/notifier.py src/orchestrator.py
+          git commit -m "fix(session): close autonomy review correctness gaps"
+          git push origin HEAD:feat/session-autonomy
