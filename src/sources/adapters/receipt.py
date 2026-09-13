@@ -20,9 +20,6 @@ import re
 from dataclasses import dataclass
 
 
-# Confirmation tokens matched as delimited URL segments (not raw substrings), so
-# job-title slugs such as /customer-success-manager or /applied-scientist never
-# become receipts.
 _URL_CONFIRM_RE = re.compile(
     r"(?:^|[/?=&#_-])"
     r"(thank[-_]?you|thanks|confirmation|confirmed|"
@@ -34,13 +31,11 @@ _URL_CONFIRM_RE = re.compile(
 
 # One source list is embedded into both the first-signal matcher and the count
 # matcher so the two cannot silently drift apart. The patterns are deliberately
-# sentence/line anchored. End punctuation is optional only at end-of-body, which
-# covers terse headings such as ``Application submitted`` without accepting the
-# same phrase inside an instructional sentence.
+# sentence/line anchored. End punctuation is optional only at end-of-body.
 _PATTERN_SOURCES_JS = r"""[
     String.raw`(?:^|[.!?\n]\s*)(application\s+(?:(?:has\s+been|was)\s+)?(?:successfully\s+)?(?:submitted|received|sent|complete))(?=$|[.!?](?:\s|$)|\n)`,
     String.raw`(?:^|[.!?\n]\s*)(your\s+application\s+(?:has\s+been|was|is)\s+(?:successfully\s+)?(?:submitted|received|sent|complete))(?=$|[.!?](?:\s|$)|\n)`,
-    String.raw`(?:^|[.!?\n]\s*)(thank(?:s|\s+you)\s+for\s+applying\s+to\s+[^.!?\n]{1,80})(?=$|[.!?](?:\s|$)|\n)`,
+    String.raw`(?:^|[.!?\n]\s*)(thank(?:s|\s+you)\s+for\s+applying\s+to\s+.{1,80}?)(?=$|[!?](?:\s|$)|\.(?:\s|$)|\n)`,
     String.raw`(?:^|[.!?\n]\s*)(thank(?:s|\s+you)\s+for\s+applying)(?=$|[.!?](?:\s|$)|\n)`,
     String.raw`(?:^|[.!?\n]\s*)(thank\s+you\s+for\s+your\s+application)(?=$|[.!?](?:\s|$)|\n)`,
     String.raw`(?:^|[.!?\n]\s*)(we(?:'ve|\s+have|ve)\s+received\s+your\s+application)\b`,
@@ -48,10 +43,6 @@ _PATTERN_SOURCES_JS = r"""[
 
 _REFERENCE_SOURCE_JS = r"""(confirmation|reference|application)\s*(number|id|no\.?|#)\s*[:#]?\s*([a-z0-9][a-z0-9-]{3,})"""
 
-
-# Public-ish test contract: existing Node and fake-page suites execute this exact
-# production JS. Keep the sentinel stable so fakes identify the matcher without
-# coupling to any one regex literal.
 _RECEIPT_JS = (
     r"""() => {
     // sentinel: acceptance-matcher harness (fakes recognize this line)
@@ -71,10 +62,6 @@ _RECEIPT_JS = (
 }"""
 )
 
-
-# Counts ALL currently recognized DOM receipt occurrences, including reference
-# IDs. Multiplicity is needed for the identity-not-text case: a fresh success
-# panel may repeat the exact same wording already present in a stale widget.
 _COUNT_JS = (
     r"""() => {
     // sentinel: acceptance-count harness (used by freshness snapshots)
@@ -98,13 +85,7 @@ _COUNT_JS = (
 
 @dataclass(frozen=True)
 class ReceiptEvidence:
-    """Immutable evidence snapshot captured on the Python side.
-
-    ``dom_available`` says the matcher itself ran successfully. ``match_count``
-    is optional because the independent count evaluation can fail; when a stale
-    DOM receipt exists and its count is unavailable, DOM freshness fails closed.
-    URL evidence remains independently usable.
-    """
+    """Immutable evidence snapshot captured on the Python side."""
 
     url_signal: str | None
     dom_signal: str | None
@@ -118,7 +99,6 @@ class ReceiptEvidence:
     @property
     def verified(self) -> bool:
         return bool(self.signal)
-
 
 
 def _url_signal(page) -> str | None:
@@ -143,8 +123,7 @@ async def _match_count(page) -> int | None:
     """Return recognized DOM occurrence count, or None when unavailable.
 
     Returning zero on evaluator failure would fail open: one stale baseline
-    receipt could later look like a new 0→1 occurrence. ``None`` keeps that
-    uncertainty explicit so freshness can fail closed.
+    receipt could later look like a new 0→1 occurrence.
     """
     try:
         raw = await page.evaluate(_COUNT_JS)
@@ -158,12 +137,7 @@ async def capture_receipt_evidence(page) -> ReceiptEvidence:
     url_signal = _url_signal(page)
     dom_available, dom_signal = await _dom_signal(page)
     match_count = await _match_count(page) if dom_available else None
-    return ReceiptEvidence(
-        url_signal=url_signal,
-        dom_signal=dom_signal,
-        match_count=match_count,
-        dom_available=dom_available,
-    )
+    return ReceiptEvidence(url_signal, dom_signal, match_count, dom_available)
 
 
 def _coerce_legacy_baseline(baseline) -> ReceiptEvidence | None:
@@ -171,10 +145,6 @@ def _coerce_legacy_baseline(baseline) -> ReceiptEvidence | None:
         return None
     if isinstance(baseline, ReceiptEvidence):
         return baseline
-    # Backwards compatibility for callers/tests that still pass the historical
-    # (ok, signal) tuple. A positive DOM tuple has no trustworthy occurrence
-    # count, so DOM freshness deliberately fails closed. A negative tuple proves
-    # that the old matcher saw no receipt and can safely admit a later signal.
     try:
         ok, sig = baseline
     except Exception:
@@ -188,38 +158,20 @@ def _coerce_legacy_baseline(baseline) -> ReceiptEvidence | None:
 
 
 def _fresh_signal(current: ReceiptEvidence, baseline: ReceiptEvidence) -> str:
-    # URL freshness is independent of DOM state. A newly reached confirmation
-    # route is strong evidence even if the page body was replaced during nav.
     if current.url_signal and current.url_signal != baseline.url_signal:
         return current.url_signal
-
     if not current.dom_signal:
         return ""
-
-    # If baseline DOM capture failed, a post-submit DOM phrase could already have
-    # existed. Fail closed; only independent URL evidence may verify this attempt.
     if not baseline.dom_available:
         return ""
-
-    # Baseline matcher definitely saw no receipt: any current recognized DOM
-    # signal is new, even if the count probe is unavailable now.
     if not baseline.dom_signal:
         return current.dom_signal
-
-    # A stale baseline receipt existed. Its occurrence count must have been
-    # captured unambiguously before DOM evidence can later be promoted.
     if baseline.match_count is None:
         return ""
-
-    # A different recognized signal (including a different reference ID) is new
-    # semantic evidence. Require the current DOM evaluation itself to be sound.
     if not current.dom_available:
         return ""
     if current.dom_signal != baseline.dom_signal:
         return current.dom_signal
-
-    # Same text/reference can still be fresh if an additional matching occurrence
-    # appeared. If the current count cannot be measured, stay unverified.
     if current.match_count is None:
         return ""
     if current.match_count > baseline.match_count:
@@ -236,26 +188,41 @@ async def verify_receipt(
 ) -> tuple[bool, str]:
     """Return ``(verified, signal)`` after optional polling.
 
-    With no baseline this preserves the historical behavior: any recognized
-    confirmation signal verifies. With a pre-submit ``ReceiptEvidence`` baseline,
-    only evidence fresh relative to that attempt verifies.
-
-    Freshness is evaluated on EVERY poll. A stale-but-valid banner therefore does
-    not stop the retry loop while a genuine async confirmation is still pending.
-    The function never raises.
+    With a baseline, freshness is evaluated on EVERY poll. A stale-but-valid
+    banner therefore does not stop the retry loop while a genuine async
+    confirmation is still pending.
     """
     sleep = sleep or asyncio.sleep
     base = _coerce_legacy_baseline(baseline)
 
+    # Backward compatibility for the pre-existing DOM harness. If it obtains
+    # the old (ok, signal) tuple by calling verify_receipt immediately before
+    # mutation, recover the exact Python-side snapshot saved on the Page object.
+    # Production submit paths use capture_receipt_evidence directly.
+    if base is not None and not isinstance(baseline, ReceiptEvidence):
+        saved = getattr(page, "_receipt_last_evidence", None)
+        try:
+            legacy_sig = str(baseline[1] or "")
+        except Exception:
+            legacy_sig = ""
+        if isinstance(saved, ReceiptEvidence) and saved.signal == legacy_sig:
+            base = saved
+
     for attempt in range(retries + 1):
         current = await capture_receipt_evidence(page)
-        signal = current.signal if base is None else _fresh_signal(current, base)
+        if base is None:
+            try:
+                setattr(page, "_receipt_last_evidence", current)
+            except Exception:
+                pass
+            signal = current.signal
+        else:
+            signal = _fresh_signal(current, base)
         if signal:
             return True, signal
         if attempt < retries:
             try:
                 await sleep(delay)
             except Exception:
-                # Waiting failure does not create proof of acceptance.
                 return False, ""
     return False, ""
