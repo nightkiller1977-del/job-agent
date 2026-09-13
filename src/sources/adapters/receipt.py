@@ -49,6 +49,7 @@ _URL_CONFIRM_RE = re.compile(
 # Freshness handling below is the second line of defense for any stale match
 # the raw regex still catches.
 _RECEIPT_JS = r"""() => {
+    // sentinel: acceptance-matcher harness (fakes recognize this line)
     const body = (document.body && document.body.innerText || '');
     const patterns = [
         // "Application (has been/was) (successfully) (submitted|received|sent|complete)."
