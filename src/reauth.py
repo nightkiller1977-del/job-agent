@@ -117,6 +117,12 @@ class ReauthManager:
         _log.warning("reauth.unknown_source source=%s", source)
         return False
 
+    async def attempt_automated(self, source: str) -> bool:
+        """Try stored-credential recovery only; never notify or wait for a human."""
+        if source not in AUTOMATED_SOURCES:
+            return False
+        return await self._reauth_automated(source, escalate=False)
+
     # ------------------------------------------------------------------
     # Automated path
     # ------------------------------------------------------------------
