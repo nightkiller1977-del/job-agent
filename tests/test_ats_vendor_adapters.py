@@ -118,8 +118,13 @@ class FakeAshbyPage:
             return self._blocker
         if "label" in script:              # generic label-driven question scan
             return []
-        if "thank you for" in script:      # generic receipt probe
+        if "sentinel: acceptance-matcher harness" in script:  # _RECEIPT_JS
             return self._receipt
+        if "thank you for" in script:      # legacy detector
+            return self._receipt
+        if "sentinel: acceptance-count harness" in script:    # _COUNT_JS
+            return 1 if self._receipt else 0
+        # _STORE_COUNT_JS / _READ_COUNT_JS: no-op (freshness gate unused).
         return None
 
 
@@ -370,8 +375,12 @@ class GhPage:
             return self.radio_groups
         if "querySelectorAll('label')" in script:
             return self.label_questions
-        if "thank you for" in script:
+        if "sentinel: acceptance-matcher harness" in script:  # _RECEIPT_JS
             return self.receipt
+        if "thank you for" in script:  # legacy detector
+            return self.receipt
+        if "sentinel: acceptance-count harness" in script:  # _COUNT_JS
+            return 1 if self.receipt else 0
         return None
 
 
@@ -603,8 +612,12 @@ class LeverFakePage:
             return self.blocker
         if "label" in script:
             return self.label_questions
-        if "thank you for" in script:
+        if "sentinel: acceptance-matcher harness" in script:  # _RECEIPT_JS
             return self.receipt
+        if "thank you for" in script:  # legacy detector
+            return self.receipt
+        if "sentinel: acceptance-count harness" in script:  # _COUNT_JS
+            return 1 if self.receipt else 0
         return None
 
 

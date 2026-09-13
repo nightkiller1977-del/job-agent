@@ -98,9 +98,16 @@ class _FakeElement:
 class _FakePage:
     """Minimal Playwright-shaped page. Configurable per test.
 
-    Only implements what the real generic adapter + session touch:
-      url, title(), goto(...), query_selector(sel), evaluate(js),
-      set_input_files(...), frames.
+    Models a realistic pre/post-click state transition: `receipt_signal`
+    represents an acceptance panel that appears AFTER the submit click has
+    dispatched, not before. This lets verify_receipt(page, baseline=...)
+    (which captures baseline BEFORE the click and re-checks after) see the
+    correct sequence: no receipt at baseline capture, receipt after dispatch.
+
+    Also handles the new receipt.py auxiliary JS calls:
+      - _COUNT_JS (occurrence counting) → 1 iff receipt currently visible
+      - _STORE_COUNT_JS (dataset write)  → recorded in `stored_count`
+      - _READ_COUNT_JS (dataset read)    → returns stored_count
     """
     def __init__(
         self,
@@ -113,10 +120,27 @@ class _FakePage:
         self._title = "Apply"
         self.submit_click_mode = submit_click_mode
         self.submit_selector_present = submit_selector_present
-        self.receipt_signal = receipt_signal
-        # Shared counters — every _FakeElement returned records into these.
+        # The receipt this page will show ONCE a click has been dispatched.
+        # Before dispatch, the page has no acceptance evidence (realistic —
+        # the form is not itself a receipt).
+        self._post_dispatch_receipt = receipt_signal
+        # Simulated `document.body.dataset.receiptBaselineCount` — verify_receipt
+        # writes to it on baseline capture and reads it on post-submit.
+        self.stored_count: int = 0
         self.counter = {"clicks": 0, "dispatched": 0, "goto": 0, "evaluate": 0}
         self.frames = []
+
+    @property
+    def receipt_signal(self) -> str | None:
+        """The signal `_RECEIPT_JS` would return on this page right now.
+        None before the first dispatch; `_post_dispatch_receipt` after."""
+        if self.counter["dispatched"] == 0:
+            return None
+        return self._post_dispatch_receipt
+
+    def _current_match_count(self) -> int:
+        """The count `_COUNT_JS` would return right now."""
+        return 1 if self.receipt_signal else 0
 
     async def title(self):
         return self._title
@@ -127,11 +151,6 @@ class _FakePage:
         return SimpleNamespace(status=200)
 
     async def query_selector(self, sel):
-        # The generic adapter tries many selectors from ats_selectors.SELECTORS.
-        # For 'generic' vendor the selset is minimal; a real submit-button lookup
-        # goes through `submit_button` selectors. We return a fake element only
-        # for selectors that look like a submit control; None for identity fields
-        # so no field-fill work happens.
         if not self.submit_selector_present:
             return None
         selector_hints = ("submit", "type=\"submit\"", "type='submit'", "apply", "button")
@@ -147,8 +166,21 @@ class _FakePage:
         # _answer_questions: no labels found
         if "querySelectorAll('label')" in js:
             return []
-        # _RECEIPT_JS: return the configured signal (None → no receipt)
-        if "document.body" in js and "innerText" in js and "patterns" in js:
+        # _COUNT_JS carries a sentinel comment identifying it (see receipt.py).
+        if "sentinel: acceptance-count harness" in js:
+            return self._current_match_count()
+        # _STORE_COUNT_JS: caller passes the count as the first arg.
+        if "receiptBaselineCount = String" in js:
+            if args:
+                self.stored_count = int(args[0] or 0)
+            return None
+        # _READ_COUNT_JS: return the recorded baseline count.
+        if "parseInt(document.body.dataset.receiptBaselineCount" in js:
+            return self.stored_count
+        # _RECEIPT_JS: the primary matcher — returns signal iff receipt is
+        # currently visible on the page (post-dispatch). Detected via the
+        # sentinel comment inside the production JS.
+        if "sentinel: acceptance-matcher harness" in js:
             return self.receipt_signal
         return None
 
