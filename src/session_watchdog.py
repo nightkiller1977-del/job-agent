@@ -47,6 +47,11 @@ _STALE_HOURS = 20
 # How old before it's treated as expired (block)
 _EXPIRED_HOURS = 48
 
+# Only auth-bearing LinkedIn cookies determine whether the login session is
+# usable. Tracking cookies such as lidc/UserMatchHistory expire much sooner and
+# must never flip an otherwise-valid li_at session to expired.
+LINKEDIN_AUTH_COOKIE_NAMES = frozenset({"li_at", "liap", "li_rm"})
+
 # Sources that support background heartbeat visits
 _HEARTBEAT_SOURCES = {"linkedin", "indeed", "jobright"}
 
@@ -109,8 +114,19 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
         age_sec = time.time() - found.stat().st_mtime
         age_hours = age_sec / 3600
 
-        # Also peek inside for LinkedIn expiry timestamps if available
-        cookie_expiry_hours = _parse_linkedin_expiry(found) if src == "linkedin" else None
+        if src == "linkedin":
+            has_auth_cookie, cookie_expiry_hours = _linkedin_auth_cookie_state(found)
+            if not has_auth_cookie:
+                results.append(SessionHealth(
+                    source=src,
+                    status="expired",
+                    age_hours=age_hours,
+                    session_path=found,
+                    detail="LinkedIn session has no recognized authentication cookie.",
+                ))
+                continue
+        else:
+            cookie_expiry_hours = None
 
         is_expired = (age_hours >= _EXPIRED_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 0)
         is_stale = (age_hours >= _STALE_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 4)
@@ -141,26 +157,34 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
     return results
 
 
-def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
-    """Extract the earliest LinkedIn cookie expiry from the session JSON.
-
-    Returns hours until expiry (can be negative if already expired),
-    or None if parsing fails.
-    """
+def _linkedin_auth_cookie_state(session_path: Path) -> tuple[bool, Optional[float]]:
+    """Return whether LinkedIn auth cookies exist and their earliest expiry."""
     try:
         data = json.loads(session_path.read_text())
-        cookies = data.get("cookies", [])
-        li_cookies = [c for c in cookies if "linkedin" in c.get("domain", "")]
-        if not li_cookies:
-            return None
-        now = time.time()
-        expiries = [c["expires"] for c in li_cookies if c.get("expires", -1) > 0]
+        auth_cookies = [
+            cookie
+            for cookie in data.get("cookies", [])
+            if "linkedin" in str(cookie.get("domain", "")).lower()
+            and str(cookie.get("name", "")) in LINKEDIN_AUTH_COOKIE_NAMES
+        ]
+        if not auth_cookies:
+            return False, None
+        expiries = [
+            float(cookie["expires"])
+            for cookie in auth_cookies
+            if float(cookie.get("expires", -1) or -1) > 0
+        ]
         if not expiries:
-            return None
-        earliest = min(expiries)
-        return (earliest - now) / 3600  # hours until expiry (negative = already expired)
-    except Exception:
-        return None
+            return True, None
+        return True, (min(expiries) - time.time()) / 3600
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False, None
+
+
+def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
+    """Extract the earliest LinkedIn authentication-cookie expiry."""
+    _has_auth_cookie, expiry_hours = _linkedin_auth_cookie_state(session_path)
+    return expiry_hours
 
 
 def print_health_table(results: list[SessionHealth]) -> None:
