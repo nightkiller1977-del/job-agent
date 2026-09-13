@@ -96,3 +96,47 @@ def _isolate_browser_pipeline_lock(tmp_path, monkeypatch):
     fail because they weren't isolated from real machine state."""
     import src.browser_pipeline_lock as _lock_mod
     monkeypatch.setattr(_lock_mod, "PROJECT_ROOT", tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def _attempt_scope_legacy_vendor_receipt_fakes(request, monkeypatch):
+    """Keep the older vendor-adapter fake pages faithful to receipt freshness.
+
+    test_ats_vendor_adapters predates attempt-scoped receipt verification and
+    models a configured receipt as visible for the entire page lifetime. That
+    makes its positive submit cases indistinguishable from a stale pre-submit
+    banner, which production now correctly rejects. Patch only those legacy
+    fakes so their configured receipt becomes visible after the modeled final
+    submit click. Intermediate Ashby Next actions use evaluate(), not element
+    click(), so they do not accidentally create a receipt.
+    """
+    if request.module.__name__.split(".")[-1] != "test_ats_vendor_adapters":
+        return
+
+    specs = (
+        ("_AshbyEl", "FakeAshbyPage"),
+        ("_GhElement", "GhPage"),
+        ("_LeverElement", "LeverFakePage"),
+    )
+
+    for element_name, page_name in specs:
+        element_cls = getattr(request.module, element_name)
+        page_cls = getattr(request.module, page_name)
+        original_click = element_cls.click
+        original_evaluate = page_cls.evaluate
+
+        async def click(self, _original=original_click):
+            await _original(self)
+            self.page._submit_dispatched = True
+
+        async def evaluate(self, script, *args, _original=original_evaluate):
+            dispatched = getattr(self, "_submit_dispatched", False)
+            if "sentinel: acceptance-matcher harness" in script or "thank you for" in script:
+                if not dispatched:
+                    return None
+            if "sentinel: acceptance-count harness" in script and not dispatched:
+                return 0
+            return await _original(self, script, *args)
+
+        monkeypatch.setattr(element_cls, "click", click)
+        monkeypatch.setattr(page_cls, "evaluate", evaluate)
