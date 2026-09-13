@@ -14,7 +14,7 @@ from rich.console import Console
 
 from .base import AtsAdapter
 from .context import AtsApplyContext, AtsApplyResult
-from .receipt import verify_receipt
+from .receipt import capture_receipt_evidence, verify_receipt
 
 console = Console()
 
@@ -165,20 +165,13 @@ class GenericAtsAdapter(AtsAdapter):
 
     async def _gated_submit(self, page, ctx: AtsApplyContext, submit_selectors,
                             ev, vendor: str) -> AtsApplyResult:
-        """Policy-gated submit + receipt verification, reused by every adapter.
+        """Policy-gated submit + attempt-scoped receipt verification.
 
-        Never auto-submits unless auto_submit AND the policy approves; a submit
-        *click* is only reported as success (`applied`) when a receipt is verified,
-        otherwise `submission_unverified` (Phase 0.1/0.3).
-
-        Submit-truth (Phase 0.1.2): `_submit` returns a 3-state outcome —
-        "absent", "dispatched", "uncertain". "uncertain" means click() raised
-        AFTER the click packet may have left the browser (e.g. Playwright's
-        post-click navigation wait timed out). It MUST NOT be reported as
-        submit_not_found — the submission may already be in flight, and the
-        session's recovery path would re-dispatch. Both "dispatched" and
-        "uncertain" flow to verify_receipt; unverified outcomes return
-        `submission_unverified`, keeping recovery out of the loop.
+        Never auto-submits unless auto_submit AND policy approves. `_submit`
+        returns a 3-state outcome: absent / dispatched / uncertain. Uncertain
+        means click() raised after the action may already have reached the page
+        or network; it is never downgraded to submit_not_found and never sent to
+        recovery for a blind second click.
         """
         if not ctx.auto_submit:
             return AtsApplyResult.blocked(
@@ -194,10 +187,10 @@ class GenericAtsAdapter(AtsAdapter):
                     evidence=ev_to_dict(ev),
                 )
 
-        # Capture baseline BEFORE the click so verify_receipt can distinguish
-        # stale acceptance evidence (help panels, dashboard widgets, previous-
-        # application notices) from evidence attributable to THIS attempt.
-        baseline = await verify_receipt(page, retries=0)
+        # Immutable Python-owned snapshot captured before dispatch. It survives
+        # navigation/body replacement and lets receipt.py distinguish stale page
+        # content from evidence attributable to this attempt.
+        baseline = await capture_receipt_evidence(page)
 
         outcome = await self._submit(page, submit_selectors)
         if outcome == "absent":
@@ -207,8 +200,9 @@ class GenericAtsAdapter(AtsAdapter):
                 evidence=ev_to_dict(ev),
             )
 
-        # Both "dispatched" and "uncertain" mean the submission MAY have gone
-        # out. Poll for receipt with freshness gate — only new evidence counts.
+        # Both dispatched and uncertain mean the submission MAY have gone out.
+        # Poll for fresh receipt evidence; stale evidence never ends the polling
+        # window early.
         verified, signal = await verify_receipt(
             page, retries=3, delay=0.4, baseline=baseline,
         )
@@ -217,13 +211,11 @@ class GenericAtsAdapter(AtsAdapter):
                 f"{vendor}: submitted with {len(ev.fields_filled)} field(s); receipt {signal}",
                 evidence=ev_to_dict(ev), vendor=vendor, receipt=signal,
             )
-        # No fresh receipt. Both cleanly-dispatched AND uncertain go here —
-        # never submit_not_found — so the session's recovery path is not
-        # triggered and the ledger holds a reconciliation marker.
+
         detail = (
-            f"{vendor}: submit clicked (post-click wait failed); no receipt observed"
+            f"{vendor}: submit clicked (post-click wait failed); no fresh receipt observed"
             if outcome == "uncertain"
-            else f"{vendor}: submit clicked but no receipt confirmation observed"
+            else f"{vendor}: submit clicked but no fresh receipt confirmation observed"
         )
         return AtsApplyResult.unverified(
             detail, evidence=ev_to_dict(ev), vendor=vendor,
@@ -254,18 +246,7 @@ class GenericAtsAdapter(AtsAdapter):
             return False
 
     async def _submit(self, page, submit_selectors) -> str:
-        """Return the click outcome as a 3-state string:
-
-          "absent"     — target not found; no click attempted. Safe to report
-                         as submit_not_found upstream.
-          "dispatched" — click resolved cleanly. Submission definitely happened.
-          "uncertain"  — click raised AFTER possibly reaching the network.
-                         Playwright's click() includes a post-click navigation
-                         wait; a raise there does not prove the click packet
-                         never left. Must NOT be reported as submit_not_found —
-                         the submission may already be in flight, and a
-                         recovery re-dispatch would double it.
-        """
+        """Return absent / dispatched / uncertain for one submit control."""
         if not submit_selectors:
             return "absent"
         sel, el = await self._first_selector(page, submit_selectors)
@@ -275,6 +256,8 @@ class GenericAtsAdapter(AtsAdapter):
             await el.click()
             return "dispatched"
         except Exception:
+            # Playwright click includes post-click waits; an exception does not
+            # prove that the click did not dispatch. Preserve uncertainty.
             return "uncertain"
 
     async def _answer_questions(self, page, ctx: AtsApplyContext) -> list[str]:
