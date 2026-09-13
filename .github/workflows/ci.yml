@@ -74,8 +74,12 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install dev dependencies
-        run: pip install -r requirements-dev.txt
+      - name: Install full-suite dependencies
+        # The full regression imports dashboard.main, whose runtime dependency
+        # set is intentionally kept in dashboard/requirements.txt. Install both
+        # dependency manifests here rather than duplicating dashboard packages
+        # into the root dev requirements.
+        run: pip install -r requirements-dev.txt -r dashboard/requirements.txt
 
       - name: Install Playwright chromium
         run: python -m playwright install --with-deps chromium
