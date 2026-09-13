@@ -1,38 +1,28 @@
 """Phase 0.1 — receipt verification with freshness-aware evidence.
 
-A submit *click* is not an application. Before any adapter may report `submitted`,
-it must observe a confirmation that the ATS accepted the application. This
-module centralises that check so GenericAtsAdapter and BrowserUseRecovery agree
-on what "receipt verified" means.
+A submit *click* is not an application. Before an adapter may report success,
+it must observe evidence that the ATS accepted THIS application attempt.
 
-Freshness (added after the visible-stale defect):
-    A whole-page scan cannot tell whether an "Application submitted" phrase was
-    already on the page (a dashboard widget, a help panel, a previous-application
-    notice) or appeared because of THIS attempt. `verify_receipt(page, baseline=...)`
-    accepts a baseline captured BEFORE the submit boundary and reports fresh
-    evidence only when the page's occurrence-count of matching acceptance
-    elements has grown relative to the baseline.
+The freshness baseline is deliberately Python-owned. A DOM-owned marker is not
+safe: normal navigation, SPA body replacement, or a renderer remount destroys
+it. ``capture_receipt_evidence`` therefore snapshots the confirmation URL,
+first recognized DOM signal, and recognized-signal occurrence count before the
+submit boundary. ``verify_receipt(..., baseline=...)`` polls until evidence is
+new relative to that immutable snapshot or the retry budget expires.
 
-    Callers capture a baseline by calling verify_receipt() with no baseline
-    argument; the call side-effects `document.body.dataset.receiptBaselineCount`
-    with the observed count, and returns the normal (ok, sig) tuple. A later
-    verify_receipt(..., baseline=(ok, sig)) reads that stored count and
-    compares it to the current count. This keeps the API a 2-tuple (backwards
-    compatible with call sites that don't pass baseline).
-
-Kept import-light (no runtime playwright import) and fake-able: only calls
-`page.url` and `page.evaluate(...)`, both of which the adapter test fakes
-provide.
+The module is import-light and fake-able: page access is limited to ``page.url``
+and ``page.evaluate``.
 """
 from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import dataclass
 
-# Confirmation tokens matched as DELIMITED url segments (not raw substrings), so a
-# job title like `/jobs/customer-success-manager` or `/jobs/applied-scientist` is
-# never mistaken for a receipt. Bare "success"/"applied"/"submitted" are excluded on
-# purpose; confirmation routes almost always carry thank-you/confirmation/received.
+
+# Confirmation tokens matched as delimited URL segments (not raw substrings), so
+# job-title slugs such as /customer-success-manager or /applied-scientist never
+# become receipts.
 _URL_CONFIRM_RE = re.compile(
     r"(?:^|[/?=&#_-])"
     r"(thank[-_]?you|thanks|confirmation|confirmed|"
@@ -41,107 +31,200 @@ _URL_CONFIRM_RE = re.compile(
     r"(?:$|[/?=&#_-])"
 )
 
-# Tightened acceptance patterns. Each requires the phrase to be anchored to a
-# sentence boundary (start of body OR after [.!\n]) AND followed by sentence-end
-# punctuation. This rejects the phrase when it appears embedded in a longer
-# descriptive sentence — job-description text, instructional text, form-field
-# labels, negation clauses — without needing fragile negative lookarounds.
-# Freshness handling below is the second line of defense for any stale match
-# the raw regex still catches.
-_RECEIPT_JS = r"""() => {
+
+# One source list is embedded into both the first-signal matcher and the count
+# matcher so the two cannot silently drift apart. The patterns are deliberately
+# sentence/line anchored. End punctuation is optional only at end-of-body, which
+# covers terse headings such as ``Application submitted`` without accepting the
+# same phrase inside an instructional sentence.
+_PATTERN_SOURCES_JS = r"""[
+    String.raw`(?:^|[.!?\n]\s*)(application\s+(?:(?:has\s+been|was)\s+)?(?:successfully\s+)?(?:submitted|received|sent|complete))(?=$|[.!?](?:\s|$)|\n)`,
+    String.raw`(?:^|[.!?\n]\s*)(your\s+application\s+(?:has\s+been|was|is)\s+(?:successfully\s+)?(?:submitted|received|sent|complete))(?=$|[.!?](?:\s|$)|\n)`,
+    String.raw`(?:^|[.!?\n]\s*)(thank(?:s|\s+you)\s+for\s+applying\s+to\s+[^.!?\n]{1,80})(?=$|[.!?](?:\s|$)|\n)`,
+    String.raw`(?:^|[.!?\n]\s*)(thank(?:s|\s+you)\s+for\s+applying)(?=$|[.!?](?:\s|$)|\n)`,
+    String.raw`(?:^|[.!?\n]\s*)(thank\s+you\s+for\s+your\s+application)(?=$|[.!?](?:\s|$)|\n)`,
+    String.raw`(?:^|[.!?\n]\s*)(we(?:'ve|\s+have|ve)\s+received\s+your\s+application)\b`,
+]"""
+
+_REFERENCE_SOURCE_JS = r"""(confirmation|reference|application)\s*(number|id|no\.?|#)\s*[:#]?\s*([a-z0-9][a-z0-9-]{3,})"""
+
+
+# Public-ish test contract: existing Node and fake-page suites execute this exact
+# production JS. Keep the sentinel stable so fakes identify the matcher without
+# coupling to any one regex literal.
+_RECEIPT_JS = (
+    r"""() => {
     // sentinel: acceptance-matcher harness (fakes recognize this line)
     const body = (document.body && document.body.innerText || '');
-    const patterns = [
-        // "Application (has been/was) (successfully) (submitted|received|sent|complete)."
-        /(?:^|[.!\n]\s*)(application\s+(?:(?:has\s+been|was)\s+)?(?:successfully\s+)?(?:submitted|received|sent|complete))\s*[.!\n]/i,
-        // "Your application (has been/was/is) (successfully) (submitted|received|sent)."
-        /(?:^|[.!\n]\s*)(your\s+application\s+(?:has\s+been|was|is)\s+(?:successfully\s+)?(?:submitted|received|sent))\s*[.!\n]/i,
-        // "Thanks/Thank you for applying to <specific target>."
-        /(?:^|[.!\n]\s*)(thank(?:s|\syou)?\s+for\s+applying\s+to\s+[^.!?\n]{1,80})[.!\n]/i,
-        // "We('ve/have) received your application"
-        /(?:^|[.!\n]\s*)(we(?:'ve|\shave|ve)\s+received\s+your\s+application)\b/i,
-    ];
-    for (const pat of patterns) {
-        const m = body.match(pat);
+    const patternSources = """
+    + _PATTERN_SOURCES_JS
+    + r""";
+    for (const src of patternSources) {
+        const m = body.match(new RegExp(src, 'i'));
         if (m) return 't:' + m[1].toLowerCase().slice(0, 60);
     }
-    // Reference id fallback (unchanged from prior implementation).
-    const ref = body.match(/(confirmation|reference|application)\s*(number|id|no\.?|#)\s*[:#]?\s*([a-z0-9][a-z0-9-]{3,})/i);
+    const ref = body.match(new RegExp(String.raw`"""
+    + _REFERENCE_SOURCE_JS
+    + r"""`, 'i'));
     if (ref) return 'ref:' + ref[3];
     return null;
 }"""
+)
 
-# Count matching acceptance-element occurrences on the current page. Used by
-# the freshness gate: an increase between baseline and post-submit means a
-# new matching element appeared (fresh evidence attributable to this attempt).
-# Uses the same patterns as _RECEIPT_JS with the global flag so all occurrences
-# are counted, not just the first.
-_COUNT_JS = r"""() => {
-    // sentinel: acceptance-count harness (used by verify_receipt freshness gate)
+
+# Counts ALL currently recognized DOM receipt occurrences, including reference
+# IDs. Multiplicity is needed for the identity-not-text case: a fresh success
+# panel may repeat the exact same wording already present in a stale widget.
+_COUNT_JS = (
+    r"""() => {
+    // sentinel: acceptance-count harness (used by freshness snapshots)
     const body = (document.body && document.body.innerText || '');
-    const patterns = [
-        /(?:^|[.!\n]\s*)(application\s+(?:(?:has\s+been|was)\s+)?(?:successfully\s+)?(?:submitted|received|sent|complete))\s*[.!\n]/gi,
-        /(?:^|[.!\n]\s*)(your\s+application\s+(?:has\s+been|was|is)\s+(?:successfully\s+)?(?:submitted|received|sent))\s*[.!\n]/gi,
-        /(?:^|[.!\n]\s*)(thank(?:s|\syou)?\s+for\s+applying\s+to\s+[^.!?\n]{1,80})[.!\n]/gi,
-        /(?:^|[.!\n]\s*)(we(?:'ve|\shave|ve)\s+received\s+your\s+application)\b/gi,
-    ];
+    const patternSources = """
+    + _PATTERN_SOURCES_JS
+    + r""";
     let n = 0;
-    for (const pat of patterns) {
-        const m = body.match(pat);
+    for (const src of patternSources) {
+        const m = body.match(new RegExp(src, 'gi'));
         if (m) n += m.length;
     }
+    const refs = body.match(new RegExp(String.raw`"""
+    + _REFERENCE_SOURCE_JS
+    + r"""`, 'gi'));
+    if (refs) n += refs.length;
     return n;
 }"""
-
-_STORE_COUNT_JS = (
-    "(n) => { if (document.body) { document.body.dataset.receiptBaselineCount = String(n); } }"
-)
-_READ_COUNT_JS = (
-    "() => { if (document.body) { return parseInt(document.body.dataset.receiptBaselineCount || '0', 10); } return 0; }"
 )
 
 
-async def _check_once(page) -> tuple[bool, str]:
-    # 1. URL-based confirmation (cheapest, and robust to SPA re-render).
-    url = ""
+@dataclass(frozen=True)
+class ReceiptEvidence:
+    """Immutable evidence snapshot captured on the Python side.
+
+    ``dom_available`` says the matcher itself ran successfully. ``match_count``
+    is optional because the independent count evaluation can fail; when a stale
+    DOM receipt exists and its count is unavailable, DOM freshness fails closed.
+    URL evidence remains independently usable.
+    """
+
+    url_signal: str | None
+    dom_signal: str | None
+    match_count: int | None
+    dom_available: bool
+
+    @property
+    def signal(self) -> str:
+        return self.url_signal or self.dom_signal or ""
+
+    @property
+    def verified(self) -> bool:
+        return bool(self.signal)
+
+
+
+def _url_signal(page) -> str | None:
     try:
         url = (getattr(page, "url", "") or "").lower()
     except Exception:
-        url = ""
+        return None
     if url and _URL_CONFIRM_RE.search(url):
-        return True, f"url:{url[:80]}"
+        return f"url:{url[:80]}"
+    return None
 
-    # 2. Confirmation copy / reference id in the rendered body.
+
+async def _dom_signal(page) -> tuple[bool, str | None]:
     try:
-        signal = await page.evaluate(_RECEIPT_JS)
+        raw = await page.evaluate(_RECEIPT_JS)
     except Exception:
-        signal = None
-    if signal:
-        return True, str(signal)
-    return False, ""
+        return False, None
+    return True, str(raw) if raw else None
 
 
-async def _count_matches(page) -> int:
+async def _match_count(page) -> int | None:
+    """Return recognized DOM occurrence count, or None when unavailable.
+
+    Returning zero on evaluator failure would fail open: one stale baseline
+    receipt could later look like a new 0→1 occurrence. ``None`` keeps that
+    uncertainty explicit so freshness can fail closed.
+    """
     try:
         raw = await page.evaluate(_COUNT_JS)
         return int(raw or 0)
     except Exception:
-        return 0
+        return None
 
 
-async def _store_count(page, n: int) -> None:
+async def capture_receipt_evidence(page) -> ReceiptEvidence:
+    """Capture one immutable receipt-evidence snapshot. Never raises."""
+    url_signal = _url_signal(page)
+    dom_available, dom_signal = await _dom_signal(page)
+    match_count = await _match_count(page) if dom_available else None
+    return ReceiptEvidence(
+        url_signal=url_signal,
+        dom_signal=dom_signal,
+        match_count=match_count,
+        dom_available=dom_available,
+    )
+
+
+def _coerce_legacy_baseline(baseline) -> ReceiptEvidence | None:
+    if baseline is None:
+        return None
+    if isinstance(baseline, ReceiptEvidence):
+        return baseline
+    # Backwards compatibility for callers/tests that still pass the historical
+    # (ok, signal) tuple. A positive DOM tuple has no trustworthy occurrence
+    # count, so DOM freshness deliberately fails closed. A negative tuple proves
+    # that the old matcher saw no receipt and can safely admit a later signal.
     try:
-        await page.evaluate(_STORE_COUNT_JS, n)
+        ok, sig = baseline
     except Exception:
-        pass
+        return ReceiptEvidence(None, None, None, False)
+    sig = str(sig or "")
+    if not ok:
+        return ReceiptEvidence(None, None, 0, True)
+    if sig.startswith("url:"):
+        return ReceiptEvidence(sig, None, 0, True)
+    return ReceiptEvidence(None, sig or None, None, False)
 
 
-async def _read_stored_count(page) -> int:
-    try:
-        raw = await page.evaluate(_READ_COUNT_JS)
-        return int(raw or 0)
-    except Exception:
-        return 0
+def _fresh_signal(current: ReceiptEvidence, baseline: ReceiptEvidence) -> str:
+    # URL freshness is independent of DOM state. A newly reached confirmation
+    # route is strong evidence even if the page body was replaced during nav.
+    if current.url_signal and current.url_signal != baseline.url_signal:
+        return current.url_signal
+
+    if not current.dom_signal:
+        return ""
+
+    # If baseline DOM capture failed, a post-submit DOM phrase could already have
+    # existed. Fail closed; only independent URL evidence may verify this attempt.
+    if not baseline.dom_available:
+        return ""
+
+    # Baseline matcher definitely saw no receipt: any current recognized DOM
+    # signal is new, even if the count probe is unavailable now.
+    if not baseline.dom_signal:
+        return current.dom_signal
+
+    # A stale baseline receipt existed. Its occurrence count must have been
+    # captured unambiguously before DOM evidence can later be promoted.
+    if baseline.match_count is None:
+        return ""
+
+    # A different recognized signal (including a different reference ID) is new
+    # semantic evidence. Require the current DOM evaluation itself to be sound.
+    if not current.dom_available:
+        return ""
+    if current.dom_signal != baseline.dom_signal:
+        return current.dom_signal
+
+    # Same text/reference can still be fresh if an additional matching occurrence
+    # appeared. If the current count cannot be measured, stay unverified.
+    if current.match_count is None:
+        return ""
+    if current.match_count > baseline.match_count:
+        return current.dom_signal
+    return ""
 
 
 async def verify_receipt(
@@ -149,59 +232,30 @@ async def verify_receipt(
     retries: int = 0,
     delay: float = 0.4,
     sleep=None,
-    baseline: tuple[bool, str] | None = None,
+    baseline: ReceiptEvidence | tuple[bool, str] | None = None,
 ) -> tuple[bool, str]:
-    """Return (verified, signal).
+    """Return ``(verified, signal)`` after optional polling.
 
-    Without `baseline`: behaves as before — a single (or polled) check for
-    URL/text/reference-id acceptance evidence. Side-effects the page's
-    `document.body.dataset.receiptBaselineCount` with the currently-observed
-    match count so a later post-submit call can compare.
+    With no baseline this preserves the historical behavior: any recognized
+    confirmation signal verifies. With a pre-submit ``ReceiptEvidence`` baseline,
+    only evidence fresh relative to that attempt verifies.
 
-    With `baseline` (an earlier return value from verify_receipt): applies the
-    freshness gate. The evidence is treated as fresh (verified True) only when
-    the current match count is strictly greater than the count observed at
-    baseline capture (i.e. a new acceptance element appeared). If baseline
-    itself had no receipt, any current receipt counts as fresh.
-
-    Never raises. `baseline` defaults to None so existing call sites remain
-    valid without migration.
+    Freshness is evaluated on EVERY poll. A stale-but-valid banner therefore does
+    not stop the retry loop while a genuine async confirmation is still pending.
+    The function never raises.
     """
     sleep = sleep or asyncio.sleep
-    ok, sig = await _check_once(page)
-    attempt = 0
-    while not ok and attempt < retries:
-        await sleep(delay)
-        ok, sig = await _check_once(page)
-        attempt += 1
+    base = _coerce_legacy_baseline(baseline)
 
-    if not ok:
-        # Even without a fired signal, record 0 as the baseline count so a
-        # later post-submit call with baseline=(False, "") knows the page
-        # had no matches at capture time.
-        if baseline is None:
-            await _store_count(page, 0)
-        return False, ""
-
-    # A receipt is currently observed.
-    if baseline is None:
-        # Baseline-capture call: stash the current match count for the later
-        # post-submit call, and return normally.
-        await _store_count(page, await _count_matches(page))
-        return ok, sig
-
-    # Freshness gate: baseline was captured before the submit boundary.
-    baseline_ok, _baseline_sig = baseline
-    if not baseline_ok:
-        # Baseline had NO receipt; any current receipt is fresh evidence
-        # attributable to this attempt.
-        return ok, sig
-    # Baseline had a receipt. Require the current match count to strictly
-    # exceed the baseline count — i.e. a NEW matching element appeared —
-    # so an identical stale panel that persists across submit does not
-    # verify a new attempt.
-    baseline_count = await _read_stored_count(page)
-    current_count = await _count_matches(page)
-    if current_count > baseline_count:
-        return ok, sig
+    for attempt in range(retries + 1):
+        current = await capture_receipt_evidence(page)
+        signal = current.signal if base is None else _fresh_signal(current, base)
+        if signal:
+            return True, signal
+        if attempt < retries:
+            try:
+                await sleep(delay)
+            except Exception:
+                # Waiting failure does not create proof of acceptance.
+                return False, ""
     return False, ""
