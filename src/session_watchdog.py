@@ -81,6 +81,13 @@ class SessionHealth:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class ReauthPreflightResult:
+    health: dict[str, SessionHealth]
+    refreshed_sources: frozenset[str]
+    notified_sources: frozenset[str]
+
+
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
@@ -473,3 +480,68 @@ def preflight_session_check(sources: list[str]) -> dict[str, SessionHealth]:
                 f"[Job Agent] {src.capitalize()} session {h.status} — apply will skip {src} jobs. Tap to fix:",
             )
     return health_map
+
+
+async def preflight_session_check_with_reauth(
+    sources: list[str],
+    config: dict | None = None,
+    *,
+    force_reauth: set[str] | None = None,
+) -> ReauthPreflightResult:
+    """Attempt unattended recovery once per source, then own any human escalation."""
+    from .reauth import AUTOMATED_SOURCES, ReauthManager
+
+    ordered_sources = list(dict.fromkeys(source for source in sources if source))
+    forced = set(force_reauth or ())
+    health = {item.source: item for item in check_session_health(ordered_sources)}
+    candidates = {
+        source
+        for source in ordered_sources
+        if source in AUTOMATED_SOURCES
+        and (
+            source in forced
+            or source not in health
+            or health[source].status in {"expired", "missing"}
+        )
+    }
+    manager = ReauthManager(config or {})
+    refreshed: set[str] = set()
+    failed_forced: set[str] = set()
+
+    for source in ordered_sources:
+        if source not in candidates:
+            continue
+        success = False
+        try:
+            success = await manager.attempt_automated(source)
+        except Exception as exc:
+            _log.warning("preflight.reauth.error source=%s error=%s", source, exc)
+        if success:
+            refreshed.add(source)
+        elif source in forced:
+            failed_forced.add(source)
+
+    if candidates:
+        health = {item.source: item for item in check_session_health(ordered_sources)}
+
+    notified: set[str] = set()
+    for source in ordered_sources:
+        item = health.get(source)
+        needs_human = (
+            source in failed_forced
+            or item is None
+            or item.status in {"expired", "missing"}
+        )
+        if not needs_human:
+            continue
+        _send_deep_link_notification(
+            source,
+            f"[Job Agent] {source.capitalize()} session unavailable after automated recovery. Tap to fix:",
+        )
+        notified.add(source)
+
+    return ReauthPreflightResult(
+        health=health,
+        refreshed_sources=frozenset(refreshed),
+        notified_sources=frozenset(notified),
+    )
