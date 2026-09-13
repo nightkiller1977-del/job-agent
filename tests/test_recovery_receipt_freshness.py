@@ -23,6 +23,11 @@ class _AllowPolicy:
         return True
 
 
+class _Locator:
+    async def inner_text(self):
+        return "form body text"
+
+
 class ReceiptPage:
     def __init__(self, signal="t:application submitted", count=1):
         self.url = "https://jobs.example.com/apply"
@@ -34,7 +39,7 @@ class ReceiptPage:
         return "Apply"
 
     def locator(self, selector):
-        return SimpleNamespace(inner_text=_async_value("form body text"))
+        return _Locator()
 
     async def evaluate(self, script, arg=None):
         if "sentinel: acceptance-matcher harness" in script:
@@ -44,16 +49,6 @@ class ReceiptPage:
         if arg is not None:
             return self.probe_map.get(arg, "other")
         return ""
-
-
-class _async_value:
-    def __init__(self, value):
-        self.value = value
-
-    def __await__(self):
-        async def _get():
-            return self.value
-        return _get().__await__()
 
 
 class _MC:
