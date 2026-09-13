@@ -419,21 +419,11 @@ def _stage_prepare_sessions(source: str) -> bool:
 
 
 def _send_deep_link_notification(source: str, message: str) -> None:
-    """Send a Telegram message with two ways to complete reauth.
+    """Stage reauth and send one durable, rate-limited human escalation.
 
-    - jobagent:// deep link — one-tap fix, but only works when read on the
-      Mac itself (macOS-only URL scheme, see scripts/install-jobagent-url-handler.sh).
-    - noVNC link over your personal Tailscale tailnet — works from a phone
-      away from the Mac; opens a live, controllable view of this Mac's real
-      screen (the same browser window prepare-sessions already opens).
-
-    Also stages the exact `prepare-sessions` command in a new Terminal window
-    on the Mac (see _stage_prepare_sessions) so there's something to see and
-    log into by the time either link is opened.
-
-    Delegates message delivery entirely to notifier._send_telegram(), which
-    reads credentials from the same centralized store telegramApprovalProvider.js
-    uses — no duplicate config needed.
+    Staging happens before delivery so a failed Terminal launch does not send a
+    link to a flow that is not ready. A failed stage also does not consume the
+    dedupe window, allowing the next watchdog pass to retry.
     """
     prepare_source = _prepare_sessions_source(source)
     deep_link = "jobagent://prepare-sessions"
@@ -446,20 +436,26 @@ def _send_deep_link_notification(source: str, message: str) -> None:
     full_msg = f"{message}\n\n" + "\n".join(link_lines)
 
     try:
-        from .notifier import _send_telegram, _desktop_notify, _last_notification_times
-        import time
-        now = time.time()
-        cache_key = f"tg:deep_link:{source}"
-        last_time = _last_notification_times.get(cache_key, 0)
-        # Rate limit identical deep link Telegram alerts to once every 12 hours (43200 seconds)
-        if now - last_time < 43200:
+        from .notifier import (
+            _desktop_notify,
+            _send_telegram,
+            notification_dedupe_active,
+            record_notification_dedupe,
+        )
+
+        key = f"deep_link:{source}"
+        if notification_dedupe_active(key, 12 * 3600):
+            return
+        if not _stage_prepare_sessions(source):
             return
 
         _send_telegram(full_msg)
-        _desktop_notify(f"{source} session needs refresh", message)
-        staged = _stage_prepare_sessions(source)
-        if staged:
-            _last_notification_times[cache_key] = now
+        _desktop_notify(
+            f"🔐 {source.capitalize()} session needs attention",
+            message,
+            subtitle="Job Agent",
+        )
+        record_notification_dedupe(key)
     except Exception as exc:
         _log.warning("session_watchdog.notify_failed source=%s error=%s", source, exc)
         console.print(f"[yellow]Session alert ({source}):[/yellow] {message}\n{full_msg}")
