@@ -42,6 +42,9 @@ jobs:
                  tests/test_llm_answer_generator.py \
                  tests/test_outreach_matcher.py \
                  tests/test_question_bank.py \
+                 tests/test_blocker_intelligence.py \
+                 tests/test_secret_classifier.py \
+                 tests/test_apply_stats.py \
                  tests/test_reauth_regressions.py \
                  tests/test_reauth_feature.py \
                  tests/test_session_autonomy_review_fixes.py \
