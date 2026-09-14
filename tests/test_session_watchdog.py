@@ -199,9 +199,10 @@ def test_stage_prepare_sessions_returns_false_on_osascript_failure():
         assert _stage_prepare_sessions("linkedin") is False
 
 
-def test_send_deep_link_notification_includes_novnc_link_when_available():
+def test_send_deep_link_notification_includes_novnc_link_when_available(tmp_path):
     with patch("src.session_watchdog._novnc_link", return_value="http://100.64.1.2:6080/vnc.html?autoconnect=true"), \
-         patch("src.session_watchdog._stage_prepare_sessions") as mock_stage, \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=True) as mock_stage, \
+         patch("src.notifier.STATUS_FILE", tmp_path / "status.json"), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
          patch("src.notifier._last_notification_times", {}):
@@ -215,9 +216,10 @@ def test_send_deep_link_notification_includes_novnc_link_when_available():
         mock_stage.assert_called_once_with("linkedin")
 
 
-def test_send_deep_link_notification_omits_jobspy_backed_deep_link_source():
+def test_send_deep_link_notification_omits_jobspy_backed_deep_link_source(tmp_path):
     with patch("src.session_watchdog._novnc_link", return_value=None), \
          patch("src.session_watchdog._stage_prepare_sessions", return_value=True), \
+         patch("src.notifier.STATUS_FILE", tmp_path / "status.json"), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
          patch("src.notifier._last_notification_times", {}):
@@ -228,9 +230,10 @@ def test_send_deep_link_notification_omits_jobspy_backed_deep_link_source():
         assert "source=" not in sent_text
 
 
-def test_send_deep_link_notification_omits_novnc_link_when_unresolvable():
+def test_send_deep_link_notification_omits_novnc_link_when_unresolvable(tmp_path):
     with patch("src.session_watchdog._novnc_link", return_value=None), \
-         patch("src.session_watchdog._stage_prepare_sessions"), \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=True), \
+         patch("src.notifier.STATUS_FILE", tmp_path / "status.json"), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
          patch("src.notifier._last_notification_times", {}):
@@ -242,10 +245,11 @@ def test_send_deep_link_notification_omits_novnc_link_when_unresolvable():
         assert "None" not in sent_text
 
 
-def test_send_deep_link_notification_respects_rate_limit():
+def test_send_deep_link_notification_respects_rate_limit(tmp_path):
     cache = {}
     with patch("src.session_watchdog._novnc_link", return_value=None), \
-         patch("src.session_watchdog._stage_prepare_sessions") as mock_stage, \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=True) as mock_stage, \
+         patch("src.notifier.STATUS_FILE", tmp_path / "status.json"), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
          patch("src.notifier._last_notification_times", cache):
@@ -256,16 +260,19 @@ def test_send_deep_link_notification_respects_rate_limit():
         mock_stage.assert_called_once()
 
 
-def test_send_deep_link_notification_does_not_rate_limit_when_staging_fails():
+def test_send_deep_link_notification_retries_staging_without_sending_when_stage_fails(tmp_path):
     cache = {}
+    status_file = tmp_path / "status.json"
     with patch("src.session_watchdog._novnc_link", return_value=None), \
          patch("src.session_watchdog._stage_prepare_sessions", return_value=False) as mock_stage, \
+         patch("src.notifier.STATUS_FILE", status_file), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
          patch("src.notifier._last_notification_times", cache):
         _send_deep_link_notification("linkedin", "first")
         _send_deep_link_notification("linkedin", "second")
 
-        assert mock_send.call_count == 2
+        assert mock_send.call_count == 0
         assert mock_stage.call_count == 2
-        assert "session_reauth_linkedin" not in cache
+        data = json.loads(status_file.read_text()) if status_file.exists() else {}
+        assert "notification_dedupe" not in data

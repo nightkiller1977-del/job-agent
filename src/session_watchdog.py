@@ -47,6 +47,11 @@ _STALE_HOURS = 20
 # How old before it's treated as expired (block)
 _EXPIRED_HOURS = 48
 
+# Only auth-bearing LinkedIn cookies determine whether the login session is
+# usable. Tracking cookies such as lidc/UserMatchHistory expire much sooner and
+# must never flip an otherwise-valid li_at session to expired.
+LINKEDIN_AUTH_COOKIE_NAMES = frozenset({"li_at", "liap", "li_rm"})
+
 # Sources that support background heartbeat visits
 _HEARTBEAT_SOURCES = {"linkedin", "indeed", "jobright"}
 
@@ -76,6 +81,14 @@ class SessionHealth:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class ReauthPreflightResult:
+    health: dict[str, SessionHealth]
+    refreshed_sources: frozenset[str]
+    notified_sources: frozenset[str]
+    attempted_sources: frozenset[str] = frozenset()
+
+
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
@@ -86,7 +99,6 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
     results: list[SessionHealth] = []
 
     for src in all_sources:
-        # Prefer the chromium export (used by background runs)
         paths = [
             SESSIONS_DIR / f"{src}_chromium.json",
             SESSIONS_DIR / f"{src}.json",
@@ -109,10 +121,27 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
         age_sec = time.time() - found.stat().st_mtime
         age_hours = age_sec / 3600
 
-        # Also peek inside for LinkedIn expiry timestamps if available
-        cookie_expiry_hours = _parse_linkedin_expiry(found) if src == "linkedin" else None
+        if src == "linkedin":
+            has_auth_cookie, cookie_expiry_hours = _linkedin_auth_cookie_state(found)
+            if not has_auth_cookie:
+                results.append(SessionHealth(
+                    source=src,
+                    status="expired",
+                    age_hours=age_hours,
+                    session_path=found,
+                    detail="LinkedIn session has no recognized authentication cookie.",
+                ))
+                continue
+        else:
+            cookie_expiry_hours = None
 
-        is_expired = (age_hours >= _EXPIRED_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 0)
+        if src == "linkedin":
+            # LinkedIn login validity is determined by auth-bearing cookies, not
+            # by the export file's mtime. File age still makes the session stale
+            # so heartbeat can refresh it proactively.
+            is_expired = cookie_expiry_hours is not None and cookie_expiry_hours <= 0
+        else:
+            is_expired = age_hours >= _EXPIRED_HOURS
         is_stale = (age_hours >= _STALE_HOURS) or (cookie_expiry_hours is not None and cookie_expiry_hours <= 4)
 
         if is_expired:
@@ -141,26 +170,34 @@ def check_session_health(sources: list[str] | None = None) -> list[SessionHealth
     return results
 
 
-def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
-    """Extract the earliest LinkedIn cookie expiry from the session JSON.
-
-    Returns hours until expiry (can be negative if already expired),
-    or None if parsing fails.
-    """
+def _linkedin_auth_cookie_state(session_path: Path) -> tuple[bool, Optional[float]]:
+    """Return whether LinkedIn auth cookies exist and their earliest expiry."""
     try:
         data = json.loads(session_path.read_text())
-        cookies = data.get("cookies", [])
-        li_cookies = [c for c in cookies if "linkedin" in c.get("domain", "")]
-        if not li_cookies:
-            return None
-        now = time.time()
-        expiries = [c["expires"] for c in li_cookies if c.get("expires", -1) > 0]
+        auth_cookies = [
+            cookie
+            for cookie in data.get("cookies", [])
+            if "linkedin" in str(cookie.get("domain", "")).lower()
+            and str(cookie.get("name", "")) in LINKEDIN_AUTH_COOKIE_NAMES
+        ]
+        if not auth_cookies:
+            return False, None
+        expiries = [
+            float(cookie["expires"])
+            for cookie in auth_cookies
+            if float(cookie.get("expires", -1) or -1) > 0
+        ]
         if not expiries:
-            return None
-        earliest = min(expiries)
-        return (earliest - now) / 3600  # hours until expiry (negative = already expired)
-    except Exception:
-        return None
+            return True, None
+        return True, (min(expiries) - time.time()) / 3600
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False, None
+
+
+def _parse_linkedin_expiry(session_path: Path) -> Optional[float]:
+    """Extract the earliest LinkedIn authentication-cookie expiry."""
+    _has_auth_cookie, expiry_hours = _linkedin_auth_cookie_state(session_path)
+    return expiry_hours
 
 
 def print_health_table(results: list[SessionHealth]) -> None:
@@ -266,7 +303,6 @@ async def _heartbeat_source(source: str, config: dict) -> bool:
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(2)
 
-            # Export refreshed cookies back to session file
             state = await ctx.storage_state()
             tmp = session_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(state))
@@ -395,21 +431,11 @@ def _stage_prepare_sessions(source: str) -> bool:
 
 
 def _send_deep_link_notification(source: str, message: str) -> None:
-    """Send a Telegram message with two ways to complete reauth.
+    """Stage reauth and send one durable, rate-limited human escalation.
 
-    - jobagent:// deep link — one-tap fix, but only works when read on the
-      Mac itself (macOS-only URL scheme, see scripts/install-jobagent-url-handler.sh).
-    - noVNC link over your personal Tailscale tailnet — works from a phone
-      away from the Mac; opens a live, controllable view of this Mac's real
-      screen (the same browser window prepare-sessions already opens).
-
-    Also stages the exact `prepare-sessions` command in a new Terminal window
-    on the Mac (see _stage_prepare_sessions) so there's something to see and
-    log into by the time either link is opened.
-
-    Delegates message delivery entirely to notifier._send_telegram(), which
-    reads credentials from the same centralized store telegramApprovalProvider.js
-    uses — no duplicate config needed.
+    Staging happens before delivery so a failed Terminal launch does not send a
+    link to a flow that is not ready. A failed stage also does not consume the
+    dedupe window, allowing the next watchdog pass to retry.
     """
     prepare_source = _prepare_sessions_source(source)
     deep_link = "jobagent://prepare-sessions"
@@ -422,20 +448,22 @@ def _send_deep_link_notification(source: str, message: str) -> None:
     full_msg = f"{message}\n\n" + "\n".join(link_lines)
 
     try:
-        from .notifier import _send_telegram, _desktop_notify, _last_notification_times
-        import time
-        now = time.time()
-        cache_key = f"tg:deep_link:{source}"
-        last_time = _last_notification_times.get(cache_key, 0)
-        # Rate limit identical deep link Telegram alerts to once every 12 hours (43200 seconds)
-        if now - last_time < 43200:
+        from .notifier import (
+            _desktop_notify,
+            _send_telegram,
+            notification_dedupe_active,
+            record_notification_dedupe,
+        )
+
+        key = f"deep_link:{source}"
+        if notification_dedupe_active(key, 12 * 3600):
+            return
+        if not _stage_prepare_sessions(source):
             return
 
         _send_telegram(full_msg)
         _desktop_notify(f"{source} session needs refresh", message)
-        staged = _stage_prepare_sessions(source)
-        if staged:
-            _last_notification_times[cache_key] = now
+        record_notification_dedupe(key)
     except Exception as exc:
         _log.warning("session_watchdog.notify_failed source=%s error=%s", source, exc)
         console.print(f"[yellow]Session alert ({source}):[/yellow] {message}\n{full_msg}")
@@ -459,3 +487,81 @@ def preflight_session_check(sources: list[str]) -> dict[str, SessionHealth]:
                 f"[Job Agent] {src.capitalize()} session {h.status} — apply will skip {src} jobs. Tap to fix:",
             )
     return health_map
+
+
+async def preflight_session_check_with_reauth(
+    sources: list[str],
+    config: dict | None = None,
+    *,
+    force_reauth: set[str] | None = None,
+) -> ReauthPreflightResult:
+    """Attempt unattended recovery once per source, then own any human escalation."""
+    from .reauth import AUTOMATED_SOURCES, ReauthManager
+
+    ordered_sources = list(dict.fromkeys(source for source in sources if source))
+    forced = set(force_reauth or ())
+    health = {item.source: item for item in check_session_health(ordered_sources)}
+    candidates = {
+        source
+        for source in ordered_sources
+        if source in AUTOMATED_SOURCES
+        and (
+            source in forced
+            or source not in health
+            or health[source].status in {"expired", "missing"}
+        )
+    }
+    manager = ReauthManager(config or {})
+    attempted: set[str] = set()
+    refreshed: set[str] = set()
+    failed_forced: set[str] = set()
+
+    for source in ordered_sources:
+        if source not in candidates:
+            continue
+        attempted.add(source)
+        success = False
+        try:
+            success = await manager.attempt_automated(source)
+        except Exception as exc:
+            _log.warning("preflight.reauth.error source=%s error=%s", source, exc)
+        if success:
+            refreshed.add(source)
+        elif source in forced:
+            failed_forced.add(source)
+
+    if candidates:
+        health = {item.source: item for item in check_session_health(ordered_sources)}
+        # An automated login is not a verified refresh until its durable session
+        # state survives the post-attempt health check. Export failures are
+        # intentionally non-fatal in BaseScraper, so the boolean alone is not
+        # sufficient evidence. A stale session is still usable; missing/expired is not.
+        refreshed = {
+            source
+            for source in refreshed
+            if (item := health.get(source)) is not None
+            and item.status not in {"expired", "missing"}
+        }
+
+    notified: set[str] = set()
+    for source in ordered_sources:
+        item = health.get(source)
+        needs_human = (
+            source in failed_forced
+            or item is None
+            or item.status in {"expired", "missing"}
+        )
+        if not needs_human:
+            continue
+        _send_deep_link_notification(
+            source,
+            f"[Job Agent] {source.capitalize()} session unavailable after automated recovery. Tap to fix:",
+        )
+        notified.add(source)
+
+    return ReauthPreflightResult(
+        health=health,
+        refreshed_sources=frozenset(refreshed),
+        notified_sources=frozenset(notified),
+        attempted_sources=frozenset(attempted),
+    )
