@@ -130,14 +130,14 @@ async def test_baseline_evaluation_failure_fails_closed_not_open():
     assert ok is False
 
 
-def _run_receipt_js(body_text: str):
+def _run_receipt_js(body_text: str, js: str | None = None):
     node = shutil.which("node")
     assert node is not None, "Node is required by the receipt truthfulness CI job"
     wrapper = (
         "const fs = require('fs');\n"
         "const body = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
         "globalThis.document = { body: { innerText: body } };\n"
-        f"const fn = ({receipt_mod._RECEIPT_JS});\n"
+        f"const fn = ({js or receipt_mod._RECEIPT_JS});\n"
         "process.stdout.write(JSON.stringify(fn()));\n"
     )
     proc = subprocess.run(
@@ -162,3 +162,52 @@ def test_common_success_phrases_remain_recognized(body):
         assert result, f"valid confirmation was not recognized: {body!r}"
     else:
         assert result, f"valid confirmation was not recognized: {body!r}"
+
+
+@pytest.mark.asyncio
+async def test_identical_receipt_text_is_fresh_only_when_occurrence_count_increases():
+    """A second occurrence of the same recognized receipt text is fresh evidence.
+
+    Kept away from the Chromium fixture in test_receipt_dom_truthfulness.py,
+    whose mutation also injects a different success phrase and so could pass for
+    the wrong reason. The counts are produced by the production counter rather
+    than hand-set, so a regression in _COUNT_JS fails here instead of silently
+    downgrading a real submission to unverified.
+    """
+    one = _run_receipt_js("Application submitted.", receipt_mod._COUNT_JS)
+    two = _run_receipt_js(
+        "Application submitted.\nApplication submitted.", receipt_mod._COUNT_JS
+    )
+    assert two > one, "production counter must see the second occurrence"
+
+    page = FreshnessPage(signal="t:application submitted", count=one)
+    baseline = await _capture_baseline(page)
+
+    # Same text, same occurrence count: stale evidence from before this attempt.
+    ok, signal = await receipt_mod.verify_receipt(page, baseline=baseline)
+    assert ok is False
+    assert signal == ""
+
+    # The only change is a second occurrence of the exact same receipt text.
+    # There is no second success phrase or reference-id channel in this fake.
+    page.count = two
+    ok, signal = await receipt_mod.verify_receipt(page, baseline=baseline)
+
+    assert ok is True
+    assert signal == "t:application submitted"
+
+
+@pytest.mark.asyncio
+async def test_post_submit_count_failure_fails_closed_not_open():
+    """Mirror of the baseline-side guard: an unreadable post-submit count must
+    not reach the comparison, which would raise TypeError and abort the apply
+    run instead of degrading to unverified.
+    """
+    page = FreshnessPage(signal="t:application submitted", count=1)
+    baseline = await _capture_baseline(page)
+
+    page.count = 2
+    page.fail_next_count = True
+    ok, signal = await receipt_mod.verify_receipt(page, baseline=baseline)
+    assert ok is False
+    assert signal == ""
