@@ -1,5 +1,9 @@
 # job-agent — Claude Code instructions
 
+@AGENTS.md
+
+`AGENTS.md` is the shared engineering source of truth. The additional detail below is retained for Claude Code and must not weaken it.
+
 ## CRITICAL: Chrome profile isolation
 
 **Never change `_profile_dir` in `src/sources/base.py` to point at the main Chrome profile.**
@@ -36,6 +40,10 @@ Never use `--no-verify` to skip pre-commit hooks.
 
 ## Source verification before quoting
 
-When a subagent, tool, or external report cites a `file:line` claim about this repo, verify it against the actual source before presenting or acting on it. Read the referenced file, run the referenced grep, or execute the referenced test yourself. Quoting a claim you have not verified — especially regex behavior, control-flow assertions, or "this pattern already matches X" — is exactly how false-confidence proposals ("just tighten the regex") get past review. If verification is skipped due to time or scope, say so explicitly.
+When a subagent, tool, or external report cites a `file:line` claim about this repo, verify it against the actual source before presenting or acting on it. Read the referenced file, run the referenced grep, or execute the referenced test yourself. If verification is skipped due to scope, say so explicitly.
 
-Applies equally to: subagent investigation reports (Explore, general-purpose), Codex/OpenHands reviews, static-analysis output, and any AI-authored suggestion that would land in a PR. Regression tests derived from a real observed failure are the only durable check; adopted-without-verification claims are not.
+Applies equally to subagent investigation reports, Codex/OpenHands reviews, static-analysis output, and AI-authored suggestions that would land in a PR.
+
+## Claude-specific side-effect rule
+
+Ask before irreversible/shared actions unless the user explicitly authorized that exact action in the current task: merging, force-pushing/history rewrite, production deploy/config changes, secret-store writes, live employer submissions/messages, destructive data changes, or permission/budget changes. Branch commits, tests, and opening a PR do not require an extra confirmation.
