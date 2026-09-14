@@ -1,138 +1,237 @@
-# job-agent
+# Job Agent
 
-`job-agent` is AI Commander's **job discovery, scoring, resume-tailoring, ATS automation, and application execution agent**. It discovers opportunities, evaluates them against configured role/compensation criteria, prepares tailored application material, drives supported application flows with Playwright, and records evidence about what actually happened.
+Job Agent is a Python + Playwright automation project for managing the repetitive parts of a job search: discovering openings, ranking fit, tailoring application material, navigating supported application systems, and keeping a durable record of what actually happened.
 
-For deeper engineering internals and apply-workflow architecture, see [`DEVELOPER_ONBOARDING.md`](DEVELOPER_ONBOARDING.md).
+The project is designed around one important rule: **an application is not considered submitted unless there is fresh evidence that the current submission attempt succeeded**. A button click, a timeout, or old success text is not enough.
 
-## Current state
+## Why this project exists
 
-**State: Functional autonomous pipeline under submission-truthfulness and reliability hardening.**
+Most job-search tools focus on only one part of the process — discovery, ranking, resume generation, or browser automation. Job Agent connects those steps into one workflow while trying to avoid one of the most dangerous automation failures: submitting the same application twice because a browser timeout was mistaken for a failed submission.
 
-Capabilities on `main` include:
+The project can be useful if you want to experiment with a self-hosted job-search workflow that combines:
 
-- Multi-source job discovery and normalization.
-- Job scoring/ranking against configured role, seniority, compensation, and work-style criteria.
-- Resume tailoring with fabrication guards and score/review gates.
-- Persistent job/application state.
-- ATS routing and adapter-based application flows.
-- LinkedIn and external ATS application handling.
-- Browser/session isolation using persistent per-source profiles.
-- Automated session recovery for scheduled runs, with bounded human-assist paths where a source requires interactive authentication/2FA.
-- Dashboard and scheduled/background execution support.
-- Runtime incident reporting into the wider AI Commander recovery path.
-- Receipt/submission verification that distinguishes confirmed evidence from ambiguous outcomes instead of claiming success from stale DOM text or timing alone.
-- Regression coverage around receipt freshness, restart safety, delayed success signals, and adapter behavior.
-- Shared OpenHands and Claude repository skills so development agents follow the same reuse, security, simplicity, and evidence rules.
+- job discovery from multiple sources;
+- configurable scoring and filtering;
+- AI-assisted resume tailoring;
+- Playwright-based browser automation;
+- ATS-specific adapters where deterministic automation is possible;
+- persistent application/session state;
+- submission receipt verification and reconciliation.
 
-The agent should **not** be described as “fully reliable” merely because it can reach and fill an application. Browser automation has ambiguous failure modes: a submit click can time out after the employer accepted it, a success message can be stale, an authentication state can expire mid-run, and an ATS can change its markup. The system therefore treats uncertain submission state as uncertain and reconciles before retrying.
+## Project status
 
-## Direction
+**Active development.** The end-to-end pipeline is functional, but job sites and applicant tracking systems change frequently. Reliability work is focused on session recovery, ATS compatibility, restart safety, receipt verification, and preventing duplicate submissions.
 
-The priority is to make the agent **truthful and restart-safe before increasing application volume or adding more sources**.
+This project should not be treated as a guarantee that every supported site or employer flow will work unchanged over time.
 
-1. **Eliminate false submission claims.** `applied`/confirmed states require fresh evidence tied to the current submission attempt. Stale/same-text UI, pre-submit DOM, or a click alone are not receipts.
-2. **Prevent duplicate employer submissions.** When a submission outcome is ambiguous, reconcile the ATS/job state before retrying. Timeout must never automatically mean “safe to submit again.”
-3. **Keep `submission_unverified` as a real state.** Uncertainty is preferable to a false positive. Follow-up logic should investigate/reconcile it rather than silently convert it to success or failure.
-4. **Prefer deterministic ATS adapters.** Vendor-specific APIs/selectors and structured adapters should be used before generic model-driven browser guessing when a reliable deterministic path exists.
-5. **Keep application side effects idempotent/restart-safe.** Persistent state, adapter event logs, attempt identity, and receipt evidence should allow a crashed/restarted run to understand what already happened.
-6. **Make session recovery autonomous but bounded.** Recover normal expired sessions automatically; fail closed or request human assistance for authentication states that cannot be safely automated.
-7. **Reduce unnecessary LLM orchestration.** Discovery normalization, session checks, adapter selection, form validation, receipt verification, retries, and reconciliation should remain deterministic where possible. Use models for scoring/tailoring/reasoning where they add value.
-8. **Expand adapter coverage based on observed failure classes.** Workday, Greenhouse, Lever, Ashby, BrassRing, LinkedIn and fallback flows should converge on shared contracts rather than one-off fixes.
-9. **Feed operational failures into AI Commander.** Structured incidents should include enough evidence for Guardian/Repair/OpenHands to distinguish source changes, authentication failures, browser/runtime faults, and code defects.
-10. **Test consequential behavior only in controlled fixtures/test tenants.** Do not use real employer submissions as regression-test side effects.
+## Highlights
 
-## Execution model
+- **Multi-source discovery** — supports job discovery and normalization from sources such as LinkedIn, Jobright, Indeed, USAJobs, and additional configured feeds.
+- **Configurable fit scoring** — ranks roles against your target titles, seniority, compensation, location/work-style preferences, and other configured criteria.
+- **Resume tailoring with fabrication guards** — can rewrite emphasis and wording for a role, but the workflow is designed not to invent employers, titles, dates, education, certifications, or skills.
+- **ATS-aware automation** — vendor-specific adapters and selectors are preferred over generic browser guessing when a reliable deterministic path exists.
+- **Persistent browser sessions** — source-specific browser profiles reduce repeated logins and support scheduled/background runs.
+- **Session recovery** — normal expired sessions can be recovered automatically, with bounded human assistance for authentication flows such as 2FA.
+- **Submission truthfulness** — confirmed submission state requires fresh evidence associated with the current attempt.
+- **Ambiguous-outcome handling** — uncertain results remain `submission_unverified` until reconciled instead of being silently reported as success.
+- **Restart-safe state** — application attempts, receipts, event history, and session state are persisted so a restart can reason about prior side effects.
+- **Dashboard and notifications** — optional dashboard, notification, and approval integrations are available for remote monitoring and control.
+
+## How it works
 
 ```text
-Discover
-   ↓
-Normalize / dedupe
-   ↓
-Score / filter
-   ↓
-Tailor resume if required
-   ↓
-Preflight
-   ↓
-Choose deterministic ATS/apply adapter
-   ↓
-Validate session + form
-   ↓
-Submit (when authorized)
-   ↓
+Discover jobs
+     ↓
+Normalize + deduplicate
+     ↓
+Score and filter
+     ↓
+Tailor resume when needed
+     ↓
+Preflight application
+     ↓
+Select ATS/application adapter
+     ↓
+Validate session + required fields
+     ↓
+Submit when authorized
+     ↓
 Verify fresh receipt/evidence
-   ├─ confirmed ─────────────► record applied
-   ├─ confirmed not sent ───► bounded recovery/retry
-   └─ ambiguous ────────────► submission_unverified + reconcile
+     ├─ confirmed ─────────────► record applied
+     ├─ confirmed not sent ───► bounded recovery/retry
+     └─ ambiguous ────────────► submission_unverified + reconcile
 ```
 
-## Safety and truthfulness rules
+The distinction between **submission** and **verification** is intentional. Browser automation often encounters states where the browser does not know whether the remote site accepted a request. The agent preserves that uncertainty instead of automatically retrying a potentially successful application.
 
-- A click is not proof of submission.
-- Existing success text is not proof of a new submission.
-- A timeout is not proof of failure.
-- Ambiguous side effects must be reconciled before retry.
-- Resume tailoring may change emphasis/wording but must not invent employers, roles, dates, education, certifications, or skills.
-- Real credentials and personal profile data remain outside Git.
-- Tests must not create live employer applications.
-- Model output is advisory; deterministic browser/ATS evidence establishes application state.
+## Getting started
 
-## Configuration
+### 1. Create a Python environment
 
-Copy the example configuration files and keep real values untracked:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chrome
+```
+
+### 2. Create local configuration
 
 ```bash
 cp .env.example .env
 cp config.example.json config.json
 ```
 
-`config.json`, `state/profile.json`, sessions, tailored resumes, credentials, and other user-specific state should remain gitignored/private. Use the shared `aicc-secrets` flow where the wider AI Commander deployment manages credentials centrally.
+Fill in only the providers and job sources you intend to use. Blank source credentials can be left disabled.
+
+The project supports local Ollama first, with optional external model providers through configured OpenRouter, Anthropic, or OpenAI credentials. See `.env.example` for the current variables and defaults.
+
+Keep `.env`, `config.json`, `state/profile.json`, browser sessions, resumes, and other personal data out of Git.
+
+### 3. Add your profile and resume
+
+Configure your target-role criteria and source resume in `config.json`, then provide the personal/work-history information required by the application flows in the local `state/` configuration described by the repository documentation.
+
+### 4. Run discovery
+
+```bash
+python src/main.py discover
+```
+
+### 5. Review the environment before applying
+
+```bash
+python src/main.py preflight
+```
+
+For first-time testing, use a controlled non-submitting run:
+
+```bash
+python src/main.py apply --limit 1 --no-auto-submit
+```
+
+Only enable automated final submission after you have reviewed your configuration and the target-site behavior:
+
+```bash
+python src/main.py apply --auto-submit
+```
 
 ## Common commands
 
 ```bash
-# Create environment and install dependencies
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chrome
-
-# Discover/score jobs
+# Discover and score jobs
 python src/main.py discover
 
-# Check approved queue and environment
+# Discover from one source
+python src/main.py discover --source linkedin
+python src/main.py discover --source indeed
+python src/main.py discover --source usajobs
+python src/main.py discover --source jobright
+
+# Validate approved applications and environment
 python src/main.py preflight
 
-# Controlled apply testing
+# Controlled application run without final submission
 python src/main.py apply --limit 1 --no-auto-submit
 
-# Authorized automatic application run
+# Authorized automated application run
 python src/main.py apply --auto-submit
 
-# Prepare/recover sessions where needed
+# Prepare or recover browser sessions
 python src/main.py prepare-sessions
 
-# Operational status/checks
+# Operational status and checks
 python src/main.py status
 python src/main.py ops-check
 ```
 
-Use `src/main.py --help`, current config examples, and `DEVELOPER_ONBOARDING.md` as the source of truth for the full command surface.
+Use `python src/main.py --help` for the current command surface.
+
+## Configuration and model routing
+
+`.env.example` documents the supported runtime variables. The current inference path can use:
+
+1. local Ollama;
+2. an OpenRouter-compatible gateway;
+3. Anthropic;
+4. OpenAI.
+
+You do not need to configure every provider. Features that depend on a missing provider or source should be disabled or skipped rather than requiring credentials you do not use.
+
+`config.example.json` contains the non-secret job-search configuration. Real configuration belongs in your local `config.json` and should not be committed.
+
+## Submission verification
+
+Consequential browser automation needs stronger evidence than “the click did not throw an exception.” Job Agent therefore uses several rules that are important for both users and contributors:
+
+- A click is not proof that an employer received an application.
+- Existing success text is not proof that a new submission succeeded.
+- A timeout is not proof that submission failed.
+- An ambiguous result must be reconciled before another submit attempt.
+- Fresh receipt evidence must be associated with the current attempt.
+- `submission_unverified` is a valid result and should not be converted to success merely to make reporting look cleaner.
+
+These rules are intentionally conservative because duplicate employer submissions are harder to undo than an application that needs manual review.
+
+## Browser sessions
+
+Each job source uses isolated browser/session state instead of sharing a normal everyday Chrome profile. This reduces browser-profile locking issues and makes background runs more predictable.
+
+Some sites can be reauthenticated automatically. Others may require human interaction, especially when MFA, CAPTCHA, or unusual security challenges are involved. The agent is intended to fail safely rather than bypass those controls.
 
 ## Testing
 
-Run the relevant pytest suites before merging application-path changes. Receipt verification, adapter selection, restart safety, session recovery, and submission reconciliation are especially load-bearing because they protect real-world side effects.
+Run the relevant pytest suite before changing application or receipt logic:
 
-The project deliberately keeps RED-then-GREEN regression history where useful so a test demonstrates the bug it is intended to prevent. Do not bypass pre-push hooks or weaken truthfulness assertions to make a change mergeable.
+```bash
+pytest
+```
+
+High-risk areas include:
+
+- submission receipt freshness;
+- duplicate-submission prevention;
+- restart/retry behavior;
+- ATS adapter selection;
+- browser/session recovery;
+- form validation and final-submit gating.
+
+Tests for application flows should use controlled fixtures, mocks, or authorized test environments. Regression testing should not create real employer applications.
+
+## Safety, privacy, and responsible use
+
+This project automates interactions with third-party websites. Before using it, review the terms and automation policies of the services you connect to and make sure your use is authorized.
+
+Do not commit personal information or credentials. Use `.env.example` and `config.example.json` only as templates, and review [`SECURITY.md`](SECURITY.md) for security guidance.
+
+The project is intentionally not designed to defeat MFA, CAPTCHA, access controls, anti-bot protections, or other site security mechanisms.
+
+## Documentation
+
+Additional documentation is available in the repository:
+
+- [`DEVELOPER_ONBOARDING.md`](DEVELOPER_ONBOARDING.md) — architecture and engineering internals.
+- [`INTEGRATION_GUIDE.md`](INTEGRATION_GUIDE.md) — integration details.
+- [`ATS_ADAPTER_PLAN.md`](ATS_ADAPTER_PLAN.md) — ATS adapter architecture and direction.
+- [`SECURITY.md`](SECURITY.md) — credential and security practices.
+- [`SECRETS.md`](SECRETS.md) — secret-resolution details.
 
 ## Relationship to AI Commander
 
-- `Ai-Command-Center-Desktop-App` schedules/observes the agent and owns the broader stability/Guardian/Repair path.
-- `Aicc-Coordinator` receives trusted operational incidents and coordinates durable recovery work.
-- `AI-Commander-Brain-Memory-` is the direction for reusable lessons, incident history, job-search preferences, and model-independent personal context under policy.
-- `email-agent` can provide job-related inbox signals without becoming the application authority.
-- `aicc-secrets` provides shared managed credentials where configured.
+Job Agent was developed as a specialized agent within the broader **AI Commander** ecosystem, where it can participate in centralized scheduling, health monitoring, incident recovery, shared model routing, and optional memory/knowledge workflows.
 
-## Documentation rule
+Those integrations are not required to understand the repository or experiment with the core job-search pipeline. The repository remains useful as a standalone project, while AI Commander provides a larger orchestration environment around it.
 
-This README describes the role, capabilities merged to `main`, and current direction. A supported ATS is not guaranteed to remain unchanged, and a historical successful run is not proof that the next live submission will succeed. Tests, receipts, ledger/state data, runtime evidence, GitHub changes, and controlled acceptance runs remain the source of truth. Avoid dated status snapshots and fixed “fully automated / bug-free” claims.
+## Contributing
+
+Contributions are most useful when they improve correctness rather than simply adding more automation. Good areas to contribute include:
+
+- ATS adapters;
+- receipt verification;
+- site-change regressions;
+- restart/idempotency behavior;
+- safer session handling;
+- tests and controlled fixtures;
+- documentation.
+
+For changes that can produce real-world side effects, include regression coverage and preserve the conservative submission-verification rules.
