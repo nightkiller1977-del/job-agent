@@ -16,13 +16,17 @@ Credential writes fail closed when the encryption key is missing; plaintext pass
 ## Authentication
 
 The dashboard is **fail-closed**. `SYNC_SECRET` gates every route except the app's
-own `/health` and `/metrics` probes:
+own `/health` and `/metrics` probes and the `/login` exchange:
 
-- Browser navigations to `/` pass the secret as `?secret=<value>`.
-- The dashboard's own JS sends it as the `X-Sync-Secret` header on every fetch.
-- Mutating requests (POST/PUT/etc.) must present the secret in the header; a query
-  param is accepted only for safe methods (`GET`/`HEAD`).
+- **Browsers** sign in once at `/login` with the sync secret. The server sets an
+  `HttpOnly; SameSite=Strict; Secure` session cookie, so the secret never appears
+  in a URL, browser history, or access log, and page scripts cannot read it.
+- **Machine callers** (the orchestrator's sync calls in `src/orchestrator.py`)
+  keep sending the secret as the `X-Sync-Secret` header.
+- A browser navigation without a session is redirected to `/login`; API calls
+  without a valid session or header get `403`.
 
 If `SYNC_SECRET` is unset the dashboard returns `503` for every non-probe route
 instead of serving data unauthenticated. `render.yaml` sets `generateValue: true`
-for this key, so a Render deploy is protected by default.
+for this key, so a Render deploy is protected by default. Rotating the secret
+invalidates all existing sessions.

@@ -4,8 +4,12 @@ Fail-closed authentication tests for the dashboard.
 Before this gate existed, only /api/sync and /api/jobs/unhydrated checked the
 shared secret — GET / rendered the review queues AND the stored credential
 emails, and POST /api/action let anyone mark jobs applied/archived. Every route
-except the app's own probes now requires SYNC_SECRET, and an unset secret is
-refused rather than silently reopening the site.
+except the app's own probes and the /login exchange now requires authentication,
+and an unset secret is refused rather than silently reopening the site.
+
+Browsers authenticate once at /login, which sets an HttpOnly session cookie; the
+shared secret never appears in a URL and is never exposed to page script. Machine
+callers keep using the X-Sync-Secret header.
 
 The middleware reads the module-level SYNC_SECRET per request, so tests patch
 that attribute rather than reloading the shared module (a reload would swap the
@@ -43,6 +47,12 @@ class TestFailClosedWhenSecretUnset(unittest.TestCase):
             resp = self.client.post("/api/action", json={"job_id": "j1", "action": "applied"})
         self.assertEqual(resp.status_code, 503)
 
+    def test_login_is_refused_while_unconfigured(self):
+        # /login is exempt from the session check, so it must refuse on its own.
+        with patch.object(dm, "SYNC_SECRET", ""):
+            self.assertEqual(self.client.get("/login").status_code, 503)
+            self.assertEqual(self.client.post("/login", data={"secret": "x"}).status_code, 503)
+
     def test_health_probe_still_works(self):
         # Render / Prometheus probes carry no secret and must keep working.
         with patch.object(dm, "SYNC_SECRET", ""):
@@ -57,20 +67,18 @@ class TestRequiresSecretWhenConfigured(unittest.TestCase):
         self._patched.start()
         self.addCleanup(self._patched.stop)
 
-    def test_homepage_without_secret_is_403(self):
-        self.assertEqual(self.client.get("/").status_code, 403)
-
-    def test_homepage_with_wrong_secret_is_403(self):
-        resp = self.client.get("/", headers={"X-Sync-Secret": "wrong"})
-        self.assertEqual(resp.status_code, 403)
-
-    def test_action_without_secret_is_403(self):
-        # 403 from the middleware, i.e. before the handler's own validation —
-        # proof the gate runs for routes that used to be wide open.
+    def test_api_without_secret_is_403(self):
         resp = self.client.post("/api/action", json={"job_id": "j1", "action": "applied"})
         self.assertEqual(resp.status_code, 403)
 
-    def test_secret_in_header_passes_the_gate(self):
+    def test_api_with_wrong_secret_is_403(self):
+        resp = self.client.post(
+            "/api/action", json={"job_id": "j1", "action": "applied"},
+            headers={"X-Sync-Secret": "wrong"},
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_machine_header_passes_the_gate(self):
         # A bogus action is a 400 from the handler, not a 403 from the gate —
         # proving the request reached application code.
         resp = self.client.post(
@@ -78,24 +86,60 @@ class TestRequiresSecretWhenConfigured(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
-    def test_secret_in_query_param_authenticates_a_navigation(self):
-        # A browser navigation cannot set a header; it carries ?secret= instead.
-        # With no MONGODB_URI the authenticated request reaches the handler, which
-        # responds 503 "not configured" — i.e. the gate let it through.
-        resp = self.client.get("/?secret=testsecret")
-        self.assertEqual(resp.status_code, 503)
-        self.assertIn("Dashboard not configured", resp.text)
+    def test_browser_navigation_redirects_to_login(self):
+        resp = self.client.get("/", follow_redirects=False)
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/login")
 
-    def test_query_param_with_wrong_secret_is_403(self):
-        self.assertEqual(self.client.get("/?secret=wrong").status_code, 403)
+    def test_query_param_secret_does_not_authenticate(self):
+        # The secret must not be replayable from a URL / browser history / access log.
+        resp = self.client.get("/?secret=testsecret", follow_redirects=False)
+        self.assertEqual(resp.status_code, 303)
 
-    def test_query_param_is_not_accepted_for_mutations(self):
-        # A cross-site link/form could carry ?secret=; mutations must require the
-        # header, so a query param on POST must not satisfy the gate.
+    def test_login_with_wrong_secret_sets_no_cookie(self):
         resp = self.client.post(
-            "/api/action?secret=testsecret", json={"job_id": "j1", "action": "applied"}
+            "/login", data={"secret": "wrong", "next": "/"}, follow_redirects=False
         )
-        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.status_code, 401)
+        self.assertNotIn("ja_session", resp.cookies)
+
+    def test_login_sets_httponly_strict_cookie_then_grants_access(self):
+        resp = self.client.post(
+            "/login", data={"secret": "testsecret", "next": "/"}, follow_redirects=False
+        )
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/")
+        cookie = resp.headers["set-cookie"].lower()
+        self.assertIn("httponly", cookie)
+        self.assertIn("samesite=strict", cookie)
+
+        # The cookie now satisfies the gate for a navigation and for API calls.
+        # No MONGODB_URI in tests, so the handler's own 503 is the success signal.
+        page = self.client.get("/")
+        self.assertEqual(page.status_code, 503)
+        self.assertIn("Dashboard not configured", page.text)
+
+    def test_login_next_cannot_redirect_off_site(self):
+        resp = self.client.post(
+            "/login",
+            data={"secret": "testsecret", "next": "//evil.example.com"},
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.headers["location"], "/")
+
+    def test_tampered_session_cookie_is_rejected(self):
+        # A forged signature must not authenticate, even with a well-formed shape.
+        self.client.cookies.set("ja_session", "deadbeef.not-a-real-signature")
+        self.assertEqual(self.client.get("/", follow_redirects=False).status_code, 303)
+
+    def test_session_cookie_invalidated_when_secret_rotates(self):
+        self.client.post("/login", data={"secret": "testsecret", "next": "/"}, follow_redirects=False)
+        with patch.object(dm, "SYNC_SECRET", "a-different-secret"):
+            # Both the old header value and the cookie's signature are tied to the
+            # previous secret, so the navigation is denied (redirected to login).
+            resp = self.client.get("/", follow_redirects=False)
+            self.assertEqual(resp.status_code, 303)
+            self.assertEqual(resp.headers["location"], "/login")
 
 
 class TestMiddlewareIsWiredIn(unittest.TestCase):

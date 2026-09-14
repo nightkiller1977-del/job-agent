@@ -5,14 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Job Agent</title>
   <link rel="stylesheet" href="/static/css/tailwind.min.css">
-  <script>
-    window.addEventListener('load', function() {
-      var link = document.querySelector('link[href="/static/css/tailwind.min.css"]');
-      if (link && !link.sheet) {
-        var s = document.createElement('script'); s.src = 'https://cdn.tailwindcss.com'; document.head.appendChild(s);
-      }
-    });
-  </script>
   <style>
     *,*::before,*::after{box-sizing:border-box;}
     body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',system-ui,sans-serif;background:#F0F4F8;color:#1A202C;display:flex;min-height:100vh;}
@@ -762,10 +754,6 @@
 </style>
 
 <script>
-  // Shared-secret header for every same-origin API call. The page itself was served
-  // through the auth gate, so it is the one place the secret can safely originate.
-  var SYNC_SECRET = {{ sync_secret | tojson }};
-
   // ── Tab navigation ──────────────────────────────────────────
   function showTab(name) {
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
@@ -890,7 +878,7 @@
       try {
         var resp = await fetch('/api/action', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Sync-Secret': SYNC_SECRET },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ job_id: jobId, action: action })
         });
         if (resp.ok) {
@@ -921,7 +909,7 @@
     try {
       var resp = await fetch('/api/action', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Sync-Secret': SYNC_SECRET },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ job_id: jobId, action: action })
       });
       var data = await resp.json();
@@ -984,7 +972,7 @@
     try {
       var resp = await fetch('/api/credentials', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Sync-Secret': SYNC_SECRET },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ platform: platform, email: email, password: password })
       });
       var data = await resp.json();
@@ -1008,7 +996,7 @@
     try {
       var resp = await fetch('/api/jobs/external', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Sync-Secret': SYNC_SECRET },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url })
       });
       var data = await resp.json();

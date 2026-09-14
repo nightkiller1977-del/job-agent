@@ -7,14 +7,18 @@ Postgres dependency.
 from __future__ import annotations
 
 import hashlib
+import hmac
+import html
 import json
 import os
+import secrets
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.templating import Jinja2Templates
@@ -38,20 +42,63 @@ CREDENTIAL_ENCRYPTION_KEY = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").stri
 _client: MongoClient | None = None
 
 # Paths reachable without the shared secret: the app's own health/metrics probes
-# (used by Render, Prometheus) carry no data and no side effects. Everything else —
+# (used by Render, Prometheus) carry no data and no side effects, plus the login
+# page that exchanges the shared secret for a session cookie. Everything else —
 # the HTML review UI, its asset bundle, and every /api/* route that reads jobs,
-# exposes credential emails, or mutates state — requires SYNC_SECRET.
-_UNAUTHENTICATED_PATHS = frozenset({"/health", "/metrics"})
-# Static assets are needed to render the authenticated shell before a fetch can
-# carry the secret; they contain no application data.
+# exposes credential emails, or mutates state — requires authentication.
+_UNAUTHENTICATED_PATHS = frozenset({"/health", "/metrics", "/login"})
+# Static assets are needed to render the login page and the authenticated shell;
+# they contain no application data.
 _UNAUTHENTICATED_PREFIXES = ("/static/",)
-# Header form of the shared secret. The dashboard UI and the orchestrator's sync
-# calls (src/orchestrator.py) both send it; handler behaviour is unchanged.
+# Header form of the shared secret. Machine callers (src/orchestrator.py) and the
+# public apply ingress send it; handler behaviour is unchanged.
 _SYNC_SECRET_HEADER = "x-sync-secret"
+# Browser session cookie. HttpOnly so page scripts cannot read it, SameSite=Strict
+# so a cross-site request cannot ride it, Secure whenever the request is https.
+_SESSION_COOKIE = "ja_session"
+_SESSION_MAX_AGE = 12 * 60 * 60
+# Browser navigations without a session are redirected here. Kept as a constant so
+# the middleware and the route cannot drift apart.
+_LOGIN_REDIRECT = "/login"
+
+
+def _session_signature(token: str) -> str:
+    return hmac.new(SYNC_SECRET.encode(), token.encode(), hashlib.sha256).hexdigest()
+
+
+def _make_session_token() -> str:
+    token = secrets.token_urlsafe(32)
+    return f"{token}.{_session_signature(token)}"
+
+
+def _valid_session_token(value: str) -> bool:
+    """True only for a token carrying a signature minted from the current secret.
+
+    Signing (rather than storing sessions) keeps the gate stateless and restart-safe
+    and invalidates every session the moment SYNC_SECRET rotates.
+    """
+    if not SYNC_SECRET:
+        return False
+    token, _, signature = value.rpartition(".")
+    if not token or not signature:
+        return False
+    return hmac.compare_digest(signature, _session_signature(token))
+
+
+def _is_secure_request(request: Request) -> bool:
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return forwarded == "https" or request.url.scheme == "https"
+
+
+def _safe_next(target: str | None) -> str:
+    """Only allow same-site relative redirects (never an open redirect)."""
+    if target and target.startswith("/") and not target.startswith("//"):
+        return target
+    return "/"
 
 
 class SharedSecretMiddleware(BaseHTTPMiddleware):
-    """Fail-closed shared-secret gate for every non-probe route.
+    """Fail-closed authentication gate for every non-probe route.
 
     This dashboard controls employer-facing submission state and stores job-board
     credential emails, yet most routes were previously open: an unauthenticated
@@ -59,31 +106,34 @@ class SharedSecretMiddleware(BaseHTTPMiddleware):
     POST /api/action could mark jobs applied/archived. The gate is fail-closed —
     if SYNC_SECRET is unset the app refuses to serve anything but /health and
     /metrics rather than silently reverting to a public site.
+
+    Browsers authenticate through a one-time exchange at /login, which sets an
+    HttpOnly session cookie; the shared secret therefore never appears in a URL,
+    browser history, or access log, and is never readable by page scripts.
     """
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if path in _UNAUTHENTICATED_PATHS:
+        if path in _UNAUTHENTICATED_PATHS or path.startswith(_UNAUTHENTICATED_PREFIXES):
             return await call_next(request)
-        if path.startswith(_UNAUTHENTICATED_PREFIXES):
+        if SYNC_SECRET and self._authenticated(request):
             return await call_next(request)
-        # The dashboard JS sends the secret in this header on its fetches. Browser
-        # navigations to "/" cannot set a header, so a GET may carry it as a query
-        # param instead — but ONLY a safe method. Accepting ?secret= on POST/PUT/etc.
-        # would let a cross-site link or form trigger state changes with the secret
-        # taken from a bookmarked/logged URL, which is exactly what the header-only
-        # rule for mutations prevents. An unset/empty secret is "not configured".
-        provided = request.headers.get(_SYNC_SECRET_HEADER)
-        if not provided and request.method in ("GET", "HEAD"):
-            provided = request.query_params.get("secret")
-        if SYNC_SECRET and provided == SYNC_SECRET:
-            return await call_next(request)
-        # Return the response directly: this middleware sits OUTSIDE Starlette's
+        # Return responses directly: this middleware sits OUTSIDE Starlette's
         # ExceptionMiddleware, so an HTTPException raised here would escape as a 500
         # instead of being rendered as 403/503.
         if not SYNC_SECRET:
             return self._denied(503, "Dashboard authentication is not configured (SYNC_SECRET unset).")
-        return self._denied(403, "Invalid sync secret")
+        if path.startswith("/api/") or request.method not in ("GET", "HEAD"):
+            return self._denied(403, "Invalid sync secret")
+        # A browser navigation: send it to the login page instead of a raw 403.
+        return RedirectResponse(_LOGIN_REDIRECT, status_code=303)
+
+    @staticmethod
+    def _authenticated(request: Request) -> bool:
+        provided = request.headers.get(_SYNC_SECRET_HEADER)
+        if provided and hmac.compare_digest(provided, SYNC_SECRET):
+            return True
+        return _valid_session_token(request.cookies.get(_SESSION_COOKIE, ""))
 
     @staticmethod
     def _denied(status_code: int, detail: str) -> JSONResponse:
@@ -91,6 +141,29 @@ class SharedSecretMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(SharedSecretMiddleware)
+
+
+def _login_page(error: str = "", next_path: str = "/") -> HTMLResponse:
+    banner = f'<p class="err">{html.escape(error)}</p>' if error else ""
+    status = 401 if error else 200
+    return HTMLResponse(
+        f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job Agent — Sign in</title></head>
+<body style="font-family:system-ui,sans-serif;background:#0F172A;color:#E2E8F0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
+  <form method="post" action="/login" style="background:#1E293B;padding:28px;border-radius:12px;min-width:300px">
+    <h1 style="font-size:16px;margin:0 0 16px">Job Agent</h1>
+    {banner}
+    <input type="hidden" name="next" value="{html.escape(next_path)}">
+    <label style="display:block;font-size:12px;margin-bottom:6px" for="secret">Sync secret</label>
+    <input id="secret" name="secret" type="password" autocomplete="current-password" autofocus
+           style="width:100%;padding:8px;border-radius:6px;border:1px solid #334155;background:#0F172A;color:#E2E8F0;box-sizing:border-box">
+    <button type="submit" style="margin-top:14px;width:100%;padding:9px;border:0;border-radius:6px;background:#4F46E5;color:#fff;font-weight:600;cursor:pointer">Sign in</button>
+  </form>
+</body></html>""",
+        status_code=status,
+    )
 
 
 def _utcnow() -> datetime:
@@ -201,6 +274,44 @@ def _sort_score_then_date(cursor, date_field: str):
     return cursor.sort([("score", DESCENDING), (date_field, DESCENDING)])
 
 
+@app.get("/login")
+async def login_form(request: Request, next: str = "/"):
+    # The middleware exempts /login from the session check, so the "not configured"
+    # refusal that every other route gets must be repeated here.
+    if not SYNC_SECRET:
+        return SharedSecretMiddleware._denied(503, "Dashboard authentication is not configured (SYNC_SECRET unset).")
+    return _login_page(next_path=_safe_next(next))
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    if not SYNC_SECRET:
+        return SharedSecretMiddleware._denied(503, "Dashboard authentication is not configured (SYNC_SECRET unset).")
+    # Parse the body by hand: the login form is a single urlencoded field, and this
+    # avoids adding python-multipart solely for it.
+    raw = (await request.body()).decode("utf-8", "replace")
+    fields = {}
+    try:
+        fields = urllib.parse.parse_qs(raw)
+    except ValueError:
+        fields = {}
+    supplied = fields.get("secret", [""])[0]
+    next_path = _safe_next(fields.get("next", [""])[0])
+    if not hmac.compare_digest(supplied, SYNC_SECRET):
+        return _login_page("Invalid sync secret.", next_path=next_path)
+    response = RedirectResponse(next_path, status_code=303)
+    response.set_cookie(
+        _SESSION_COOKIE,
+        _make_session_token(),
+        max_age=_SESSION_MAX_AGE,
+        httponly=True,
+        samesite="strict",
+        secure=_is_secure_request(request),
+        path="/",
+    )
+    return response
+
+
 @app.get("/health")
 async def health():
     if not MONGODB_URI:
@@ -295,10 +406,6 @@ async def index(request: Request):
             "last_sync": last_sync,
             "now": _utcnow(),
             "credentials": credentials,
-            # Same-origin page, already past the middleware gate. The template uses
-            # this to attach the secret to its fetches; it is a one-time bearer
-            # value for this origin, not a credential the page ever displays.
-            "sync_secret": SYNC_SECRET,
         },
     )
 
