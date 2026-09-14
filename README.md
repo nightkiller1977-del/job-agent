@@ -1,422 +1,138 @@
 # job-agent
 
-A fully automated job application pipeline that scrapes listings across multiple job boards, scores them against your role and compensation criteria using Claude AI, presents a terminal review queue, and applies — including resume tailoring, ATS form autofill, and final submission — via Playwright-controlled Chrome. When a site session expires, the agent heals itself automatically, writes a regression test, and sends you an iMessage summary of what it fixed.
+`job-agent` is AI Commander's **job discovery, scoring, resume-tailoring, ATS automation, and application execution agent**. It discovers opportunities, evaluates them against configured role/compensation criteria, prepares tailored application material, drives supported application flows with Playwright, and records evidence about what actually happened.
 
-For engineering internals and apply-workflow architecture, see [`DEVELOPER_ONBOARDING.md`](DEVELOPER_ONBOARDING.md).
+For deeper engineering internals and apply-workflow architecture, see [`DEVELOPER_ONBOARDING.md`](DEVELOPER_ONBOARDING.md).
 
----
+## Current state
 
-## Capabilities at a Glance
+**State: Functional autonomous pipeline under submission-truthfulness and reliability hardening.**
 
-| Capability | Details |
-|---|---|
-| **Multi-source discovery** | LinkedIn, Jobright, Indeed, USAJobs |
-| **AI scoring** | Claude evaluates each job against your role, seniority, and comp criteria |
-| **Terminal review queue** | Approve / skip / bookmark with keyboard controls |
-| **Resume tailoring** | Claude rewrites resume bullets + summary for each specific role |
-| **ATS autofill** | Playwright fills Workday, BrassRing, Greenhouse, Lever, and fallback portals |
-| **LinkedIn Easy Apply** | Full modal and full-page `/apply/` flows, reading `profile.json` |
-| **Session management** | Persistent Chrome profiles per source; one-time prepare-sessions for Workday SSO |
-| **Self-healing auth** | Expired sessions auto-recovered; human-assist path for 2FA-gated sources |
-| **iMessage alerts** | Auth failures, self-heal outcomes, and correction summaries sent to your phone |
-| **macOS notifications** | Native banners for every error, warning, and reauth event |
-| **Regression test generation** | Each successful self-heal appends a pytest test documenting the exact failure |
-| **Cloud dashboard** | Render.com API for approving/rejecting jobs from any browser |
-| **Scheduled runs** | Cron-safe; Chrome opens and closes automatically, no user presence needed |
+Capabilities on `main` include:
 
----
+- Multi-source job discovery and normalization.
+- Job scoring/ranking against configured role, seniority, compensation, and work-style criteria.
+- Resume tailoring with fabrication guards and score/review gates.
+- Persistent job/application state.
+- ATS routing and adapter-based application flows.
+- LinkedIn and external ATS application handling.
+- Browser/session isolation using persistent per-source profiles.
+- Automated session recovery for scheduled runs, with bounded human-assist paths where a source requires interactive authentication/2FA.
+- Dashboard and scheduled/background execution support.
+- Runtime incident reporting into the wider AI Commander recovery path.
+- Receipt/submission verification that distinguishes confirmed evidence from ambiguous outcomes instead of claiming success from stale DOM text or timing alone.
+- Regression coverage around receipt freshness, restart safety, delayed success signals, and adapter behavior.
+- Shared OpenHands and Claude repository skills so development agents follow the same reuse, security, simplicity, and evidence rules.
 
-## Architecture
+The agent should **not** be described as “fully reliable” merely because it can reach and fill an application. Browser automation has ambiguous failure modes: a submit click can time out after the employer accepted it, a success message can be stale, an authentication state can expire mid-run, and an ATS can change its markup. The system therefore treats uncertain submission state as uncertain and reconciles before retrying.
 
-```
-job-agent/
-├── src/
-│   ├── main.py              # CLI entry point — all commands defined here
-│   ├── orchestrator.py      # Flow coordinator: discover → score → review → apply
-│   │                        #   catches AuthFailedError, invokes ReauthManager, retries
-│   ├── scorer.py            # Claude Haiku job scoring (role match, ATS score, tailoring)
-│   ├── reauth.py            # ReauthManager — self-healing auth (automated + human paths)
-│   │                        #   on success: writes regression test + sends iMessage
-│   ├── notifier.py          # agent_status.json writer + macOS notification dispatcher
-│   │                        #   record_reauth_event() appends to a capped event log
-│   ├── state_manager.py     # SQLite persistence: jobs, status, analytics
-│   ├── review_queue.py      # Rich terminal review UI
-│   ├── resume_helper.py     # Resume path resolution + Claude PDF generation
-│   └── sources/
-│       ├── base.py          # BaseScraper: Chrome profile isolation, session export,
-│       │                    #   _safe_evaluate(), _safe_goto(), AuthFailedError
-│       ├── jobright.py      # Discovery, Orion AI tailoring, Claude ATS, ATS autofill
-│       ├── linkedin.py      # Discovery, saved jobs, Easy Apply, external ATS routing
-│       ├── indeed.py        # Discovery + application
-│       └── usajobs.py       # USAJobs.gov discovery + application
-├── tests/
-│   ├── test_reauth_unit.py        # 53 unit tests — auth, safe_evaluate, reauth routing
-│   ├── test_reauth_feature.py     # 16 integration tests — orchestrator end-to-end flows
-│   ├── test_reauth_regressions.py # Auto-generated — appended on each self-heal
-│   ├── test_state_manager.py
-│   ├── test_apply_functional.py
-│   └── test_credentials.py
-├── dashboard/               # Render.com cloud API + job approval UI
-├── state/
-│   ├── jobs.db              # SQLite (auto-created, gitignored)
-│   ├── profile.json         # Work history, skills, contact info for form autofill (gitignored)
-│   ├── sessions/            # Per-source Chrome profiles + session JSON exports (gitignored)
-│   ├── tailored_resumes/    # Claude-generated and Orion-generated PDFs (gitignored)
-│   └── agent_status.json    # Live alerts + reauth event log
-├── config.example.json      # Template — copy to config.json (gitignored) and edit
-├── config.json              # Scoring config, resume path, search settings (gitignored, not committed)
-├── .env.example             # Template with all required and optional keys
-├── SECURITY.md              # Vulnerability disclosure and credential management policy
-├── CLAUDE.md                # Critical constraints for Claude Code (Chrome profile isolation)
-├── DEVELOPER_ONBOARDING.md  # Engineering internals and apply-workflow architecture
-└── requirements.txt
+## Direction
+
+The priority is to make the agent **truthful and restart-safe before increasing application volume or adding more sources**.
+
+1. **Eliminate false submission claims.** `applied`/confirmed states require fresh evidence tied to the current submission attempt. Stale/same-text UI, pre-submit DOM, or a click alone are not receipts.
+2. **Prevent duplicate employer submissions.** When a submission outcome is ambiguous, reconcile the ATS/job state before retrying. Timeout must never automatically mean “safe to submit again.”
+3. **Keep `submission_unverified` as a real state.** Uncertainty is preferable to a false positive. Follow-up logic should investigate/reconcile it rather than silently convert it to success or failure.
+4. **Prefer deterministic ATS adapters.** Vendor-specific APIs/selectors and structured adapters should be used before generic model-driven browser guessing when a reliable deterministic path exists.
+5. **Keep application side effects idempotent/restart-safe.** Persistent state, adapter event logs, attempt identity, and receipt evidence should allow a crashed/restarted run to understand what already happened.
+6. **Make session recovery autonomous but bounded.** Recover normal expired sessions automatically; fail closed or request human assistance for authentication states that cannot be safely automated.
+7. **Reduce unnecessary LLM orchestration.** Discovery normalization, session checks, adapter selection, form validation, receipt verification, retries, and reconciliation should remain deterministic where possible. Use models for scoring/tailoring/reasoning where they add value.
+8. **Expand adapter coverage based on observed failure classes.** Workday, Greenhouse, Lever, Ashby, BrassRing, LinkedIn and fallback flows should converge on shared contracts rather than one-off fixes.
+9. **Feed operational failures into AI Commander.** Structured incidents should include enough evidence for Guardian/Repair/OpenHands to distinguish source changes, authentication failures, browser/runtime faults, and code defects.
+10. **Test consequential behavior only in controlled fixtures/test tenants.** Do not use real employer submissions as regression-test side effects.
+
+## Execution model
+
+```text
+Discover
+   ↓
+Normalize / dedupe
+   ↓
+Score / filter
+   ↓
+Tailor resume if required
+   ↓
+Preflight
+   ↓
+Choose deterministic ATS/apply adapter
+   ↓
+Validate session + form
+   ↓
+Submit (when authorized)
+   ↓
+Verify fresh receipt/evidence
+   ├─ confirmed ─────────────► record applied
+   ├─ confirmed not sent ───► bounded recovery/retry
+   └─ ambiguous ────────────► submission_unverified + reconcile
 ```
 
-### Data Flow
+## Safety and truthfulness rules
 
-```
-main.py
-  └─ Orchestrator.discover()
-        ├─ ScraperCls(config).scrape()   ← raises AuthFailedError on session expiry
-        │     └─ ReauthManager.handle()  ← automated or human-assist reauth
-        │           ├─ _reauth_automated()  → _auto_login() → export session JSON
-        │           └─ _reauth_human()     → iMessage → poll mtime → detect refresh
-        │                 └─ on success: _write_regression_test() + _notify_correction()
-        ├─ JobScorer.score()             ← Claude Haiku evaluation
-        └─ ReviewQueue.run()             ← terminal approve/skip/bookmark
+- A click is not proof of submission.
+- Existing success text is not proof of a new submission.
+- A timeout is not proof of failure.
+- Ambiguous side effects must be reconciled before retry.
+- Resume tailoring may change emphasis/wording but must not invent employers, roles, dates, education, certifications, or skills.
+- Real credentials and personal profile data remain outside Git.
+- Tests must not create live employer applications.
+- Model output is advisory; deterministic browser/ATS evidence establishes application state.
 
-  └─ Orchestrator.apply_approved()
-        ├─ scraper.apply(job)            ← raises AuthFailedError if session gone
-        │     └─ ReauthManager.handle(context="apply")  ← shorter timeout
-        └─ retry scraper.apply(job)
-```
+## Configuration
 
-### Self-Healing Auth
-
-```
-AuthFailedError raised by scraper
-          │
-          ▼
-  ReauthManager.handle(source, detail, context)
-          │
-    ┌─────┴──────┐
-    │            │
-automated    human-assisted
-(jobright,   (usajobs)
- indeed,
- linkedin)
-    │            │
-_auto_login()  iMessage → poll session file mtime
-    │            │
-    └────────────┘
-          │
-     on success
-          ├─ record_reauth_event(source, mode, "success")
-          ├─ _write_regression_test()   → tests/test_reauth_regressions.py
-          ├─ _notify_correction()       → iMessage to NOTIFY_PHONE
-          └─ return True               → orchestrator retries the scraper
-```
-
-### Browser Architecture
-
-Each source scraper uses an **isolated Chromium profile** under `state/sessions/<source>_profile/`. This avoids Chrome's ProcessSingleton lock that would occur if any scraper pointed at the main Chrome profile. Session cookies are exported to `state/sessions/<source>_chromium.json` after every successful login so headless background runs can load them without re-authenticating.
-
-`_safe_evaluate()` and `_safe_goto()` on `BaseScraper` protect every `page.evaluate()` and `page.goto()` call:
-
-- Non-fatal Playwright errors (selector timeouts, parse failures) return a configurable default and log a warning.
-- Browser-death signals (`closed`, `detached`, `crashed`, `browser has been`) are re-raised immediately so the scraper loop exits cleanly rather than silently swallowing the failure.
-
----
-
-## Quick Start
-
-### 1. Install dependencies
+Copy the example configuration files and keep real values untracked:
 
 ```bash
+cp .env.example .env
+cp config.example.json config.json
+```
+
+`config.json`, `state/profile.json`, sessions, tailored resumes, credentials, and other user-specific state should remain gitignored/private. Use the shared `aicc-secrets` flow where the wider AI Commander deployment manages credentials centrally.
+
+## Common commands
+
+```bash
+# Create environment and install dependencies
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chrome
-```
 
-### 2. Configure credentials
-
-```bash
-cp .env.example .env
-# Edit .env — add your API key and site credentials
-```
-
-Key `.env` values:
-
-```
-ANTHROPIC_API_KEY=...          # Required for scoring and resume tailoring
-LINKEDIN_EMAIL=...
-LINKEDIN_PASSWORD=...
-JOBRIGHT_EMAIL=...
-JOBRIGHT_PASSWORD=...
-INDEED_EMAIL=...
-INDEED_PASSWORD=...
-COMPANY_EMAIL=...              # Workday / BrassRing portal auto-login
-COMPANY_PASSWORD=...
-NOTIFY_PHONE=+1XXXXXXXXXX      # iMessage alerts and self-heal notifications
-REAUTH_TIMEOUT_MINUTES=30      # How long to wait for a human-assisted session refresh
-REAUTH_TIMEOUT_APPLY_MINUTES=10
-DASHBOARD_URL=...              # Render.com cloud dashboard URL
-SYNC_SECRET=...
-```
-
-Copy `config.example.json` to `config.json` (gitignored — this is where your real target roles, compensation thresholds, and resume path live) and set your resume path:
-
-```json
-{ "local_resume_path": "/path/to/your/resume.pdf" }
-```
-
-To enable per-job resume tailoring with a score gate, also point `resume.baseline_path`
-at your source-of-truth resume (Markdown recommended; `.txt`, `.json`, or `.pdf` also work —
-a PDF baseline is text-extracted once into `state/resumes/baseline_extracted.md`):
-
-```json
-{
-  "resume": {
-    "enabled": true,
-    "baseline_path": "~/resume_baseline.md",
-    "min_score": 90,
-    "max_iterations": 3,
-    "output_dir": "state/resumes"
-  }
-}
-```
-
-Before each apply, the agent scores the baseline against the job description
-(keyword coverage / title alignment / experience relevance), iteratively rewrites
-emphasis and wording toward the job (never inventing employers, titles, dates,
-degrees, certifications, or skills — a verification pass rejects fabricated drafts),
-and only applies once the tailored resume scores ≥ `min_score`. Jobs that can't reach
-the threshold are held with a `needs_resume_review` marker (visible in the dashboard)
-instead of being applied to. Tailored artifacts persist under `state/resumes/<job_id>.*`.
-Without a `resume.baseline_path`, the agent falls back to `local_resume_path` — but it
-will always refuse to apply with the bundled `tests/dummy_resume.pdf` fixture.
-
-> **Upgrading an existing checkout that predates this?** `config.json` used to be
-> tracked in git; pulling the commit that untracked it will delete an unmodified
-> local copy along with it. Run `scripts/migrate-config-json.sh backup` *before*
-> pulling/merging, then `scripts/migrate-config-json.sh restore` after — it
-> restores your real config.json (now gitignored) from the backup if it's gone.
-
-Fill in `state/profile.json` with your work history, skills, and contact information — this feeds LinkedIn Easy Apply autofill and Claude resume tailoring.
-
-### 3. One-time setup
-
-```bash
-python src/main.py setup
-```
-
-Chrome opens to the Web Store. Click **Add to Chrome** on the Jobright AI extension, then close the window. All source logins are automatic from `.env` — no other manual steps required.
-
-### 4. Run
-
-```bash
-# Scrape all sources, score, and open review queue
+# Discover/score jobs
 python src/main.py discover
 
-# Single source
-python src/main.py discover --source linkedin
-python src/main.py discover --source linkedin-saved --no-review
-python src/main.py discover --source usajobs
-python src/main.py discover --source jobright
-python src/main.py discover --source indeed
-
-# Hydrate externally pasted dashboard jobs
-python src/main.py hydrate
-
-# Check approved queue before applying
+# Check approved queue and environment
 python src/main.py preflight
 
-# Apply to all approved jobs — fully automatic
+# Controlled apply testing
+python src/main.py apply --limit 1 --no-auto-submit
+
+# Authorized automatic application run
 python src/main.py apply --auto-submit
 
-# Targeted apply (safer for first-time testing)
-python src/main.py apply --limit 1 --no-auto-submit
-python src/main.py apply --company "Microsoft" --no-auto-submit
-python src/main.py apply --job-id <job_id> --auto-submit
-
-# Resolve blocked Workday sessions
+# Prepare/recover sessions where needed
 python src/main.py prepare-sessions
-python src/main.py prepare-sessions --source jobright --company "CVS"
 
-# Show stats
+# Operational status/checks
 python src/main.py status
-
-# Pre-flight check + mock apply-path tests
 python src/main.py ops-check
 ```
 
----
-
-## What's Automated vs Manual
-
-| Task | Status |
-|---|---|
-| LinkedIn login | ✅ Auto from `.env` |
-| Jobright login | ✅ Auto from `.env` |
-| Indeed login | ✅ Auto from `.env` |
-| USAJobs login | ✅ Auto from `.env` via login.gov |
-| Company ATS portals (Workday, BrassRing) | ✅ Auto attempt via `COMPANY_EMAIL/PASSWORD` |
-| ATS scoring + resume tailoring | ✅ Claude Haiku API |
-| Tailored resume PDF generation | ✅ Playwright + HTML template |
-| LinkedIn Easy Apply autofill | ✅ Reading `state/profile.json` |
-| Jobright extension autofill | ✅ Extension in Chrome profile |
-| Final application submit | ✅ With `--auto-submit` |
-| Session self-healing (LinkedIn, Jobright, Indeed) | ✅ Fully automated |
-| Session self-healing (USAJobs 2FA) | ✅ iMessage prompt + mtime polling |
-| Regression test on each self-heal | ✅ Auto-written to `tests/test_reauth_regressions.py` |
-| iMessage on each self-heal | ✅ Sent to `NOTIFY_PHONE` |
-| Workday portals that reject `COMPANY_EMAIL` | ⚠️ One-time `prepare-sessions` per company |
-| Jobright extension install | ⚠️ One-time `setup` |
-| USAJobs 2FA (first run only) | ⚠️ Human in browser, then auto thereafter |
-
----
-
-## Apply Workflow
-
-### Resume Priority Order
-
-1. Claude-generated tailored PDF (`state/tailored_resumes/<title>_<company>_claude.pdf`)
-2. Jobright Orion AI tailored resume (if Orion download succeeded)
-3. `local_resume_path` in `config.json`
-4. `LOCAL_RESUME_PATH` / `RESUME_PATH` env vars
-5. Common locations: `state/resumes/`, `~/Documents/`, `~/Downloads/`, `~/Desktop/`
-
-### Claude ATS Scoring
-
-Before filling any form, Claude Haiku analyzes the job description and returns:
-
-- **ATS score** (0–100) — keyword match against your resume
-- **Missing keywords** — in the JD but not your resume
-- **Tailored summary + bullets** — rewritten for this specific role
-- **Cover letter** — 3-paragraph, role-specific
-
-If the ATS score is below 85 and `--auto-submit` is set, a warning is printed but the application proceeds.
-
-### Jobright Jobs
-
-1. Opens job detail page and extracts company ATS URL
-2. Runs Jobright Orion AI resume tailoring; falls back to Claude PDF if Orion fails
-3. Opens ATS URL and runs Claude ATS scoring
-4. Triggers Jobright Autofill extension for form filling
-5. Runs pre-submit validation checklist (resume uploaded, required fields filled)
-6. Submits unless `--auto-submit` is not set
-
-### LinkedIn Jobs
-
-1. Runs Jobright resume tailoring first (same as above)
-2. Opens LinkedIn job page
-3. Supports both legacy modal Easy Apply and newer full-page `/jobs/view/<id>/apply/` flows
-4. Autofills phone, contact, and profile fields from `state/profile.json`
-5. Uploads tailored or fallback resume
-6. If no LinkedIn apply flow found, extracts external ATS URL and routes to ATS path
-
----
-
-## Scoring Configuration
-
-Scoring criteria are configured in `config.json`. The agent evaluates each job listing against your defined:
-
-- **Target roles** — job titles and seniority levels you want to apply to
-- **Rejected roles** — individual contributor or out-of-scope titles to skip
-- **Compensation thresholds** — minimum salary by work type (remote, on-site, hybrid, cleared, federal)
-
-Claude uses these to score each listing 0–100 and assign a recommendation. You review borderline scores in the terminal queue before any application is submitted.
-
-See `.env.example` and `config.example.json` for all configurable fields.
-
----
-
-## Review Queue Controls
-
-```
-[A] Apply     — mark job for application
-[S] Skip      — skip and never show again
-[B] Bookmark  — save for later reference
-[Q] Quit      — exit (progress is saved)
-```
-
----
+Use `src/main.py --help`, current config examples, and `DEVELOPER_ONBOARDING.md` as the source of truth for the full command surface.
 
 ## Testing
 
-```bash
-source .venv/bin/activate
-pytest tests/test_reauth_unit.py tests/test_reauth_feature.py -v
-```
+Run the relevant pytest suites before merging application-path changes. Receipt verification, adapter selection, restart safety, session recovery, and submission reconciliation are especially load-bearing because they protect real-world side effects.
 
-| Suite | Tests | Coverage |
-|---|---|---|
-| `test_reauth_unit.py` | 53 | `AuthFailedError`, `_safe_evaluate`, `_safe_goto`, `record_reauth_event`, `ReauthManager` routing, automated reauth, human reauth, `_write_regression_test`, `_notify_correction` |
-| `test_reauth_feature.py` | 16 | Full orchestrator flows: discover + apply with reauth success/failure/retry-failure paths; `_safe_evaluate` integration through concrete scrapers |
-| `test_reauth_regressions.py` | auto-grows | Appended by `ReauthManager` every time a real session self-heals in production |
-| `test_state_manager.py` | — | SQLite persistence layer |
-| `test_apply_functional.py` | — | Apply-workflow end-to-end |
-| `test_credentials.py` | — | Credential loading and validation |
+The project deliberately keeps RED-then-GREEN regression history where useful so a test demonstrates the bug it is intended to prevent. Do not bypass pre-push hooks or weaken truthfulness assertions to make a change mergeable.
 
----
+## Relationship to AI Commander
 
-## Notifications
+- `Ai-Command-Center-Desktop-App` schedules/observes the agent and owns the broader stability/Guardian/Repair path.
+- `Aicc-Coordinator` receives trusted operational incidents and coordinates durable recovery work.
+- `AI-Commander-Brain-Memory-` is the direction for reusable lessons, incident history, job-search preferences, and model-independent personal context under policy.
+- `email-agent` can provide job-related inbox signals without becoming the application authority.
+- `aicc-secrets` provides shared managed credentials where configured.
 
-Every significant event writes to `state/agent_status.json` and fires a native macOS notification banner. The `reauth_events` list in that file is capped at 100 entries and records every reauth attempt outcome for post-run inspection.
+## Documentation rule
 
-| Event | Channel |
-|---|---|
-| Auth failure detected | macOS notification |
-| Automated reauth started | macOS notification |
-| Session refreshed (automated) | macOS notification + iMessage |
-| Session refreshed (human-assisted) | macOS notification + iMessage |
-| Reauth timed out | macOS notification |
-| Missing credentials | macOS notification |
-
-iMessage format on self-heal:
-
-```
-✅ Job Agent self-healed: JOBRIGHT
-What failed: redirect to /login
-How fixed: automated reauth
-When: 2026-06-26 14:22:01 UTC
-Status: Session refreshed — source will be retried
-```
-
----
-
-## Safety
-
-- `--auto-submit` is required for actual submission — runs without it stop before the final click
-- All discovered jobs are stored in SQLite — the agent never applies to the same job twice
-- Browser runs in headed (visible) mode — Chrome windows open and close automatically
-- `python src/main.py preflight` reports session blockers before a full run
-- `python src/main.py ops-check` runs preflight + mock Playwright apply-path tests
-- Never commit `.env`, `state/jobs.db`, `state/profile.json`, `state/sessions/`, or `state/tailored_resumes/`
-
----
-
-## Scheduling
-
-```bash
-# Example: run every weekday at 8am
-# crontab -e
-0 8 * * 1-5 cd /path/to/job-agent && source .venv/bin/activate && python src/main.py apply --auto-submit >> /tmp/job-agent.log 2>&1
-```
-
-Chrome opens and closes automatically — no user presence required. If a session expires mid-run, `ReauthManager` recovers it and retries the source without interrupting the rest of the queue.
-
----
-
-## Security
-
-All credentials are managed via environment variables. See [`.env.example`](./.env.example) for the full list of required and optional keys, and [`SECURITY.md`](./SECURITY.md) for the credential management policy and secrets resolution architecture.
-
-**Never commit `.env` to the repository.** The secrets resolver (`src/secret_store.py`) supports a phased credential architecture — local `.env`, encrypted store (Phase 2), and a dedicated CLI (Phase 3).
-
----
-
-## License
-
-TBD
+This README describes the role, capabilities merged to `main`, and current direction. A supported ATS is not guaranteed to remain unchanged, and a historical successful run is not proof that the next live submission will succeed. Tests, receipts, ledger/state data, runtime evidence, GitHub changes, and controlled acceptance runs remain the source of truth. Avoid dated status snapshots and fixed “fully automated / bug-free” claims.
