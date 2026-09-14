@@ -18,6 +18,11 @@ _log = logging.getLogger(__name__)
 # extra_json ended up double-nested ({"updated_at": ..., "extra_json": "<json>"}).
 _SYNC_META_KEYS = {"extra_json", "updated_at", "created_at", "confirmation_status"}
 
+# Cap on the per-job apply-status trail written by record_apply_attempt(). Long
+# enough to attribute a later success to the transient statuses a job passed
+# through, bounded so extra_json cannot grow without limit on a retried job.
+_APPLY_HISTORY_LIMIT = 20
+
 
 def parse_extra_json(raw: Any) -> dict:
     """Parse an extra_json column value into a flat dict — tolerantly.
@@ -590,6 +595,19 @@ class StateManager:
             extra["apply_last_status"]  = status
             extra["apply_last_detail"]  = (detail or "")[:500]
             extra["apply_attempt_count"] = extra.get("apply_attempt_count", 0) + 1
+            # Bounded per-attempt status trail. apply_last_status alone only ever
+            # shows each job's LATEST outcome, which makes a per-(source,status)
+            # success rate structurally 0: a job that failed with a transient
+            # status and later succeeded leaves the failure bucket entirely, so
+            # adaptive_cap() saw "0 successes over N attempts" for every failure
+            # status and hard-lowered its retry cap. Keeping the trail lets the
+            # funnel attribute a later success back to the statuses that job
+            # passed through.
+            history = extra.get("apply_status_history")
+            if not isinstance(history, list):
+                history = []
+            history.append({"status": str(status), "at": now, "detail": (detail or "")[:200]})
+            extra["apply_status_history"] = history[-_APPLY_HISTORY_LIMIT:]
             # A fresh attempt supersedes any earlier clear_session_block() flag —
             # otherwise a stale flag from a prior sign-in could mask a brand-new
             # block recorded by this attempt.
@@ -884,18 +902,42 @@ class StateManager:
             src = r["source"] or "unknown"
             ps = per_source.setdefault(src, {"attempts": 0, "submitted": 0})
             ps["attempts"] += 1
-            pss = per_source_status.setdefault(src, {}).setdefault(
-                str(last), {"attempts": 0, "submitted": 0, "sample_reasons": []}
-            )
-            pss["attempts"] += 1
             reason_text = extra.get("apply_last_detail") or extra.get("apply_last_reason") or ""
-            if reason_text and len(pss["sample_reasons"]) < 5 and reason_text not in pss["sample_reasons"]:
-                pss["sample_reasons"].append(reason_text)
+
+            # Attribute the job's outcomes using the full attempt trail when it
+            # exists. Counting only apply_last_status made every failure status
+            # look like 0 successes: a job that failed N times with a transient
+            # status and finally succeeded contributed its trial to the success
+            # bucket and none to the failure buckets, so adaptive_cap() lowered
+            # the retry cap on statuses that actually do recover. Legacy rows
+            # without a trail fall back to the single latest status.
+            trail = extra.get("apply_status_history")
+            if not isinstance(trail, list) or not trail:
+                trail = [{"status": last, "detail": reason_text}]
+            for step in trail:
+                step_status = str((step or {}).get("status") or "").strip()
+                if not step_status:
+                    continue
+                pss = per_source_status.setdefault(src, {}).setdefault(
+                    step_status, {"attempts": 0, "submitted": 0, "sample_reasons": []}
+                )
+                pss["attempts"] += 1
+                # Sample reasons are evidence for the model classifier, so they
+                # are captured for every observation of the status, not only the
+                # successful ones.
+                step_reason = str((step or {}).get("detail") or "")
+                if step_reason and len(pss["sample_reasons"]) < 5 and step_reason not in pss["sample_reasons"]:
+                    pss["sample_reasons"].append(step_reason)
+                # A success is credited to every status the job passed through
+                # on the way there: each of those retries demonstrably led to a
+                # submit for this source, which is the evidence adaptive_cap
+                # needs to not treat the pair as doomed.
+                if was_submitted:
+                    pss["submitted"] += 1
 
             if was_submitted:
                 submitted += 1
                 ps["submitted"] += 1
-                pss["submitted"] += 1
             else:
                 failure_hist[last] = failure_hist.get(last, 0) + 1
                 cluster = self._cluster_for(last)
