@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
@@ -35,6 +36,61 @@ JOB_AGENT_DB = os.environ.get("JOB_AGENT_DB", "job_agent").strip() or "job_agent
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "")
 CREDENTIAL_ENCRYPTION_KEY = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
 _client: MongoClient | None = None
+
+# Paths reachable without the shared secret: the app's own health/metrics probes
+# (used by Render, Prometheus) carry no data and no side effects. Everything else —
+# the HTML review UI, its asset bundle, and every /api/* route that reads jobs,
+# exposes credential emails, or mutates state — requires SYNC_SECRET.
+_UNAUTHENTICATED_PATHS = frozenset({"/health", "/metrics"})
+# Static assets are needed to render the authenticated shell before a fetch can
+# carry the secret; they contain no application data.
+_UNAUTHENTICATED_PREFIXES = ("/static/",)
+# Header form of the shared secret. The dashboard UI and the orchestrator's sync
+# calls (src/orchestrator.py) both send it; handler behaviour is unchanged.
+_SYNC_SECRET_HEADER = "x-sync-secret"
+
+
+class SharedSecretMiddleware(BaseHTTPMiddleware):
+    """Fail-closed shared-secret gate for every non-probe route.
+
+    This dashboard controls employer-facing submission state and stores job-board
+    credential emails, yet most routes were previously open: an unauthenticated
+    GET / rendered the queues and credential emails, and an unauthenticated
+    POST /api/action could mark jobs applied/archived. The gate is fail-closed —
+    if SYNC_SECRET is unset the app refuses to serve anything but /health and
+    /metrics rather than silently reverting to a public site.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path in _UNAUTHENTICATED_PATHS:
+            return await call_next(request)
+        if path.startswith(_UNAUTHENTICATED_PREFIXES):
+            return await call_next(request)
+        # The dashboard JS sends the secret in this header on its fetches. Browser
+        # navigations to "/" cannot set a header, so a GET may carry it as a query
+        # param instead — but ONLY a safe method. Accepting ?secret= on POST/PUT/etc.
+        # would let a cross-site link or form trigger state changes with the secret
+        # taken from a bookmarked/logged URL, which is exactly what the header-only
+        # rule for mutations prevents. An unset/empty secret is "not configured".
+        provided = request.headers.get(_SYNC_SECRET_HEADER)
+        if not provided and request.method in ("GET", "HEAD"):
+            provided = request.query_params.get("secret")
+        if SYNC_SECRET and provided == SYNC_SECRET:
+            return await call_next(request)
+        # Return the response directly: this middleware sits OUTSIDE Starlette's
+        # ExceptionMiddleware, so an HTTPException raised here would escape as a 500
+        # instead of being rendered as 403/503.
+        if not SYNC_SECRET:
+            return self._denied(503, "Dashboard authentication is not configured (SYNC_SECRET unset).")
+        return self._denied(403, "Invalid sync secret")
+
+    @staticmethod
+    def _denied(status_code: int, detail: str) -> JSONResponse:
+        return JSONResponse({"detail": detail}, status_code=status_code)
+
+
+app.add_middleware(SharedSecretMiddleware)
 
 
 def _utcnow() -> datetime:
@@ -93,11 +149,15 @@ def init_db() -> None:
 
 
 def _get_cipher():
-    if not CREDENTIAL_ENCRYPTION_KEY:
+    # Read the key at call time, not import time: the previous import-time constant
+    # made encryption silently unavailable whenever the environment was populated
+    # after module import (and made test results depend on import order).
+    key = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
+    if not key:
         return None
     try:
         from cryptography.fernet import Fernet
-        return Fernet(CREDENTIAL_ENCRYPTION_KEY.encode())
+        return Fernet(key.encode())
     except Exception:
         return None
 
@@ -235,6 +295,10 @@ async def index(request: Request):
             "last_sync": last_sync,
             "now": _utcnow(),
             "credentials": credentials,
+            # Same-origin page, already past the middleware gate. The template uses
+            # this to attach the secret to its fetches; it is a one-time bearer
+            # value for this origin, not a credential the page ever displays.
+            "sync_secret": SYNC_SECRET,
         },
     )
 

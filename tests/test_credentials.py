@@ -29,6 +29,8 @@ with patch.dict("os.environ", {
 }):
     from dashboard.main import app, _encrypt_password
 
+_AUTH = {"X-Sync-Secret": "testsecret"}
+
 
 # ── Helper: encrypt a value the same way the app would ─────────────────────
 def _enc(plain: str) -> str:
@@ -69,7 +71,7 @@ class TestCredentialsEndpoints(unittest.TestCase):
                 "platform": "indeed",
                 "email": "save@indeed.com",
                 "password": "secretpassword",
-            })
+            }, headers=_AUTH)
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"ok": True, "platform": "indeed"})
@@ -93,21 +95,24 @@ class TestCredentialsEndpoints(unittest.TestCase):
         mock_db = MagicMock()
         mock_get_db.return_value = mock_db
 
-        for platform in ("indeed", "linkedin", "jobright"):
-            with self.subTest(platform=platform):
-                resp = self.client.post("/api/credentials", json={
-                    "platform": platform,
-                    "email": f"user@{platform}.com",
-                    "password": "pw",
-                })
-                self.assertEqual(resp.status_code, 200)
+        # _get_cipher reads CREDENTIAL_ENCRYPTION_KEY per call, so a password save
+        # needs the key present in the environment at request time.
+        with patch.dict("os.environ", {"CREDENTIAL_ENCRYPTION_KEY": _TEST_KEY}):
+            for platform in ("indeed", "linkedin", "jobright"):
+                with self.subTest(platform=platform):
+                    resp = self.client.post("/api/credentials", json={
+                        "platform": platform,
+                        "email": f"user@{platform}.com",
+                        "password": "pw",
+                    }, headers=_AUTH)
+                    self.assertEqual(resp.status_code, 200)
 
     def test_save_credentials_invalid_platform(self):
         resp = self.client.post("/api/credentials", json={
             "platform": "company_portal",
             "email": "x@x.com",
             "password": "pw",
-        })
+        }, headers=_AUTH)
         self.assertEqual(resp.status_code, 400)
         self.assertIn("platform must be one of", resp.json()["detail"])
 
@@ -116,7 +121,7 @@ class TestCredentialsEndpoints(unittest.TestCase):
             "platform": "random_site",
             "email": "x@x.com",
             "password": "pw",
-        })
+        }, headers=_AUTH)
         self.assertEqual(resp.status_code, 400)
 
 

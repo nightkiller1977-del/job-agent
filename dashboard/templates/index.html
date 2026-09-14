@@ -762,6 +762,10 @@
 </style>
 
 <script>
+  // Shared-secret header for every same-origin API call. The page itself was served
+  // through the auth gate, so it is the one place the secret can safely originate.
+  var SYNC_SECRET = {{ sync_secret | tojson }};
+
   // ── Tab navigation ──────────────────────────────────────────
   function showTab(name) {
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
@@ -886,7 +890,7 @@
       try {
         var resp = await fetch('/api/action', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Sync-Secret': SYNC_SECRET },
           body: JSON.stringify({ job_id: jobId, action: action })
         });
         if (resp.ok) {
@@ -917,7 +921,7 @@
     try {
       var resp = await fetch('/api/action', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Sync-Secret': SYNC_SECRET },
         body: JSON.stringify({ job_id: jobId, action: action })
       });
       var data = await resp.json();
@@ -980,7 +984,7 @@
     try {
       var resp = await fetch('/api/credentials', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Sync-Secret': SYNC_SECRET },
         body: JSON.stringify({ platform: platform, email: email, password: password })
       });
       var data = await resp.json();
@@ -1004,7 +1008,7 @@
     try {
       var resp = await fetch('/api/jobs/external', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Sync-Secret': SYNC_SECRET },
         body: JSON.stringify({ url: url })
       });
       var data = await resp.json();
