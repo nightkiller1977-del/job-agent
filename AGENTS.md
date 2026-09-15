@@ -16,6 +16,20 @@
 12. Do not claim completion without validation evidence; state remaining risk.
 13. Review priority: correctness/security, reuse, simplicity, validation evidence.
 
+## Jira work tracking is mandatory
+
+Jira is the planning and source-of-truth layer for AI Commander implementation work. Before any code-changing implementation, repair, refactor, or feature work, use the `aicc-jira-work-tracking` skill.
+- Site: `https://shoalinwu.atlassian.net`; active project: `ACES`; issue pattern: `https://shoalinwu.atlassian.net/browse/<KEY>`.
+- `KAN` is legacy/historical unless explicitly requested.
+- Every work item must have a Jira ticket and an appropriate parent Epic/roadmap ticket. Do not work orphan tickets.
+- Read/follow the parent before coding. If child/request conflicts with parent, reconcile Jira first.
+- Keep Jira current through work start, findings/blockers/decisions, PR open, validation, and completion.
+- Every PR identifies both work ticket and parent; Jira references the PR.
+- Out-of-scope discoveries get separate Jira child tickets under the appropriate parent.
+- Do not mark `Done` before required validation/delivery/reconciliation evidence exists.
+- Component/repository routing is Coordinator-authoritative; do not invent mappings.
+- Never store Jira email, API tokens, Cloud ID, enrollment secrets, or credentials in repo guidance, prompts, logs, tests, or PR text.
+
 ## job-agent invariants
 
 - Never point Playwright/scrapers at the user's main Chrome profile. Each scraper must use its isolated profile under `state/sessions/<name>_profile/`; do not add `--profile-directory=Default` or bypass profile-lock cleanup semantics to use the main profile.
