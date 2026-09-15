@@ -7,6 +7,8 @@ Covers:
   - _build_profile_from_config: config values propagate to prompt
   - _smart_excerpt: truncation strategy
   - score(): IC fast-path, model cascade fallback
+  - SCORING_FAILED: failed evaluations are not conflated with a real ~50 score
+  - _classify_status(): scoring_failed neither approves nor skips
   - batch_score(): concurrency, exception isolation
 """
 from __future__ import annotations
@@ -112,12 +114,13 @@ def test_parse_embedded_json() -> None:
     assert score == 85
 
 
-def test_parse_invalid_json_returns_flag() -> None:
+def test_parse_invalid_json_returns_scoring_failed() -> None:
     scorer = _make_scorer()
     score, reason, flags, action = scorer._parse_response("not json at all")
-    assert score == 50
-    assert flags == "FLAG_FOR_REVIEW"
-    assert action == "review"
+    # A parse failure is no evaluation at all, not a genuine ~50 score.
+    assert score is None
+    assert flags == "SCORING_FAILED"
+    assert action == "scoring_failed"
 
 
 def test_parse_score_clamped() -> None:
@@ -202,12 +205,25 @@ async def test_score_ic_role_fast_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_score_model_unavailable_returns_review() -> None:
+async def test_score_model_unavailable_returns_scoring_failed() -> None:
     scorer = _make_scorer()
     scorer._model_client.complete = AsyncMock(return_value="No model available: Ollama is not running")
     score, reason, flags, action = await scorer.score({"title": "Director of Engineering", "description": ""})
-    assert score == 50
-    assert flags == "FLAG_FOR_REVIEW"
+    # No model tier answered: this must not look like a genuine 50 score.
+    assert score is None
+    assert flags == "SCORING_FAILED"
+    assert action == "scoring_failed"
+
+
+@pytest.mark.asyncio
+async def test_score_exception_returns_scoring_failed() -> None:
+    scorer = _make_scorer()
+    scorer._model_client.complete = AsyncMock(side_effect=RuntimeError("boom"))
+    score, reason, flags, action = await scorer.score({"title": "Director of Engineering", "description": ""})
+    assert score is None
+    assert flags == "SCORING_FAILED"
+    assert action == "scoring_failed"
+    assert "boom" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -248,5 +264,84 @@ async def test_batch_score_isolates_exceptions() -> None:
     jobs = [{"title": f"Job {i}", "description": ""} for i in range(5)]
     results = await scorer.batch_score(jobs, concurrency=5)
     assert len(results) == 5
-    failed = [j for j in results if j.get("flags") == "FLAG_FOR_REVIEW"]
+    failed = [j for j in results if j.get("flags") == "SCORING_FAILED"]
     assert len(failed) == 1
+    # The isolated failure is unscored, not a fabricated 50.
+    assert failed[0]["score"] is None
+    assert failed[0]["recommended_action"] == "scoring_failed"
+
+
+@pytest.mark.asyncio
+async def test_batch_score_callback_error_does_not_clobber_valid_verdict() -> None:
+    """on_result is a progress tick. If it raises, the already-computed verdict
+    must survive — otherwise a UI error silently discards a real evaluation."""
+    scorer = _make_scorer()
+
+    async def mock_score(job):
+        return 90, "Great fit", "CLEARED_ROLE", "apply"
+
+    scorer.score = mock_score  # type: ignore[method-assign]
+
+    def bad_callback():
+        raise RuntimeError("progress bar exploded")
+
+    results = await scorer.batch_score(
+        [{"title": "Director of Engineering", "description": ""}],
+        concurrency=1,
+        on_result=bad_callback,
+    )
+    assert results[0]["score"] == 90
+    assert results[0]["flags"] == "CLEARED_ROLE"
+    assert results[0]["recommended_action"] == "apply"
+    assert results[0]["flags"] != "SCORING_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_genuine_midrange_score_is_not_scoring_failed() -> None:
+    """A real model verdict of 50/FLAG_FOR_REVIEW must stay distinguishable from
+    an infrastructure failure — the whole point of the SCORING_FAILED outcome."""
+    scorer = _make_scorer()
+    verdict = json.dumps({
+        "score": 50,
+        "reason": "Moderate fit; salary not listed.",
+        "flags": "FLAG_FOR_REVIEW",
+        "recommended_action": "review",
+    })
+    scorer._model_client.complete = AsyncMock(return_value=verdict)
+    score, _, flags, action = await scorer.score({"title": "Director of Engineering", "description": ""})
+    assert score == 50
+    assert flags == "FLAG_FOR_REVIEW"
+    assert action == "review"
+    assert flags != "SCORING_FAILED"
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator status mapping for a failed evaluation
+# ---------------------------------------------------------------------------
+
+def _bare_orchestrator():
+    from src.orchestrator import Orchestrator
+    return Orchestrator.__new__(Orchestrator)
+
+
+def test_classify_status_scoring_failed_stays_discovered() -> None:
+    orc = _bare_orchestrator()
+    job = {
+        "title": "Director of Engineering",
+        "company": "Acme",
+        "score": None,
+        "recommended_action": "scoring_failed",
+    }
+    orc._classify_status(job)
+    # Neither approved nor skipped: an unscored job must stay in review.
+    assert job["status"] == "discovered"
+
+
+def test_classify_status_apply_and_skip_unchanged() -> None:
+    orc = _bare_orchestrator()
+    approved = {"title": "t", "company": "c", "score": 90, "recommended_action": "apply"}
+    skipped = {"title": "t", "company": "c", "score": 5, "recommended_action": "skip"}
+    orc._classify_status(approved)
+    orc._classify_status(skipped)
+    assert approved["status"] == "approved"
+    assert skipped["status"] == "skipped"

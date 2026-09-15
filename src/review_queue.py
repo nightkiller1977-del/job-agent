@@ -14,7 +14,9 @@ from rich import box
 console = Console()
 
 
-def _score_color(score: int) -> str:
+def _score_color(score: int | None) -> str:
+    if score is None:
+        return "dim"
     if score >= 80:
         return "bold green"
     elif score >= 60:
@@ -57,6 +59,7 @@ def _flag_badges(flags: str) -> list[Text]:
         "CLEARED_ROLE": ("TS CLEARED", "bold white on dark_red"),
         "ALWAYS_APPLY": ("AUTO-APPLY", "bold white on green"),
         "FLAG_FOR_REVIEW": ("REVIEW", "bold black on yellow"),
+        "SCORING_FAILED": ("UNSCORED", "bold white on magenta"),
         "SALARY_MISSING": ("SALARY?", "bold yellow"),
         "BELOW_THRESHOLD": ("BELOW $", "bold red"),
         "LOCATION_MISMATCH": ("LOCATION!", "bold red"),
@@ -72,7 +75,9 @@ def _flag_badges(flags: str) -> list[Text]:
 
 def render_job_card(job: dict, index: int, total: int) -> Panel:
     """Render a single job as a Rich Panel."""
-    score = job.get("score") or 0
+    # None means scoring never produced a value (SCORING_FAILED) — show it as
+    # unscored rather than as a real 0/100.
+    score = job.get("score")
     score_color = _score_color(score)
 
     # Header line
@@ -101,7 +106,10 @@ def render_job_card(job: dict, index: int, total: int) -> Panel:
 
     # Score row
     score_text = Text()
-    score_text.append(f"{score}/100", style=score_color)
+    if score is None:
+        score_text.append("unscored", style=score_color)
+    else:
+        score_text.append(f"{score}/100", style=score_color)
     reason = job.get("score_reason", "")
     if reason:
         score_text.append(f"  {reason[:120]}", style="dim")

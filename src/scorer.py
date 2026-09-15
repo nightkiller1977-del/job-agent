@@ -11,12 +11,29 @@ config change propagates everywhere without restarting.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 from typing import Optional
 
 from src.model_client import ModelClient
 from src.json_utils import extract_json
+
+_log = logging.getLogger("job_agent.scorer")
+
+# Outcome for a scoring run that produced no valid evaluation — the model tier
+# was unavailable, the call raised, or the response was unparseable. This is not
+# the same as the model evaluating a job as ~50: no score was ever computed, so
+# the score is None (rendered "unscored") and these distinct flag/action values
+# let analytics and recovery separate "infrastructure failed" from "human review".
+SCORING_FAILED_FLAG = "SCORING_FAILED"
+SCORING_FAILED_ACTION = "scoring_failed"
+
+
+def _scoring_failed(reason: str) -> tuple[None, str, str, str]:
+    """Build the (score, reason, flags, action) outcome for a failed evaluation."""
+    return None, reason, SCORING_FAILED_FLAG, SCORING_FAILED_ACTION
+
 
 # ---------------------------------------------------------------------------
 # Default profile (used only when config is absent — never hardcoded in prod)
@@ -228,10 +245,13 @@ class JobScorer:
             anthropic_model=_CLAUDE_SONNET,
         )
 
-    async def score(self, job: dict) -> tuple[int, str, str, str]:
+    async def score(self, job: dict) -> tuple[Optional[int], str, str, str]:
         """Score a single job via Ollama → Claude → OpenAI cascade.
 
-        Returns (score, reason, flags, recommended_action).
+        Returns (score, reason, flags, recommended_action). When no evaluation
+        could be produced (no model tier available, the call raised, or the
+        response was unparseable) the score is None with the SCORING_FAILED
+        flag/action, so a failure is never mistaken for a genuine ~50 score.
         """
         ic_check = self._quick_ic_check(job)
         if ic_check:
@@ -258,10 +278,10 @@ class JobScorer:
                 max_tokens=512,
             )
             if not text or text.startswith("No model available"):
-                return 50, "No model available for scoring", "FLAG_FOR_REVIEW", "review"
+                return _scoring_failed("No model available for scoring")
             return self._parse_response(text)
         except Exception as exc:
-            return 50, f"Scoring error: {exc}", "FLAG_FOR_REVIEW", "review"
+            return _scoring_failed(f"Scoring error: {exc}")
 
     async def batch_score(
         self, jobs: list[dict], concurrency: int = 5, on_result=None
@@ -272,7 +292,8 @@ class JobScorer:
         Reduces 50-job batch time from ~100s to ~20s.
 
         on_result: optional zero-arg callback invoked once per job as each score
-        settles (success or failure) — used to drive a progress bar.
+        settles (success or failure) — used to drive a progress bar. Callback
+        errors are isolated: they must not be mistaken for scoring failures.
         """
         sem = asyncio.Semaphore(concurrency)
 
@@ -287,26 +308,34 @@ class JobScorer:
                     return job
                 finally:
                     if on_result is not None:
-                        on_result()
+                        # The callback is a progress tick (a UI side effect). Letting
+                        # it raise would surface here as a scoring failure and
+                        # overwrite a verdict self.score() already produced, so
+                        # isolate it and log instead.
+                        try:
+                            on_result()
+                        except Exception as exc:
+                            _log.warning("scorer.on_result.callback_failed error=%s", exc)
 
         results = await asyncio.gather(*[_score_one(j) for j in jobs], return_exceptions=True)
         out = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                jobs[i]["score"] = 50
+                # A raised exception is a failed evaluation, not a real 50.
+                jobs[i]["score"] = None
                 jobs[i]["score_reason"] = f"Scoring failed: {result}"
-                jobs[i]["flags"] = "FLAG_FOR_REVIEW"
-                jobs[i]["recommended_action"] = "review"
+                jobs[i]["flags"] = SCORING_FAILED_FLAG
+                jobs[i]["recommended_action"] = SCORING_FAILED_ACTION
                 out.append(jobs[i])
             else:
                 out.append(result)
         return out
 
-    def _parse_response(self, raw: str) -> tuple[int, str, str, str]:
+    def _parse_response(self, raw: str) -> tuple[Optional[int], str, str, str]:
         """Parse a JSON scoring response into (score, reason, flags, action)."""
         data = extract_json(raw, expect="object")
         if data is None:
-            return 50, "Could not parse model response", "FLAG_FOR_REVIEW", "review"
+            return _scoring_failed("Could not parse model response")
         try:
             score = max(0, min(100, int(float(data.get("score", 50)))))
         except (TypeError, ValueError):

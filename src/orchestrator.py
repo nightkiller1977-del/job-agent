@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .state_manager import StateManager, parse_extra_json
-from .scorer import JobScorer
+from .scorer import JobScorer, SCORING_FAILED_ACTION
 from .review_queue import run_review_queue, show_summary_table
 from .sources.jobright import JobrightScraper
 from .sources.linkedin import LinkedInScraper
@@ -411,6 +411,13 @@ class Orchestrator:
         elif action == "skip":
             job["status"] = "skipped"
             console.print(f"  [dim]→ Auto-skipped: {job.get('title')} @ {job.get('company')} (Score: {score})[/dim]")
+        elif action == SCORING_FAILED_ACTION:
+            # No evaluation happened: neither approve nor skip, so the job stays
+            # in the review queue and remains identifiable via the SCORING_FAILED
+            # flag. It is not auto-rescored (already_seen skips known job_ids);
+            # retrying failed rows is a separate follow-up.
+            job["status"] = "discovered"
+            console.print(f"  [yellow]→ Scoring failed (unscored): {job.get('title')} @ {job.get('company')}[/yellow]")
         else:
             job["status"] = "discovered"
         return job
