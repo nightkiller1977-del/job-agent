@@ -79,6 +79,12 @@ CANONICAL_KEYS: tuple[str, ...] = (
     "EMAIL_2FA_ADDRESS", "IMAP_USER", "IMAP_PASSWORD",
     "ICLOUD_APP_PASSWORD_PERSONAL", "ICLOUD_APP_PASSWORD",
     "ICLOUD_APP_PASSWORD_ICLOUD", "ICLOUD_APP_PASSWORD_MAC",
+    # Alternative names the central store has shipped this credential under.
+    # email_helper.imap_password_candidates() reads all of these and treats
+    # them as interchangeable — accept whichever the store rotated to.
+    "ICLOUD_API_KEY", "ICLOUD_IMAP_PASSWORD",
+    "APPLE_APP_PASSWORD", "APPLE_APP_SPECIFIC_PASSWORD",
+    "APPLE_ID_APP_PASSWORD", "APPLE_API_KEY",
     "COMPANY_EMAIL", "COMPANY_PASSWORD",
     "COMPANY_EMAIL_ALT", "COMPANY_PASSWORD_ALT",
     "DASHBOARD_URL", "SYNC_SECRET", "CREDENTIAL_ENCRYPTION_KEY",
@@ -298,9 +304,187 @@ def fill_missing(names: tuple[str, ...] | list[str] | None = None) -> list[str]:
     if filled:
         _log.info("secrets: filled %d key(s) from central store: %s", len(filled), ", ".join(filled))
     apply_store_authoritative([k for k in keys if k in STORE_AUTHORITATIVE_KEYS])
+    # Warm the model-backed classifier cache in the background so the next
+    # discover_by_purpose call ranks unknown store names correctly. Never
+    # blocks fill_missing — if no loop is running (sync caller), skip.
+    try:
+        from src.secret_classifier import refresh_purpose_cache_background
+        refresh_purpose_cache_background()
+    except Exception:  # noqa: BLE001
+        pass
     return filled
 
 
 def clear_cache() -> None:
     """Drop the cached store read (tests / after the store is rewritten)."""
     _read_store.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Purpose-based key discovery
+# ---------------------------------------------------------------------------
+#
+# Every credential in the store has a purpose (IMAP inbox password, an
+# LLM API key, a source-site login, …) but not always a name we recognize.
+# CANONICAL_KEYS lets fill_missing() hydrate a fixed list into os.environ,
+# but a rotation that renames the key — or a store the user set up with
+# a different naming convention — falls out of reach silently. discover_by_purpose
+# scans EVERY key visible in the store, classifies it by regex against its name,
+# and returns the candidates in priority order.
+#
+# Add a purpose here (not in every caller) and every scraper picks it up.
+import re as _re
+
+_PURPOSE_PATTERNS: dict[str, tuple[_re.Pattern, ...]] = {
+    # IMAP inbox app-specific passwords. Ordered: explicit IMAP names, then
+    # iCloud/Apple app-password variants, then anything that looks like an
+    # app password / API key for mail. Patterns use .search() so a suffix
+    # like _MAC, _PERSONAL, _ICLOUD after PASSWORD is honored.
+    "imap_password": (
+        _re.compile(r"^IMAP.*PASSWORD", _re.IGNORECASE),
+        _re.compile(r"^IMAP.*(TOKEN|KEY)", _re.IGNORECASE),
+        _re.compile(r"^(ICLOUD|APPLE).*APP.*(PASSWORD|SPECIFIC)", _re.IGNORECASE),
+        _re.compile(r"^(ICLOUD|APPLE).*(IMAP|MAIL).*PASSWORD", _re.IGNORECASE),
+        _re.compile(r"^(ICLOUD|APPLE).*(API_KEY|KEY|TOKEN)", _re.IGNORECASE),
+        _re.compile(r"^MAIL.*(PASSWORD|APP.*PASSWORD)", _re.IGNORECASE),
+    ),
+    "imap_address": (
+        _re.compile(r"^EMAIL.*2FA.*ADDRESS", _re.IGNORECASE),
+        _re.compile(r"^IMAP.*(USER|EMAIL|ADDRESS)", _re.IGNORECASE),
+        _re.compile(r"^(NOTIFY|APPROVAL).*EMAIL", _re.IGNORECASE),
+    ),
+}
+
+# Explicit, reviewed aliases for a purpose. This is the supported way to teach
+# the store about a key whose name no regex convention covers (e.g. a freeform
+# name the user chose). It is deterministic and human-auditable, which is
+# deliberate: an entry here is what AUTHORIZES using a resolved secret, so it
+# must be a reviewed declaration rather than a model inference. Add a name here
+# (and to CANONICAL_KEYS if fill_missing should hydrate it) when the operator
+# confirms the key really holds that credential.
+#
+# Do NOT populate this from the model classifier's cache. See
+# :func:`advisory_keys_by_purpose` for the non-authorizing suggestion path.
+PURPOSE_ALIASES: dict[str, tuple[str, ...]] = {
+    "imap_password": (),
+    "imap_address": (),
+}
+
+
+def _all_store_keys() -> list[str]:
+    """Every key visible in the central store (plaintext .env + SOPS-decrypted, plus
+    the aicc-secrets CLI's `list` output if it supports one). Deduplicated, in a
+    stable order. Values are not returned here — callers use resolve_secret() to
+    read them so the CLI/SOPS access rules stay in one place."""
+    names: dict[str, None] = {}  # dict preserves insertion order → stable
+    if shutil.which("aicc-secrets"):
+        for sub in (["list"], ["list", "--names"], ["keys"]):
+            try:
+                res = subprocess.run(
+                    ["aicc-secrets", *sub],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except Exception:
+                continue
+            if res.returncode != 0:
+                continue
+            for line in res.stdout.splitlines():
+                # Accept plain names or `NAME=value` — take the name half.
+                token = line.strip().split("=", 1)[0].strip()
+                if token and _re.fullmatch(r"[A-Z0-9_]+", token):
+                    names[token] = None
+            if names:
+                break
+    for name in _read_store().keys():
+        names[name] = None
+    return list(names.keys())
+
+
+def discover_by_purpose(
+    purpose: str,
+    *,
+    filter_regex: str | None = None,
+    max_candidates: int = 8,
+) -> list[str]:
+    """Return AUTHORIZED names of secrets in the central store that serve *purpose*.
+
+    Only deterministic, reviewed sources are consulted:
+      1. Explicit aliases declared in PURPOSE_ALIASES (operator-confirmed).
+      2. Regex patterns declared in _PURPOSE_PATTERNS, tried in order.
+
+    Model classifications are deliberately NOT merged in here. A name returned
+    from this function may be resolved and transmitted (e.g. as an IMAP
+    password to an external mail server), so it must rest on reviewed evidence
+    rather than an unverified inference. Use
+    :func:`advisory_keys_by_purpose` for model suggestions, which callers may
+    log or surface but must not act on.
+
+    filter_regex lets a caller narrow further (e.g. addresses matching an
+    iCloud domain). It's applied to the KEY NAME, not the value — the caller
+    is expected to resolve() the value itself.
+    """
+    patterns = _PURPOSE_PATTERNS.get(purpose, ())
+    keys = _all_store_keys()
+    if not patterns and not keys:
+        return []
+    narrow = _re.compile(filter_regex) if filter_regex else None
+    known = set(keys)
+
+    ranked: list[str] = []
+    seen: set[str] = set()
+
+    def _take(name: str) -> bool:
+        if name in seen or name not in known:
+            return False
+        if narrow and not narrow.search(name):
+            return False
+        ranked.append(name)
+        seen.add(name)
+        return True
+
+    # 1. Operator-declared aliases — the explicit authorization path.
+    for name in PURPOSE_ALIASES.get(purpose, ()):
+        if _take(name) and len(ranked) >= max_candidates:
+            return ranked
+
+    # 2. Deterministic regex rules in declared priority order.
+    for pat in patterns:
+        for name in keys:
+            if name in seen or not pat.search(name):
+                continue
+            if _take(name) and len(ranked) >= max_candidates:
+                return ranked
+    return ranked
+
+
+def advisory_keys_by_purpose(
+    purpose: str,
+    *,
+    filter_regex: str | None = None,
+    max_candidates: int = 8,
+) -> list[str]:
+    """Names the model believes serve *purpose*, minus the authorized ones.
+
+    ADVISORY ONLY — never treat these as authorization to resolve or transmit a
+    secret value. They exist so an operator can see "the model thinks
+    MAIL_BOT_KEY_V2 is an IMAP password; add it to PURPOSE_ALIASES if that is
+    correct" without the inference itself deciding where a credential goes.
+    """
+    authorized = set(discover_by_purpose(
+        purpose, filter_regex=filter_regex, max_candidates=max_candidates,
+    ))
+    narrow = _re.compile(filter_regex) if filter_regex else None
+    suggestions: list[str] = []
+    try:
+        from src.secret_classifier import classified_keys as _classified
+        for name in _classified(purpose, _all_store_keys()):
+            if name in authorized or name in suggestions:
+                continue
+            if narrow and not narrow.search(name):
+                continue
+            suggestions.append(name)
+            if len(suggestions) >= max_candidates:
+                break
+    except Exception:  # noqa: BLE001 — classifier is best-effort
+        pass
+    return suggestions

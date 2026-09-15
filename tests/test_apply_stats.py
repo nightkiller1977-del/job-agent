@@ -137,3 +137,56 @@ def test_legacy_rows_without_submitted_flag_fall_back_to_status(sm):
     f = sm.get_apply_funnel()
     assert f["submitted"] == 1
     assert f["attempts"] == 1
+
+
+def test_per_source_status_credits_success_to_recovered_transient_status(sm):
+    """PR #120 review P1: a job that failed with browser_timeout N times and then
+    succeeded must contribute a success to the browser_timeout bucket, otherwise
+    adaptive_cap() sees a fake 0/N and lowers the cap on a recovering status."""
+    for i in range(5):
+        _job(sm, f"t{i}", source="linkedin")
+        sm.record_apply_attempt(f"t{i}", "browser_timeout", "timed out")
+        sm.record_apply_attempt(f"t{i}", "applied", "submitted on retry")
+
+    f = sm.get_apply_funnel()
+    bucket = f["per_source_status"]["linkedin"]["browser_timeout"]
+    assert bucket["attempts"] == 5
+    assert bucket["submitted"] == 5, "later success must credit the transient status"
+
+    # 5 attempts, 5 attributed successes -> cap stays at the static ceiling.
+    from src import blocker_intelligence as bi
+    cap, _ = bi.adaptive_cap("linkedin", "browser_timeout", static_cap=2, funnel=f)
+    assert cap == 2
+
+
+def test_per_source_status_still_lowers_cap_for_genuinely_doomed_pair(sm):
+    """A pair with real attempts and no success anywhere must stay lowered."""
+    for i in range(6):
+        _job(sm, f"d{i}", source="workday")
+        sm.record_apply_attempt(f"d{i}", "workday_session_expired", "wall")
+
+    f = sm.get_apply_funnel()
+    bucket = f["per_source_status"]["workday"]["workday_session_expired"]
+    assert bucket == {"attempts": 6, "submitted": 0, "sample_reasons": ["wall"], "rate": 0.0}
+
+    from src import blocker_intelligence as bi
+    cap, reason = bi.adaptive_cap("workday", "workday_session_expired", static_cap=5, funnel=f)
+    assert cap == 1 and "0/6" in reason
+
+
+def test_funnel_legacy_row_without_history_uses_latest_status(sm):
+    """Legacy rows have no apply_status_history — the funnel must fall back to
+    the single latest status instead of dropping the row from per_source_status."""
+    _job(sm, "legacy2", source="indeed")
+    sm.record_apply_attempt("legacy2", "submit_not_found", "no button")
+
+    import json as _json
+    with sm._connect() as conn:
+        row = conn.execute("SELECT extra_json FROM jobs WHERE job_id = ?", ("legacy2",)).fetchone()
+        extra = _json.loads(row["extra_json"])
+        extra.pop("apply_status_history", None)
+        conn.execute("UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                     (_json.dumps(extra), "legacy2"))
+
+    f = sm.get_apply_funnel()
+    assert f["per_source_status"]["indeed"]["submit_not_found"]["attempts"] == 1

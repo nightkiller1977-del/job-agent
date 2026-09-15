@@ -358,3 +358,53 @@ async def test_force_provider_openrouter_does_not_fall_through_on_gateway_failur
     assert result == "", "forced-gateway call must return empty on gateway failure"
     assert not claude_called, "direct Claude MUST NOT be called when force_provider='openrouter'"
     assert not openai_called, "direct OpenAI MUST NOT be called when force_provider='openrouter'"
+
+
+@pytest.mark.asyncio
+async def test_local_only_never_reaches_remote_providers(monkeypatch):
+    """Metadata classification must not egress when no local model is available.
+
+    local_only=True is how the secret/blocker classifiers keep internal key
+    names and reason strings on the machine. With Ollama unavailable, the call
+    must return "" and must not touch the gateway, Claude, or OpenAI.
+    """
+    import httpx
+
+    monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "http://127.0.0.1:3848")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stub-anthropic-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "stub-openai-key")
+
+    client = ModelClient(anthropic_api_key="stub-anthropic-key")
+
+    async def no_local_models(self, task_type="general"):
+        return None
+
+    monkeypatch.setattr(client, "_pick_ollama_model", no_local_models.__get__(client))
+
+    remote_calls = []
+
+    async def gateway_calls(self, url, json=None, headers=None):
+        remote_calls.append(("gateway", url))
+        raise httpx.ConnectError("gateway should not be reached")
+
+    async def fake_claude(*args, **kwargs):
+        remote_calls.append(("claude",))
+        return "SHOULD_NOT_APPEAR"
+
+    async def fake_openai(*args, **kwargs):
+        remote_calls.append(("openai",))
+        return "SHOULD_NOT_APPEAR"
+
+    monkeypatch.setattr("httpx.AsyncClient.post", gateway_calls)
+    monkeypatch.setattr(client, "_call_claude", fake_claude)
+    monkeypatch.setattr(client, "_call_openai", fake_openai)
+
+    result = await client.complete(
+        messages=[{"role": "user", "content": "SECRET_KEY_NAME"}],
+        task_type="classification",
+        local_only=True,
+    )
+
+    assert result == ""
+    assert remote_calls == [], f"local_only must not reach remote tiers, got {remote_calls}"
