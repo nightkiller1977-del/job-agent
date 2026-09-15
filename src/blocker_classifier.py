@@ -114,10 +114,12 @@ def classify(status: str | None) -> BlockerClass:
     static = _STATUS_TO_CLASS.get(key)
     if static is not None:
         return static
-    # Fall back to the model-classified cache (sync read; never blocks).
+    # Fall back to the model-classified cache (sync read; never blocks). The
+    # background classifier stored its verdict against the reason samples IT
+    # observed, so this lookup must not require the reasons to match.
     try:
-        from src.blocker_intelligence import classified_status
-        verdict = classified_status(key, [])
+        from src.blocker_intelligence import latest_classification
+        verdict = latest_classification(key)
         if verdict:
             return BlockerClass(verdict)
     except Exception:

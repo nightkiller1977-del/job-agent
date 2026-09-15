@@ -466,6 +466,7 @@ class ModelClient:
         max_tokens: int = ANTHROPIC_MAX_TOKENS,
         temperature: float | None = None,
         force_provider: str | None = None,
+        local_only: bool = False,
     ) -> str:
         """Return the model response text.  Cascade: Ollama → OpenRouter Gateway → Claude → OpenAI.
 
@@ -476,6 +477,12 @@ class ModelClient:
         exhausted local iterations without meeting a quality gate and want to
         escalate deliberately, rather than wait for a local failure the cascade
         would treat as recoverable.
+
+        Pass local_only=True to forbid leaving the machine: only Ollama is
+        tried, and the call returns "" when no local model is available instead
+        of escalating to a remote provider. Callers that feed internal metadata
+        (secret key names, blocker reason strings) use this so that metadata
+        cannot silently egress when local inference is down.
         """
         last_error = ""
 
@@ -496,6 +503,13 @@ class ModelClient:
                 _log.warning("ModelClient: Ollama failed (%s) — escalating to OpenRouter Gateway", exc)
         else:
             _log.info("ModelClient: no Ollama models fit constraints — trying OpenRouter Gateway")
+
+        if local_only:
+            _log.info(
+                "ModelClient: local_only set — refusing remote tiers task=%s last_error=%s",
+                task_type, last_error,
+            )
+            return ""
 
         # Tier 2: AI-OpenRouter Gateway (Centralized budget-managed cloud tier)
         gateway_configured, gateway_url, gateway_key = self.get_gateway_config()

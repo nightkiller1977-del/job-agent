@@ -355,6 +355,21 @@ _PURPOSE_PATTERNS: dict[str, tuple[_re.Pattern, ...]] = {
     ),
 }
 
+# Explicit, reviewed aliases for a purpose. This is the supported way to teach
+# the store about a key whose name no regex convention covers (e.g. a freeform
+# name the user chose). It is deterministic and human-auditable, which is
+# deliberate: an entry here is what AUTHORIZES using a resolved secret, so it
+# must be a reviewed declaration rather than a model inference. Add a name here
+# (and to CANONICAL_KEYS if fill_missing should hydrate it) when the operator
+# confirms the key really holds that credential.
+#
+# Do NOT populate this from the model classifier's cache. See
+# :func:`advisory_keys_by_purpose` for the non-authorizing suggestion path.
+PURPOSE_ALIASES: dict[str, tuple[str, ...]] = {
+    "imap_password": (),
+    "imap_address": (),
+}
+
 
 def _all_store_keys() -> list[str]:
     """Every key visible in the central store (plaintext .env + SOPS-decrypted, plus
@@ -391,18 +406,18 @@ def discover_by_purpose(
     filter_regex: str | None = None,
     max_candidates: int = 8,
 ) -> list[str]:
-    """Return names of secrets in the central store that serve *purpose*.
+    """Return AUTHORIZED names of secrets in the central store that serve *purpose*.
 
-    Order of authority:
-      1. Model-backed classification from :mod:`secret_classifier`, when
-         a cached ranking exists for the current candidate set — this
-         catches names that don't match any regex convention (freeform
-         names the user chose, like ``mail_bot_key_v2``).
+    Only deterministic, reviewed sources are consulted:
+      1. Explicit aliases declared in PURPOSE_ALIASES (operator-confirmed).
       2. Regex patterns declared in _PURPOSE_PATTERNS, tried in order.
 
-    Model results are additive: any regex hits the model missed are
-    appended after the model ranking so a fast path always exists even
-    when the classifier has never run.
+    Model classifications are deliberately NOT merged in here. A name returned
+    from this function may be resolved and transmitted (e.g. as an IMAP
+    password to an external mail server), so it must rest on reviewed evidence
+    rather than an unverified inference. Use
+    :func:`advisory_keys_by_purpose` for model suggestions, which callers may
+    log or surface but must not act on.
 
     filter_regex lets a caller narrow further (e.g. addresses matching an
     iCloud domain). It's applied to the KEY NAME, not the value — the caller
@@ -413,36 +428,63 @@ def discover_by_purpose(
     if not patterns and not keys:
         return []
     narrow = _re.compile(filter_regex) if filter_regex else None
+    known = set(keys)
 
     ranked: list[str] = []
     seen: set[str] = set()
 
-    # 1. Model-classified cache (never calls the model here — this is sync).
-    try:
-        from src.secret_classifier import classified_keys as _classified
-        for name in _classified(purpose, keys):
-            if name in seen:
-                continue
-            if narrow and not narrow.search(name):
-                continue
-            ranked.append(name)
-            seen.add(name)
-            if len(ranked) >= max_candidates:
-                return ranked
-    except Exception:  # noqa: BLE001 — classifier is best-effort
-        pass
+    def _take(name: str) -> bool:
+        if name in seen or name not in known:
+            return False
+        if narrow and not narrow.search(name):
+            return False
+        ranked.append(name)
+        seen.add(name)
+        return True
 
-    # 2. Regex fallback in declared priority order.
+    # 1. Operator-declared aliases — the explicit authorization path.
+    for name in PURPOSE_ALIASES.get(purpose, ()):
+        if _take(name) and len(ranked) >= max_candidates:
+            return ranked
+
+    # 2. Deterministic regex rules in declared priority order.
     for pat in patterns:
         for name in keys:
-            if name in seen:
+            if name in seen or not pat.search(name):
                 continue
-            if not pat.search(name):
+            if _take(name) and len(ranked) >= max_candidates:
+                return ranked
+    return ranked
+
+
+def advisory_keys_by_purpose(
+    purpose: str,
+    *,
+    filter_regex: str | None = None,
+    max_candidates: int = 8,
+) -> list[str]:
+    """Names the model believes serve *purpose*, minus the authorized ones.
+
+    ADVISORY ONLY — never treat these as authorization to resolve or transmit a
+    secret value. They exist so an operator can see "the model thinks
+    MAIL_BOT_KEY_V2 is an IMAP password; add it to PURPOSE_ALIASES if that is
+    correct" without the inference itself deciding where a credential goes.
+    """
+    authorized = set(discover_by_purpose(
+        purpose, filter_regex=filter_regex, max_candidates=max_candidates,
+    ))
+    narrow = _re.compile(filter_regex) if filter_regex else None
+    suggestions: list[str] = []
+    try:
+        from src.secret_classifier import classified_keys as _classified
+        for name in _classified(purpose, _all_store_keys()):
+            if name in authorized or name in suggestions:
                 continue
             if narrow and not narrow.search(name):
                 continue
-            ranked.append(name)
-            seen.add(name)
-            if len(ranked) >= max_candidates:
-                return ranked
-    return ranked
+            suggestions.append(name)
+            if len(suggestions) >= max_candidates:
+                break
+    except Exception:  # noqa: BLE001 — classifier is best-effort
+        pass
+    return suggestions

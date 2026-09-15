@@ -39,6 +39,19 @@ _log = logging.getLogger("job-agent.blocker_intelligence")
 
 _CACHE_PATH = Path(__file__).parent.parent / "state" / "blocker_intelligence.json"
 
+
+def _remote_classification_allowed() -> bool:
+    """Whether blocker reason strings may leave this machine for classification.
+
+    Off by default: reason strings are internal metadata, and the shared
+    ModelClient cascade can reach OpenRouter/Claude/OpenAI. An operator who
+    accepts that egress sets ALLOW_REMOTE_METADATA_CLASSIFICATION=1.
+    """
+    return os.environ.get("ALLOW_REMOTE_METADATA_CLASSIFICATION", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
 # The buckets returned by the classifier — must match BlockerClass names in
 # src.blocker_classifier so the caller can convert without a translation map.
 _VALID_CLASSES = ("transient", "auth_required", "needs_human", "permanent")
@@ -70,19 +83,32 @@ def _samples_hash(samples: list[str]) -> str:
     return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
 
-def classified_status(status: str, sample_reasons: list[str]) -> str | None:
-    """Return the cached bucket name for *status*, or None on cache miss.
+def latest_classification(status: str) -> str | None:
+    """Return the cached bucket for *status*, or None if we have never classified it.
 
-    Cache miss when: no entry yet, or the sample reasons have changed
-    materially since the model last saw them (new failure texts = re-ask).
+    This is what the retry-decision path (:func:`blocker_classifier.classify`)
+    consumes: it needs the best answer we currently hold, and must not depend on
+    the exact reason strings this particular run happened to observe — the
+    background classifier stores its verdict against the samples it saw, which
+    will not match a later caller's sample list.
     """
     entry = _cache_load().get("classifications", {}).get(status)
     if not entry:
         return None
-    if entry.get("samples_hash") != _samples_hash(sample_reasons):
-        return None
     verdict = entry.get("class")
     return verdict if verdict in _VALID_CLASSES else None
+
+
+def evidence_is_fresh(status: str, sample_reasons: list[str]) -> bool:
+    """True when the cached verdict was derived from this exact evidence.
+
+    Used only to decide whether the background classifier should re-ask the
+    model. New failure texts mean the old verdict rests on stale evidence.
+    """
+    entry = _cache_load().get("classifications", {}).get(status)
+    if not entry:
+        return False
+    return entry.get("samples_hash") == _samples_hash(sample_reasons)
 
 
 def _store_classification(status: str, sample_reasons: list[str], verdict: str) -> None:
@@ -177,10 +203,10 @@ async def classify_status_async(
     """
     if not status:
         return None
-    if not force:
-        cached = classified_status(status, sample_reasons)
-        if cached:
-            return cached
+    if not force and evidence_is_fresh(status, sample_reasons):
+        # The cached verdict already rests on this exact evidence — no need to
+        # re-ask, but still return the held answer so callers stay consistent.
+        return latest_classification(status)
 
     try:
         from src.model_client import ModelClient
@@ -230,6 +256,7 @@ async def classify_status_async(
             task_type="classification",
             max_tokens=60,
             temperature=0.0,
+            local_only=not _remote_classification_allowed(),
         )
     except Exception as exc:  # noqa: BLE001
         _log.warning("blocker_intelligence: model call failed status=%s error=%s", status, exc)

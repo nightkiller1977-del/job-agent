@@ -132,7 +132,32 @@ def resolve_imap_credentials(email_addr: str = "", password: str = "") -> tuple[
                     _log.info("mail.resolve.discovered_password key=%s", key)
                     pwd = val
                     break
+        if not pwd:
+            _log_advisory_password_suggestions()
     return addr, pwd
+
+
+def _log_advisory_password_suggestions() -> None:
+    """Log model-suggested IMAP password keys when deterministic discovery failed.
+
+    Advisory only: the model's guess is not acted on. Surfacing it lets an
+    operator confirm the key and add it to secret_store.PURPOSE_ALIASES, which
+    is the reviewed path that actually authorizes resolution.
+    """
+    try:
+        from src.secret_store import advisory_keys_by_purpose as _advisory
+    except Exception:  # noqa: BLE001 — advisory is best-effort
+        return
+    try:
+        suggestions = _advisory("imap_password")
+    except Exception:  # noqa: BLE001
+        return
+    if suggestions:
+        _log.info(
+            "mail.resolve.unresolved_password advisory_keys=%s — if one is correct, "
+            "add it to secret_store.PURPOSE_ALIASES to authorize its use",
+            ", ".join(suggestions),
+        )
 
 
 def is_imap_auth_failure(exc: BaseException) -> bool:

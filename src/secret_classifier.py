@@ -1,17 +1,23 @@
-"""Model-backed secret classifier — teach the app what each store key is for
-without adding a regex or a canonical-name entry per credential.
+"""Model-backed secret classifier — helps the app suggest what each store key
+is for without adding a regex or a canonical-name entry per credential.
 
 Purpose-based key discovery in :mod:`secret_store` uses regex over the KEY
 NAME, which works for names close to a convention (IMAP_PASSWORD,
 ICLOUD_APP_PASSWORD_MAC) but misses names the user chose freely
 (``mail_bot_key_v2``, ``inbox-token-personal``). This module asks the shared
-:class:`ModelClient` cascade to classify every unknown key by NAME + short
+:class:`ModelClient` to classify every unknown key by NAME + short
 description prompt, and caches the ranked answer to disk so we run the
 model at most once per (purpose, key-set) — a rotation that adds/removes a
 key invalidates only that entry.
 
-Values are never sent to the model — only KEY NAMES. The store's contents
-stay local.
+ADVISORY ONLY. The ranking is a suggestion, not authorization: callers must
+not resolve or transmit a secret value on the strength of it. The reviewed,
+deterministic path is ``secret_store.PURPOSE_ALIASES`` (post a suggestion
+there once an operator confirms the key really holds that credential).
+
+Values are never sent to the model — only KEY NAMES. Key names are still
+internal metadata, so classification runs local-only (Ollama) unless the
+operator sets ALLOW_REMOTE_METADATA_CLASSIFICATION=1.
 """
 from __future__ import annotations
 
@@ -26,6 +32,19 @@ from pathlib import Path
 _log = logging.getLogger("job-agent.secret_classifier")
 
 _CACHE_PATH = Path(__file__).parent.parent / "state" / "secret_purpose_cache.json"
+
+
+def _remote_classification_allowed() -> bool:
+    """Whether key NAMES may leave this machine for classification.
+
+    Off by default: key names are internal metadata, and the shared
+    ModelClient cascade can reach OpenRouter/Claude/OpenAI. An operator who
+    accepts that egress sets ALLOW_REMOTE_METADATA_CLASSIFICATION=1.
+    """
+    return os.environ.get("ALLOW_REMOTE_METADATA_CLASSIFICATION", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
 
 # Purpose registry — the model prompt for each purpose. Add a purpose here
 # (and a matching regex set in secret_store._PURPOSE_PATTERNS) and every
@@ -191,6 +210,7 @@ async def classify_purpose_async(
             task_type="classification",
             max_tokens=200,
             temperature=0.0,
+            local_only=not _remote_classification_allowed(),
         )
     except Exception as exc:  # noqa: BLE001
         _log.warning("secret_classifier: model call failed purpose=%s error=%s", purpose, exc)

@@ -29,8 +29,8 @@ def _isolated_cache(tmp_path, monkeypatch):
     yield
 
 
-def test_classified_status_empty_when_no_cache():
-    assert bi.classified_status("mystery_status", []) is None
+def test_latest_classification_empty_when_no_cache():
+    assert bi.latest_classification("mystery_status") is None
 
 
 def test_classify_status_async_persists_verdict():
@@ -39,7 +39,7 @@ def test_classify_status_async_persists_verdict():
         verdict = asyncio.run(bi.classify_status_async("mystery", ["reason A", "reason B"]))
     assert verdict == "auth_required"
     # Cache hit — second call must not re-invoke the model.
-    assert bi.classified_status("mystery", ["reason A", "reason B"]) == "auth_required"
+    assert bi.latest_classification("mystery") == "auth_required"
     assert fake.calls == 1
 
 
@@ -53,10 +53,25 @@ def test_classify_status_async_short_circuits_on_cache():
     assert fake.calls == 0
 
 
-def test_classified_status_busts_on_evidence_change():
+def test_evidence_change_marks_cache_stale():
     bi._store_classification("s", ["r1"], "transient")
-    # Different evidence → treat as fresh.
-    assert bi.classified_status("s", ["r1", "r2"]) is None
+    # Different evidence → not fresh, so the background classifier re-asks...
+    assert bi.evidence_is_fresh("s", ["r1", "r2"]) is False
+    # ...but the last known verdict is still what classify() would consume.
+    assert bi.latest_classification("s") == "transient"
+    assert bi.evidence_is_fresh("s", ["r1"]) is True
+
+
+def test_classify_consumes_verdict_stored_from_nonempty_reasons():
+    """Regression: the retry path must not miss a verdict stored against samples.
+
+    The background classifier stores the verdict keyed to the reason strings it
+    observed; classify() has no reasons to hand. Previously classify() called
+    classified_status(status, []), whose hash never matched — so the headline
+    model-backed classification silently never affected retry behaviour.
+    """
+    bi._store_classification("brand_new_status", ["timeout waiting for submit", "browser stalled"], "transient")
+    assert classify("brand_new_status") is BlockerClass.TRANSIENT
 
 
 def test_adaptive_cap_lowers_for_doomed_pair():
