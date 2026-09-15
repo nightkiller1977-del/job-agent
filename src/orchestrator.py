@@ -412,11 +412,12 @@ class Orchestrator:
             job["status"] = "skipped"
             console.print(f"  [dim]→ Auto-skipped: {job.get('title')} @ {job.get('company')} (Score: {score})[/dim]")
         elif action == SCORING_FAILED_ACTION:
-            # No evaluation happened: neither approve nor skip. Leaving it in the
-            # review queue keeps it visible and eligible for a later rescore,
-            # and the SCORING_FAILED flag makes the cause obvious.
+            # No evaluation happened: neither approve nor skip, so the job stays
+            # in the review queue and remains identifiable via the SCORING_FAILED
+            # flag. It is not auto-rescored (already_seen skips known job_ids);
+            # retrying failed rows is a separate follow-up.
             job["status"] = "discovered"
-            console.print(f"  [yellow]→ Unscored (retry later): {job.get('title')} @ {job.get('company')}[/yellow]")
+            console.print(f"  [yellow]→ Scoring failed (unscored): {job.get('title')} @ {job.get('company')}[/yellow]")
         else:
             job["status"] = "discovered"
         return job

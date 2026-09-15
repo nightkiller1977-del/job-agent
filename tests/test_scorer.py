@@ -272,6 +272,31 @@ async def test_batch_score_isolates_exceptions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_batch_score_callback_error_does_not_clobber_valid_verdict() -> None:
+    """on_result is a progress tick. If it raises, the already-computed verdict
+    must survive — otherwise a UI error silently discards a real evaluation."""
+    scorer = _make_scorer()
+
+    async def mock_score(job):
+        return 90, "Great fit", "CLEARED_ROLE", "apply"
+
+    scorer.score = mock_score  # type: ignore[method-assign]
+
+    def bad_callback():
+        raise RuntimeError("progress bar exploded")
+
+    results = await scorer.batch_score(
+        [{"title": "Director of Engineering", "description": ""}],
+        concurrency=1,
+        on_result=bad_callback,
+    )
+    assert results[0]["score"] == 90
+    assert results[0]["flags"] == "CLEARED_ROLE"
+    assert results[0]["recommended_action"] == "apply"
+    assert results[0]["flags"] != "SCORING_FAILED"
+
+
+@pytest.mark.asyncio
 async def test_genuine_midrange_score_is_not_scoring_failed() -> None:
     """A real model verdict of 50/FLAG_FOR_REVIEW must stay distinguishable from
     an infrastructure failure — the whole point of the SCORING_FAILED outcome."""
