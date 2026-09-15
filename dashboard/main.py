@@ -12,6 +12,7 @@ import html
 import json
 import os
 import secrets
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
@@ -41,12 +42,12 @@ SYNC_SECRET = os.environ.get("SYNC_SECRET", "")
 CREDENTIAL_ENCRYPTION_KEY = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
 _client: MongoClient | None = None
 
-# Paths reachable without the shared secret: the app's own health/metrics probes
-# (used by Render, Prometheus) carry no data and no side effects, plus the login
-# page that exchanges the shared secret for a session cookie. Everything else —
-# the HTML review UI, its asset bundle, and every /api/* route that reads jobs,
-# exposes credential emails, or mutates state — requires authentication.
-_UNAUTHENTICATED_PATHS = frozenset({"/health", "/metrics", "/login"})
+# Paths reachable without the shared secret: the app's own liveness probe, which
+# carries no data and no side effects, plus the login page that exchanges the
+# shared secret for a session cookie. /metrics is deliberately NOT here — it
+# exposes the Prometheus process/runtime registry, and no public scraper depends
+# on it, so it authenticates like any other machine route.
+_UNAUTHENTICATED_PATHS = frozenset({"/health", "/login"})
 # Static assets are needed to render the login page and the authenticated shell;
 # they contain no application data.
 _UNAUTHENTICATED_PREFIXES = ("/static/",)
@@ -67,22 +68,38 @@ def _session_signature(token: str) -> str:
 
 
 def _make_session_token() -> str:
-    token = secrets.token_urlsafe(32)
+    # The issue time is bound into the signed payload, so expiry is enforced by
+    # THIS process rather than left to the browser honoring max-age. A copied
+    # cookie stops working after _SESSION_MAX_AGE even while SYNC_SECRET is stable.
+    token = f"{secrets.token_urlsafe(32)}.{int(time.time())}"
     return f"{token}.{_session_signature(token)}"
 
 
 def _valid_session_token(value: str) -> bool:
-    """True only for a token carrying a signature minted from the current secret.
+    """True only for an unexpired token carrying a signature minted from the
+    current secret.
 
-    Signing (rather than storing sessions) keeps the gate stateless and restart-safe
-    and invalidates every session the moment SYNC_SECRET rotates.
+    Signing (rather than storing sessions) keeps the gate stateless and
+    restart-safe and invalidates every session the moment SYNC_SECRET rotates.
     """
     if not SYNC_SECRET:
         return False
     token, _, signature = value.rpartition(".")
     if not token or not signature:
         return False
-    return hmac.compare_digest(signature, _session_signature(token))
+    if not hmac.compare_digest(signature, _session_signature(token)):
+        return False
+    random_part, _, issued_raw = token.rpartition(".")
+    if not random_part:
+        return False
+    try:
+        issued_at = int(issued_raw)
+    except ValueError:
+        return False
+    # Reject future-dated payloads too: a signed issue time that is not yet past
+    # is either clock skew or a forged payload, and must not extend the window.
+    now = time.time()
+    return 0 <= now - issued_at <= _SESSION_MAX_AGE
 
 
 def _is_secure_request(request: Request) -> bool:
@@ -104,8 +121,8 @@ class SharedSecretMiddleware(BaseHTTPMiddleware):
     credential emails, yet most routes were previously open: an unauthenticated
     GET / rendered the queues and credential emails, and an unauthenticated
     POST /api/action could mark jobs applied/archived. The gate is fail-closed —
-    if SYNC_SECRET is unset the app refuses to serve anything but /health and
-    /metrics rather than silently reverting to a public site.
+    if SYNC_SECRET is unset the app refuses to serve anything but /health
+    rather than silently reverting to a public site.
 
     Browsers authenticate through a one-time exchange at /login, which sets an
     HttpOnly session cookie; the shared secret therefore never appears in a URL,

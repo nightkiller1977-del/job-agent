@@ -15,6 +15,8 @@ The middleware reads the module-level SYNC_SECRET per request, so tests patch
 that attribute rather than reloading the shared module (a reload would swap the
 app object other test files already hold).
 """
+import secrets
+import time
 import unittest
 from unittest.mock import patch
 
@@ -54,10 +56,15 @@ class TestFailClosedWhenSecretUnset(unittest.TestCase):
             self.assertEqual(self.client.post("/login", data={"secret": "x"}).status_code, 503)
 
     def test_health_probe_still_works(self):
-        # Render / Prometheus probes carry no secret and must keep working.
+        # Render's liveness probe carries no secret and must keep working.
         with patch.object(dm, "SYNC_SECRET", ""):
             self.assertEqual(self.client.get("/health").status_code, 200)
-            self.assertEqual(self.client.get("/metrics").status_code, 200)
+
+    def test_metrics_is_refused_while_unconfigured(self):
+        # /metrics is no longer an unauthenticated probe; an unset secret must not
+        # silently expose the Prometheus registry.
+        with patch.object(dm, "SYNC_SECRET", ""):
+            self.assertEqual(self.client.get("/metrics").status_code, 503)
 
 
 class TestRequiresSecretWhenConfigured(unittest.TestCase):
@@ -140,6 +147,45 @@ class TestRequiresSecretWhenConfigured(unittest.TestCase):
             resp = self.client.get("/", follow_redirects=False)
             self.assertEqual(resp.status_code, 303)
             self.assertEqual(resp.headers["location"], "/login")
+
+    def test_metrics_requires_the_machine_secret(self):
+        # The Prometheus registry is not an anonymous route: an unauthenticated GET
+        # is denied (redirected to login, not served), and the machine header works.
+        resp = self.client.get("/metrics", follow_redirects=False)
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/login")
+        self.assertEqual(self.client.get("/metrics", headers=_AUTH).status_code, 200)
+
+    def test_expired_but_correctly_signed_cookie_is_rejected(self):
+        # The signature is valid and the secret never rotated, so ONLY server-side
+        # expiry can reject this: it is exactly the replay the browser max-age
+        # alone used to permit.
+        issued_at = int(time.time()) - (dm._SESSION_MAX_AGE + 60)
+        payload = f"{secrets.token_urlsafe(32)}.{issued_at}"
+        stale = f"{payload}.{dm._session_signature(payload)}"
+
+        self.client.cookies.set("ja_session", stale)
+        resp = self.client.get("/", follow_redirects=False)
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/login")
+
+    def test_future_dated_signed_cookie_is_rejected(self):
+        # A signed issue time in the future must not extend the 12h window.
+        issued_at = int(time.time()) + 3600
+        payload = f"{secrets.token_urlsafe(32)}.{issued_at}"
+        future = f"{payload}.{dm._session_signature(payload)}"
+
+        self.client.cookies.set("ja_session", future)
+        self.assertEqual(self.client.get("/", follow_redirects=False).status_code, 303)
+
+    def test_fresh_signed_cookie_still_authenticates(self):
+        # Guard against the expiry check over-rejecting: a just-minted token works.
+        payload = f"{secrets.token_urlsafe(32)}.{int(time.time())}"
+        fresh = f"{payload}.{dm._session_signature(payload)}"
+
+        self.client.cookies.set("ja_session", fresh)
+        # No MONGODB_URI in tests, so the handler's own 503 proves the gate passed.
+        self.assertEqual(self.client.get("/").status_code, 503)
 
 
 class TestMiddlewareIsWiredIn(unittest.TestCase):
