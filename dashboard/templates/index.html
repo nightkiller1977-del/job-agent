@@ -116,7 +116,7 @@
     .jcard-reason{font-size:11px;color:#9CA3AF;font-style:italic;line-height:1.5;margin-bottom:8px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
     .jcard-flags{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;}
     .jflag{font-size:10px;font-weight:700;padding:1px 7px;border-radius:20px;}
-    .jf-ts{background:#5B21B6;color:#fff;} .jf-fed{background:#1D4ED8;color:#fff;} .jf-gen{background:#374151;color:#fff;}
+    .jf-ts{background:#5B21B6;color:#fff;} .jf-fed{background:#1D4ED8;color:#fff;} .jf-gen{background:#374151;color:#fff;} .jf-unscored{background:#A21CAF;color:#fff;}
     .jcard-status{font-size:11px;padding:6px 10px;border-radius:8px;margin-bottom:8px;display:flex;gap:6px;align-items:center;}
     .jcs-yellow{background:#FFFBEB;border:1px solid #FDE68A;color:#92400E;}
     .jcs-orange{background:#FFF7ED;border:1px solid #FED7AA;color:#9A3412;}
@@ -361,7 +361,8 @@
               {% if job.flags %}
               <div class="jcard-flags">
                 {% for flag in job.flags.split(',') %}{% set f = flag.strip() %}{% if f %}
-                  {% if 'TS' in f or 'CLEARED' in f or 'CLEARANCE' in f %}<span class="jflag jf-ts">{{ f }}</span>
+                  {% if 'SCORING_FAILED' in f %}<span class="jflag jf-unscored">UNSCORED</span>
+                  {% elif 'TS' in f or 'CLEARED' in f or 'CLEARANCE' in f %}<span class="jflag jf-ts">{{ f }}</span>
                   {% elif 'FEDERAL' in f or 'GOV' in f or 'SES' in f %}<span class="jflag jf-fed">{{ f }}</span>
                   {% else %}<span class="jflag jf-gen">{{ f }}</span>{% endif %}
                 {% endif %}{% endfor %}
