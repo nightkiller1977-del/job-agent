@@ -27,9 +27,9 @@ _log = logging.getLogger("job-agent.secret_classifier")
 
 _CACHE_PATH = Path(__file__).parent.parent / "state" / "secret_purpose_cache.json"
 
-# Purpose registry — the model prompt for each purpose and how many
-# candidates to keep. Add a purpose here and every caller of
-# :func:`classified_keys` picks it up.
+# Purpose registry — the model prompt for each purpose. Add a purpose here
+# (and a matching regex set in secret_store._PURPOSE_PATTERNS) and every
+# caller of :func:`classified_keys` picks it up.
 PURPOSE_PROMPTS: dict[str, str] = {
     "imap_password": (
         "An IMAP inbox password used to read incoming email. This is an "
@@ -40,18 +40,6 @@ PURPOSE_PROMPTS: dict[str, str] = {
     "imap_address": (
         "The email address whose inbox we should read for 2FA codes and "
         "delivery receipts. This is a mail address, not an ATS site login."
-    ),
-    "linkedin_login": (
-        "A LinkedIn account credential (email or password)."
-    ),
-    "jobright_login": (
-        "A jobright.ai account credential (email or password)."
-    ),
-    "telegram_bot_token": (
-        "A Telegram Bot API token — used to post notifications to a chat."
-    ),
-    "twilio_sms": (
-        "A Twilio account SID, auth token, or from-number used to send SMS."
     ),
 }
 
@@ -99,7 +87,6 @@ def store_classification(purpose: str, candidate_keys: list[str], ranked: list[s
     data = _cache_load()
     data[purpose] = {
         "keys_hash": _key_set_hash(candidate_keys),
-        "keys_count": len(candidate_keys),
         "ranked": ranked,
     }
     _cache_save(data)
