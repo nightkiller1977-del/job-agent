@@ -11,12 +11,15 @@ config change propagates everywhere without restarting.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 from typing import Optional
 
 from src.model_client import ModelClient
 from src.json_utils import extract_json
+
+_log = logging.getLogger("job_agent.scorer")
 
 # Outcome for a scoring run that produced no valid evaluation — the model tier
 # was unavailable, the call raised, or the response was unparseable. This is not
@@ -289,7 +292,8 @@ class JobScorer:
         Reduces 50-job batch time from ~100s to ~20s.
 
         on_result: optional zero-arg callback invoked once per job as each score
-        settles (success or failure) — used to drive a progress bar.
+        settles (success or failure) — used to drive a progress bar. Callback
+        errors are isolated: they must not be mistaken for scoring failures.
         """
         sem = asyncio.Semaphore(concurrency)
 
@@ -304,7 +308,14 @@ class JobScorer:
                     return job
                 finally:
                     if on_result is not None:
-                        on_result()
+                        # The callback is a progress tick (a UI side effect). Letting
+                        # it raise would surface here as a scoring failure and
+                        # overwrite a verdict self.score() already produced, so
+                        # isolate it and log instead.
+                        try:
+                            on_result()
+                        except Exception as exc:
+                            _log.warning("scorer.on_result.callback_failed error=%s", exc)
 
         results = await asyncio.gather(*[_score_one(j) for j in jobs], return_exceptions=True)
         out = []
