@@ -14,6 +14,9 @@ Regression tests for two production bugs fixed on 2026-09-11:
 Both endpoints call get_db() directly with no dependency-injection seam,
 so these tests patch dashboard.main.get_db the same way
 tests/test_credentials.py does for /api/credentials.
+
+Every request also carries the shared secret: the dashboard is fail-closed
+(see tests/test_dashboard_auth.py), so /api/* and / are 403 without it.
 """
 import unittest
 from unittest.mock import MagicMock, patch
@@ -22,6 +25,8 @@ from fastapi.testclient import TestClient
 
 with patch.dict("os.environ", {"MONGODB_URI": "", "SYNC_SECRET": "testsecret"}):
     from dashboard.main import app
+
+_AUTH = {"X-Sync-Secret": "testsecret"}
 
 
 def _chainable(rows):
@@ -90,7 +95,7 @@ class TestExternalJobScorePlaceholder(unittest.TestCase):
         mock_db.jobs.find_one.return_value = None  # not a duplicate
         mock_get_db.return_value = mock_db
 
-        resp = self.client.post("/api/jobs/external", json={"url": "https://example.com/jobs/123"})
+        resp = self.client.post("/api/jobs/external", json={"url": "https://example.com/jobs/123"}, headers=_AUTH)
         self.assertEqual(resp.status_code, 200)
 
         mock_db.jobs.insert_one.assert_called_once()
@@ -116,7 +121,7 @@ class TestExternalJobScorePlaceholder(unittest.TestCase):
         mock_db.jobs.find_one.return_value = None
         mock_get_db.return_value = mock_db
 
-        post_resp = self.client.post("/api/jobs/external", json={"url": "https://example.com/jobs/456"})
+        post_resp = self.client.post("/api/jobs/external", json={"url": "https://example.com/jobs/456"}, headers=_AUTH)
         self.assertEqual(post_resp.status_code, 200)
         inserted_job = mock_db.jobs.insert_one.call_args[0][0]
 
@@ -129,7 +134,7 @@ class TestExternalJobScorePlaceholder(unittest.TestCase):
         mock_db.sync_events.find_one.return_value = None
         mock_db.credentials.find.return_value = []
 
-        get_resp = self.client.get("/")
+        get_resp = self.client.get("/", headers=_AUTH)
         self.assertEqual(
             get_resp.status_code, 200,
             f"homepage crashed rendering a job with score=None: {get_resp.text[:500]}",
