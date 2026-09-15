@@ -10,7 +10,7 @@ import sys
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from src.state_manager import StateManager
 from src.scorer import JobScorer
@@ -388,7 +388,7 @@ class _ReviewOnlyScorer:
         return 50, "Email-origin lead queued for review without live scorer.", "FLAG_FOR_REVIEW", "review"
 
 
-async def _score_email_job(job: dict[str, Any], scorer: Any) -> tuple[int, str, str, str]:
+async def _score_email_job(job: dict[str, Any], scorer: Any) -> tuple[Optional[int], str, str, str]:
     score_input = {
         "source": "email",
         "title": job["title"],
@@ -401,7 +401,10 @@ async def _score_email_job(job: dict[str, Any], scorer: Any) -> tuple[int, str, 
     if hasattr(result, "__await__"):
         result = await result
     score, reason, flags, action = result
-    return int(score), str(reason or ""), str(flags or ""), str(action or "review")
+    # A failed evaluation carries score=None (SCORING_FAILED); preserve it rather
+    # than coercing to 0, which would read as a real bottom-tier score.
+    normalized_score = int(score) if score is not None else None
+    return normalized_score, str(reason or ""), str(flags or ""), str(action or "review")
 
 
 def _status_for_recommendation(recommended_action: str, lane: str) -> str:

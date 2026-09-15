@@ -141,6 +141,37 @@ class TestExternalJobScorePlaceholder(unittest.TestCase):
         )
         self.assertIn(inserted_job["job_id"], get_resp.text)
 
+    @patch("dashboard.main.MONGODB_URI", "mongodb://fake-for-test")
+    @patch("dashboard.main.get_db")
+    def test_homepage_renders_scoring_failed_job_as_unscored(self, mock_get_db):
+        # A SCORING_FAILED job carries score=None (no evaluation happened) plus a
+        # distinct flag. It must render as unscored — not as a real 0/100 score,
+        # and not crash the page.
+        failed_job = {
+            "job_id": "unscored-1", "source": "linkedin", "title": "Director of Engineering",
+            "company": "Acme", "status": "discovered", "flags": "SCORING_FAILED",
+            "score": None, "score_reason": "No model available for scoring",
+            "discovered_at": "2026-09-14T00:00:00+00:00", "url": "https://example.com/jobs/789",
+        }
+        mock_db = MagicMock()
+        mock_get_db.return_value = mock_db
+        mock_db.jobs.find.side_effect = lambda filt, *a, **kw: (
+            _chainable([failed_job]) if filt.get("status") == "discovered" else _chainable([])
+        )
+        mock_db.jobs.aggregate.return_value = []
+        mock_db.jobs.count_documents.return_value = 0
+        mock_db.sync_events.find.return_value.sort.return_value.limit.return_value = []
+        mock_db.sync_events.find_one.return_value = None
+        mock_db.credentials.find.return_value = []
+
+        resp = self.client.get("/", headers=_AUTH)
+        self.assertEqual(resp.status_code, 200, f"homepage crashed: {resp.text[:500]}")
+        # Assert on the rendered element, not the CSS rule (which also contains
+        # the class name and would make this pass even with the badge removed).
+        self.assertIn('class="jflag jf-unscored"', resp.text,
+                      "SCORING_FAILED should render the UNSCORED badge element")
+        self.assertIn(">UNSCORED<", resp.text)
+
 
 if __name__ == "__main__":
     unittest.main()
