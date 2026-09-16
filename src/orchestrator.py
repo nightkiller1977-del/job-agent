@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .state_manager import StateManager, parse_extra_json
-from .scorer import JobScorer, SCORING_FAILED_ACTION
+from .scorer import JobScorer, SCORING_FAILED_ACTION, SCORING_FAILED_FLAG
 from .review_queue import run_review_queue, show_summary_table
 from .sources.jobright import JobrightScraper
 from .sources.linkedin import LinkedInScraper
@@ -414,8 +414,8 @@ class Orchestrator:
         elif action == SCORING_FAILED_ACTION:
             # No evaluation happened: neither approve nor skip, so the job stays
             # in the review queue and remains identifiable via the SCORING_FAILED
-            # flag. It is not auto-rescored (already_seen skips known job_ids);
-            # retrying failed rows is a separate follow-up.
+            # flag. already_seen() skips it on the next discover run, so recovery
+            # is explicit: `rescore` re-scores the flagged rows.
             job["status"] = "discovered"
             console.print(f"  [yellow]→ Scoring failed (unscored): {job.get('title')} @ {job.get('company')}[/yellow]")
         else:
@@ -1474,6 +1474,64 @@ class Orchestrator:
             f"{mode}={stats['reset'] if not dry_run else stats['matched']} "
             f"unmatched={stats['unmatched']}"
         )
+
+    async def rescore_failed(self, limit: Optional[int] = None, dry_run: bool = False) -> dict:
+        """Re-score jobs whose evaluation previously failed.
+
+        Discovery cannot recover these rows: already_seen() skips every known
+        job_id, so a transient scoring failure would otherwise leave the row
+        permanently unscored. This re-runs the same scorer over the SCORING_FAILED
+        population and writes the outcome back in place. Successfully scored rows
+        are never selected, and a run with no failed rows is a no-op.
+        """
+        failed = self.state.get_scoring_failed_jobs(limit=limit)
+        if not failed:
+            console.print("[green]No SCORING_FAILED jobs to re-score.[/green]")
+            return {"matched": 0, "rescored": 0, "still_failed": 0, "triaged": 0}
+
+        if dry_run:
+            console.print(
+                f"[yellow]Would re-score {len(failed)} failed job(s). "
+                "Run without --dry-run to apply.[/yellow]"
+            )
+            return {
+                "matched": len(failed),
+                "rescored": 0,
+                "still_failed": 0,
+                "triaged": 0,
+            }
+
+        scored = await self._score_jobs_with_progress(failed)
+
+        still_failed = 0
+        triaged = 0
+        for job in scored:
+            job_id = job.get("job_id")
+            if not job_id:
+                continue
+            # A failed re-score must stay selectable, otherwise the row silently
+            # drops out of the failed population while still unscored.
+            if job.get("flags") == SCORING_FAILED_FLAG or job.get("score") is None:
+                still_failed += 1
+                continue
+            # The re-score produced a real evaluation: store it and clear the
+            # failure flag so the row stops being selected as failed.
+            self.state.update_score(job_id, job.get("score"), job.get("score_reason") or "", "")
+            self.state.clear_scoring_failed_flag(job_id)
+            self.state.set_status(job_id, job.get("status") or "discovered")
+            triaged += 1
+
+        console.print(
+            f"[green]Re-score complete:[/green] matched={len(failed)} "
+            f"re-scored={len(failed) - still_failed} still_failed={still_failed} "
+            f"triaged={triaged}"
+        )
+        return {
+            "matched": len(failed),
+            "rescored": len(failed) - still_failed,
+            "still_failed": still_failed,
+            "triaged": triaged,
+        }
 
     async def _pull_approved_from_cloud(self) -> None:
         """Fetch jobs marked 'approved' on the cloud dashboard and upsert them

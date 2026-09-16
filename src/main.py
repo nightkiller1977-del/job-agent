@@ -640,6 +640,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show how many jobs would be reset without changing the database",
     )
 
+    # rescore
+    rescore_parser = subparsers.add_parser(
+        "rescore",
+        help="Re-score jobs whose evaluation previously failed (SCORING_FAILED)",
+    )
+    rescore_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of failed jobs to re-score",
+    )
+    rescore_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show how many jobs would be re-scored without calling the model",
+    )
+
     # ingest-email
     ingest_email_parser = subparsers.add_parser(
         "ingest-email",
@@ -820,6 +837,12 @@ async def main_async(args: argparse.Namespace) -> int:
     elif args.command == "reset-failures":
         orchestrator.reset_failures(
             reason=args.reason,
+            dry_run=args.dry_run,
+        )
+
+    elif args.command == "rescore":
+        await orchestrator.rescore_failed(
+            limit=args.limit,
             dry_run=args.dry_run,
         )
 
