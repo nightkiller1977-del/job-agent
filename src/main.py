@@ -169,6 +169,151 @@ def preflight_env_check(sources: list[str] | None) -> bool:
     return True
 
 
+def _resolve_profile_path() -> Path | None:
+    """Locate state/profile.json the way the runtime readers do.
+
+    Most readers use a CWD-relative path; linkedin.py also tries the project
+    root. Check both so a preflight from another directory isn't a false failure.
+    """
+    for candidate in (Path("state/profile.json"), project_root / "state" / "profile.json"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _validate_resume_for_run(config: dict) -> list[str]:
+    """Return resume problems that should block a run ([] when usable)."""
+    from src.resume_helper import (
+        RESUME_EXTENSIONS,
+        PDFTextLayerError,
+        check_ats_readability,
+        resolve_resume_path,
+    )
+    from src.resume_tailor import is_dummy_resume
+
+    configured = [
+        value
+        for value in (
+            os.environ.get("LOCAL_RESUME_PATH"),
+            os.environ.get("RESUME_PATH"),
+            config.get("local_resume_path"),
+            config.get("resume_path"),
+        )
+        if value
+    ]
+    resolved = resolve_resume_path(config)
+
+    if not configured and not resolved:
+        return ["no resume configured: set local_resume_path in config.json (or LOCAL_RESUME_PATH)"]
+
+    if configured:
+        resolved_configured = [Path(value).expanduser() for value in configured]
+
+        # Every branch below reports what was explicitly configured rather than
+        # what auto-discovery found: resolve_resume_path() scans the project
+        # tree and can substitute an unrelated file (this repo resolves to
+        # tests/dummy_resume.pdf), which is exactly the silent degradation this
+        # preflight exists to prevent.
+        if not any(p.is_file() for p in resolved_configured):
+            return [
+                "configured resume path does not exist: "
+                + ", ".join(configured)
+                + " (refusing to fall back to an auto-discovered file)"
+            ]
+
+        unsupported = sorted(
+            {p.suffix.lower() for p in resolved_configured if p.is_file()} - RESUME_EXTENSIONS
+        )
+        if unsupported:
+            return [
+                f"configured resume has unsupported extension '{', '.join(unsupported)}' "
+                f"(supported: {sorted(RESUME_EXTENSIONS)})"
+            ]
+
+    if not resolved:
+        return ["no resume file found on disk"]
+
+    path = Path(resolved).expanduser()
+    problems: list[str] = []
+    if is_dummy_resume(str(path)):
+        problems.append(f"resolved resume is the test fixture ({path}) — set a real resume")
+    if path.suffix.lower() not in RESUME_EXTENSIONS:
+        problems.append(
+            f"resume has unsupported extension '{path.suffix}' (supported: {sorted(RESUME_EXTENSIONS)})"
+        )
+    elif path.suffix.lower() == ".pdf":
+        try:
+            check_ats_readability(str(path), [])
+        except PDFTextLayerError as exc:
+            problems.append(f"resume PDF has no readable text layer: {exc}")
+        except Exception as exc:
+            problems.append(f"resume PDF could not be read: {exc}")
+    return problems
+
+
+def _validate_profile_for_run(profile_path: str | Path | None = None) -> list[str]:
+    """Return state/profile.json problems that should block a run ([] when usable)."""
+    path = Path(profile_path) if profile_path is not None else _resolve_profile_path()
+    if path is None or not path.is_file():
+        return ["state/profile.json not found — application forms would be filled without your profile"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"{path} is not valid JSON: {exc}"]
+    if not isinstance(data, dict):
+        return [f"{path} must contain a JSON object"]
+    info = data.get("personal_info")
+    if not isinstance(info, dict):
+        return [f"{path} is missing the 'personal_info' object"]
+
+    def _present(key: str) -> bool:
+        return bool(str(info.get(key) or "").strip())
+
+    problems: list[str] = []
+    if not _present("email"):
+        problems.append(f"{path} personal_info is missing required field: email")
+    # A name is usable as first+last (what the field filler sends) or as a
+    # single full_name (what generic ATS adapters send).
+    if not ((_present("first_name") and _present("last_name")) or _present("full_name")):
+        problems.append(
+            f"{path} personal_info has no usable name "
+            "(need first_name + last_name, or full_name)"
+        )
+    return problems
+
+
+def preflight_resume_profile_check(
+    config: dict,
+    *,
+    check_resume: bool = True,
+    check_profile: bool = True,
+    profile_path: str | Path | None = None,
+) -> bool:
+    """Validate the resolved resume and state/profile.json before a run.
+
+    Returns True when everything the run needs is usable, otherwise prints each
+    problem and returns False. Call before launching any browser: a configured
+    resume that is missing would otherwise degrade silently to auto-discovery,
+    which can upload an unrelated file.
+    """
+    problems: list[str] = []
+    if check_resume:
+        problems += _validate_resume_for_run(config)
+    if check_profile:
+        problems += _validate_profile_for_run(profile_path)
+
+    if not problems:
+        return True
+
+    for problem in problems:
+        print(f"[PREFLIGHT FAIL] {problem}", file=sys.stderr)
+    print(
+        "\n[PREFLIGHT FAIL] Resume/profile preflight failed. Fix the above and re-run.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _db_path_from_config() -> str:
     """Resolve the jobs DB path the same way the Orchestrator does."""
     import json
@@ -193,26 +338,26 @@ def _load_config_from_project() -> dict:
         return {}
 
 
-def _sources_in_apply_queue(company: str | None) -> list[str]:
-    """Distinct credential-requiring sources in the approved-but-unapplied queue.
+def _apply_queue_scope(company: str | None) -> tuple[list[str], bool]:
+    """Inspect the approved-but-unapplied queue.
 
-    Used by the 'apply' preflight so only sources with jobs actually queued get
-    their credentials validated. Returns [] when the queue is empty or when no
-    queued source needs credentials (e.g. legacy 'external' jobs).
+    Returns (credential-requiring sources, whether any job is queued at all).
+    The two are independent: legacy 'external' jobs need a resume but no
+    source credentials, so callers gate their checks on different values.
     """
     try:
         from src.state_manager import StateManager
         state = StateManager(_db_path_from_config())
         jobs = state.get_approved_unapplied()
     except Exception:
-        # If we can't read the queue, fall back to validating nothing here;
-        # the apply flow will surface any real problem.
-        return []
+        # If we can't read the queue, don't invent a reason to block; the apply
+        # flow will surface any real problem.
+        return [], False
     if company:
         needle = company.lower()
         jobs = [j for j in jobs if needle in (j.get("company") or "").lower()]
     queued = {(j.get("source") or "").lower() for j in jobs if j.get("source")}
-    return sorted(s for s in queued if s in _SOURCE_CREDS)
+    return sorted(s for s in queued if s in _SOURCE_CREDS), bool(jobs)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -735,19 +880,30 @@ def main() -> None:
         src = getattr(args, "source", None)
         if src:
             sources_to_check = [src]
+            has_queued_jobs = True
         elif os.environ.get("DASHBOARD_URL"):
             # apply_approved() pulls cloud-approved jobs into the local queue
             # AFTER this preflight, so the local queue can't tell us which
             # sources those jobs use yet. Validate all sources to preserve the
             # fail-fast guarantee for the cloud-approval workflow.
             sources_to_check = None
+            has_queued_jobs = True
         else:
             # Local-only: validate creds just for sources actually represented
             # in the approved queue — a missing USAJOBS_PASSWORD shouldn't block
             # an apply run whose queue is all LinkedIn jobs. An empty queue means
             # nothing to apply, so nothing to validate.
-            sources_to_check = _sources_in_apply_queue(getattr(args, "company", None))
+            sources_to_check, has_queued_jobs = _apply_queue_scope(getattr(args, "company", None))
         if sources_to_check != [] and not preflight_env_check(sources_to_check):
+            sys.exit(1)
+
+        # Resume/profile are only consumed by the employer-facing apply flow
+        # (resume upload + form filling). Validate them here so a missing
+        # configured resume can't silently degrade to auto-discovered files.
+        # Gate on the queue being non-empty rather than on credential-bearing
+        # sources: legacy 'external' jobs need a resume but carry no creds, and
+        # an empty queue has nothing to apply.
+        if has_queued_jobs and not preflight_resume_profile_check(_load_config_from_project()):
             sys.exit(1)
 
     try:
