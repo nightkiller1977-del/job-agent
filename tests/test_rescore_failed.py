@@ -99,6 +99,23 @@ def test_get_scoring_failed_jobs_ignores_rows_with_a_real_score(state):
     assert state.get_scoring_failed_jobs() == []
 
 
+def test_get_scoring_failed_jobs_matches_the_flag_inside_a_flag_set(state):
+    """`flags` is a comma-joined set, and clearing preserves unrelated tokens, so
+    a row such as `IC_ROLE,SCORING_FAILED` must still be selectable."""
+    state.upsert_job(
+        {
+            "job_id": "compound",
+            "source": "linkedin",
+            "title": "Compound",
+            "status": "discovered",
+            "score": None,
+            "flags": f"IC_ROLE,{SCORING_FAILED_FLAG}",
+        }
+    )
+
+    assert [j["job_id"] for j in state.get_scoring_failed_jobs()] == ["compound"]
+
+
 def test_selector_matches_the_shape_batch_score_persists_on_failure(state):
     """The selector must select exactly what a failed discovery run persists.
 
@@ -225,6 +242,33 @@ async def test_rescore_failed_persists_a_successful_re_score(state):
     assert row["status"] == "approved"
     # Recovery is complete: the row is no longer selectable as failed.
     assert state.get_scoring_failed_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_rescore_failed_persists_the_flags_from_the_new_verdict(state):
+    """The verdict's own flags must survive: passing "" would wipe them and make
+    the targeted failure-token clear a no-op."""
+    _failed_job(state, "failed-1")
+    orc = _orchestrator_with_state(state)
+
+    async def _rescore(jobs):
+        for job in jobs:
+            job["score"] = 77
+            job["score_reason"] = "Cleared role"
+            job["flags"] = "CLEARED_ROLE"
+            job["recommended_action"] = "apply"
+            job["status"] = "approved"
+        return jobs
+
+    orc._score_jobs_with_progress = _rescore
+
+    result = await orc.rescore_failed()
+
+    assert result["triaged"] == 1
+    row = state.get_job("failed-1")
+    assert row["score"] == 77
+    assert row["flags"] == "CLEARED_ROLE"
+    assert SCORING_FAILED_FLAG not in (row["flags"] or "")
 
 
 @pytest.mark.asyncio

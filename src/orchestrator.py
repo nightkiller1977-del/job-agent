@@ -1541,9 +1541,11 @@ class Orchestrator:
             if job.get("flags") == SCORING_FAILED_FLAG or job.get("score") is None:
                 still_failed += 1
                 continue
-            # The re-score produced a real evaluation: store it and clear the
-            # failure flag so the row stops being selected as failed.
-            self.state.update_score(job_id, job.get("score"), job.get("score_reason") or "", "")
+            # The re-score produced a real evaluation: store the verdict together
+            # with the flags the scorer emitted, then drop only the failure token.
+            # Passing "" here would wipe every flag and make the targeted clear
+            # below meaningless.
+            self.state.update_score(job_id, job.get("score"), job.get("score_reason") or "", job.get("flags") or "")
             self.state.clear_scoring_failed_flag(job_id)
             self.state.set_status(job_id, job.get("status") or "discovered")
             triaged += 1

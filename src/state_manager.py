@@ -808,14 +808,20 @@ class StateManager:
         written by JobScorer on every failed evaluation, so it is authoritative
         for "no evaluation happened" (score is NULL); filtering on the flag then
         score IS NULL avoids re-scoring a row that already has a usable score.
+
+        Matching is token-based rather than equality: ``flags`` is a comma-joined
+        set (see clear_scoring_failed_flag), so a row carrying
+        ``IC_ROLE,SCORING_FAILED`` must still be selected.
         """
+        token = f",{SCORING_FAILED_FLAG},"
         sql = (
             "SELECT * FROM jobs WHERE status = 'discovered' "
-            "AND flags = ? AND score IS NULL "
+            "AND score IS NULL "
+            "AND (',' || COALESCE(flags, '') || ',') LIKE ? "
             "ORDER BY discovered_at ASC"
         )
         with self._connect() as conn:
-            rows = conn.execute(sql, (SCORING_FAILED_FLAG,)).fetchall()
+            rows = conn.execute(sql, (f"%{token}%",)).fetchall()
         jobs = [dict(r) for r in rows]
         if limit is not None:
             jobs = jobs[: max(0, limit)]
