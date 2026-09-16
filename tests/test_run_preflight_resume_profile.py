@@ -15,6 +15,15 @@ from pypdf import PdfReader
 import src.main as main_mod
 
 
+@pytest.fixture(autouse=True)
+def _clear_resume_env(monkeypatch):
+    """Keep these tests hermetic: a developer or CI runner with either env var
+    set would otherwise send the validators down a different branch. Tests that
+    exercise env precedence set them explicitly on top of this."""
+    monkeypatch.delenv("LOCAL_RESUME_PATH", raising=False)
+    monkeypatch.delenv("RESUME_PATH", raising=False)
+
+
 def _write_text_pdf(path, text="Hello Resume") -> None:
     """Write a minimal, genuinely readable PDF with a text layer.
 
@@ -136,6 +145,87 @@ def test_no_resume_configured_and_nothing_found_fails(tmp_path, monkeypatch):
     assert "no resume" in problems[0]
 
 
+def test_doc_extension_is_rejected_by_preflight(tmp_path):
+    """Issue #24 defines the supported formats as .pdf/.docx. RESUME_EXTENSIONS
+    also carries .doc for discovery, but preflight must reject it as promised."""
+    doc = tmp_path / "resume.doc"
+    doc.write_bytes(b"\xd0\xcf\x11\xe0legacy word")
+
+    problems = main_mod._validate_resume_for_run({"local_resume_path": str(doc)})
+
+    assert problems
+    assert any("unsupported extension" in p for p in problems)
+
+
+def test_tailoring_only_setup_passes_without_a_static_resume(tmp_path):
+    """With tailoring enabled and a readable baseline, apply uploads a per-job
+    tailored PDF. The default missing ~/resume.pdf must not block that setup."""
+    baseline = tmp_path / "baseline.md"
+    baseline.write_text("# Ada\n\nExperience...", encoding="utf-8")
+    config = {
+        "local_resume_path": str(tmp_path / "missing.pdf"),
+        "resume": {"enabled": True, "baseline_path": str(baseline)},
+    }
+
+    assert main_mod._validate_resume_for_run(config) == []
+
+
+def test_broken_tailoring_baseline_is_reported(tmp_path):
+    """A baseline that doesn't exist would silently disable tailoring and fall
+    back to the static resume, so it must fail fast."""
+    config = {
+        "local_resume_path": str(tmp_path / "missing.pdf"),
+        "resume": {"enabled": True, "baseline_path": str(tmp_path / "nope_baseline.md")},
+    }
+
+    problems = main_mod._validate_resume_for_run(config)
+
+    assert problems
+    assert any("baseline_path does not exist" in p for p in problems)
+
+
+def test_static_resume_is_still_required_when_tailoring_disabled(tmp_path):
+    """With resume.enabled=false the static path is the active source, so a
+    missing file must still be reported even if a baseline is configured."""
+    config = {
+        "local_resume_path": str(tmp_path / "missing.pdf"),
+        "resume": {"enabled": False, "baseline_path": str(tmp_path / "baseline.md")},
+    }
+
+    problems = main_mod._validate_resume_for_run(config)
+
+    assert problems
+    assert any("does not exist" in p for p in problems)
+
+
+def test_readable_pdf_baseline_is_accepted(tmp_path):
+    baseline = tmp_path / "baseline.pdf"
+    _write_text_pdf(baseline, text="Ada Lovelace Experience")
+
+    config = {
+        "local_resume_path": str(tmp_path / "missing.pdf"),
+        "resume": {"enabled": True, "baseline_path": str(baseline)},
+    }
+
+    assert main_mod._validate_resume_for_run(config) == []
+
+
+def test_textless_pdf_baseline_is_rejected(tmp_path):
+    """A PDF baseline with no text layer would silently disable tailoring."""
+    baseline = tmp_path / "baseline.pdf"
+    baseline.write_bytes(b"%PDF-1.4\nnot a real pdf")
+
+    config = {
+        "local_resume_path": str(tmp_path / "missing.pdf"),
+        "resume": {"enabled": True, "baseline_path": str(baseline)},
+    }
+
+    problems = main_mod._validate_resume_for_run(config)
+
+    assert problems
+    assert any("baseline_path PDF" in p for p in problems)
+
+
 # ── profile validation ───────────────────────────────────────────────────────
 
 def test_missing_profile_fails(tmp_path):
@@ -252,7 +342,7 @@ def test_apply_command_enforces_resume_profile_preflight(monkeypatch):
     monkeypatch.setattr(main_mod, "check_api_key", lambda: True)
     monkeypatch.setattr(main_mod, "preflight_env_check", lambda sources: True)
     monkeypatch.setattr(
-        main_mod, "_apply_queue_scope", lambda company: (["linkedin"], True)
+        main_mod, "_apply_queue_scope", lambda **kw: (["linkedin"], True)
     )
     monkeypatch.setattr(
         main_mod, "_load_config_from_project", lambda: {"local_resume_path": "/nope.pdf"}
@@ -278,7 +368,7 @@ def test_apply_preflight_runs_for_credless_queued_jobs(monkeypatch):
     monkeypatch.setattr(main_mod, "load_env", lambda: None)
     monkeypatch.setattr(main_mod, "check_api_key", lambda: True)
     monkeypatch.setattr(main_mod, "preflight_env_check", lambda sources: True)
-    monkeypatch.setattr(main_mod, "_apply_queue_scope", lambda company: ([], True))
+    monkeypatch.setattr(main_mod, "_apply_queue_scope", lambda **kw: ([], True))
     monkeypatch.setattr(main_mod, "_load_config_from_project", lambda: {})
     monkeypatch.setattr(
         main_mod,
@@ -299,7 +389,7 @@ def test_apply_preflight_skipped_for_empty_queue(monkeypatch):
     monkeypatch.setattr(main_mod, "load_env", lambda: None)
     monkeypatch.setattr(main_mod, "check_api_key", lambda: True)
     monkeypatch.setattr(main_mod, "preflight_env_check", lambda sources: True)
-    monkeypatch.setattr(main_mod, "_apply_queue_scope", lambda company: ([], False))
+    monkeypatch.setattr(main_mod, "_apply_queue_scope", lambda **kw: ([], False))
     monkeypatch.setattr(
         main_mod,
         "preflight_resume_profile_check",
@@ -340,3 +430,112 @@ def test_discover_command_skips_resume_profile_preflight(monkeypatch):
         main_mod.main()
 
     assert exc.value.code == 0
+
+
+# ── apply queue scoping ──────────────────────────────────────────────────────
+
+class _FakeState:
+    def __init__(self, jobs):
+        self._jobs = jobs
+
+    def get_approved_unapplied(self):
+        return list(self._jobs)
+
+
+def _patch_state(monkeypatch, jobs):
+    import src.state_manager as state_mod
+
+    monkeypatch.setattr(state_mod, "StateManager", lambda *a, **kw: _FakeState(jobs))
+
+
+def _job(job_id, source, company="Acme", score=90):
+    return {"job_id": job_id, "source": source, "company": company, "score": score}
+
+
+def test_queue_scope_ignores_jobs_excluded_by_source(monkeypatch):
+    """`apply --source linkedin` with only Jobright jobs queued selects nothing,
+    so it must not require LinkedIn's credentials."""
+    _patch_state(monkeypatch, [_job("j1", "jobright")])
+
+    sources, has_jobs = main_mod._apply_queue_scope(source="linkedin")
+
+    assert sources == []
+    assert has_jobs is False
+
+
+def test_queue_scope_ignores_unmatched_job_id(monkeypatch):
+    """`apply --job-id missing` with an unrelated job queued attempts nothing."""
+    _patch_state(monkeypatch, [_job("j1", "linkedin")])
+
+    sources, has_jobs = main_mod._apply_queue_scope(job_id="does-not-exist")
+
+    assert sources == []
+    assert has_jobs is False
+
+
+def test_queue_scope_selects_matching_job(monkeypatch):
+    _patch_state(monkeypatch, [_job("j1", "linkedin"), _job("j2", "jobright")])
+
+    sources, has_jobs = main_mod._apply_queue_scope(source="linkedin")
+
+    assert sources == ["linkedin"]
+    assert has_jobs is True
+
+
+def test_queue_scope_respects_limit(monkeypatch):
+    """A --limit that selects no job must not validate, mirroring the run."""
+    _patch_state(monkeypatch, [_job("j1", "linkedin")])
+
+    sources, has_jobs = main_mod._apply_queue_scope(limit=0)
+
+    assert sources == []
+    assert has_jobs is False
+
+
+def test_queue_scope_excludes_below_min_apply_score(monkeypatch):
+    """apply_approved() skips low-score jobs before attempting anything, so the
+    preflight must not be triggered by a job the run would skip."""
+    _patch_state(monkeypatch, [_job("j1", "linkedin", score=10)])
+
+    sources, has_jobs = main_mod._apply_queue_scope(
+        config={"search_settings": {"min_apply_score": 50}}
+    )
+
+    assert sources == []
+    assert has_jobs is False
+
+
+def test_queue_scope_keeps_jobs_at_min_apply_score(monkeypatch):
+    _patch_state(monkeypatch, [_job("j1", "linkedin", score=50)])
+
+    sources, has_jobs = main_mod._apply_queue_scope(
+        config={"search_settings": {"min_apply_score": 50}}
+    )
+
+    assert sources == ["linkedin"]
+    assert has_jobs is True
+
+
+# ── shared profile path (validated path == read path) ───────────────────────
+
+def test_profile_readers_resolve_to_the_preflight_path(tmp_path, monkeypatch):
+    """The preflight and the apply-stack readers must agree on which profile
+    file is in use; a CWD-only reader would otherwise fill forms with nothing."""
+    import src.resume_helper as resume_helper
+
+    # Simulate a checkout whose only profile is <root>/state/profile.json and
+    # whose CWD has no state/profile.json at all.
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "checkout"
+    (root / "src").mkdir(parents=True)
+    (root / "state").mkdir()
+    profile = root / "state" / "profile.json"
+    _write_profile(profile)
+
+    monkeypatch.setattr(main_mod, "project_root", root)
+    monkeypatch.setattr(resume_helper, "__file__", str(root / "src" / "resume_helper.py"))
+
+    assert main_mod._resolve_profile_path() == profile
+    # ResumeFieldFixer resolves through the same helper, so it reads that file.
+    fixer = resume_helper.ResumeFieldFixer()
+    assert fixer.profile.get("personal_info", {}).get("email") == "ada@example.com"

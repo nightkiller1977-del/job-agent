@@ -16,6 +16,46 @@ console = Console()
 RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
 
 
+def resolve_profile_path(
+    preferred: str | Path | None = None, project_root: str | Path | None = None
+) -> Path | None:
+    """Return the state/profile.json the apply stack should read, or None.
+
+    The profile readers historically disagreed: some opened CWD-relative
+    ``state/profile.json`` only, others also tried the project root. A run
+    started from another directory could therefore clear a preflight against
+    the project-root file and then fill forms from an empty profile. Every
+    reader now resolves through this one helper so the path validated is the
+    path used.
+
+    ``project_root`` defaults to this repo's root; callers that track their own
+    root (src/main.py) pass it so tests can simulate a checkout elsewhere.
+    """
+    if preferred:
+        path = Path(preferred).expanduser()
+        return path if path.is_file() else None
+    cwd_path = Path("state/profile.json")
+    if cwd_path.is_file():
+        return cwd_path
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    root_path = root / "state" / "profile.json"
+    if root_path.is_file():
+        return root_path
+    return None
+
+
+def load_profile(preferred: str | Path | None = None) -> dict:
+    """Load the resolved profile JSON as a dict, or {} when unavailable."""
+    path = resolve_profile_path(preferred)
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def resolve_resume_path(config: dict | None = None, preferred: str = "") -> str:
     """Return the best existing resume file path for uploads.
 
@@ -90,8 +130,11 @@ class ResumeFieldFixer:
     Intelligent second-pass agent that scans form pages for empty or incorrectly
     populated inputs and fills them using structured data from state/profile.json.
     """
-    def __init__(self, profile_path: str = "state/profile.json"):
-        self.profile_path = Path(profile_path)
+    def __init__(self, profile_path: str | Path | None = None):
+        # None means "resolve like the rest of the apply stack" so a run from a
+        # non-repo CWD still reads the profile the preflight validated.
+        resolved = resolve_profile_path(profile_path)
+        self.profile_path = resolved if resolved is not None else Path(profile_path or "state/profile.json")
         self.profile = {}
         self.load_profile()
 

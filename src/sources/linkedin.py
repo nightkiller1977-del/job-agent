@@ -9,14 +9,13 @@ import asyncio
 import os
 import sys
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
 from rich.console import Console
 
 from .base import BaseScraper, AuthFailedError, JobExpiredError
-from src.resume_helper import resolve_resume_path, PDFTextLayerError
+from src.resume_helper import resolve_resume_path, PDFTextLayerError, load_profile
 
 console = Console()
 
@@ -1539,16 +1538,7 @@ class LinkedInScraper(BaseScraper):
             return ""
 
     def _load_profile(self) -> dict:
-        try:
-            import json
-            profile_path = Path("state/profile.json")
-            if not profile_path.exists():
-                profile_path = Path(__file__).parent.parent.parent / "state" / "profile.json"
-            if not profile_path.exists():
-                return {}
-            return json.loads(profile_path.read_text())
-        except Exception:
-            return {}
+        return load_profile()
 
     def _answer_bank(self):
         try:

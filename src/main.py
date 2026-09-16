@@ -170,26 +170,89 @@ def preflight_env_check(sources: list[str] | None) -> bool:
 
 
 def _resolve_profile_path() -> Path | None:
-    """Locate state/profile.json the way the runtime readers do.
+    """Locate state/profile.json the same way the apply-stack readers do.
 
-    Most readers use a CWD-relative path; linkedin.py also tries the project
-    root. Check both so a preflight from another directory isn't a false failure.
+    Delegates to resume_helper.resolve_profile_path so the file this preflight
+    validates is exactly the file ResumeFieldFixer / the scrapers will read.
     """
-    for candidate in (Path("state/profile.json"), project_root / "state" / "profile.json"):
-        if candidate.is_file():
-            return candidate
+    from src.resume_helper import resolve_profile_path
+
+    return resolve_profile_path(project_root=project_root)
+
+
+# Issue #24 defines the supported upload formats as .pdf/.docx. RESUME_EXTENSIONS
+# additionally carries .doc for path *discovery*; preflight must not clear a
+# format the issue (and the upload path's PDF readability check) cannot handle.
+PREFLIGHT_RESUME_EXTENSIONS = frozenset({".pdf", ".docx"})
+
+# Baseline formats ResumeTailor.load_baseline() can read.
+BASELINE_EXTENSIONS = frozenset({".md", ".markdown", ".txt", ".json", ".pdf"})
+
+
+def _tailoring_baseline_problem(config: dict) -> str | None:
+    """Return a problem string when tailoring is on but its baseline is unusable.
+
+    When resume.enabled is true and resume.baseline_path is set, apply uploads a
+    per-job tailored PDF, not the statically configured resume. Validating only
+    the static path would block a correct tailoring-only setup whose default
+    ~/resume.pdf is absent.
+    """
+    rcfg = config.get("resume") or {}
+    if not isinstance(rcfg, dict) or not bool(rcfg.get("enabled", True)):
+        return None
+    baseline = str(rcfg.get("baseline_path") or "").strip()
+    if not baseline:
+        return None
+    path = Path(baseline).expanduser()
+    if not path.is_absolute():
+        path = project_root / path
+    if not path.is_file():
+        return f"resume.baseline_path does not exist: {path}"
+    if path.suffix.lower() not in BASELINE_EXTENSIONS:
+        return (
+            f"resume.baseline_path has unsupported format '{path.suffix}' "
+            f"(supported: {sorted(BASELINE_EXTENSIONS)})"
+        )
+    if path.suffix.lower() == ".pdf":
+        # load_baseline() extracts PDF text; a baseline with no text layer would
+        # silently disable tailoring, so treat it as unusable here too.
+        try:
+            from pypdf import PdfReader
+
+            text = "\n".join(
+                (page.extract_text() or "") for page in PdfReader(str(path)).pages
+            ).strip()
+        except Exception as exc:
+            return f"resume.baseline_path PDF could not be read: {exc}"
+        if not text:
+            return f"resume.baseline_path PDF has no extractable text layer: {path}"
     return None
 
 
 def _validate_resume_for_run(config: dict) -> list[str]:
-    """Return resume problems that should block a run ([] when usable)."""
+    """Return resume problems that should block a run ([] when usable).
+
+    Tailoring-aware: when tailoring is enabled with a readable baseline, that
+    baseline is the active resume source and the static path is only a
+    fallback, so it is validated as such rather than required outright.
+    """
     from src.resume_helper import (
-        RESUME_EXTENSIONS,
         PDFTextLayerError,
         check_ats_readability,
         resolve_resume_path,
     )
     from src.resume_tailor import is_dummy_resume
+
+    # A broken tailoring baseline is a config error that would silently disable
+    # tailoring and fall back to the static resume — fail fast on it.
+    baseline_problem = _tailoring_baseline_problem(config)
+    if baseline_problem:
+        return [baseline_problem]
+
+    rcfg = config.get("resume") or {}
+    tailoring_ready = bool(rcfg.get("enabled", True)) and bool(
+        str(rcfg.get("baseline_path") or "").strip()
+    )
 
     configured = [
         value
@@ -202,6 +265,18 @@ def _validate_resume_for_run(config: dict) -> list[str]:
         if value
     ]
     resolved = resolve_resume_path(config)
+
+    if tailoring_ready:
+        # Apply uploads the per-job tailored PDF; the static resume is only the
+        # fallback used if tailoring fails for a job (and the resume gate still
+        # refuses the dummy fixture there). Requiring it here would block a
+        # valid tailoring-only setup that keeps the default ~/resume.pdf.
+        if configured and not any(Path(value).expanduser().is_file() for value in configured):
+            console.print(
+                "[yellow]Resume preflight:[/yellow] configured resume path does not exist "
+                f"({', '.join(configured)}); per-job tailoring will be used instead.",
+            )
+        return []
 
     if not configured and not resolved:
         return ["no resume configured: set local_resume_path in config.json (or LOCAL_RESUME_PATH)"]
@@ -222,12 +297,16 @@ def _validate_resume_for_run(config: dict) -> list[str]:
             ]
 
         unsupported = sorted(
-            {p.suffix.lower() for p in resolved_configured if p.is_file()} - RESUME_EXTENSIONS
+            {
+                p.suffix.lower()
+                for p in resolved_configured
+                if p.is_file() and p.suffix.lower() not in PREFLIGHT_RESUME_EXTENSIONS
+            }
         )
         if unsupported:
             return [
                 f"configured resume has unsupported extension '{', '.join(unsupported)}' "
-                f"(supported: {sorted(RESUME_EXTENSIONS)})"
+                f"(supported: {sorted(PREFLIGHT_RESUME_EXTENSIONS)})"
             ]
 
     if not resolved:
@@ -237,9 +316,10 @@ def _validate_resume_for_run(config: dict) -> list[str]:
     problems: list[str] = []
     if is_dummy_resume(str(path)):
         problems.append(f"resolved resume is the test fixture ({path}) — set a real resume")
-    if path.suffix.lower() not in RESUME_EXTENSIONS:
+    if path.suffix.lower() not in PREFLIGHT_RESUME_EXTENSIONS:
         problems.append(
-            f"resume has unsupported extension '{path.suffix}' (supported: {sorted(RESUME_EXTENSIONS)})"
+            f"resume has unsupported extension '{path.suffix}' "
+            f"(supported: {sorted(PREFLIGHT_RESUME_EXTENSIONS)})"
         )
     elif path.suffix.lower() == ".pdf":
         try:
@@ -338,12 +418,25 @@ def _load_config_from_project() -> dict:
         return {}
 
 
-def _apply_queue_scope(company: str | None) -> tuple[list[str], bool]:
-    """Inspect the approved-but-unapplied queue.
+def _apply_queue_scope(
+    *,
+    company: str | None = None,
+    source: str | None = None,
+    job_id: str | None = None,
+    limit: int | None = None,
+    config: dict | None = None,
+) -> tuple[list[str], bool]:
+    """Inspect the jobs `apply` will actually select.
 
-    Returns (credential-requiring sources, whether any job is queued at all).
-    The two are independent: legacy 'external' jobs need a resume but no
-    source credentials, so callers gate their checks on different values.
+    Mirrors the selection in Orchestrator.apply_approved(): the same
+    job_id/source/company/limit filtering plus the min_apply_score skip. Using
+    the *whole* queue instead would fail a run for jobs it would never touch —
+    e.g. `apply --source linkedin` with only Jobright jobs queued, or
+    `apply --job-id missing` while an unrelated job sits queued.
+
+    Returns (credential-requiring sources, whether any job will be attempted).
+    The two are independent: legacy 'external' jobs need a resume but no source
+    credentials, so callers gate their checks on different values.
     """
     try:
         from src.state_manager import StateManager
@@ -353,9 +446,32 @@ def _apply_queue_scope(company: str | None) -> tuple[list[str], bool]:
         # If we can't read the queue, don't invent a reason to block; the apply
         # flow will surface any real problem.
         return [], False
+
+    if job_id:
+        jobs = [j for j in jobs if j.get("job_id") == job_id]
+    if source:
+        jobs = [j for j in jobs if j.get("source") == source]
     if company:
         needle = company.lower()
         jobs = [j for j in jobs if needle in (j.get("company") or "").lower()]
+    if limit is not None:
+        jobs = jobs[: max(0, limit)]
+
+    min_apply_score = 0
+    if config:
+        min_apply_score = int(config.get("search_settings", {}).get("min_apply_score", 0) or 0)
+    if min_apply_score > 0:
+        # apply_approved() skips (and marks) these before attempting anything.
+        jobs = [
+            j
+            for j in jobs
+            if not (
+                isinstance(j.get("score"), (int, float))
+                and not isinstance(j.get("score"), bool)
+                and j["score"] < min_apply_score
+            )
+        ]
+
     queued = {(j.get("source") or "").lower() for j in jobs if j.get("source")}
     return sorted(s for s in queued if s in _SOURCE_CREDS), bool(jobs)
 
@@ -877,11 +993,8 @@ def main() -> None:
             sys.exit(1)
 
     if args.command == "apply":
-        src = getattr(args, "source", None)
-        if src:
-            sources_to_check = [src]
-            has_queued_jobs = True
-        elif os.environ.get("DASHBOARD_URL"):
+        config = _load_config_from_project()
+        if os.environ.get("DASHBOARD_URL"):
             # apply_approved() pulls cloud-approved jobs into the local queue
             # AFTER this preflight, so the local queue can't tell us which
             # sources those jobs use yet. Validate all sources to preserve the
@@ -889,11 +1002,18 @@ def main() -> None:
             sources_to_check = None
             has_queued_jobs = True
         else:
-            # Local-only: validate creds just for sources actually represented
-            # in the approved queue — a missing USAJOBS_PASSWORD shouldn't block
-            # an apply run whose queue is all LinkedIn jobs. An empty queue means
-            # nothing to apply, so nothing to validate.
-            sources_to_check, has_queued_jobs = _apply_queue_scope(getattr(args, "company", None))
+            # Local-only: derive both the credential sources and whether any job
+            # will be attempted from the same job_id/source/company/limit
+            # selection apply_approved() uses. An --source/--job-id/--limit run
+            # that selects nothing must not be blocked by queue entries it would
+            # never touch; a run that does select jobs must still fail fast.
+            sources_to_check, has_queued_jobs = _apply_queue_scope(
+                company=getattr(args, "company", None),
+                source=getattr(args, "source", None),
+                job_id=getattr(args, "job_id", None),
+                limit=getattr(args, "limit", None),
+                config=config,
+            )
         if sources_to_check != [] and not preflight_env_check(sources_to_check):
             sys.exit(1)
 
@@ -903,7 +1023,7 @@ def main() -> None:
         # Gate on the queue being non-empty rather than on credential-bearing
         # sources: legacy 'external' jobs need a resume but carry no creds, and
         # an empty queue has nothing to apply.
-        if has_queued_jobs and not preflight_resume_profile_check(_load_config_from_project()):
+        if has_queued_jobs and not preflight_resume_profile_check(config):
             sys.exit(1)
 
     try:
