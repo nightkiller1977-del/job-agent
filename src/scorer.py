@@ -336,10 +336,19 @@ class JobScorer:
         data = extract_json(raw, expect="object")
         if data is None:
             return _scoring_failed("Could not parse model response")
+        # A parseable object is not by itself a verdict. If the score is absent,
+        # null, boolean or non-numeric, no evaluation happened: substituting 50
+        # would recreate the phantom mid-range score this flag exists to
+        # eliminate, and the response's recommended_action would still be
+        # honoured — auto-approving a job the model never actually scored.
+        raw_score = data.get("score")
+        if raw_score is None or isinstance(raw_score, bool):
+            return _scoring_failed("Model response had no usable score")
         try:
-            score = max(0, min(100, int(float(data.get("score", 50)))))
-        except (TypeError, ValueError):
-            score = 50
+            # OverflowError covers infinities, which int() rejects after float().
+            score = max(0, min(100, int(float(raw_score))))
+        except (TypeError, ValueError, OverflowError):
+            return _scoring_failed("Model response had no usable score")
         return (
             score,
             data.get("reason", ""),

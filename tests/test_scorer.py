@@ -131,6 +131,57 @@ def test_parse_score_clamped() -> None:
     assert score == 100
 
 
+# A parseable JSON object is not by itself a verdict. Each case below previously
+# fabricated a score of 50 and honoured the model's recommended_action.
+
+@pytest.mark.parametrize(
+    "payload, label",
+    [
+        ({"reason": "x", "recommended_action": "apply"}, "score key absent"),
+        ({"score": None, "recommended_action": "apply"}, "score is null"),
+        ({"score": "high", "recommended_action": "apply"}, "score non-numeric"),
+        ({"score": True, "recommended_action": "apply"}, "score is boolean"),
+        ({"score": "inf", "recommended_action": "apply"}, "score is infinity"),
+        ({"score": "nan", "recommended_action": "apply"}, "score is NaN"),
+    ],
+)
+def test_parse_unusable_score_is_scoring_failed(payload: dict, label: str) -> None:
+    scorer = _make_scorer()
+    score, _, flags, action = scorer._parse_response(json.dumps(payload))
+    assert score is None, f"{label}: fabricated a score instead of failing"
+    assert flags == "SCORING_FAILED", label
+    # The model's own recommended_action must not survive a failed evaluation.
+    assert action == "scoring_failed", f"{label}: honoured an unearned action"
+
+
+def test_parse_missing_score_does_not_auto_approve() -> None:
+    """The escalation: no score + "apply" must not reach approved status."""
+    scorer = _make_scorer()
+    _, _, _, action = scorer._parse_response(json.dumps({"recommended_action": "apply"}))
+    job = {"title": "t", "company": "c", "score": None, "recommended_action": action}
+    _bare_orchestrator()._classify_status(job)
+    assert job["status"] == "discovered"
+
+
+def test_parse_numeric_string_score_still_accepted() -> None:
+    """Regression guard: a quoted number is a real verdict, not a failure."""
+    scorer = _make_scorer()
+    raw = json.dumps({"score": "85", "reason": "x", "flags": "", "recommended_action": "apply"})
+    score, _, _, action = scorer._parse_response(raw)
+    assert score == 85
+    assert action == "apply"
+
+
+def test_parse_zero_score_is_a_real_verdict() -> None:
+    """0 is falsy but genuinely evaluated: it must not be treated as missing."""
+    scorer = _make_scorer()
+    raw = json.dumps({"score": 0, "reason": "x", "flags": "", "recommended_action": "skip"})
+    score, _, flags, action = scorer._parse_response(raw)
+    assert score == 0
+    assert flags != "SCORING_FAILED"
+    assert action == "skip"
+
+
 # ---------------------------------------------------------------------------
 # _build_profile_from_config
 # ---------------------------------------------------------------------------
