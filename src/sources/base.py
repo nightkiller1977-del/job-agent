@@ -552,24 +552,90 @@ class BaseScraper(ABC):
         return hashlib.md5(url.encode()).hexdigest()[:16]
 
     async def _upload_resume_if_prompted(self, page, resume_path: str) -> None:
-        path = Path(resume_path).expanduser()
-        if not path.exists():
-            return
+        """Resume-only convenience wrapper around _upload_documents_if_prompted."""
+        await self._upload_documents_if_prompted(page, resume_path)
+
+    async def _upload_documents_if_prompted(
+        self, page, resume_path: str, cover_letter_path: str = ""
+    ) -> bool:
+        """Upload resume and/or cover letter into the page's file inputs.
+
+        Chooses the right input by matching its accept types and nearby label
+        text; returns True when a resume was uploaded. Label resolution runs
+        in-page (walking up to 4 ancestors, falling back to aria-label /
+        data-automation-id) because ATS widgets rarely expose a real <label for>.
+        """
+        res_path = Path(resume_path).expanduser() if resume_path else None
+        cl_path = Path(cover_letter_path).expanduser() if cover_letter_path else None
+
+        uploaded_resume = False
+
         try:
             file_inputs = await page.query_selector_all('input[type="file"]')
             for file_input in file_inputs:
                 accept = (await file_input.get_attribute("accept") or "").lower()
                 name = (await file_input.get_attribute("name") or "").lower()
-                label = (await self._get_field_label(page, file_input) or "").lower()
-                hints = " ".join([accept, name, label])
-                if accept and not any(ext in accept for ext in [".pdf", "pdf", "application/pdf"]):
+                try:
+                    label = await file_input.evaluate(
+                        """
+                        node => {
+                            const id = node.id;
+                            const explicit = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+                            if (explicit?.innerText) return explicit.innerText;
+                            let p = node.parentElement;
+                            for (let i = 0; p && i < 4; i++, p = p.parentElement) {
+                                const txt = (p.innerText || '').trim();
+                                if (txt) return txt;
+                            }
+                            return node.getAttribute('aria-label') || node.getAttribute('data-automation-id') || '';
+                        }
+                        """
+                    )
+                except Exception:
+                    label = ""
+                hints = " ".join([accept, name, (label or "").lower()])
+
+                # Skip inputs that accept only document types we can't supply.
+                if accept and not any(
+                    ext in accept for ext in [".pdf", ".doc", ".docx", "pdf", "word"]
+                ):
                     continue
-                if any(word in hints for word in ["resume", "cv", "upload", "file"]) or not hints.strip():
-                    await file_input.set_input_files(str(path))
-                    console.print(f"[green]{self.name.capitalize()}:[/green] Uploaded resume: {path.name}")
+
+                is_cover_letter = any(
+                    word in hints for word in ["cover", "letter", "cl", "motivation", "motivational"]
+                )
+                is_resume = any(
+                    word in hints for word in ["resume", "cv", "vitae", "work history"]
+                ) or not hints.strip()
+
+                if is_cover_letter and cl_path and cl_path.exists():
+                    await file_input.set_input_files(str(cl_path))
+                    console.print(
+                        f"[green]{self.name.capitalize()}:[/green] Uploaded cover letter: {cl_path.name}"
+                    )
                     await self._delay(1, 2)
+                elif is_resume and res_path and res_path.exists():
+                    await file_input.set_input_files(str(res_path))
+                    console.print(
+                        f"[green]{self.name.capitalize()}:[/green] Uploaded resume: {res_path.name}"
+                    )
+                    uploaded_resume = True
+                    await self._delay(1, 2)
+                elif res_path and res_path.exists() and not uploaded_resume and not is_cover_letter:
+                    # Unlabeled input: fall back to uploading the resume once.
+                    # Never target an input identified as cover-letter-only —
+                    # callers that pass no cover letter (e.g. LinkedIn Easy
+                    # Apply) must not leak the resume into that field.
+                    await file_input.set_input_files(str(res_path))
+                    console.print(
+                        f"[green]{self.name.capitalize()}:[/green] Uploaded resume (fallback): {res_path.name}"
+                    )
+                    uploaded_resume = True
+                    await self._delay(1, 2)
+
         except Exception as exc:
-            console.print(f"[yellow]{self.name.capitalize()}:[/yellow] Resume upload check failed: {exc}")
+            console.print(f"[yellow]{self.name.capitalize()}:[/yellow] Document upload check failed: {exc}")
+        return uploaded_resume
 
     async def _get_field_label(self, page, element) -> str:
         """Try to find the label text for an input element."""
