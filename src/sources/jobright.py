@@ -7,6 +7,7 @@ or simply navigates — if redirected to login, prints a clear error).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -19,7 +20,7 @@ from rich.console import Console
 
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_success
-from src.resume_helper import ResumeFieldFixer, resolve_resume_path, check_ats_readability, ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
+from src.resume_helper import ResumeFieldFixer, resolve_resume_path, check_ats_readability, ATSReadabilityError, KeywordCoverageError, PDFTextLayerError, load_profile
 from src.model_client import ModelCascadeError
 from src.latex_compiler import LaTeXCompiler
 from src.telemetry import model_span
@@ -412,13 +413,8 @@ class JobrightScraper(BaseScraper):
                             pdf_cv_path = str(TAILORED_RESUMES_DIR / f"{safe_title}_{safe_co}_resume.pdf")
                             pdf_cl_path = str(TAILORED_RESUMES_DIR / f"{safe_title}_{safe_co}_cover_letter.pdf")
 
-                            # Load profile
-                            profile: dict = {}
-                            import json as _json
-                            _ppath = os.path.join("state", "profile.json")
-                            if os.path.isfile(_ppath):
-                                with open(_ppath) as _f:
-                                    profile = _json.load(_f)
+                            # Load profile (shared resolver: matches the preflight)
+                            profile: dict = load_profile()
 
                             # Compile CV/Resume (LaTeX with Playwright HTML fallback)
                             success_cv = await compiler.compile_cv(profile, _tailored, pdf_cv_path, page=page)
@@ -2675,14 +2671,7 @@ class JobrightScraper(BaseScraper):
         Covers: LinkedIn Profile URL, work-auth radio (Yes), sponsorship radio (No),
         and any other visible text/select inputs left empty.
         """
-        import json as _json
-        profile_path = Path(__file__).parent.parent.parent / "state" / "profile.json"
-        profile: dict = {}
-        if profile_path.exists():
-            try:
-                profile = _json.loads(profile_path.read_text())
-            except Exception:
-                pass
+        profile: dict = load_profile()
 
         linkedin_url = profile.get("social_links", {}).get("linkedin", "")
 
@@ -3389,14 +3378,9 @@ class JobrightScraper(BaseScraper):
                     return text[:6000]
             except Exception:
                 pass
-        profile_path = os.path.join("state", "profile.json")
-        if os.path.isfile(profile_path):
-            try:
-                import json as _json
-                with open(profile_path) as f:
-                    return _json.dumps(_json.load(f), indent=2)[:4000]
-            except Exception:
-                pass
+        profile = load_profile()
+        if profile:
+            return json.dumps(profile, indent=2)[:4000]
         return ""
 
     async def _claude_ats_and_tailor(self, job: dict, jd_text: str) -> dict:
@@ -3511,12 +3495,7 @@ class JobrightScraper(BaseScraper):
         Returns the path to the generated PDF, or '' on failure.
         """
         try:
-            import json as _json
-            profile: dict = {}
-            _ppath = os.path.join("state", "profile.json")
-            if os.path.isfile(_ppath):
-                with open(_ppath) as _f:
-                    profile = _json.load(_f)
+            profile: dict = load_profile()
             info = profile.get("personal_info", {})
             name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or "Candidate"
             email = info.get("email", "")
