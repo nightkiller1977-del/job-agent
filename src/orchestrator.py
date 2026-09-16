@@ -44,6 +44,18 @@ console = Console()
 _log = logging.getLogger(__name__)
 
 
+def meets_min_apply_score(score, min_apply_score: int) -> bool:
+    """Whether an approved job's score clears the configured apply threshold.
+
+    Fail closed: a missing/non-numeric score means no evaluation happened
+    (SCORING_FAILED), so it cannot be shown to clear the policy and must not be
+    submitted. Callers hold such jobs back until a rescore produces a verdict.
+    """
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
+        return False
+    return score >= min_apply_score
+
+
 SOURCE_MAP = {
     "jobright": JobrightScraper,
     "linkedin": LinkedInScraper,
@@ -838,9 +850,13 @@ class Orchestrator:
         min_apply_score = int(self.config.get("search_settings", {}).get("min_apply_score", 0))
         if min_apply_score > 0:
             valid_approved = []
+            hold = []
             for j in all_approved:
+                if meets_min_apply_score(j.get("score"), min_apply_score):
+                    valid_approved.append(j)
+                    continue
                 s = j.get("score")
-                if s is not None and isinstance(s, (int, float)) and s < min_apply_score:
+                if isinstance(s, (int, float)) and not isinstance(s, bool):
                     console.print(f"[dim]Auto-skipping low-score job ({s} < {min_apply_score}): {j.get('title')} @ {j.get('company')}[/dim]")
                     self.state.set_status(j["job_id"], "skipped")
                     try:
@@ -848,8 +864,19 @@ class Orchestrator:
                     except Exception:
                         pass
                 else:
-                    valid_approved.append(j)
+                    # Fail closed: an un-evaluated job (SCORING_FAILED) has no
+                    # score to compare, so it must not be treated as
+                    # threshold-eligible and submitted. Hold it approved and
+                    # unscored until `rescore` produces a verdict.
+                    hold.append(j)
+                    console.print(f"[yellow]Holding unscored approved job: {j.get('title')} @ {j.get('company')} (score missing; run 'rescore')[/yellow]")
             all_approved = valid_approved
+            if hold:
+                _log.warning(
+                    "apply.hold_unscored count=%d job_ids=%s",
+                    len(hold),
+                    ",".join(j.get("job_id", "") for j in hold),
+                )
 
         if not all_approved:
             console.print("[yellow]No approved jobs meeting minimum score pending application.[/yellow]")

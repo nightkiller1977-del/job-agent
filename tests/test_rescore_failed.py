@@ -297,6 +297,108 @@ async def test_rescore_failed_does_not_touch_successfully_scored_rows(state):
 
 
 # ---------------------------------------------------------------------------
+# Minimum-apply-score policy (fail closed on an unscored job)
+# ---------------------------------------------------------------------------
+
+def test_meets_min_apply_score_holds_unscored_and_invalid_values():
+    from src.orchestrator import meets_min_apply_score
+
+    assert meets_min_apply_score(50, 50) is True
+    assert meets_min_apply_score(60, 50) is True
+    assert meets_min_apply_score(49, 50) is False
+    # No evaluation happened (SCORING_FAILED) → cannot be shown to clear policy.
+    assert meets_min_apply_score(None, 50) is False
+    assert meets_min_apply_score("90", 50) is False
+    assert meets_min_apply_score(True, 50) is False
+
+
+def _job(job_id, status="approved", source="jobright", **overrides):
+    job = {
+        "job_id": job_id,
+        "source": source,
+        "title": "Director of Engineering",
+        "company": "Acme",
+        "url": "https://jobright.ai/jobs/info/abc123",
+        "status": status,
+        "score": 90,
+    }
+    job.update(overrides)
+    return job
+
+
+def _make_orchestrator(tmp_path, config_extra=None):
+    config = {"state_db_path": str(tmp_path / "jobs.db")}
+    if config_extra:
+        config.update(config_extra)
+    orc = Orchestrator.__new__(Orchestrator)
+    orc.config = config
+    orc.state = StateManager(config["state_db_path"])
+    orc.scorer = MagicMock()
+    return orc
+
+
+@pytest.mark.asyncio
+async def test_unscored_approved_job_is_held_out_of_the_apply_pool(tmp_path, caplog):
+    """A SCORING_FAILED row approved by a reviewer has no score to compare, so
+    it must not slip past min_apply_score into an employer submission."""
+    orc = _make_orchestrator(tmp_path, {"search_settings": {"min_apply_score": 50}})
+    orc.state.upsert_job(_job("unscored", score=None, flags=SCORING_FAILED_FLAG))
+    scraper = MagicMock()
+    scraper.apply = AsyncMock()
+    scraper_cls = MagicMock(return_value=scraper)
+
+    with patch.dict("src.orchestrator.SOURCE_MAP", {"jobright": scraper_cls}), \
+         patch.object(Orchestrator, "_pull_approved_from_cloud", new_callable=AsyncMock), \
+         patch.object(Orchestrator, "_push_status_to_cloud", new_callable=AsyncMock), \
+         patch.object(Orchestrator, "expiry_sweep", new_callable=AsyncMock), \
+         caplog.at_level("WARNING", logger="src.orchestrator"):
+        await orc.apply_approved(auto_submit=False)
+
+    # Held as approved (not skipped, since it was never evaluated), explicitly
+    # logged as held, and never handed to a scraper.
+    assert orc.state.get_job("unscored")["status"] == "approved"
+    assert any("apply.hold_unscored" in rec.getMessage() for rec in caplog.records)
+    scraper.apply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_low_score_approved_job_is_still_skipped(tmp_path):
+    orc = _make_orchestrator(tmp_path, {"search_settings": {"min_apply_score": 50}})
+    orc.state.upsert_job(_job("low", score=10))
+
+    with patch.object(Orchestrator, "_pull_approved_from_cloud", new_callable=AsyncMock), \
+         patch.object(Orchestrator, "_push_status_to_cloud", new_callable=AsyncMock), \
+         patch.object(Orchestrator, "expiry_sweep", new_callable=AsyncMock):
+        await orc.apply_approved(auto_submit=False)
+
+    assert orc.state.get_job("low")["status"] == "skipped"
+
+
+def test_queue_scope_excludes_unscored_approved_jobs(monkeypatch):
+    """The `apply` preflight must not validate a job the run will hold back."""
+    from src import main as main_mod
+
+    jobs = [_job("unscored", score=None)]
+
+    class _FakeState:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_approved_unapplied(self):
+            return jobs
+
+    import src.state_manager as state_mod
+    monkeypatch.setattr(state_mod, "StateManager", lambda *a, **kw: _FakeState())
+
+    sources, has_jobs = main_mod._apply_queue_scope(
+        config={"search_settings": {"min_apply_score": 50}}
+    )
+
+    assert sources == []
+    assert has_jobs is False
+
+
+# ---------------------------------------------------------------------------
 # CLI wiring
 # ---------------------------------------------------------------------------
 
