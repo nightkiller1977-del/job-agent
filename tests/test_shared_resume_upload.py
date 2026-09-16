@@ -167,7 +167,7 @@ def test_unlabeled_input_falls_back_to_resume(tmp_path):
 
 
 def test_aria_label_is_used_when_no_ancestor_text():
-    """araia-label fallback (from the deeper Jobright walk) must survive."""
+    """aria-label fallback (from the deeper Jobright walk) must survive."""
     html = '<form><input type="file" id="r" aria-label="Resume upload"></form>'
     result = _run_dom(html)
 
@@ -193,3 +193,53 @@ def test_cover_letter_only_input_gets_nothing_when_no_cover_letter_supplied():
 
     assert result["uploaded"] is False
     assert result["files"] == [None]
+
+
+# ─ Review fixes: exact accept matching, tokenized "cl", scoped fallback ──
+
+def test_resume_not_attached_to_an_incompatible_accept_field():
+    """A resume input restricted to .docx must not receive a .pdf resume: the
+    old check only asked whether the field mentioned *some* document type."""
+    html = '<form><div>Resume <input type="file" name="resume" accept=".docx"></div></form>'
+    result = _run_dom(html)
+
+    assert result["uploaded"] is False
+    assert result["files"] == [None]
+
+
+def test_resume_attached_when_accept_matches_the_file():
+    html = '<form><div>Resume <input type="file" name="resume" accept=".pdf"></div></form>'
+    result = _run_dom(html)
+
+    assert result["uploaded"] is True
+    assert result["files"] == ["_issue15_resume.pdf"]
+
+
+def test_click_to_upload_label_is_not_treated_as_cover_letter():
+    """'cl' is a substring of 'Click'; cover-letter detection must use tokens so
+    a resume labeled 'Click to upload your resume' still gets the resume badge."""
+    html = '<form><div>Click to upload your resume <input type="file" name="f"></div></form>'
+    result = _run_dom(html)
+
+    assert result["uploaded"] is True
+    assert result["files"] == ["_issue15_resume.pdf"]
+
+
+def test_labeled_non_resume_field_does_not_receive_the_resume():
+    """A field labeled 'Portfolio' is neither resume nor generic; attaching the
+    resume there could send private applicant data to the wrong upload."""
+    html = '<form><div>Portfolio <input type="file" name="portfolio" accept=".pdf"></div></form>'
+    result = _run_dom(html)
+
+    assert result["uploaded"] is False
+    assert result["files"] == [None]
+
+
+def test_unlabeled_accept_only_resume_field_still_gets_the_resume():
+    """An accept-only field has no readable label, so it must still count as
+    generic and receive the resume (a strict label gate would break this)."""
+    html = '<form><input type="file" name="f" accept=".pdf"></form>'
+    result = _run_dom(html)
+
+    assert result["uploaded"] is True
+    assert result["files"] == ["_issue15_resume.pdf"]
