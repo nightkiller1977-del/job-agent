@@ -12,12 +12,57 @@ import json
 import logging
 import os
 import random
+import re
 import subprocess
 import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 from rich.console import Console
+
+# MIME types for the document formats we upload, used to match `accept` lists
+# that specify types rather than extensions.
+_DOC_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+def _hint_words(text: str) -> set[str]:
+    """Split a hint string into lowercase word tokens.
+
+    Substring matching is not safe here: "cl" appears inside ordinary words like
+    "Click", so cover-letter detection needs real tokens.
+    """
+    return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+
+def _input_accepts_file(accept: str, path: Path) -> bool:
+    """True when a file input's `accept` list permits this specific file.
+
+    Matching is exact (extension or MIME token, plus coarse `word`/`application/*`
+    families) rather than substring: a `.doc` resume must not satisfy a
+    `.docx`-only field, which plain `".doc" in accept` would wrongly allow.
+    """
+    if not accept:
+        return True
+    tokens = {token.strip().lower() for token in accept.split(",") if token.strip()}
+    if not tokens or "*" in tokens or "*/*" in tokens:
+        return True
+    suffix = path.suffix.lower()
+    if suffix in tokens:
+        return True
+    mime = _DOC_MIME_TYPES.get(suffix)
+    if mime:
+        if mime in tokens:
+            return True
+        if f"{mime.split('/')[0]}/*" in tokens:
+            return True
+    # Some ATS list a coarse family instead of exact types.
+    if suffix in (".doc", ".docx") and "word" in tokens:
+        return True
+    return False
 
 # P4 (external_ats_error, the biggest failure bucket): prefer patchright — a drop-in
 # Playwright replacement that patches the headless/WebDriver/Runtime.enable signals
@@ -552,24 +597,111 @@ class BaseScraper(ABC):
         return hashlib.md5(url.encode()).hexdigest()[:16]
 
     async def _upload_resume_if_prompted(self, page, resume_path: str) -> None:
-        path = Path(resume_path).expanduser()
-        if not path.exists():
-            return
+        """Resume-only convenience wrapper around _upload_documents_if_prompted."""
+        await self._upload_documents_if_prompted(page, resume_path)
+
+    async def _upload_documents_if_prompted(
+        self, page, resume_path: str, cover_letter_path: str = ""
+    ) -> bool:
+        """Upload resume and/or cover letter into the page's file inputs.
+
+        Chooses the right input by matching its accept types and nearby label
+        text; returns True when a resume was uploaded. Label resolution runs
+        in-page (walking up to 4 ancestors, falling back to aria-label /
+        data-automation-id) because ATS widgets rarely expose a real <label for>.
+        """
+        res_path = Path(resume_path).expanduser() if resume_path else None
+        cl_path = Path(cover_letter_path).expanduser() if cover_letter_path else None
+
+        uploaded_resume = False
+
         try:
             file_inputs = await page.query_selector_all('input[type="file"]')
             for file_input in file_inputs:
                 accept = (await file_input.get_attribute("accept") or "").lower()
                 name = (await file_input.get_attribute("name") or "").lower()
-                label = (await self._get_field_label(page, file_input) or "").lower()
-                hints = " ".join([accept, name, label])
-                if accept and not any(ext in accept for ext in [".pdf", "pdf", "application/pdf"]):
+                try:
+                    label = await file_input.evaluate(
+                        """
+                        node => {
+                            const id = node.id;
+                            const explicit = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+                            if (explicit?.innerText) return explicit.innerText;
+                            let p = node.parentElement;
+                            for (let i = 0; p && i < 4; i++, p = p.parentElement) {
+                                const txt = (p.innerText || '').trim();
+                                if (txt) return txt;
+                            }
+                            return node.getAttribute('aria-label') || node.getAttribute('data-automation-id') || '';
+                        }
+                        """
+                    )
+                except Exception:
+                    label = ""
+                hints = " ".join([accept, name, (label or "").lower()])
+                words = _hint_words(hints)
+                label_words = _hint_words(label or "")
+                generic_words = {"upload", "file", "attach", "attachment", "choose"}
+
+                # Cover-letter detection needs whole tokens ("cl" is a substring
+                # of "Click", so substring matching would misfire on labels like
+                # "Click to upload your resume").
+                is_cover_letter = bool(
+                    words & {"cover", "coverletter", "letter", "cl", "motivation", "motivational"}
+                )
+                is_resume = bool(
+                    words & {"resume", "cv", "vitae", "curriculum"}
+                ) or "work history" in hints or not hints.strip()
+
+                # An input is "generic" when its label doesn't identify a
+                # purpose: no accessible label text at all, or only a generic
+                # upload/choose hint. Accept-only resume fields (accept=".pdf"
+                # with no readable label) are common, so an empty label counts.
+                # The input's name/accept are deliberately excluded here so a
+                # field labeled "Portfolio" isn't treated as generic merely
+                # because its `name` happens to be "file".
+                is_generic = not label_words or bool(label_words & generic_words)
+
+                # Pick the document this input wants, then confirm the input
+                # actually accepts that file — an `accept=".docx"` field must not
+                # be handed a .pdf resume just because it mentions a document type.
+                target: Path | None = None
+                if is_cover_letter and cl_path and cl_path.exists():
+                    target = cl_path
+                elif is_resume and res_path and res_path.exists():
+                    target = res_path
+                elif (
+                    res_path
+                    and res_path.exists()
+                    and not uploaded_resume
+                    and not is_cover_letter
+                    and is_generic
+                ):
+                    # Only genuinely unlabeled or explicitly generic ("Upload file")
+                    # inputs fall back to the resume. This must not catch labeled
+                    # fields like "Portfolio" or "Transcript": attaching a resume
+                    # to an unrecognized non-resume field could send private
+                    # applicant data to a wrong employer-facing upload.
+                    target = res_path
+
+                if target is None or not _input_accepts_file(accept, target):
                     continue
-                if any(word in hints for word in ["resume", "cv", "upload", "file"]) or not hints.strip():
-                    await file_input.set_input_files(str(path))
-                    console.print(f"[green]{self.name.capitalize()}:[/green] Uploaded resume: {path.name}")
-                    await self._delay(1, 2)
+
+                await file_input.set_input_files(str(target))
+                if target == cl_path:
+                    console.print(
+                        f"[green]{self.name.capitalize()}:[/green] Uploaded cover letter: {cl_path.name}"
+                    )
+                elif target == res_path:
+                    uploaded_resume = True
+                    console.print(
+                        f"[green]{self.name.capitalize()}:[/green] Uploaded resume: {res_path.name}"
+                    )
+                await self._delay(1, 2)
+
         except Exception as exc:
-            console.print(f"[yellow]{self.name.capitalize()}:[/yellow] Resume upload check failed: {exc}")
+            console.print(f"[yellow]{self.name.capitalize()}:[/yellow] Document upload check failed: {exc}")
+        return uploaded_resume
 
     async def _get_field_label(self, page, element) -> str:
         """Try to find the label text for an input element."""
