@@ -25,8 +25,8 @@ async def test_pdf_text_layer_error_pauses_the_batch(tmp_path):
     resume_pdf.write_text("real resume")
     orch.config = {"local_resume_path": str(resume_pdf)}
 
-    job1 = {"job_id": "j1", "title": "Dir Eng", "company": "Acme", "source": "jobright"}
-    job2 = {"job_id": "j2", "title": "VP IT", "company": "Globex", "source": "jobright"}
+    job1 = {"job_id": "j1", "title": "Dir Eng", "company": "Acme", "source": "jobright", "score": 90}
+    job2 = {"job_id": "j2", "title": "VP IT", "company": "Globex", "source": "jobright", "score": 85}
 
     state = MagicMock()
     state.get_approved_unapplied.return_value = [job1, job2]
@@ -67,8 +67,8 @@ async def test_ats_readability_error_does_not_abort_batch(tmp_path):
     resume_pdf.write_text("real resume")
     orch.config = {"local_resume_path": str(resume_pdf)}
 
-    job1 = {"job_id": "j1", "title": "Dir Eng", "company": "Acme", "source": "jobright"}
-    job2 = {"job_id": "j2", "title": "VP IT", "company": "Globex", "source": "jobright"}
+    job1 = {"job_id": "j1", "title": "Dir Eng", "company": "Acme", "source": "jobright", "score": 90}
+    job2 = {"job_id": "j2", "title": "VP IT", "company": "Globex", "source": "jobright", "score": 85}
 
     # State stub
     state = MagicMock()

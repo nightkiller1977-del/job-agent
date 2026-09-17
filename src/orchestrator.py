@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
 from datetime import datetime
@@ -15,7 +16,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .state_manager import StateManager, parse_extra_json
-from .scorer import JobScorer
+from .scorer import JobScorer, SCORING_FAILED_ACTION, SCORING_FAILED_FLAG
 from .review_queue import run_review_queue, show_summary_table
 from .sources.jobright import JobrightScraper
 from .sources.linkedin import LinkedInScraper
@@ -42,6 +43,23 @@ from .session_watchdog import (
 
 console = Console()
 _log = logging.getLogger(__name__)
+
+
+def meets_min_apply_score(score, min_apply_score: int) -> bool:
+    """Whether an approved job's score clears the configured apply threshold.
+
+    Fail closed: a missing/non-numeric/non-finite score means no evaluation
+    happened (SCORING_FAILED) or the stored value is unusable, so it cannot be
+    shown to clear the policy and must not be submitted. Callers hold such jobs
+    back until a rescore produces a verdict. This holds for every threshold,
+    including 0/missing: a zero threshold waives the score *bar*, not the
+    requirement that an evaluation happened.
+    """
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
+        return False
+    if not math.isfinite(score):
+        return False
+    return score >= min_apply_score
 
 
 SOURCE_MAP = {
@@ -411,6 +429,13 @@ class Orchestrator:
         elif action == "skip":
             job["status"] = "skipped"
             console.print(f"  [dim]→ Auto-skipped: {job.get('title')} @ {job.get('company')} (Score: {score})[/dim]")
+        elif action == SCORING_FAILED_ACTION:
+            # No evaluation happened: neither approve nor skip, so the job stays
+            # in the review queue and remains identifiable via the SCORING_FAILED
+            # flag. already_seen() skips it on the next discover run, so recovery
+            # is explicit: `rescore` re-scores the flagged rows.
+            job["status"] = "discovered"
+            console.print(f"  [yellow]→ Scoring failed (unscored): {job.get('title')} @ {job.get('company')}[/yellow]")
         else:
             job["status"] = "discovered"
         return job
@@ -829,20 +854,39 @@ class Orchestrator:
             limit=limit,
         )
         min_apply_score = int(self.config.get("search_settings", {}).get("min_apply_score", 0))
-        if min_apply_score > 0:
-            valid_approved = []
-            for j in all_approved:
-                s = j.get("score")
-                if s is not None and isinstance(s, (int, float)) and s < min_apply_score:
-                    console.print(f"[dim]Auto-skipping low-score job ({s} < {min_apply_score}): {j.get('title')} @ {j.get('company')}[/dim]")
-                    self.state.set_status(j["job_id"], "skipped")
-                    try:
-                        await self._push_status_to_cloud(j["job_id"], "skipped")
-                    except Exception:
-                        pass
-                else:
-                    valid_approved.append(j)
-            all_approved = valid_approved
+        # The validity gate runs for every approved job, not only when a positive
+        # threshold is configured: a zero/missing threshold waives the score bar
+        # for real numeric scores, but an unscored (SCORING_FAILED) row must
+        # still be held — otherwise reviewer approval of "no evaluation
+        # happened" becomes eligibility for an employer-facing submission.
+        valid_approved = []
+        hold = []
+        for j in all_approved:
+            if meets_min_apply_score(j.get("score"), min_apply_score):
+                valid_approved.append(j)
+                continue
+            s = j.get("score")
+            if isinstance(s, (int, float)) and not isinstance(s, bool) and math.isfinite(s):
+                console.print(f"[dim]Auto-skipping low-score job ({s} < {min_apply_score}): {j.get('title')} @ {j.get('company')}[/dim]")
+                self.state.set_status(j["job_id"], "skipped")
+                try:
+                    await self._push_status_to_cloud(j["job_id"], "skipped")
+                except Exception:
+                    pass
+            else:
+                # Fail closed: an un-evaluated job (SCORING_FAILED) has no
+                # score to compare, so it must not be treated as
+                # threshold-eligible and submitted. Hold it approved and
+                # unscored until `rescore` produces a verdict.
+                hold.append(j)
+                console.print(f"[yellow]Holding unscored approved job: {j.get('title')} @ {j.get('company')} (score missing; run 'rescore')[/yellow]")
+        all_approved = valid_approved
+        if hold:
+            _log.warning(
+                "apply.hold_unscored count=%d job_ids=%s",
+                len(hold),
+                ",".join(j.get("job_id", "") for j in hold),
+            )
 
         if not all_approved:
             console.print("[yellow]No approved jobs meeting minimum score pending application.[/yellow]")
@@ -1467,6 +1511,80 @@ class Orchestrator:
             f"{mode}={stats['reset'] if not dry_run else stats['matched']} "
             f"unmatched={stats['unmatched']}"
         )
+
+    async def rescore_failed(self, limit: Optional[int] = None, dry_run: bool = False) -> dict:
+        """Re-score jobs whose evaluation previously failed.
+
+        Discovery cannot recover these rows: already_seen() skips every known
+        job_id, so a transient scoring failure would otherwise leave the row
+        permanently unscored. This re-runs the same scorer over the SCORING_FAILED
+        population and writes the outcome back in place. Successfully scored rows
+        are never selected, and a run with no failed rows is a no-op.
+        """
+        failed = self.state.get_scoring_failed_jobs(limit=limit)
+        if not failed:
+            console.print("[green]No SCORING_FAILED jobs to re-score.[/green]")
+            return {"matched": 0, "rescored": 0, "still_failed": 0, "triaged": 0}
+
+        if dry_run:
+            console.print(
+                f"[yellow]Would re-score {len(failed)} failed job(s). "
+                "Run without --dry-run to apply.[/yellow]"
+            )
+            return {
+                "matched": len(failed),
+                "rescored": 0,
+                "still_failed": 0,
+                "triaged": 0,
+            }
+
+        # A reviewer-approved row held by apply_approved() keeps its approval
+        # across a rescore: _classify_status() re-triages from the new verdict,
+        # which would otherwise demote a human decision back to 'discovered'.
+        # Captured before scoring because the scorer mutates job["status"].
+        originally_approved = {j["job_id"] for j in failed if j.get("status") == "approved"}
+
+        scored = await self._score_jobs_with_progress(failed)
+
+        still_failed = 0
+        triaged = 0
+        for job in scored:
+            job_id = job.get("job_id")
+            if not job_id:
+                continue
+            # A failed re-score must stay selectable, otherwise the row silently
+            # drops out of the failed population while still unscored. Nothing is
+            # persisted here, so an originally approved row stays approved (and
+            # held by apply_approved()) rather than being demoted.
+            if job.get("flags") == SCORING_FAILED_FLAG or job.get("score") is None:
+                still_failed += 1
+                continue
+            # The re-score produced a real evaluation: store the verdict together
+            # with the flags the scorer emitted, then drop only the failure token.
+            # Passing "" here would wipe every flag and make the targeted clear
+            # below meaningless.
+            self.state.update_score(job_id, job.get("score"), job.get("score_reason") or "", job.get("flags") or "")
+            self.state.clear_scoring_failed_flag(job_id)
+            if job_id in originally_approved:
+                # The approval predates the verdict; the new score only feeds the
+                # min_apply_score gate in apply_approved(), which decides
+                # eligibility — rescore must not run a second copy of that policy.
+                self.state.set_status(job_id, "approved")
+            else:
+                self.state.set_status(job_id, job.get("status") or "discovered")
+            triaged += 1
+
+        console.print(
+            f"[green]Re-score complete:[/green] matched={len(failed)} "
+            f"re-scored={len(failed) - still_failed} still_failed={still_failed} "
+            f"triaged={triaged}"
+        )
+        return {
+            "matched": len(failed),
+            "rescored": len(failed) - still_failed,
+            "still_failed": still_failed,
+            "triaged": triaged,
+        }
 
     async def _pull_approved_from_cloud(self) -> None:
         """Fetch jobs marked 'approved' on the cloud dashboard and upsert them

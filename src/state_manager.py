@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Any
 
+from src.scorer import SCORING_FAILED_FLAG
+
 _log = logging.getLogger(__name__)
 
 # Columns that exist on the cloud dashboard's Postgres `jobs` table but not in
@@ -797,6 +799,58 @@ class StateManager:
                 """,
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_scoring_failed_jobs(self, limit: Optional[int] = None) -> list[dict]:
+        """Jobs whose scoring failed (persisted SCORING_FAILED flag).
+
+        These rows are skipped forever by already_seen() during discovery, so this
+        is the only selector that can hand them back to the scorer. The flag is
+        written by JobScorer on every failed evaluation, so it is authoritative
+        for "no evaluation happened" (score is NULL); filtering on the flag then
+        score IS NULL avoids re-scoring a row that already has a usable score.
+
+        Both recoverable statuses are selected: 'discovered' (the normal failed
+        outcome) and 'approved' (a reviewer approved the unscored row, which
+        apply_approved() then holds until a rescore produces a verdict — without
+        this the held row would be invisible to `rescore` and stay unscored
+        forever). Terminal statuses (skipped/applied/…) are never re-scored.
+
+        Matching is token-based rather than equality: ``flags`` is a comma-joined
+        set (see clear_scoring_failed_flag), so a row carrying
+        ``IC_ROLE,SCORING_FAILED`` must still be selected.
+        """
+        token = f",{SCORING_FAILED_FLAG},"
+        sql = (
+            "SELECT * FROM jobs WHERE status IN ('discovered', 'approved') "
+            "AND score IS NULL "
+            "AND (',' || COALESCE(flags, '') || ',') LIKE ? "
+            "ORDER BY discovered_at ASC"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(sql, (f"%{token}%",)).fetchall()
+        jobs = [dict(r) for r in rows]
+        if limit is not None:
+            jobs = jobs[: max(0, limit)]
+        return jobs
+
+    def clear_scoring_failed_flag(self, job_id: str) -> None:
+        """Drop the SCORING_FAILED flag after a successful re-score.
+
+        A full-column overwrite would erase unrelated flags (e.g. IC_ROLE) that
+        the new evaluation may not repeat, so this only removes the exact token
+        and only from rows that actually carry it.
+        """
+        token = f",{SCORING_FAILED_FLAG},"
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET flags = TRIM(REPLACE(',' || COALESCE(flags, '') || ',', ?, ','), ',')
+                WHERE job_id = ?
+                  AND (',' || COALESCE(flags, '') || ',') LIKE ?
+                """,
+                (token, job_id, f"%{token}%"),
+            )
 
     def get_approved_unapplied(self) -> list[dict]:
         """Jobs approved for application but not yet applied."""

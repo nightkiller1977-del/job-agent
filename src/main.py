@@ -460,17 +460,13 @@ def _apply_queue_scope(
     min_apply_score = 0
     if config:
         min_apply_score = int(config.get("search_settings", {}).get("min_apply_score", 0) or 0)
-    if min_apply_score > 0:
-        # apply_approved() skips (and marks) these before attempting anything.
-        jobs = [
-            j
-            for j in jobs
-            if not (
-                isinstance(j.get("score"), (int, float))
-                and not isinstance(j.get("score"), bool)
-                and j["score"] < min_apply_score
-            )
-        ]
+    # Mirror apply_approved() exactly: it skips low-score jobs and holds
+    # unscored ones — even when the threshold is 0/missing — so the preflight
+    # must not validate either kind. Sharing the predicate keeps preflight and
+    # execution from diverging.
+    from src.orchestrator import meets_min_apply_score
+
+    jobs = [j for j in jobs if meets_min_apply_score(j.get("score"), min_apply_score)]
 
     queued = {(j.get("source") or "").lower() for j in jobs if j.get("source")}
     return sorted(s for s in queued if s in _SOURCE_CREDS), bool(jobs)
@@ -638,6 +634,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Show how many jobs would be reset without changing the database",
+    )
+
+    # rescore
+    rescore_parser = subparsers.add_parser(
+        "rescore",
+        help="Re-score jobs whose evaluation previously failed (SCORING_FAILED)",
+    )
+    rescore_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of failed jobs to re-score",
+    )
+    rescore_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show how many jobs would be re-scored without calling the model",
     )
 
     # ingest-email
@@ -820,6 +833,12 @@ async def main_async(args: argparse.Namespace) -> int:
     elif args.command == "reset-failures":
         orchestrator.reset_failures(
             reason=args.reason,
+            dry_run=args.dry_run,
+        )
+
+    elif args.command == "rescore":
+        await orchestrator.rescore_failed(
+            limit=args.limit,
             dry_run=args.dry_run,
         )
 
