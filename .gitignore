@@ -11,6 +11,7 @@ secrets.enc.env
 secrets.yaml
 secrets.yml
 credentials.json
+settings-v3.json
 aws_credentials
 .aws/
 .kube/
@@ -38,6 +39,7 @@ state/profile.json
 state/agent.log
 state/agent_status.json
 state/extensions/
+state/tailored_resumes/
 
 # ── Playwright ────────────────────────────────────────────────────────────────
 playwright-report/
