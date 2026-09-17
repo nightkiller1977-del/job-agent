@@ -801,7 +801,7 @@ class StateManager:
             return [dict(r) for r in rows]
 
     def get_scoring_failed_jobs(self, limit: Optional[int] = None) -> list[dict]:
-        """Discovered jobs whose scoring failed (persisted SCORING_FAILED flag).
+        """Jobs whose scoring failed (persisted SCORING_FAILED flag).
 
         These rows are skipped forever by already_seen() during discovery, so this
         is the only selector that can hand them back to the scorer. The flag is
@@ -809,13 +809,19 @@ class StateManager:
         for "no evaluation happened" (score is NULL); filtering on the flag then
         score IS NULL avoids re-scoring a row that already has a usable score.
 
+        Both recoverable statuses are selected: 'discovered' (the normal failed
+        outcome) and 'approved' (a reviewer approved the unscored row, which
+        apply_approved() then holds until a rescore produces a verdict — without
+        this the held row would be invisible to `rescore` and stay unscored
+        forever). Terminal statuses (skipped/applied/…) are never re-scored.
+
         Matching is token-based rather than equality: ``flags`` is a comma-joined
         set (see clear_scoring_failed_flag), so a row carrying
         ``IC_ROLE,SCORING_FAILED`` must still be selected.
         """
         token = f",{SCORING_FAILED_FLAG},"
         sql = (
-            "SELECT * FROM jobs WHERE status = 'discovered' "
+            "SELECT * FROM jobs WHERE status IN ('discovered', 'approved') "
             "AND score IS NULL "
             "AND (',' || COALESCE(flags, '') || ',') LIKE ? "
             "ORDER BY discovered_at ASC"
