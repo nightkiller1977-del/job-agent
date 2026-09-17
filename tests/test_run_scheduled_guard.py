@@ -15,6 +15,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "run-scheduled.sh"
 
 
+def _clean_git_env(env: dict) -> dict:
+    """Strip GIT_* vars a wrapping git process (e.g. the pre-push hook) may
+    have exported into our environment. Left in place, they redirect the
+    subprocess git calls below at *this* repo's .git instead of the throwaway
+    tmp_path repo, so the branch-drift guard tests misbehave only when run
+    via `git push` and pass when run directly with `pytest`."""
+    local_env_vars = subprocess.run(
+        ["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True,
+    ).stdout.split()
+    return {k: v for k, v in env.items() if k not in set(local_env_vars)}
+
+
 def _make_repo(tmp_path, branch: str) -> Path:
     """A throwaway git repo with scripts/run-scheduled.sh and a stub venv
     python that records it ran instead of launching the real agent."""
@@ -31,7 +43,7 @@ def _make_repo(tmp_path, branch: str) -> Path:
     stub.write_text("#!/usr/bin/env bash\necho \"RAN:$*\"\n")
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
 
-    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    env = _clean_git_env({**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"})
     subprocess.run(["git", "init", "-q", "-b", branch, str(repo)], check=True, env=env)
     subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
                     "commit", "-q", "--allow-empty", "-m", "init"], check=True, env=env)
@@ -39,7 +51,7 @@ def _make_repo(tmp_path, branch: str) -> Path:
 
 
 def _run(repo: Path, cmd: str, pinned: str | None):
-    env = {**os.environ}
+    env = _clean_git_env({**os.environ})
     if pinned is None:
         env.pop("JOBAGENT_RUNTIME_BRANCH", None)
     else:
@@ -64,7 +76,7 @@ def test_runs_on_the_pinned_branch(tmp_path):
 def test_refuses_on_a_drifted_branch(tmp_path):
     repo = _make_repo(tmp_path, "main-rewrite")
     subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "feat/dev-experiment"],
-                   check=True)
+                   check=True, env=_clean_git_env({**os.environ}))
     res = _run(repo, "apply", pinned="main-rewrite")
     assert res.returncode == 1
     assert "REFUSING" in res.stderr
