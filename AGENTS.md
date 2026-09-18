@@ -35,7 +35,7 @@ Jira is the planning and source-of-truth layer for AI Commander implementation w
 - Never point Playwright/scrapers at the user's main Chrome profile. Each scraper must use its isolated profile under `state/sessions/<name>_profile/`; do not add `--profile-directory=Default` or bypass profile-lock cleanup semantics to use the main profile.
 - Never commit `settings-v3.json`, `.env`, `state/jobs.db`, `state/profile.json`, `state/sessions/`, or `state/tailored_resumes/`.
 - Never push directly to `main`; use a feature branch and PR. Never use `--no-verify` to skip pre-commit/pre-push hooks.
-- Verify file/line and behavior claims from subagents, tools, OpenHands, Codex, or external reports against actual source/tests before acting on or quoting them.
+- Verify file/line and behavior claims from subagents, tools, OpenHands, GitHub Copilot Code Review, the AI Commander Code Review Agent, or external reports against actual source/tests before acting on or quoting them.
 - Employer-facing submissions and messages are external side effects. Do not claim a submission succeeded without durable evidence. Reconcile an ambiguous outcome before retrying to avoid duplicate applications.
 
 ## Skills
