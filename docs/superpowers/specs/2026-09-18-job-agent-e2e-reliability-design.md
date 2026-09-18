@@ -32,10 +32,12 @@ Add a small, local helper for safe error descriptions used at network and proces
 - endpoint class, never an endpoint URL or header value;
 - exception type and a bounded normalized message;
 - classification (`timeout`, `dns`, `connect`, `tls`, `http_status`, `configuration`, or `unknown`);
-- retryability;
+- transport retryability (diagnostic only, never retry authorization);
 - status code only when a response exists.
 
-The helper must redact URLs, query strings, authorization headers, sync secrets, credentials, and response bodies. It will be used by dashboard sync, provider preflight, and platform-notification paths instead of introducing separate logging systems.
+Operation names and endpoint classes come from module-owned allowlisted enums rather than request URLs. The helper must redact nested-cause text, URLs, query strings, authorization headers, sync secrets, credentials, and response bodies. Its output always contains a bounded nonblank message, including for `TimeoutError("")`. It will be used by dashboard sync, provider preflight, and platform-notification paths instead of introducing separate logging systems.
+
+The structured classification is durably written to the existing bounded run journal (`state/runs/<run-id>.jsonl`) as a new event payload. It is not written to jobs, ledger records, or dashboard payloads in the foundation PR, so their schemas remain compatible. Console output and notifications consume the same safe record but are not themselves the durable source. Persisted observability beyond run journals requires a separately scoped ticket and migration.
 
 ### 2. Cloud synchronization
 
@@ -43,17 +45,17 @@ Keep dashboard writes non-fatal, because discovery and the local SQLite journal 
 
 - distinguish missing configuration from transport failure and non-2xx response;
 - log and notify a safe structured failure record;
-- retry only idempotent read/push operations that have not received a response, with a small bounded backoff;
+- retry only operations named in an explicit retry-authorization allowlist, with a small bounded backoff and attempt limit;
 - preserve the exact existing payload and sync-secret header contract;
-- never retry a completed `/api/action` request after an ambiguous response because that endpoint changes job state.
+- never retry `/api/action`, including after an ambiguous client timeout, because the server may have committed the state change.
 
-The `/health` check remains unauthenticated and is only a diagnostic readiness probe; it is not a substitute for successful authenticated sync.
+The `/health` check remains unauthenticated and is only a diagnostic readiness probe; it is not a substitute for successful authenticated sync. Missing HTTP response never proves that a write was not processed. Retry authorization independently evaluates: operation allowlist, operation idempotency or server-side deduplication, submission state, configured attempt cap, and ACES-284's breaker decision. A `transport_retryable` diagnostic therefore never authorizes repeating a state-changing action.
 
 ### 3. Scheduler and host readiness
 
-Extend the existing read-only operational status command to expose: runtime branch vs pinned branch, virtual-environment executable presence, config/profile availability, timer/service last result, and source/provider readiness. The branch guard remains fail-closed. A run blocked by it receives a concise remediation that does not imply its application queue was processed.
+Extend the existing read-only operational status command to expose: observation timestamp, runtime branch vs pinned branch, virtual-environment executable presence, config/profile availability, timer/service last result, and source/provider readiness. The branch guard remains fail-closed. A run blocked by it receives a concise remediation that does not imply its application queue was processed.
 
-Platform notification delivery becomes capability-gated: macOS `osascript` integrations execute only on macOS. On another platform, the system records a `notification_unavailable` secondary condition while preserving the original session failure as primary.
+Platform notification delivery becomes capability-gated: macOS `osascript` integrations execute only on macOS. On another platform, the system records a deduplicated `notification_unavailable` secondary condition while preserving the original session failure as primary.
 
 ### 4. Provider and session taxonomy
 
@@ -62,17 +64,19 @@ At the existing boundaries, map deterministic exceptions to a narrow taxonomy:
 - model: local timeout, DNS, connect/TLS, unauthenticated, quota/budget, unavailable, malformed output;
 - session: expired/invalid credentials, human 2FA required, CAPTCHA, email code timeout, browser failure, and notification unavailable.
 
-The model cascade may fall through to another configured provider but records which providers were attempted and why each was unavailable. Session automation does not attempt to bypass CAPTCHA or 2FA and retains isolated `state/sessions/<name>_profile/` browser profiles.
+The model cascade may fall through to another configured provider but records an ordered, bounded history of provider attempts and why each was unavailable. Session automation does not attempt to bypass CAPTCHA or 2FA and retains isolated `state/sessions/<name>_profile/` browser profiles.
+
+Each boundary result carries one `primary_failure` and zero or more `secondary_conditions`. The primary failure is the operation outcome; secondary conditions describe failures while reporting or recovering from that outcome. For example, a CAPTCHA during session recovery remains primary while a Linux notification capability gap is secondary; an email-code timeout remains primary when notification delivery also fails; and a provider DNS failure stays in the ordered provider history even when a later cascade tier succeeds.
 
 ### 5. Submission and adapter failure truthfulness
 
 Preserve the existing result and ledger ownership. Adapter fixes only improve classification and diagnostics:
 
-- selector/navigation exceptions must not be persisted as a genuine missing ATS URL;
+- invalid URL, absent URL, DNS failure, browser-navigation failure, selector/navigation exception, and missing submit control must retain distinct classifications;
 - absent submit controls remain `submit_not_found`;
 - CAPTCHA remains a human-required blocker;
 - an unresolved external URL is distinguished from a DNS/navigation failure;
-- post-click timeout, stale DOM, or missing receipt remains `submission_unverified` and is reconciled before any retry.
+- post-click timeout, stale DOM, browser crash, or missing receipt remains `submission_unverified` and is reconciled before any retry or restart-driven continuation.
 
 Each individual adapter change is a separate child work item under ACES-18, because endpoints, controls, and vendor behavior differ. This protects the E2E foundation PR from becoming an unreviewable selector rewrite.
 
@@ -94,7 +98,7 @@ Each individual adapter change is a separate child work item under ACES-18, beca
 
 ## Verification
 
-Tests use a local fake dashboard and mocked transport exceptions, not production secrets or live dashboard mutation. Coverage must include empty-message timeout handling, DNS/connect classification, redaction, retry boundaries, non-retry of ambiguous state actions, Linux notification capability gating, model/session taxonomy, ATS resolution error separation, and no-retry behavior for unverified submissions.
+Tests use a local fake dashboard and mocked transport exceptions, not production secrets or live dashboard mutation. Coverage must include empty-message timeout handling; nested-cause redaction; enum-only operation/endpoint identity; DNS/connect/TLS classification; exact retry count and bounded backoff; a server-committed/client-timeout `/api/action` attempted exactly once; Linux notification capability gating with preserved primary failure and deduplicated secondary condition; timestamped scheduler observations; ordered, bounded provider history; model/session taxonomy; ATS resolution error separation; and restart-safe no-retry behavior for unverified submissions.
 
 The validation sequence is targeted unit tests, local integration tests, scheduler dry run/status, then the relevant broader suite. No live employer submission, CAPTCHA bypass, 2FA bypass, production database reset, or deletion of user state is authorized.
 
@@ -104,4 +108,3 @@ The validation sequence is targeted unit tests, local integration tests, schedul
 2. Provider/session PR: deterministic model/session taxonomy and preflight reporting.
 3. Adapter PRs: one child ticket per vendor/source confirmed by audit or fixture evidence.
 4. ACES-284 reconciliation: breaker decay/re-arm policy in its owning work item, consumed by the adapter work but not duplicated here.
-
