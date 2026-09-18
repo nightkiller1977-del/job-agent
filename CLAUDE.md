@@ -42,7 +42,7 @@ Never use `--no-verify` to skip pre-commit hooks.
 
 When a subagent, tool, or external report cites a `file:line` claim about this repo, verify it against the actual source before presenting or acting on it. Read the referenced file, run the referenced grep, or execute the referenced test yourself. If verification is skipped due to scope, say so explicitly.
 
-Applies equally to subagent investigation reports, Codex/OpenHands reviews, static-analysis output, and AI-authored suggestions that would land in a PR.
+Applies equally to subagent investigation reports, GitHub Copilot Code Review, AI Commander Code Review Agent, and OpenHands reviews, static-analysis output, and AI-authored suggestions that would land in a PR.
 
 ## Claude-specific side-effect rule
 
