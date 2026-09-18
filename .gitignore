@@ -51,3 +51,6 @@ test-results/
 .cursor/
 .idea/
 .vscode/
+
+# ── Local Git worktrees ─────────────────────────────────────────────────────
+.worktrees/
