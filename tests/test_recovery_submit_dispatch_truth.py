@@ -352,3 +352,59 @@ async def test_session_clears_marker_on_genuine_pre_submit_failure(tmp_path):
     from src.sources.adapters.idempotency import canonical_key
     fresh = SubmissionLedger(path=tmp_path / "apply_ledger.json")
     assert fresh.record(canonical_key(job)) is None
+
+
+# ─── 6. recovery's own failure reason is never silently discarded ──────────
+
+@pytest.mark.asyncio
+async def test_unadopted_recovery_failure_reason_is_preserved(tmp_path):
+    """A recovery attempt that runs and fails without being adopted (status
+    stays the pre-recovery adapter's, for breaker classification) must still
+    surface *why recovery itself failed* — in res.detail (console/DB/dashboard)
+    and as a structured run_log event — instead of silently reverting to only
+    the pre-recovery adapter's message with no sign recovery ever ran."""
+    # Recovery's status ("form_not_reached") is deliberately DIFFERENT from the
+    # fixture adapter's ("submit_not_found") — both assertions below would pass
+    # vacuously if the code accidentally read `res.status` instead of
+    # `recovery_res.status` for either check (Copilot review, PR #136).
+    s, _Recovery, _Lock = _session(
+        tmp_path, AtsApplyResult.blocked("form_not_reached", "nothing clicked"))
+    job = {"url": "https://jobs.example.com/apply/789", "job_id": "j3"}
+
+    with patch("src.sources.adapters.session.ProfileLock", _Lock), \
+         patch("src.sources.adapters.recovery_browseruse_refactored.BrowserUseRecoveryRefactored", _Recovery):
+        res = await s.apply(job, auto_submit=True)
+
+    # breaker classification is untouched — stays the pre-recovery adapter's...
+    assert res.status == "submit_not_found"
+    # ...but both failure reasons are now visible in the persisted detail.
+    assert "no submit control found" in res.detail  # pre-recovery adapter
+    assert "nothing clicked" in res.detail            # recovery's own reason
+
+    # and a structured event carries recovery's OWN outcome unconditionally,
+    # independent of whether it was adopted into res.
+    events = [c.args[0] for c in s.run_log.emit.call_args_list]
+    assert "recovery_result" in events
+    result_call = next(
+        c for c in s.run_log.emit.call_args_list if c.args[0] == "recovery_result"
+    )
+    assert result_call.kwargs["status"] == "form_not_reached"
+    assert result_call.kwargs["submitted"] is False
+
+
+@pytest.mark.asyncio
+async def test_unadopted_recovery_with_empty_detail_falls_back_to_status(tmp_path):
+    """The defense-in-depth fallback (`recovery_res.detail or recovery_res.status`)
+    has to earn its place with a real test: recovery failing with NO detail at
+    all (no current call site does this, but nothing stops a future one) must
+    still leave a trace in res.detail via the status, not silently revert to
+    the exact information loss this fix exists to prevent (Copilot review, PR #136)."""
+    s, _Recovery, _Lock = _session(tmp_path, AtsApplyResult.blocked("form_not_reached"))
+    job = {"url": "https://jobs.example.com/apply/999", "job_id": "j4"}
+
+    with patch("src.sources.adapters.session.ProfileLock", _Lock), \
+         patch("src.sources.adapters.recovery_browseruse_refactored.BrowserUseRecoveryRefactored", _Recovery):
+        res = await s.apply(job, auto_submit=True)
+
+    assert res.status == "submit_not_found"
+    assert "recovery: form_not_reached" in res.detail
