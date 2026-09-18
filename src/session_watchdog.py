@@ -24,6 +24,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -405,6 +406,9 @@ def _stage_prepare_sessions(source: str) -> bool:
     logged and intentionally does not count as a successful notification cycle,
     so the next watchdog pass may retry staging instead of waiting 12 hours.
     """
+    if sys.platform != "darwin":
+        _log.info("session_watchdog.stage_terminal_unavailable source=%s platform=%s", source, sys.platform)
+        return False
     cmd, prepare_source = _prepare_sessions_command(source)
     if prepare_source != (source or "").strip().lower():
         _log.info(

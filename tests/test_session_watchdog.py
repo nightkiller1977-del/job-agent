@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 import time
 import tempfile
 from pathlib import Path
@@ -172,7 +173,8 @@ def test_prepare_sessions_command_omits_unknown_source():
     assert "--source" not in cmd
 
 
-def test_stage_prepare_sessions_omits_jobspy_backed_source_filter():
+def test_stage_prepare_sessions_omits_jobspy_backed_source_filter(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
     with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
         assert _stage_prepare_sessions("glassdoor") is True
 
@@ -183,7 +185,8 @@ def test_stage_prepare_sessions_omits_jobspy_backed_source_filter():
     assert "jobright" not in script
 
 
-def test_stage_prepare_sessions_keeps_supported_source_filter():
+def test_stage_prepare_sessions_keeps_supported_source_filter(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
     with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
         assert _stage_prepare_sessions("linkedin") is True
 
@@ -191,12 +194,20 @@ def test_stage_prepare_sessions_keeps_supported_source_filter():
     assert "prepare-sessions --source linkedin" in script
 
 
-def test_stage_prepare_sessions_returns_false_on_osascript_failure():
+def test_stage_prepare_sessions_returns_false_on_osascript_failure(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
     with patch(
         "src.session_watchdog.subprocess.run",
         return_value=_fake_run(1, stderr="not authorized"),
     ):
         assert _stage_prepare_sessions("linkedin") is False
+
+
+def test_stage_prepare_sessions_does_not_call_osascript_on_linux(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    with patch("src.session_watchdog.subprocess.run") as mock_run:
+        assert _stage_prepare_sessions("linkedin") is False
+    mock_run.assert_not_called()
 
 
 def test_send_deep_link_notification_includes_novnc_link_when_available(tmp_path):
