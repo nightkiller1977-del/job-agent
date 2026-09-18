@@ -306,6 +306,13 @@ class ExternalApplySession(BaseScraper):
                 recovery_res = self._enforce_authorization(
                     await BrowserUseRecoveryRefactored().apply(ctx), ctx, policy
                 )
+                # Emitted unconditionally — not just on adoption below — so the
+                # structured run log always shows why recovery ended the way it
+                # did, even when its result isn't adopted into `res`.
+                _event(
+                    "recovery_result", AttemptPhase.FIELDS_FILLED,
+                    status=recovery_res.status, submitted=recovery_res.submitted,
+                )
                 # Adopt a verified submit — AND an ambiguous one. unverified() sets
                 # submitted=False, so adopting only on `submitted` silently discarded
                 # a recovery run that clicked submit without receipt confirmation:
@@ -317,6 +324,16 @@ class ExternalApplySession(BaseScraper):
                 # for reconciliation.
                 if recovery_res.submitted or recovery_res.status == "submission_unverified":
                     res = recovery_res
+                else:
+                    # Not adopted (res.status/breaker classification must stay the
+                    # pre-recovery adapter's), but recovery's own failure reason —
+                    # step limit, loop detected, LLM 'fail', disabled — would
+                    # otherwise vanish: every downstream reader (console,
+                    # record_apply_attempt, dashboard) only ever saw the
+                    # pre-recovery adapter's message, with no sign recovery even
+                    # ran. Fall back to the bare status so this still says
+                    # *something* even if a future recovery path leaves detail empty.
+                    res.detail = f"{res.detail} | recovery: {recovery_res.detail or recovery_res.status}"
 
             res.attempt_id = attempt_id
             if marked:

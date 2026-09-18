@@ -352,3 +352,37 @@ async def test_session_clears_marker_on_genuine_pre_submit_failure(tmp_path):
     from src.sources.adapters.idempotency import canonical_key
     fresh = SubmissionLedger(path=tmp_path / "apply_ledger.json")
     assert fresh.record(canonical_key(job)) is None
+
+
+# ─── 6. recovery's own failure reason is never silently discarded ──────────
+
+@pytest.mark.asyncio
+async def test_unadopted_recovery_failure_reason_is_preserved(tmp_path):
+    """A recovery attempt that runs and fails without being adopted (status
+    stays the pre-recovery adapter's, for breaker classification) must still
+    surface *why recovery itself failed* — in res.detail (console/DB/dashboard)
+    and as a structured run_log event — instead of silently reverting to only
+    the pre-recovery adapter's message with no sign recovery ever ran."""
+    s, _Recovery, _Lock = _session(
+        tmp_path, AtsApplyResult.blocked("submit_not_found", "nothing clicked"))
+    job = {"url": "https://jobs.example.com/apply/789", "job_id": "j3"}
+
+    with patch("src.sources.adapters.session.ProfileLock", _Lock), \
+         patch("src.sources.adapters.recovery_browseruse_refactored.BrowserUseRecoveryRefactored", _Recovery):
+        res = await s.apply(job, auto_submit=True)
+
+    # breaker classification is untouched...
+    assert res.status == "submit_not_found"
+    # ...but both failure reasons are now visible in the persisted detail.
+    assert "no submit control found" in res.detail  # pre-recovery adapter
+    assert "nothing clicked" in res.detail            # recovery's own reason
+
+    # and a structured event carries recovery's outcome unconditionally,
+    # independent of whether it was adopted into res.
+    events = [c.args[0] for c in s.run_log.emit.call_args_list]
+    assert "recovery_result" in events
+    result_call = next(
+        c for c in s.run_log.emit.call_args_list if c.args[0] == "recovery_result"
+    )
+    assert result_call.kwargs["status"] == "submit_not_found"
+    assert result_call.kwargs["submitted"] is False
