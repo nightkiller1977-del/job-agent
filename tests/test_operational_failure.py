@@ -6,7 +6,7 @@ import ssl
 import httpx
 import pytest
 
-from src.operational_failure import describe_failure, is_retry_authorized
+from src.operational_failure import describe_failure, describe_http_failure, is_retry_authorized
 
 
 def test_empty_timeout_has_safe_nonblank_record():
@@ -73,6 +73,19 @@ def test_known_transport_failures_are_classified(exc, expected):
 def test_ssl_connect_error_is_not_misclassified_as_generic_connect():
     ssl_connect_error = type("ConnectError", (Exception,), {})("SSL certificate verify failed")
     assert describe_failure("cloud_pull_approved", "dashboard_read", ssl_connect_error)["kind"] == "tls"
+
+
+def test_http_failure_record_is_safe_and_non_retryable():
+    record = describe_http_failure("cloud_action", "dashboard_action", 503)
+
+    assert record == {
+        "operation": "cloud_action",
+        "endpoint_class": "dashboard_action",
+        "kind": "http_status",
+        "message": "http 503",
+        "status_code": 503,
+        "retryable_transport": False,
+    }
 
 
 def test_unknown_operation_is_rejected():

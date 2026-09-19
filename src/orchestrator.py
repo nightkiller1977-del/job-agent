@@ -41,7 +41,7 @@ from .session_watchdog import (
     preflight_session_check_with_reauth,
 )
 from .events import RunLog
-from .operational_failure import describe_failure, is_retry_authorized
+from .operational_failure import describe_failure, describe_http_failure, is_retry_authorized
 
 console = Console()
 _log = logging.getLogger(__name__)
@@ -1651,7 +1651,7 @@ class Orchestrator:
         for attempt in range(max_attempts):
             try:
                 async with httpx.AsyncClient(timeout=15) as client:
-                    return await getattr(client, method)(url, **kwargs)
+                    response = await getattr(client, method)(url, **kwargs)
             except Exception as exc:
                 record = describe_failure(operation, endpoint_class, exc)
                 self.run_log.emit("boundary_failure", **record, attempt=attempt + 1)
@@ -1668,6 +1668,12 @@ class Orchestrator:
                     notify_error(f"Cloud sync failed: {operation}", record["message"])
                     return None
                 await asyncio.sleep(0.1)
+                continue
+            if not response.is_success:
+                record = describe_http_failure(operation, endpoint_class, response.status_code)
+                self.run_log.emit("boundary_failure", **record, attempt=attempt + 1)
+                notify_error(f"Cloud sync failed: {operation}", record["message"])
+            return response
         return None
 
     async def _push_status_to_cloud(self, job_id: str, status: str) -> None:

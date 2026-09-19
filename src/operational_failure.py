@@ -87,6 +87,22 @@ def describe_failure(operation: str, endpoint_class: str, exc: BaseException) ->
     }
 
 
+def describe_http_failure(operation: str, endpoint_class: str, status_code: int) -> dict[str, object]:
+    """Return a safe failure record for a non-success HTTP response."""
+    if operation not in OPERATIONS:
+        raise ValueError(f"unknown operation: {operation}")
+    if endpoint_class not in ENDPOINT_CLASSES:
+        raise ValueError(f"unknown endpoint class: {endpoint_class}")
+    return {
+        "operation": operation,
+        "endpoint_class": endpoint_class,
+        "kind": "http_status",
+        "message": f"http {status_code}",
+        "status_code": int(status_code),
+        "retryable_transport": False,
+    }
+
+
 def is_retry_authorized(
     operation: str,
     *,
