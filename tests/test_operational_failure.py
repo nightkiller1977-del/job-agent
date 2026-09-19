@@ -1,7 +1,9 @@
 """Regression tests for bounded, redacted operational-failure records."""
 
 import socket
+import ssl
 
+import httpx
 import pytest
 
 from src.operational_failure import describe_failure, is_retry_authorized
@@ -31,11 +33,37 @@ def test_nested_cause_redacts_url_query_and_secret():
     assert "secret" not in record["message"].lower()
 
 
+def test_redacts_basic_auth_and_common_secret_assignments():
+    error = RuntimeError(
+        'request failed with Authorization: Basic YWJj, api_key=abc123, '
+        '"access_token": "tok456", and secret_key=secret789'
+    )
+
+    record = describe_failure("cloud_sync_jobs", "dashboard_sync", error)
+
+    message = record["message"]
+    assert "YWJj" not in message
+    assert "abc123" not in message
+    assert "tok456" not in message
+    assert "secret789" not in message
+    assert message.count("[redacted]") >= 4
+
+
+def _connect_error(message: str, *, cause: BaseException | None = None) -> httpx.ConnectError:
+    exc = httpx.ConnectError(message, request=httpx.Request("GET", "https://dashboard.example/api"))
+    if cause is not None:
+        exc.__cause__ = cause
+    return exc
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [
         (socket.gaierror(-3, "name resolution failed"), "dns"),
         (ConnectionRefusedError("refused"), "connect"),
+        (_connect_error("connect failed", cause=socket.gaierror(-3, "name resolution failed")), "dns"),
+        (_connect_error("ssl handshake failed"), "tls"),
+        (_connect_error("connect failed", cause=ssl.SSLError("CERTIFICATE_VERIFY_FAILED")), "tls"),
     ],
 )
 def test_known_transport_failures_are_classified(exc, expected):

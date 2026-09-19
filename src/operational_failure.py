@@ -7,6 +7,7 @@ idempotency and state-transition policy to :func:`is_retry_authorized`.
 from __future__ import annotations
 
 import re
+import ssl
 import socket
 from collections.abc import Iterator
 
@@ -26,8 +27,11 @@ ENDPOINT_CLASSES = frozenset({
 _RETRYABLE_TRANSPORT_KINDS = frozenset({"timeout", "dns", "connect"})
 _MAX_MESSAGE = 300
 _URL = re.compile(r"\bhttps?://[^\s\]\[\"']+", re.IGNORECASE)
-_QUERY = re.compile(r"\b(?:token|secret|key|password|authorization)=[^\s&]+", re.IGNORECASE)
-_BEARER = re.compile(r"\b(?:authorization\s*:\s*)?bearer\s+[^\s,;]+", re.IGNORECASE)
+_QUERY = re.compile(
+    r"(?<!\w)[\"']?(?:[\w.-]*?(?:token|secret|password)[\w.-]*|[\w.-]*[_-]key|key|authorization)[\"']?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;&}\])]+)",
+    re.IGNORECASE,
+)
+_AUTH_HEADER = re.compile(r"\bauthorization\s*:\s*(?:basic|bearer)\s+[^\s,;]+", re.IGNORECASE)
 _SECRET_WORD = re.compile(r"\b[\w.-]*(?:secret|token|password)[\w.-]*\b", re.IGNORECASE)
 
 
@@ -42,16 +46,17 @@ def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
 
 
 def _kind(exc: BaseException) -> str:
+    saw_connect = False
     for item in _exception_chain(exc):
         if isinstance(item, (TimeoutError,)) or item.__class__.__name__ in {"ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout"}:
             return "timeout"
         if isinstance(item, socket.gaierror):
             return "dns"
-        if isinstance(item, (ConnectionError, ConnectionRefusedError)) or item.__class__.__name__ in {"ConnectError", "NetworkError"}:
-            return "connect"
-        if item.__class__.__name__ in {"SSLError", "ConnectError"} and "ssl" in str(item).lower():
+        if isinstance(item, ssl.SSLError) or (item.__class__.__name__ in {"SSLError", "ConnectError"} and "ssl" in str(item).lower()):
             return "tls"
-    return "unknown"
+        if isinstance(item, (ConnectionError, ConnectionRefusedError)) or item.__class__.__name__ in {"ConnectError", "NetworkError"}:
+            saw_connect = True
+    return "connect" if saw_connect else "unknown"
 
 
 def _safe_message(exc: BaseException, kind: str) -> str:
@@ -60,8 +65,8 @@ def _safe_message(exc: BaseException, kind: str) -> str:
         return kind
     message = "; ".join(pieces)
     message = _URL.sub("[redacted-url]", message)
+    message = _AUTH_HEADER.sub("[redacted]", message)
     message = _QUERY.sub("[redacted]", message)
-    message = _BEARER.sub("[redacted]", message)
     message = _SECRET_WORD.sub("[redacted]", message)
     return message[:_MAX_MESSAGE] or kind
 
