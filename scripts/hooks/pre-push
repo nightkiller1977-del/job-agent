@@ -8,7 +8,18 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
 if [ -x "$REPO_ROOT/.venv/bin/pytest" ]; then
-  PYTEST=("$REPO_ROOT/.venv/bin/pytest")
+  PYTEST_PATH="$REPO_ROOT/.venv/bin/pytest"
+else
+  PRIMARY_WORKTREE="$(git worktree list --porcelain | awk '/^worktree / {sub(/^worktree /, ""); print; exit}')"
+  if [ -n "$PRIMARY_WORKTREE" ] && [ -x "$PRIMARY_WORKTREE/.venv/bin/pytest" ]; then
+    PYTEST_PATH="$PRIMARY_WORKTREE/.venv/bin/pytest"
+  else
+    PYTEST_PATH=""
+  fi
+fi
+
+if [ -n "${PYTEST_PATH:-}" ]; then
+  PYTEST=("$PYTEST_PATH")
 else
   PYTEST=(python3 -m pytest)
 fi

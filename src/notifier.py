@@ -80,6 +80,32 @@ def record_notification_dedupe(key: str, *, now: float | None = None) -> None:
     _last_notification_times[cache_key] = timestamp
 
 
+def record_secondary_condition(
+    primary_kind: str,
+    condition_kind: str,
+    operation: str,
+    *,
+    dedupe_key: str,
+    dedupe_seconds: int = 12 * 3600,
+) -> bool:
+    """Persist one bounded secondary condition without replacing the primary failure."""
+    key = f"secondary:{dedupe_key}"
+    if notification_dedupe_active(key, dedupe_seconds):
+        return False
+    status = _load_status()
+    conditions = status.setdefault("secondary_conditions", [])
+    conditions.append({
+        "primary_kind": primary_kind,
+        "kind": condition_kind,
+        "operation": operation,
+        "ts": datetime.utcnow().isoformat(),
+    })
+    status["secondary_conditions"] = conditions[-99:]
+    _save_status(status)
+    record_notification_dedupe(key)
+    return True
+
+
 def _sanitize_notification_text(value: str) -> str:
     text = str(value or "")
     home = str(Path.home())

@@ -55,6 +55,32 @@ CIRCUIT_CAP_FAILURES = 3
 CIRCUIT_OPEN_COOLDOWN_SECONDS = 4 * 60 * 60
 
 
+def classify_session_failure(
+    exc: BaseException,
+    *,
+    notification_error: BaseException | None = None,
+) -> dict[str, object]:
+    """Keep the session outcome primary when reporting itself also fails."""
+    message = str(exc).lower()
+    if "captcha" in message:
+        kind = "captcha"
+    elif "two-factor" in message or "2fa" in message or "verification code" in message:
+        kind = "two_factor_required"
+    elif isinstance(exc, TimeoutError) or "mail" in message and "timeout" in message:
+        kind = "email_code_timeout"
+    elif "credential" in message or "password" in message or "login" in message:
+        kind = "invalid_credentials"
+    else:
+        kind = "browser_failure"
+    secondary: list[dict[str, str]] = []
+    if notification_error is not None:
+        secondary.append({"kind": "notification_unavailable", "operation": "platform_notification"})
+    return {
+        "primary_failure": {"kind": kind, "operation": "session_recovery"},
+        "secondary_conditions": secondary,
+    }
+
+
 def _is_interactive() -> bool:
     """True when attached to a terminal, i.e. a human is present to complete an
     interactive re-login. launchd/cron set stdin to /dev/null → not a TTY.
@@ -266,7 +292,8 @@ class ReauthManager:
                         pass
                 return False
         except Exception as exc:
-            record_reauth_event(source, "automated", "failed", str(exc)[:300])
+            classification = classify_session_failure(exc)
+            record_reauth_event(source, "automated", "failed", classification["primary_failure"]["kind"])
             _log.error("reauth.error source=%s mode=automated error=%s", source, exc)
             if escalate:
                 notify_error(f"{source} automated reauth error", str(exc)[:200])

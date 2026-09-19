@@ -40,6 +40,8 @@ from .session_watchdog import (
     preflight_session_check,
     preflight_session_check_with_reauth,
 )
+from .events import RunLog
+from .operational_failure import describe_failure, describe_http_failure, is_retry_authorized
 
 console = Console()
 _log = logging.getLogger(__name__)
@@ -126,6 +128,7 @@ class Orchestrator:
             pass
         self.config = self._load_config(config_path)
         self.state = StateManager(self.config.get("state_db_path", "state/jobs.db"))
+        self.run_log = RunLog(agent="orchestrator")
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         self.scorer = JobScorer(config=self.config, api_key=api_key)
 
@@ -1594,31 +1597,84 @@ class Orchestrator:
         if not dashboard_url:
             return
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get(
-                    f"{dashboard_url}/api/jobs/approved",
-                    headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
-                )
-                if r.status_code != 200:
-                    console.print(f"[yellow]Cloud pull returned {r.status_code} — skipping.[/yellow]")
-                    return
-                jobs = r.json()
-                if not jobs:
-                    return
-                pulled = 0
-                for job in jobs:
-                    # Insert if new, then always force status to "approved"
-                    # (upsert_job skips existing rows, so set_status does the update)
-                    job["status"] = "approved"
-                    self.state.upsert_job(job)
-                    self.state.set_status(job["job_id"], "approved")
-                    pulled += 1
-                console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")
+            r = await self._cloud_request(
+                "cloud_pull_approved",
+                "dashboard_read",
+                "get",
+                f"{dashboard_url}/api/jobs/approved",
+                headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
+                idempotent=True,
+                state_changing=False,
+            )
+            if r is None:
+                return
+            if r.status_code != 200:
+                console.print(f"[yellow]Cloud pull returned {r.status_code} — skipping.[/yellow]")
+                return
+            jobs = r.json()
+            if not jobs:
+                return
+            pulled = 0
+            for job in jobs:
+                # Insert if new, then always force status to "approved"
+                # (upsert_job skips existing rows, so set_status does the update)
+                job["status"] = "approved"
+                self.state.upsert_job(job)
+                self.state.set_status(job["job_id"], "approved")
+                pulled += 1
+            console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")
         except Exception as e:
             console.print(f"[dim]Cloud pull failed (non-fatal): {e}[/dim]")
             _log.warning("cloud_sync.pull_failed error=%s", e)
             notify_error("Cloud sync failed: _pull_approved_from_cloud", str(e)[:200])
+
+    async def _cloud_request(
+        self,
+        operation: str,
+        endpoint_class: str,
+        method: str,
+        url: str,
+        *,
+        idempotent: bool,
+        state_changing: bool,
+        **kwargs,
+    ):
+        """Perform a cloud request with a policy-controlled transport retry.
+
+        The absence of a response never makes a write safe to repeat.  Only
+        explicit idempotent operation entries can retry, and state actions are
+        always one attempt.
+        """
+        import httpx
+
+        max_attempts = 2
+        for attempt in range(max_attempts):
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    response = await getattr(client, method)(url, **kwargs)
+            except Exception as exc:
+                record = describe_failure(operation, endpoint_class, exc)
+                self.run_log.emit("boundary_failure", **record, attempt=attempt + 1)
+                authorized = record["retryable_transport"] and is_retry_authorized(
+                    operation,
+                    idempotent=idempotent,
+                    state_changing=state_changing,
+                    submission_state=None,
+                    attempts=attempt + 1,
+                    max_attempts=max_attempts,
+                    breaker_allows=True,
+                )
+                if not authorized:
+                    notify_error(f"Cloud sync failed: {operation}", record["message"])
+                    return None
+                await asyncio.sleep(0.1)
+                continue
+            if not response.is_success:
+                record = describe_http_failure(operation, endpoint_class, response.status_code)
+                self.run_log.emit("boundary_failure", **record, attempt=attempt + 1)
+                notify_error(f"Cloud sync failed: {operation}", record["message"])
+            return response
+        return None
 
     async def _push_status_to_cloud(self, job_id: str, status: str) -> None:
         """POST a status update back to the cloud dashboard (non-fatal)."""
@@ -1627,15 +1683,18 @@ class Orchestrator:
         if not dashboard_url:
             return
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.post(
-                    f"{dashboard_url}/api/action",
-                    json={"job_id": job_id, "action": status},
-                    headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
-                )
-                if r.status_code != 200:
-                    console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
+            r = await self._cloud_request(
+                "cloud_action",
+                "dashboard_action",
+                "post",
+                f"{dashboard_url}/api/action",
+                json={"job_id": job_id, "action": status},
+                headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
+                idempotent=False,
+                state_changing=True,
+            )
+            if r is not None and r.status_code != 200:
+                console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
         except Exception as e:
             console.print(f"[dim]Cloud status push failed (non-fatal): {e}[/dim]")
             _log.warning("cloud_sync.push_status_failed error=%s", e)
@@ -1664,17 +1723,24 @@ class Orchestrator:
         if not dashboard_url or not jobs:
             return
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.post(
-                    f"{dashboard_url}/api/sync",
-                    json=jobs,
-                    headers={"X-Sync-Secret": sync_secret},
-                )
-                if r.status_code == 200:
-                    console.print(f"[green]☁ Synced {len(jobs)} jobs to dashboard.[/green]")
-                else:
-                    console.print(f"[yellow]Dashboard sync returned {r.status_code}[/yellow]")
+            r = await self._cloud_request(
+                "cloud_sync_jobs",
+                "dashboard_sync",
+                "post",
+                f"{dashboard_url}/api/sync",
+                json=jobs,
+                headers={"X-Sync-Secret": sync_secret},
+                # The server upserts jobs but also creates an audit event, so
+                # this POST is not safe to repeat without an idempotency key.
+                idempotent=False,
+                state_changing=True,
+            )
+            if r is None:
+                return
+            if r.status_code == 200:
+                console.print(f"[green]☁ Synced {len(jobs)} jobs to dashboard.[/green]")
+            else:
+                console.print(f"[yellow]Dashboard sync returned {r.status_code}[/yellow]")
         except Exception as e:
             console.print(f"[dim]Dashboard sync failed (non-fatal): {e}[/dim]")
 
