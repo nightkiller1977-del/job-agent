@@ -408,6 +408,16 @@ def _stage_prepare_sessions(source: str) -> bool:
     """
     if sys.platform != "darwin":
         _log.info("session_watchdog.stage_terminal_unavailable source=%s platform=%s", source, sys.platform)
+        try:
+            from .notifier import record_secondary_condition
+            record_secondary_condition(
+                "session_recovery_required",
+                "notification_unavailable",
+                "platform_notification",
+                dedupe_key=f"session-stage:{source}",
+            )
+        except Exception:
+            pass
         return False
     cmd, prepare_source = _prepare_sessions_command(source)
     if prepare_source != (source or "").strip().lower():

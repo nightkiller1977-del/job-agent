@@ -177,13 +177,26 @@ def test_stage_prepare_sessions_omits_jobspy_backed_source_filter(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
     with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
         assert _stage_prepare_sessions("glassdoor") is True
-
     script = _osascript_from_run(mock_run)
     assert "prepare-sessions" in script
     assert "--source" not in script
     assert "glassdoor" not in script
     assert "jobright" not in script
 
+
+def test_linux_session_notification_records_deduped_secondary_without_osascript(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+    with patch("src.session_watchdog._novnc_link", return_value=None), patch("src.session_watchdog.subprocess.run") as run:
+        _send_deep_link_notification("linkedin", "session expired")
+        _send_deep_link_notification("linkedin", "session expired")
+
+    assert not run.called
+    status = json.loads((tmp_path / "status.json").read_text())
+    conditions = status["secondary_conditions"]
+    assert len(conditions) == 1
+    assert conditions[0]["primary_kind"] == "session_recovery_required"
+    assert conditions[0]["kind"] == "notification_unavailable"
 
 def test_stage_prepare_sessions_keeps_supported_source_filter(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
