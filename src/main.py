@@ -14,6 +14,7 @@ Usage:
   python src/main.py preflight                 # Check approved queue readiness
   python src/main.py prepare-sessions          # Open blocked portals to refresh login/session cookies
   python src/main.py status                    # Show stats
+  python src/main.py operational-status        # Show timestamped read-only host readiness
   python src/main.py prune                     # Archive jobs older than 30 days (discovered/approved with no apply)
   python src/main.py prune --max-age-days 14   # Use a shorter staleness window
   python src/main.py prune --dry-run           # Preview what would be pruned without changing anything
@@ -742,6 +743,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show session health for all sources (healthy/stale/expired/missing)",
     )
 
+    subparsers.add_parser(
+        "operational-status",
+        help="Show timestamped, read-only host readiness",
+    )
+
     # heartbeat
     heartbeat_p = subparsers.add_parser(
         "heartbeat",
@@ -764,6 +770,11 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.command == "ingest-email":
         from src.ingest_email import run_ingest_email_command_async
         return await run_ingest_email_command_async(args, config=_load_config_from_project())
+
+    if args.command == "operational-status":
+        from src.operational_status import show_operational_status
+        show_operational_status(project_root)
+        return 0
 
     from src.orchestrator import Orchestrator
 

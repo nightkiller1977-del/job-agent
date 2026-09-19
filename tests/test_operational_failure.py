@@ -70,6 +70,11 @@ def test_known_transport_failures_are_classified(exc, expected):
     assert describe_failure("cloud_pull_approved", "dashboard_read", exc)["kind"] == expected
 
 
+def test_ssl_connect_error_is_not_misclassified_as_generic_connect():
+    ssl_connect_error = type("ConnectError", (Exception,), {})("SSL certificate verify failed")
+    assert describe_failure("cloud_pull_approved", "dashboard_read", ssl_connect_error)["kind"] == "tls"
+
+
 def test_unknown_operation_is_rejected():
     with pytest.raises(ValueError, match="operation"):
         describe_failure("https://dashboard.example/api", "dashboard_read", TimeoutError())
