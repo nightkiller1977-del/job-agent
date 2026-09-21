@@ -156,11 +156,18 @@ async def test_registry_path_produces_the_expected_phase_timeline(tmp_path, monk
     attempt_id = next(e["attempt_id"] for e in events if e["event"] == "attempt_started")
     assert all(e["attempt_id"] == attempt_id for e in forensic)
 
+    assert "started" in forensic_phases  # the pre-CTA landing-page snapshot
     assert "form_reached" in forensic_phases
     assert "entry_cta_found" in forensic_phases
     assert "submit_clicked" in forensic_phases
     assert "receipt_verified" in forensic_phases
-    # ENTRY_CTA_FOUND must be observed before SUBMIT_CLICKED/RECEIPT_VERIFIED.
+    # Copilot review (PR #138): ENTRY_CTA_FOUND must be observed before
+    # FORM_REACHED too, not just before SUBMIT_CLICKED/RECEIPT_VERIFIED — the
+    # confirmed-form probe now lives in GenericAtsAdapter.apply(), reached
+    # only via CtaApplyAdapter's super().apply(ctx) AFTER its CTA click
+    # confirms a form, so it can no longer race ahead of ENTRY_CTA_FOUND like
+    # the old pre-CTA landing-page probe (now tagged STARTED, not FORM_REACHED).
+    assert forensic_phases.index("entry_cta_found") < forensic_phases.index("form_reached")
     assert forensic_phases.index("entry_cta_found") < forensic_phases.index("submit_clicked")
     assert forensic_phases.index("submit_clicked") < forensic_phases.index("receipt_verified")
 
@@ -205,10 +212,12 @@ async def test_submit_control_absent_records_form_reached_not_submit_clicked(tmp
     forensic = [e for e in events if e["event"] == "forensic_phase"]
     forensic_phases = {e["phase"] for e in forensic}
     assert "submit_clicked" not in forensic_phases
-    # Two "form_reached"-phase events legitimately exist here: session.py's
-    # rich-evidence probe right after navigation (no failure_reason_code —
-    # nothing failed yet at that point) and generic.py's "submit control was
-    # never found" evidence (which does carry it). Match the latter.
+    # Two "form_reached"-phase events legitimately exist here: the confirmed-
+    # form probe at the top of GenericAtsAdapter.apply() (no failure_reason_code
+    # — nothing failed yet at that point) and _gated_submit's "submit control
+    # was never found" evidence (which does carry it). Match the latter. (The
+    # pre-CTA landing-page probe in session.py is tagged "started", not
+    # "form_reached" — see the ordering fix in test_registry_path_produces_...)
     absent_evt = next(e for e in forensic if e["phase"] == "form_reached"
                       and e.get("failure_reason_code") == "submit_not_found")
     assert absent_evt["submit_control_present"] is False

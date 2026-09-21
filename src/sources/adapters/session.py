@@ -301,13 +301,24 @@ class ExternalApplySession(BaseScraper):
             # phase event above — never gates or alters what happens next.
             # Best-effort: any probe/sanitize failure degrades to
             # capture_incomplete rather than raising into the apply flow.
+            #
+            # Copilot review (PR #138): this fires right after the FIRST goto,
+            # before the adapter has even been picked — for a CTA vendor
+            # (Microsoft/BrassRing/SmartRecruiters/Teamtailor) that is the job
+            # LISTING page, not the form, so tagging it "form_reached" put a
+            # form_present=False reading before ENTRY_CTA_FOUND in the
+            # timeline despite ranking after it. Tag it STARTED — a landing
+            # snapshot, valuable for catching a bot/login wall immediately —
+            # and let GenericAtsAdapter.apply() emit the real, confirmed
+            # FORM_REACHED once a form is actually present (see forensics
+            # probe call at the top of that method).
             try:
                 if self.run_log is not None:
                     _page_url = getattr(page, "url", "") or external_url
                     _evidence = await forensics.probe_page_evidence(page)
                     forensics.emit_forensic_phase(
                         self.run_log, attempt_id=attempt_id, job_id=job_id,
-                        phase=AttemptPhase.FORM_REACHED.value,
+                        phase=AttemptPhase.STARTED.value,
                         source=str(job.get("source") or ""), vendor=vendor,
                         host=_host(_page_url),
                         path_class=forensics.path_class_of(_page_url),

@@ -126,6 +126,20 @@ class GenericAtsAdapter(AtsAdapter):
         if ctx.resume_path:
             ev.with_resume(ctx.resume_path)
 
+        # ACES-399 (Copilot review, PR #138): the CONFIRMED-form rich-evidence
+        # probe. apply() is only reached once a form actually exists — directly
+        # for non-CTA vendors, or via CtaApplyAdapter.apply()'s super().apply(ctx)
+        # call AFTER its own CTA click confirms one — so this always fires after
+        # ENTRY_CTA_FOUND for CTA vendors, never before. Best-effort: never
+        # raises, never gates what happens next (see forensics.probe_page_evidence
+        # / _emit_forensic's own no-op-on-None-run_log guard).
+        if getattr(ctx, "run_log", None) is not None:
+            try:
+                probe = await forensics.probe_page_evidence(page)
+                self._emit_forensic(ctx, AttemptPhase.FORM_REACHED, vendor, **probe)
+            except Exception:
+                pass
+
         # 1. Blocker detection up front — never burn a submit on a login/captcha wall.
         blocker = await self._detect_blocker(page)
         if blocker:
