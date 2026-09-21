@@ -113,6 +113,68 @@ def test_is_timeout_error_false_for_unrelated_error():
 
 
 # --------------------------------------------------------------------------- #
+# test_domain_with_engine — the Playwright/Patchright baseline leg
+# --------------------------------------------------------------------------- #
+
+class _FakeEnginePage:
+    async def goto(self, url, timeout=None, wait_until=None):
+        return _FakeResp(200)
+
+    async def title(self):
+        return "Acme Careers"
+
+    def locator(self, sel):
+        return self
+
+    async def inner_text(self):
+        return "Welcome to Acme"
+
+    async def evaluate(self, script):
+        if "captcha" in script:
+            return False
+        return None  # navigator.webdriver
+
+
+class _FakeEngineContext:
+    async def new_page(self):
+        return _FakeEnginePage()
+
+
+class _BoomOnCloseBrowser:
+    async def new_context(self, **kwargs):
+        return _FakeEngineContext()
+
+    async def close(self):
+        raise RuntimeError("browser process crashed during shutdown")
+
+
+class _FakeEngineChromium:
+    def __init__(self, browser):
+        self._browser = browser
+
+    async def launch(self, headless=True):
+        return self._browser
+
+
+class _FakeEnginePlaywright:
+    def __init__(self, browser):
+        self.chromium = _FakeEngineChromium(browser)
+
+
+@pytest.mark.asyncio
+async def test_engine_leg_resets_success_when_cleanup_fails_after_a_good_probe():
+    """Copilot review, PR #140: browser.close() raising AFTER a successful
+    probe must not leave success=True alongside outcome="error"/"timeout" —
+    run_benchmark()'s win/loss comparison only checks the success flag."""
+    p = _FakeEnginePlaywright(_BoomOnCloseBrowser())
+
+    result = await spike.test_domain_with_engine(p, "playwright", "https://example.com")
+
+    assert result["outcome"] in ("error", "timeout")
+    assert result["success"] is False
+
+
+# --------------------------------------------------------------------------- #
 # test_domain_with_cdp — graceful degradation + the anti-sabotage guardrail
 # --------------------------------------------------------------------------- #
 
@@ -316,6 +378,33 @@ async def test_cdp_post_connect_failure_is_not_misclassified_as_unavailable(monk
 
     assert result["outcome"] != "unavailable"
     assert result["outcome"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_cdp_resets_success_when_created_context_cleanup_fails(monkeypatch):
+    """Copilot review, PR #140: same success/outcome inconsistency as the
+    engine-leg test above, but for the CDP leg's own created-context cleanup
+    (context.close() in the finally, only reached when this function had to
+    create a fallback context — see test_cdp_closes_a_context_it_had_to_create...)."""
+    class _BoomOnCloseContext(_FakeCDPContext):
+        async def close(self):
+            raise RuntimeError("context already closed")
+
+    browser = _FakeCDPBrowser(existing_contexts=[])  # forces the new_context() fallback
+
+    async def _new_context(**kwargs):
+        browser.new_context_calls.append(kwargs)
+        ctx = _BoomOnCloseContext()
+        browser.created_contexts.append(ctx)
+        return ctx
+
+    browser.new_context = _new_context
+    monkeypatch.setattr(spike, "playwright_async", lambda: _connectable_cdp_ctx(browser))
+
+    result = await spike.test_domain_with_cdp("http://localhost:9222", "https://example.com")
+
+    assert result["outcome"] in ("error", "timeout")
+    assert result["success"] is False
 
 
 # --------------------------------------------------------------------------- #

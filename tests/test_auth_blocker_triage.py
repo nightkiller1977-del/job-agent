@@ -117,14 +117,42 @@ def test_auth_blocked_jobs_covers_every_status_blocker_classifier_maps_to_auth_r
 # --------------------------------------------------------------------------- #
 
 def test_blocker_url_prefers_recorded_ats_url_over_discovery_source():
-    job = {"url": "https://linkedin.com/jobs/view/123",
+    job = {"url": "https://linkedin.com/jobs/view/123", "source": "linkedin",
+           "apply_last_status": "workday_session_expired",  # portal-owned
            "ats_url": "https://acme.wd1.myworkdayjobs.com/en-US/careers/job/456"}
     assert triage.blocker_url(job) == job["ats_url"]
 
 
 def test_blocker_url_falls_back_to_source_url_when_no_ats_url_recorded():
-    job = {"url": "https://boards.greenhouse.io/acme/jobs/1", "ats_url": ""}
+    job = {"url": "https://boards.greenhouse.io/acme/jobs/1", "source": "greenhouse",
+           "apply_last_status": "workday_session_expired", "ats_url": ""}
     assert triage.blocker_url(job) == job["url"]
+
+
+def test_blocker_url_ignores_stale_ats_url_for_a_source_owned_status():
+    """Copilot review, PR #140: record_apply_attempt() merges extra_json
+    without clearing older fields, so ats_url from an EARLIER, unrelated
+    external-ATS attempt can still be sitting there when the CURRENT
+    apply_last_status is a source-owned status (the discovery source's own
+    session, not any ATS portal). Must use job.url, not the stale ats_url."""
+    job = {"url": "https://www.linkedin.com/jobs/view/123", "source": "linkedin",
+           "apply_last_status": "needs_session_prep",  # source-owned (any source)
+           "ats_url": "https://acme.wd1.myworkdayjobs.com/en-US/careers/job/456"}
+    assert triage.blocker_url(job) == job["url"]
+
+
+def test_blocker_url_ignores_stale_ats_url_for_a_per_source_owned_status():
+    job = {"url": "https://www.linkedin.com/jobs/view/123", "source": "linkedin",
+           "apply_last_status": "linkedin_authwall",  # source-owned (linkedin-specific)
+           "ats_url": "https://acme.wd1.myworkdayjobs.com/en-US/careers/job/456"}
+    assert triage.blocker_url(job) == job["url"]
+
+
+def test_blocker_url_still_prefers_ats_url_for_a_portal_owned_status():
+    job = {"url": "https://www.usajobs.gov/job/123", "source": "usajobs",
+           "apply_last_status": "brassring_login_required",  # portal-owned
+           "ats_url": "https://careers.example.brassring.com/job/456"}
+    assert triage.blocker_url(job) == job["ats_url"]
 
 
 # --------------------------------------------------------------------------- #

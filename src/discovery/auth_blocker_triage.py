@@ -150,11 +150,39 @@ def auth_blocked_jobs(jobs: List[dict]) -> List[dict]:
     return [j for j in jobs if classify(j.get("apply_last_status")) is BlockerClass.AUTH_REQUIRED]
 
 
+# Statuses meaning "the discovery source's OWN login session was the blocker"
+# — mirrors src/orchestrator.py's _OWN_SESSION_STATUSES_ANY / _OWN_SESSION_STATUSES
+# (duplicated, not imported: orchestrator.py is the live pipeline's entry
+# point — heavy to pull into a read-only diagnostic tool, same reasoning as
+# _PROBE_JS above). External-ATS walls (workday_session_expired,
+# brassring_login_required, ...) are deliberately NOT here — a discovery
+# source's own re-auth never clears those (orchestrator.py's own comment).
+_SOURCE_OWNED_STATUSES_ANY = {"reauth_failed", "needs_session_prep"}
+_SOURCE_OWNED_STATUSES_BY_SOURCE = {
+    "linkedin": {"linkedin_authwall", "linkedin_login_required"},
+    "usajobs": {"usajobs_login_required"},
+}
+
+
 def blocker_url(job: dict) -> str:
-    """The URL where the recorded blocker actually occurred: the resolved
-    external ATS portal for LinkedIn/Indeed-origin jobs routed elsewhere
-    (extra_json.ats_url), falling back to the discovery-source URL for
-    source-owned auth statuses that never left it."""
+    """The URL where the recorded blocker actually occurred.
+
+    Copilot review (PR #140): extra_json.ats_url can be stale — record_apply_attempt()
+    (state_manager.py) merges new metadata into extra_json without clearing
+    older fields, so an ats_url from an earlier, unrelated external-ATS
+    attempt can still be sitting there when the CURRENT apply_last_status is
+    actually a source-owned status (the discovery source's own session, not
+    any ATS portal). Only prefer ats_url for portal-owned statuses; a
+    source-owned status always uses job.url.
+    """
+    status = job.get("apply_last_status") or ""
+    source = job.get("source") or ""
+    is_source_owned = (
+        status in _SOURCE_OWNED_STATUSES_ANY
+        or status in _SOURCE_OWNED_STATUSES_BY_SOURCE.get(source, set())
+    )
+    if is_source_owned:
+        return str(job.get("url") or "")
     return external_ats_url(job) or str(job.get("url") or "")
 
 

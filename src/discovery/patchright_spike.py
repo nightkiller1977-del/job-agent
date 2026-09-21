@@ -16,9 +16,11 @@ JS-layer stealth patches (playwright-stealth) and a fixed User-Agent both
 undo Fortress's kernel-level fingerprint patches — an engine "sabotaged on
 day one" if either leaks into its context. So the CDP leg here:
   - never sets `user_agent=` on a context (Fortress owns that persona);
-  - never calls `browser.new_context()` — it reuses the container's own
-    default context (`browser.contexts[0]`), matching the connect_over_cdp
-    guidance in Playwright's own docs, not a fresh incognito one;
+  - never calls `browser.new_context()` when the container already has a
+    default context (`browser.contexts[0]`) — reuses that instead of a
+    fresh incognito one, matching the connect_over_cdp guidance in
+    Playwright's own docs. Only creates (and then closes) a fallback
+    context on the rare occasion Fortress has none yet;
   - never calls `browser.close()` — a CDP-connected browser is a
     long-lived, externally-owned container, not a process this script
     launched (closing it would kill Fortress for anyone else using it).
@@ -178,7 +180,13 @@ async def test_domain_with_engine(playwright_engine, engine_name: str, url: str)
         finally:
             await browser.close()
     except Exception as e:
+        # Copilot review, PR #140: a browser.close() failure AFTER a
+        # successful probe must not leave success=True alongside
+        # outcome="error" — run_benchmark()'s win/loss comparison only
+        # checks success, so an inconsistent pair would still count a
+        # cleanup crash as a valid result.
         result["outcome"] = "timeout" if _is_timeout_error(e) else "error"
+        result["success"] = False
         result["error"] = str(e)
 
     return result
@@ -258,6 +266,7 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
         # comparison. Only stays "unavailable" when we never connected at all.
         if connected:
             result["outcome"] = "timeout" if _is_timeout_error(e) else "error"
+            result["success"] = False
         result["error"] = _redact_error(e, cdp_url)
 
     return result
