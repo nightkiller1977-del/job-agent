@@ -150,22 +150,29 @@ class _FakeCDPPage:
 class _FakeCDPContext:
     def __init__(self):
         self.pages_created = []
+        self.closed = False
 
     async def new_page(self):
         p = _FakeCDPPage()
         self.pages_created.append(p)
         return p
 
+    async def close(self):
+        self.closed = True
+
 
 class _FakeCDPBrowser:
     def __init__(self, existing_contexts):
         self.contexts = existing_contexts
         self.new_context_calls = []
+        self.created_contexts = []
         self.close_called = False
 
     async def new_context(self, **kwargs):
         self.new_context_calls.append(kwargs)
-        return _FakeCDPContext()
+        ctx = _FakeCDPContext()
+        self.created_contexts.append(ctx)
+        return ctx
 
     async def close(self):
         self.close_called = True
@@ -198,6 +205,7 @@ async def test_cdp_reuses_default_context_not_a_fresh_one(monkeypatch):
     assert result["outcome"] == "ok"
     assert browser.new_context_calls == []  # never called — reused contexts[0]
     assert len(default_ctx.pages_created) == 1
+    assert default_ctx.closed is False  # never ours to close
 
 
 @pytest.mark.asyncio
@@ -211,6 +219,23 @@ async def test_cdp_never_sets_user_agent_when_it_must_create_a_context(monkeypat
     assert result["outcome"] == "ok"
     assert len(browser.new_context_calls) == 1
     assert "user_agent" not in browser.new_context_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_cdp_closes_a_context_it_had_to_create_but_not_a_reused_one(monkeypatch):
+    """Copilot review (PR #140): this function reconnects once per domain, so
+    a harness-created fallback context left open on every run accumulates in
+    a long-lived Fortress container. It must be closed — but only when WE
+    created it; a reused default context (see the sibling test above) must
+    be left alone."""
+    browser = _FakeCDPBrowser(existing_contexts=[])  # forces the new_context() fallback
+
+    monkeypatch.setattr(spike, "playwright_async", lambda: _connectable_cdp_ctx(browser))
+
+    await spike.test_domain_with_cdp("http://localhost:9222", "https://example.com")
+
+    assert len(browser.created_contexts) == 1
+    assert browser.created_contexts[0].closed is True
 
 
 @pytest.mark.asyncio
@@ -282,3 +307,49 @@ async def test_run_benchmark_gate_fails_and_flags_unavailable_when_fortress_neve
 
     assert report["gate_passed"] is False
     assert report["fortress_unavailable"] is True
+
+
+# --------------------------------------------------------------------------- #
+# _redact_cdp_url — never persist credentials from FORTRESS_CDP_URL
+# --------------------------------------------------------------------------- #
+
+def test_redact_cdp_url_strips_userinfo():
+    assert spike._redact_cdp_url("http://user:secrettoken@remote-fortress:9222") == \
+        "http://remote-fortress:9222"
+
+
+def test_redact_cdp_url_strips_query_string_tokens():
+    assert spike._redact_cdp_url("http://remote-fortress:9222?token=abc123") == \
+        "http://remote-fortress:9222"
+
+
+def test_redact_cdp_url_keeps_scheme_host_port_for_plain_localhost():
+    assert spike._redact_cdp_url("http://localhost:9222") == "http://localhost:9222"
+
+
+def test_redact_cdp_url_never_raises_on_garbage_input():
+    assert spike._redact_cdp_url("not a url at all") != None  # noqa: E711 - just must not raise
+
+
+@pytest.mark.asyncio
+async def test_run_benchmark_never_persists_the_raw_cdp_url(monkeypatch, tmp_path):
+    monkeypatch.setattr(spike, "TEST_DOMAINS", ["https://a.example.com"])
+    monkeypatch.setattr(spike, "RESULTS_DIR", tmp_path)
+
+    async def _fake_engine(playwright_engine, engine_name, url):
+        return {"engine": engine_name, "outcome": "ok", "success": True,
+                "title": "A", "webdriver_val": None, "error": None}
+
+    async def _fake_cdp(cdp_url, url):
+        return {"engine": "fortress-cdp", "outcome": "unavailable", "success": False,
+                "title": "", "webdriver_val": None, "error": "cdp_connect_failed"}
+
+    monkeypatch.setattr(spike, "test_domain_with_engine", _fake_engine)
+    monkeypatch.setattr(spike, "test_domain_with_cdp", _fake_cdp)
+
+    secret_url = "http://user:supersecret@remote-fortress:9222"
+    report = await spike.run_benchmark(fortress_cdp_url=secret_url)
+
+    assert "supersecret" not in json.dumps(report)
+    out_file = tmp_path / "aces-402-engine-benchmark-results.json"
+    assert "supersecret" not in out_file.read_text()

@@ -99,6 +99,26 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timeout" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
 
 
+def _redact_cdp_url(url: str) -> str:
+    """scheme://host:port only — never userinfo, path, query, or fragment.
+
+    Codex review (PR #140): a remote/authenticated Fortress endpoint can put
+    credentials (userinfo, or a bearer token in the query string) in
+    FORTRESS_CDP_URL. The full value is needed to actually connect, but the
+    persisted docs/benchmarks/ JSON artifact is meant to be a diffable,
+    shareable regression record — it must never carry that secret. Use the
+    full url to connect; use this redacted form only in anything written to
+    disk."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return f"{parsed.scheme}://{netloc}" if parsed.scheme else netloc
+    except Exception:
+        return "<redacted>"
+
+
 async def test_domain_with_engine(playwright_engine, engine_name: str, url: str) -> Dict[str, Any]:
     """Navigates to a URL with the given browser engine and returns detection and loading stats."""
     result: Dict[str, Any] = {
@@ -166,10 +186,17 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
                 result["error"] = f"cdp_connect_failed: {type(e).__name__}: {e}"
                 return result
 
+            # Guardrail: reuse Fortress's own default context — never a fresh
+            # new_context(), and never a user_agent override here. Only when
+            # the container has no default context yet do we create one —
+            # and then WE own it: it must be closed (Copilot review, PR #140:
+            # this function reconnects once per domain, so leaving a
+            # harness-created context open on every run accumulates them in
+            # a long-lived container). The pre-existing default context, and
+            # the browser/container itself, are never ours to close.
+            created_context = not browser.contexts
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
             try:
-                # Guardrail: reuse Fortress's own default context — never a
-                # fresh new_context(), and never a user_agent override here.
-                context = browser.contexts[0] if browser.contexts else await browser.new_context()
                 page = await context.new_page()
                 try:
                     resp = await page.goto(url, timeout=25000, wait_until="domcontentloaded")
@@ -189,9 +216,10 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
                 finally:
                     await page.close()
             finally:
+                if created_context:
+                    await context.close()
                 # Deliberately NOT browser.close() — Fortress is a long-lived,
                 # externally-owned container, not a process we launched.
-                pass
     except Exception as e:
         result["error"] = str(e)
 
@@ -233,7 +261,7 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
         async with patchright_async() as p_patch:
             patch_res = await test_domain_with_engine(p_patch, "patchright", url)
 
-        print(f" -> Testing with Fortress-CDP ({cdp_url})...")
+        print(f" -> Testing with Fortress-CDP ({_redact_cdp_url(cdp_url)})...")
         fortress_res = await test_domain_with_cdp(cdp_url, url)
 
         results[domain] = {
@@ -273,7 +301,7 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
     print("-" * 100)
     if fortress_unavailable:
         print("Fortress-CDP container was not reachable for at least one domain "
-              f"(tried {cdp_url}) — gate cannot be fully evaluated this run.")
+              f"(tried {_redact_cdp_url(cdp_url)}) — gate cannot be fully evaluated this run.")
     print(f"Fortress-CDP wins over Patchright: {fortress_wins} | "
           f"Patchright wins over Fortress-CDP: {patchright_wins} | Ties: {other_ties}")
     gate_passed = fortress_wins > 0
@@ -283,7 +311,7 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
 
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "fortress_cdp_url": cdp_url,
+        "fortress_cdp_url": _redact_cdp_url(cdp_url),
         "fortress_unavailable": fortress_unavailable,
         "gate_passed": gate_passed,
         "fortress_wins": fortress_wins,
