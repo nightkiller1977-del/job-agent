@@ -58,6 +58,28 @@ async def test_classify_outcome_detects_waf_403():
 
 
 @pytest.mark.asyncio
+async def test_classify_outcome_403_wins_over_overlapping_blocked_text():
+    """Copilot review, PR #140: a real WAF 403 commonly says "Access Denied"
+    or mentions Cloudflare in its own body — exactly the words the captcha
+    text heuristic matches. Checking text before status meant every real 403
+    got mislabeled "captcha" and waf_403 never fired. Status must win."""
+    out = await spike.classify_outcome(
+        _FakePage(), "Access Denied - Cloudflare", "403 Forbidden", _FakeResp(403)
+    )
+    assert out == "waf_403"
+
+
+@pytest.mark.asyncio
+async def test_classify_outcome_captcha_iframe_still_wins_over_403():
+    # An actual captcha iframe is unambiguous — still highest precedence
+    # even on a 403 response.
+    out = await spike.classify_outcome(
+        _FakePage(has_captcha_iframe=True), "", "", _FakeResp(403)
+    )
+    assert out == "captcha"
+
+
+@pytest.mark.asyncio
 async def test_classify_outcome_ok_when_nothing_matches():
     out = await spike.classify_outcome(_FakePage(), "Welcome to Acme Careers", "Acme Careers",
                                        _FakeResp(200))
@@ -120,6 +142,33 @@ async def test_cdp_degrades_gracefully_when_container_not_running(monkeypatch):
     assert result["outcome"] == "unavailable"
     assert result["success"] is False
     assert "cdp_connect_failed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_cdp_connect_failure_redacts_credentials_from_the_error_message(monkeypatch):
+    """Codex review, PR #140: connect_over_cdp's own exception can echo the
+    full endpoint it tried to reach — including any userinfo/token in
+    FORTRESS_CDP_URL. _redact_cdp_url() alone doesn't protect this string."""
+    secret_cdp_url = "http://user:supersecret@remote-fortress:9222"
+
+    class _LeakyFailingPlaywright:
+        class chromium:
+            @staticmethod
+            async def connect_over_cdp(url, timeout=5000):
+                raise ConnectionRefusedError(f"Cannot connect to {url}")
+
+    class _LeakyCtx:
+        async def __aenter__(self):
+            return _LeakyFailingPlaywright()
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(spike, "playwright_async", lambda: _LeakyCtx())
+
+    result = await spike.test_domain_with_cdp(secret_cdp_url, "https://example.com")
+
+    assert "supersecret" not in result["error"]
 
 
 class _FakeCDPPage:
@@ -249,6 +298,26 @@ async def test_cdp_never_closes_the_externally_owned_browser(monkeypatch):
     assert browser.close_called is False
 
 
+@pytest.mark.asyncio
+async def test_cdp_post_connect_failure_is_not_misclassified_as_unavailable(monkeypatch):
+    """Copilot review, PR #140: a failure AFTER a successful CDP connect
+    (context/page creation, cleanup) is a real engine error, not "the
+    container isn't running" — result["outcome"] must not silently stay at
+    its "unavailable" default, or run_benchmark() hides a genuine crash
+    behind the same label as a container that was never up."""
+    class _BoomOnNewPageContext(_FakeCDPContext):
+        async def new_page(self):
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    browser = _FakeCDPBrowser(existing_contexts=[_BoomOnNewPageContext()])
+    monkeypatch.setattr(spike, "playwright_async", lambda: _connectable_cdp_ctx(browser))
+
+    result = await spike.test_domain_with_cdp("http://localhost:9222", "https://example.com")
+
+    assert result["outcome"] != "unavailable"
+    assert result["outcome"] == "error"
+
+
 # --------------------------------------------------------------------------- #
 # run_benchmark — gate logic + JSON artifact
 # --------------------------------------------------------------------------- #
@@ -329,6 +398,31 @@ def test_redact_cdp_url_keeps_scheme_host_port_for_plain_localhost():
 
 def test_redact_cdp_url_never_raises_on_garbage_input():
     assert spike._redact_cdp_url("not a url at all") != None  # noqa: E711 - just must not raise
+
+
+# --------------------------------------------------------------------------- #
+# _redact_error — scrub credentials out of an exception message too, not
+# just the top-level fortress_cdp_url field (Codex review, PR #140)
+# --------------------------------------------------------------------------- #
+
+def test_redact_error_strips_the_exact_cdp_url_when_echoed_verbatim():
+    cdp_url = "http://user:supersecret@remote-fortress:9222"
+    exc = ConnectionRefusedError(f"Cannot connect to {cdp_url}")
+    out = spike._redact_error(exc, cdp_url)
+    assert "supersecret" not in out
+    assert "remote-fortress:9222" in out  # host still useful for debugging
+
+
+def test_redact_error_strips_userinfo_even_in_a_differently_formatted_message():
+    exc = RuntimeError("connection failed: scheme://admin:hunter2@somehost/path")
+    out = spike._redact_error(exc, "http://different-url:9222")
+    assert "hunter2" not in out
+    assert "admin" not in out
+
+
+def test_redact_error_leaves_a_plain_message_unchanged():
+    exc = RuntimeError("plain timeout, nothing sensitive here")
+    assert spike._redact_error(exc, "http://localhost:9222") == str(exc)
 
 
 @pytest.mark.asyncio

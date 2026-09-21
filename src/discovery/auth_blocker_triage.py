@@ -81,9 +81,15 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent.parent / "docs" / "benchmar
 # beyond the one pure URL-resolution helper above), not import from it.
 _PROBE_JS = r"""() => {
     const password = !!document.querySelector('input[type="password"]');
-    const challenge = !!document.querySelector(
+    const challengeFrame = !!document.querySelector(
         'iframe[src*="captcha" i], iframe[src*="recaptcha" i], iframe[src*="turnstile" i]');
-    return { password, challenge };
+    // Copilot review, PR #140: an iframe-only check misses a text-only
+    // JS challenge (e.g. some Cloudflare "checking your browser"
+    // interstitials render no iframe at all) — same signal generic.py's
+    // _detect_blocker and patchright_spike.py's classify_outcome both check.
+    const bodyText = (document.body && document.body.innerText || '').toLowerCase();
+    const challengeText = /attention required|access denied|security check|please confirm you are human|checking your browser|verify you are human|verify your connection|cloudflare/.test(bodyText);
+    return { password, challenge: challengeFrame || challengeText };
 }"""
 
 CLASSIFICATIONS = ("login_wall", "bot_interstitial", "no_wall_detected", "posting_expired", "error")

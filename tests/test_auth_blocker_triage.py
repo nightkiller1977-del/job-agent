@@ -16,6 +16,21 @@ from src.blocker_classifier import BlockerClass, _STATUS_TO_CLASS
 
 
 # --------------------------------------------------------------------------- #
+# _PROBE_JS — regression guard for the text-based challenge signal
+# --------------------------------------------------------------------------- #
+
+def test_probe_js_checks_challenge_text_not_just_an_iframe():
+    """Copilot review, PR #140: an iframe-only check misses a text-only JS
+    challenge (some Cloudflare "checking your browser" interstitials render
+    no iframe at all). This can't be exercised through classify_one's Python
+    fakes (the OR-ing happens inside the browser evaluate() call) — guard
+    against silently reverting to iframe-only by asserting the same keyword
+    set generic.py's _detect_blocker checks is still present in the probe."""
+    for keyword in ("checking your browser", "verify you are human", "cloudflare"):
+        assert keyword in triage._PROBE_JS.lower()
+
+
+# --------------------------------------------------------------------------- #
 # read_jobs_with_apply_status — genuinely read-only DB access
 # --------------------------------------------------------------------------- #
 

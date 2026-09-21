@@ -82,16 +82,27 @@ OUTCOMES = ("ok", "captcha", "waf_403", "timeout", "error")
 
 
 async def classify_outcome(page, body_text: str, title: str, resp: Any) -> str:
-    """Return one of OUTCOMES for a page that loaded without raising."""
+    """Return one of OUTCOMES for a page that loaded without raising.
+
+    Order matters (Copilot review, PR #140): a WAF 403 page commonly says
+    "Access Denied" or mentions Cloudflare in its own body text — the exact
+    words _BLOCKED_TEXT_RE matches for a captcha/JS-challenge page. Checking
+    text before status meant every real 403 got mislabeled "captcha" and the
+    waf_403 category never fired. Precedence now: an actual captcha iframe
+    (unambiguous) > HTTP 403 (unambiguous WAF signal) > blocked-text heuristic
+    (catches a text-only JS challenge that returns 200, e.g. some Cloudflare
+    "checking your browser" interstitials)."""
     try:
         has_captcha_iframe = await page.evaluate(_CAPTCHA_IFRAME_JS)
     except Exception:
         has_captcha_iframe = False
-    if has_captcha_iframe or _BLOCKED_TEXT_RE.search(f"{body_text} {title}"):
+    if has_captcha_iframe:
         return "captcha"
     status = getattr(resp, "status", None)
     if status == 403:
         return "waf_403"
+    if _BLOCKED_TEXT_RE.search(f"{body_text} {title}"):
+        return "captcha"
     return "ok"
 
 
@@ -117,6 +128,18 @@ def _redact_cdp_url(url: str) -> str:
         return f"{parsed.scheme}://{netloc}" if parsed.scheme else netloc
     except Exception:
         return "<redacted>"
+
+
+def _redact_error(exc: Exception, cdp_url: str) -> str:
+    """str(exc) with any trace of cdp_url's credentials scrubbed. A connect/
+    transport exception can legitimately embed the full endpoint it was
+    trying to reach — redact the exact URL if present, then defensively
+    strip any scheme://user:pass@ pattern that might appear in a differently
+    -formatted message (Copilot review, PR #140)."""
+    msg = str(exc)
+    if cdp_url and cdp_url in msg:
+        msg = msg.replace(cdp_url, _redact_cdp_url(cdp_url))
+    return re.sub(r'://[^/@\s]+@', '://', msg)
 
 
 async def test_domain_with_engine(playwright_engine, engine_name: str, url: str) -> Dict[str, Any]:
@@ -177,14 +200,20 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
         "title": "",
         "error": None,
     }
+    connected = False
 
     try:
         async with playwright_async() as p:
             try:
                 browser = await p.chromium.connect_over_cdp(cdp_url, timeout=5000)
             except Exception as e:
-                result["error"] = f"cdp_connect_failed: {type(e).__name__}: {e}"
+                # Copilot review, PR #140: a connect failure's own exception
+                # message can echo the endpoint (host, and any userinfo/token
+                # in it) — _redact_cdp_url() only protects the top-level
+                # fortress_cdp_url field, not this string. Scrub it too.
+                result["error"] = f"cdp_connect_failed: {type(e).__name__}: {_redact_error(e, cdp_url)}"
                 return result
+            connected = True
 
             # Guardrail: reuse Fortress's own default context — never a fresh
             # new_context(), and never a user_agent override here. Only when
@@ -212,7 +241,7 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
                     result["success"] = result["outcome"] == "ok"
                 except Exception as e:
                     result["outcome"] = "timeout" if _is_timeout_error(e) else "error"
-                    result["error"] = str(e)
+                    result["error"] = _redact_error(e, cdp_url)
                 finally:
                     await page.close()
             finally:
@@ -221,7 +250,15 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
                 # Deliberately NOT browser.close() — Fortress is a long-lived,
                 # externally-owned container, not a process we launched.
     except Exception as e:
-        result["error"] = str(e)
+        # Copilot review, PR #140: this branch also catches failures AFTER a
+        # successful CDP connect (context/page creation, cleanup) — those are
+        # real engine errors, not "the container isn't running". Leaving
+        # outcome at its "unavailable" default made run_benchmark() report a
+        # genuine crash as a missing container and silently skip it from the
+        # comparison. Only stays "unavailable" when we never connected at all.
+        if connected:
+            result["outcome"] = "timeout" if _is_timeout_error(e) else "error"
+        result["error"] = _redact_error(e, cdp_url)
 
     return result
 
