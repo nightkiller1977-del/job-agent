@@ -44,6 +44,8 @@ from typing import Any, Dict, Optional
 from playwright.async_api import async_playwright as playwright_async
 from patchright.async_api import async_playwright as patchright_async
 
+from ..challenge_detect import HAS_VISIBLE_CHALLENGE_FRAME_JS
+
 TEST_DOMAINS = [
     "https://jobs.northropgrumman.com",
     "https://jobs.jacksonhealth.org",
@@ -68,11 +70,14 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent.parent / "docs" / "benchmar
 # three named outcomes the benchmark table can report separately.
 # --------------------------------------------------------------------------- #
 
-_CAPTCHA_IFRAME_JS = (
-    "() => !!document.querySelector("
-    "'iframe[src*=\"captcha\" i], iframe[src*=\"recaptcha\" i], iframe[src*=\"turnstile\" i]'"
-    ")"
-)
+# Shared with generic.py/forensics.py/auth_blocker_triage.py via
+# src/challenge_detect.py — was previously a fourth independent copy of a
+# bare iframe[src*="recaptcha"] selector, which false-positived on invisible
+# reCAPTCHA v3/Enterprise scoring anchors present on ordinary, unblocked
+# pages. Confirmed live against jobs.northropgrumman.com: fully loaded
+# (8564 chars of real content, 200) while the old bare selector still
+# reported a match.
+_CAPTCHA_IFRAME_JS = f"() => ({HAS_VISIBLE_CHALLENGE_FRAME_JS})"
 _BLOCKED_TEXT_RE = re.compile(
     r"attention required|access denied|security check|"
     r"please confirm you are human|checking your browser|"
