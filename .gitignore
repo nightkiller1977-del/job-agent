@@ -54,3 +54,7 @@ test-results/
 
 # ── Local Git worktrees ─────────────────────────────────────────────────────
 .worktrees/
+
+# ── Generated diagnostic artifacts (ACES-402/403 spikes) — can contain real
+# job IDs, company names, and job titles from a local state/jobs.db run ─────
+docs/benchmarks/

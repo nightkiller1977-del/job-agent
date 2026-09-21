@@ -23,6 +23,15 @@ persistent profile under state/sessions/ — and classify by:
     password field present, no challenge iframe  -> login_wall
     neither                                      -> no_wall_detected
 
+Jobs job-agent's OWN workflow status already marks `expired` are excluded
+from live navigation and reported separately as `posting_expired` — a stale
+posting was confirmed against a real run: Workday still returns HTTP 200 and
+a rendered page for a removed job req, just with "The page you are looking
+for doesn't exist" as the body text, indistinguishable from a real page by
+title/status-code alone. Navigating those tells you nothing about session or
+bot state; job-agent already knows the answer to a different question
+("does this posting still exist") without a live request.
+
 IMPORTANT (Copilot + Codex review, PR #140): a password field in this
 deliberately logged-out, cookie-less context does NOT prove the *saved*
 session expired — it only proves the portal requires login when accessed
@@ -77,7 +86,7 @@ _PROBE_JS = r"""() => {
     return { password, challenge };
 }"""
 
-CLASSIFICATIONS = ("login_wall", "bot_interstitial", "no_wall_detected", "error")
+CLASSIFICATIONS = ("login_wall", "bot_interstitial", "no_wall_detected", "posting_expired", "error")
 
 
 def read_jobs_with_apply_status(db_path: str = "state/jobs.db") -> List[dict]:
@@ -146,7 +155,15 @@ def blocker_url(job: dict) -> str:
 async def classify_one(url: str, timeout_ms: int = 25000) -> Dict[str, Any]:
     """Navigate one URL logged-out and classify it. Never raises — a
     per-job navigation failure degrades to {"classification": "error"}
-    and the triage continues with the rest of the set."""
+    and the triage continues with the rest of the set.
+
+    Waits for `networkidle`, not a fixed sleep after `domcontentloaded`:
+    confirmed against a real Workday URL that `domcontentloaded` + 1s fires
+    while the page is still an empty client-rendered shell (title='',
+    body_len=0) — every real signal (title, password field, challenge
+    iframe) is still unrendered at that point, silently producing
+    `no_wall_detected` for pages that were never actually inspected.
+    """
     result: Dict[str, Any] = {
         "classification": "error", "password_present": None,
         "challenge_present": None, "title": "", "error": None,
@@ -161,8 +178,15 @@ async def classify_one(url: str, timeout_ms: int = 25000) -> Dict[str, Any]:
                 context = await browser.new_context()
                 page = await context.new_page()
                 try:
-                    await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-                    await asyncio.sleep(1)
+                    try:
+                        await page.goto(url, timeout=timeout_ms, wait_until="networkidle")
+                    except Exception:
+                        # A page that never goes network-idle (long-poll,
+                        # analytics beacon, etc.) shouldn't fail the whole
+                        # probe — domcontentloaded + a fixed settle window
+                        # already got it, just fall back to that.
+                        await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+                        await asyncio.sleep(3)
                     result["title"] = await page.title()
                     probe = await page.evaluate(_PROBE_JS)
                     password = bool(probe.get("password"))
@@ -191,16 +215,29 @@ async def run_triage(db_path: str = "state/jobs.db",
     dicts here directly — no database, no StateManager, no fakes needed."""
     all_jobs = jobs if jobs is not None else read_jobs_with_apply_status(db_path)
     blocked = auth_blocked_jobs(all_jobs)
+    live_candidates = [j for j in blocked if j.get("status") != "expired"]
+    already_expired = [j for j in blocked if j.get("status") == "expired"]
 
     print("================================================================")
     print("   ACES-403 AUTH BLOCKER TRIAGE: bot interstitial vs login wall ")
     print("================================================================")
-    print(f"{len(blocked)} job(s) with a latest apply attempt classifying as AUTH_REQUIRED.\n")
+    print(f"{len(blocked)} job(s) with a latest apply attempt classifying as AUTH_REQUIRED "
+          f"({len(already_expired)} already marked expired in job-agent's own tracking — "
+          f"excluded from live navigation, reported as posting_expired).\n")
 
     rows: List[Dict[str, Any]] = []
     counts = {c: 0 for c in CLASSIFICATIONS}
 
-    for job in blocked:
+    for job in already_expired:
+        counts["posting_expired"] += 1
+        rows.append({
+            "job_id": job.get("job_id") or "", "source": job.get("source") or "",
+            "apply_last_status": job.get("apply_last_status") or "",
+            "url_used": "", "classification": "posting_expired",
+            "password_present": None, "challenge_present": None, "title": "", "error": None,
+        })
+
+    for job in live_candidates:
         url = blocker_url(job)
         job_id = job.get("job_id") or ""
         source = job.get("source") or ""
@@ -224,16 +261,20 @@ async def run_triage(db_path: str = "state/jobs.db",
     for c in CLASSIFICATIONS:
         print(f"{c:<18}: {counts[c]}")
     print("-" * 66)
-    print(f"Gate: {counts['bot_interstitial']} of {len(blocked)} are bot/WAF "
-          "interstitials misreported as auth — these should not burn the "
-          "AUTH_REQUIRED retry cap.")
+    print(f"{counts['posting_expired']} already marked expired by job-agent — excluded from "
+          "the gate below (a live navigation there answers a different question).")
+    print(f"Gate (of {len(live_candidates)} still-live postings): "
+          f"{counts['bot_interstitial']} are bot/WAF interstitials misreported as auth — "
+          "these should not burn the AUTH_REQUIRED retry cap.")
     print(f"{counts['login_wall']} show a login wall with no bot challenge — "
           "candidates for prepare-sessions, NOT confirmed expirations. Option B "
           "(checking the isolated persistent saved profile) is needed to tell a "
           "genuinely expired session apart from one that was simply never "
           "authenticated in this fresh, logged-out context.")
     if counts["no_wall_detected"]:
-        print(f"{counts['no_wall_detected']} showed neither signal — worth a manual look.")
+        print(f"{counts['no_wall_detected']} showed neither signal — worth a manual look "
+              "(could still be a slow-rendering page; classify_one waits for networkidle "
+              "but a very slow SPA could still race it).")
     print("================================================================")
     print("\nThis report does NOT change state/jobs.db or call prepare-sessions — "
           "read-only triage only. Act on the results as a separate, deliberate step.")
@@ -241,6 +282,7 @@ async def run_triage(db_path: str = "state/jobs.db",
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "total_auth_blocked": len(blocked),
+        "live_candidate_count": len(live_candidates),
         "counts": counts,
         "jobs": rows,
     }

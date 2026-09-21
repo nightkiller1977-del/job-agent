@@ -228,6 +228,29 @@ async def test_classify_one_error_never_raises_on_navigation_failure(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_classify_one_falls_back_to_domcontentloaded_when_networkidle_never_settles(monkeypatch):
+    """A page with e.g. a long-poll/analytics beacon never goes network-idle
+    — that must not sink the whole probe; fall back to the older wait
+    strategy instead of reporting `error`."""
+    calls = []
+
+    class _FlakyNetworkIdlePage(_FakePage):
+        async def goto(self, url, timeout=None, wait_until=None):
+            calls.append(wait_until)
+            if wait_until == "networkidle":
+                raise RuntimeError("Timeout 25000ms exceeded waiting for networkidle")
+            return None
+
+    page = _FlakyNetworkIdlePage({"password": True, "challenge": False})
+    _patch_playwright(monkeypatch, page)
+
+    out = await triage.classify_one("https://example.com/job/1")
+
+    assert calls == ["networkidle", "domcontentloaded"]
+    assert out["classification"] == "login_wall"  # still classified, not "error"
+
+
+@pytest.mark.asyncio
 async def test_classify_one_closes_the_browser_it_launched(monkeypatch):
     page = _FakePage({"password": False, "challenge": False})
     captured = {}
@@ -318,6 +341,39 @@ async def test_run_triage_uses_the_ats_url_not_the_discovery_source_url(monkeypa
     await triage.run_triage(jobs=jobs)
 
     assert seen_urls == ["https://acme.wd1.myworkdayjobs.com/en-US/careers/job/456"]
+
+
+@pytest.mark.asyncio
+async def test_run_triage_excludes_already_expired_postings_from_live_navigation(monkeypatch, tmp_path):
+    """Confirmed against a real run: a job-agent-tracked-expired Workday
+    posting still returns HTTP 200 with "The page you are looking for
+    doesn't exist" — indistinguishable from a real page without already
+    knowing it's gone. job-agent already knows; don't spend a live
+    navigation re-discovering it, and don't let it pollute the gate."""
+    jobs = [
+        {"job_id": "j1", "source": "workday", "apply_last_status": "workday_session_expired",
+         "status": "expired", "url": "https://a.example.com/job/1", "ats_url": ""},
+        {"job_id": "j2", "source": "workday", "apply_last_status": "workday_session_expired",
+         "status": "approved", "url": "https://b.example.com/job/2", "ats_url": ""},
+    ]
+    monkeypatch.setattr(triage, "RESULTS_DIR", tmp_path)
+
+    classified_urls = []
+
+    async def _fake_classify_one(url, timeout_ms=25000):
+        classified_urls.append(url)
+        return {"classification": "login_wall", "password_present": True,
+                "challenge_present": False, "title": "", "error": None}
+
+    monkeypatch.setattr(triage, "classify_one", _fake_classify_one)
+
+    report = await triage.run_triage(jobs=jobs)
+
+    assert classified_urls == ["https://b.example.com/job/2"]  # j1 never navigated to
+    assert report["counts"]["posting_expired"] == 1
+    assert report["counts"]["login_wall"] == 1
+    assert report["live_candidate_count"] == 1
+    assert report["total_auth_blocked"] == 2
 
 
 @pytest.mark.asyncio
