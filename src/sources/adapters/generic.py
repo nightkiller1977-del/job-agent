@@ -15,6 +15,8 @@ from rich.console import Console
 from .base import AtsAdapter
 from .context import AtsApplyContext, AtsApplyResult
 from .receipt import capture_receipt_evidence, verify_receipt
+from .attempt import AttemptPhase
+from . import forensics
 
 console = Console()
 
@@ -124,6 +126,20 @@ class GenericAtsAdapter(AtsAdapter):
         if ctx.resume_path:
             ev.with_resume(ctx.resume_path)
 
+        # ACES-399 (Copilot review, PR #138): the CONFIRMED-form rich-evidence
+        # probe. apply() is only reached once a form actually exists — directly
+        # for non-CTA vendors, or via CtaApplyAdapter.apply()'s super().apply(ctx)
+        # call AFTER its own CTA click confirms one — so this always fires after
+        # ENTRY_CTA_FOUND for CTA vendors, never before. Best-effort: never
+        # raises, never gates what happens next (see forensics.probe_page_evidence
+        # / _emit_forensic's own no-op-on-None-run_log guard).
+        if getattr(ctx, "run_log", None) is not None:
+            try:
+                probe = await forensics.probe_page_evidence(page)
+                self._emit_forensic(ctx, AttemptPhase.FORM_REACHED, vendor, **probe)
+            except Exception:
+                pass
+
         # 1. Blocker detection up front — never burn a submit on a login/captcha wall.
         blocker = await self._detect_blocker(page)
         if blocker:
@@ -163,6 +179,35 @@ class GenericAtsAdapter(AtsAdapter):
         # 5. Submit gate + receipt verification (shared with vendor adapters).
         return await self._gated_submit(page, ctx, selset.get("submit_button"), ev, vendor)
 
+    def _emit_forensic(self, ctx: AtsApplyContext, phase: AttemptPhase, vendor: str,
+                       **evidence) -> None:
+        """ACES-399: best-effort, bounded forensic_phase evidence.
+
+        No-ops whenever ctx.run_log isn't wired (the default — every existing
+        adapter unit test's fake page/context keeps working unchanged) and
+        never raises into the real fill/submit flow it describes."""
+        if getattr(ctx, "run_log", None) is None:
+            return
+        try:
+            # Prefer the LIVE page URL: ctx.url is a snapshot taken once, before
+            # any CTA click/vendor rewrite navigates further (session.py sets it
+            # right after the first goto). Falling back to it only when the page
+            # itself has none yet avoids recording a stale pre-handoff host on
+            # every later phase event (Copilot review, ACES-399 PR #138).
+            url = getattr(ctx.page, "url", "") or ctx.url or ""
+            forensics.emit_forensic_phase(
+                ctx.run_log,
+                attempt_id=getattr(ctx, "attempt_id", "") or "",
+                job_id=str((ctx.job or {}).get("job_id") or ""),
+                phase=phase.value,
+                source=str((ctx.job or {}).get("source") or ""),
+                vendor=vendor, adapter=self.name,
+                host=forensics.host_of(url), path_class=forensics.path_class_of(url),
+                **evidence,
+            )
+        except Exception:
+            pass
+
     async def _gated_submit(self, page, ctx: AtsApplyContext, submit_selectors,
                             ev, vendor: str) -> AtsApplyResult:
         """Policy-gated submit + attempt-scoped receipt verification.
@@ -172,6 +217,10 @@ class GenericAtsAdapter(AtsAdapter):
         means click() raised after the action may already have reached the page
         or network; it is never downgraded to submit_not_found and never sent to
         recovery for a blind second click.
+
+        ACES-399: this is also the shared submission/receipt boundary the
+        SUBMIT_CLICKED / RECEIPT_VERIFIED forensic evidence hangs off of — the
+        boundary itself (submit dispatch, receipt polling) is unchanged.
         """
         if not ctx.auto_submit:
             return AtsApplyResult.blocked(
@@ -195,10 +244,20 @@ class GenericAtsAdapter(AtsAdapter):
         outcome = await self._submit(page, submit_selectors)
         if outcome == "absent":
             ev.blocker_detected = "submit_not_found"
+            # No submit control was ever found, so the phase we actually
+            # reached is still FORM_REACHED — submit_control_present=False is
+            # the evidence explaining why it went no further (ACES-399: this
+            # is deliberately NOT its own AttemptPhase; see attempt.py).
+            self._emit_forensic(ctx, AttemptPhase.FORM_REACHED, vendor,
+                                submit_control_present=False,
+                                failure_reason_code="submit_not_found")
             return AtsApplyResult.blocked(
                 "submit_not_found", f"{vendor}: no submit control matched",
                 evidence=ev_to_dict(ev),
             )
+
+        self._emit_forensic(ctx, AttemptPhase.SUBMIT_CLICKED, vendor,
+                            submit_control_present=True)
 
         # Both dispatched and uncertain mean the submission MAY have gone out.
         # Poll for fresh receipt evidence; stale evidence never ends the polling
@@ -207,6 +266,8 @@ class GenericAtsAdapter(AtsAdapter):
             page, retries=3, delay=0.4, baseline=baseline,
         )
         if verified:
+            self._emit_forensic(ctx, AttemptPhase.RECEIPT_VERIFIED, vendor,
+                                submit_control_present=True)
             return AtsApplyResult.ok(
                 f"{vendor}: submitted with {len(ev.fields_filled)} field(s); receipt {signal}",
                 evidence=ev_to_dict(ev), vendor=vendor, receipt=signal,

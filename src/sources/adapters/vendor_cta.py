@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from .context import AtsApplyContext, AtsApplyResult
 from .generic import GenericAtsAdapter, detect_vendor
+from .attempt import AttemptPhase
 
 # Reused from the legacy _looks_like_login_wall.
 _LOGIN_WALL_JS = r"""() => {
@@ -95,6 +96,10 @@ class CtaApplyAdapter(GenericAtsAdapter):
         # could be the final submit and fire outside the policy gate. Fill directly.
         if not await self._looks_like_form(page):
             entered = await self._click_cta(page)
+            if entered:
+                # ACES-399: observational only — a supported entry CTA was
+                # located and clicked. Never gates what happens next.
+                self._emit_forensic(ctx, AttemptPhase.ENTRY_CTA_FOUND, self.name)
 
             # Some portals redirect to login only after the CTA.
             if entered and await self._login_wall(page):
