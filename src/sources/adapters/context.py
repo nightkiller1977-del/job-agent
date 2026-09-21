@@ -31,6 +31,12 @@ class AtsApplyContext:
     url: str = ""                      # convenience mirror of page.url at pick time
     attempt_id: str = ""               # Phase 0.2/0.3: per-attempt id for idempotency + auth
     extra: dict = field(default_factory=dict)
+    # ACES-399: optional RunLog handle so adapters can emit bounded, read-only
+    # forensic_phase evidence (see adapters/forensics.py) via ctx.run_log
+    # instead of threading a new parameter through every adapter's apply().
+    # None by default — every existing call site that never sets it keeps
+    # working unchanged, and forensic capture call sites must all no-op on None.
+    run_log: Any = None
 
 
 @dataclass

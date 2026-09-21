@@ -21,13 +21,12 @@ Verified corrections honored here:
 from __future__ import annotations
 
 import time
-import urllib.parse
 import uuid
 
 from rich.console import Console
 
 from ..base import BaseScraper
-from ...events import RunLog
+from ...events import RunLog, read_run
 from .context import AtsApplyContext, AtsApplyResult
 from .registry import AtsAdapterRegistry
 from .generic import GenericAtsAdapter, detect_vendor
@@ -36,17 +35,16 @@ from .policy import AutoSubmitPolicy, SubmissionPolicy
 from .idempotency import SubmissionLedger, canonical_key, LedgerUnreadableError
 from .profile_lock import ProfileLock, ProfileLockError
 from .auth_routing import directive_for
+from . import forensics
+from .forensic_classifier import classify_forensic_evidence
 
 console = Console()
 
-
-def _host(url: str) -> str:
-    # hostname (NOT netloc) so embedded credentials like user:pass@host never leak
-    # into the audit stream.
-    try:
-        return (urllib.parse.urlparse(url).hostname or "").lower()
-    except Exception:
-        return ""
+# hostname (NOT netloc) so embedded credentials like user:pass@host never leak
+# into the audit stream. Shared with the rich forensic-evidence call sites in
+# generic.py/vendor_cta.py — see forensics.host_of (ACES-399: do not write a
+# second URL parser).
+_host = forensics.host_of
 
 
 def _phase_for(res: AtsApplyResult) -> AttemptPhase:
@@ -139,6 +137,33 @@ class ExternalApplySession(BaseScraper):
             return
         try:  # fail-open at the call site too
             self.dispatcher.dispatch_event(event, outcome, title, message, key=key)
+        except Exception:
+            pass
+
+    def _emit_forensic_classification(self, attempt_id: str, job_id: str) -> None:
+        """ACES-399: read-only, best-effort. Re-reads this run's own JSONL for
+        the forensic_phase events this attempt already wrote, classifies them
+        with the separate observational classifier, and logs one more event.
+
+        Never touches AtsApplyResult, the ledger, notifications, or re-auth —
+        it runs strictly after those are already decided, so a bug here can
+        only cost a missing log line, never an application outcome. Does not
+        call or import blocker_classifier.py.
+        """
+        if self.run_log is None:
+            return
+        try:
+            all_events = read_run(self.run_log.run_id, runs_dir=self.run_log.dir)
+            mine = [
+                e for e in all_events
+                if e.get("event") == "forensic_phase" and e.get("attempt_id") == attempt_id
+            ]
+            verdict = classify_forensic_evidence(mine)
+            self.run_log.emit(
+                "forensic_classification", attempt_id=attempt_id, job_id=job_id,
+                candidate=verdict.get("candidate", "unknown"),
+                capture_incomplete=bool(verdict.get("capture_incomplete")),
+            )
         except Exception:
             pass
 
@@ -272,6 +297,26 @@ class ExternalApplySession(BaseScraper):
             # from the navigated URL so post-nav events aren't mislabeled 'generic'.
             vendor = detect_vendor(getattr(page, "url", "") or external_url) or vendor
             _event("form_reached", AttemptPhase.FORM_REACHED)
+            # ACES-399: bounded, read-only rich evidence alongside the plain
+            # phase event above — never gates or alters what happens next.
+            # Best-effort: any probe/sanitize failure degrades to
+            # capture_incomplete rather than raising into the apply flow.
+            try:
+                if self.run_log is not None:
+                    _page_url = getattr(page, "url", "") or external_url
+                    _evidence = await forensics.probe_page_evidence(page)
+                    forensics.emit_forensic_phase(
+                        self.run_log, attempt_id=attempt_id, job_id=job_id,
+                        phase=AttemptPhase.FORM_REACHED.value,
+                        source=str(job.get("source") or ""), vendor=vendor,
+                        host=_host(_page_url),
+                        path_class=forensics.path_class_of(_page_url),
+                        http_class=forensics.http_class_of(nav_status),
+                        redirect_count=forensics.redirect_count_of(resp),
+                        **_evidence,
+                    )
+            except Exception:
+                pass
 
             ctx = AtsApplyContext(
                 page=page,
@@ -283,6 +328,7 @@ class ExternalApplySession(BaseScraper):
                 policy=policy,
                 url=page.url,
                 attempt_id=attempt_id,
+                run_log=self.run_log,
             )
 
             # A submit may happen -> write the in-progress marker BEFORE it (crash-safe).
@@ -348,6 +394,7 @@ class ExternalApplySession(BaseScraper):
                 else:
                     self.ledger.clear(key)
             _event("attempt_finished", _phase_for(res), outcome=res.status, verified=res.verified)
+            self._emit_forensic_classification(attempt_id, job_id)
             self._maybe_notify("attempt_finished", res.status,
                                f"{vendor}: {res.status}", res.detail,
                                key=f"{key or attempt_id}:{res.status}")
@@ -369,6 +416,7 @@ class ExternalApplySession(BaseScraper):
             # or per-run failure metrics silently undercount real crashes.
             _event("attempt_finished", AttemptPhase.FAILED, outcome="error",
                    error=type(exc).__name__)
+            self._emit_forensic_classification(attempt_id, job_id)
             raise
         finally:
             # Release the OUTER lock in a nested finally so even a CancelledError

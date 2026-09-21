@@ -8,6 +8,7 @@ import json
 import math
 import os
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,6 +41,13 @@ from .session_watchdog import (
     preflight_session_check,
     preflight_session_check_with_reauth,
 )
+# ACES-399: universal (every source/path) apply-attempt evidence — observational
+# only, see sources/adapters/forensics.py. get_run_log() is the SAME
+# process-scoped RunLog singleton ExternalApplySession uses (sources/adapters/
+# runtime.py), so these outer records land in the same per-run JSONL stream as
+# any registry-path rich evidence for the same run.
+from .sources.adapters import forensics as _forensics
+from .sources.adapters.runtime import get_run_log as _get_run_log
 
 console = Console()
 _log = logging.getLogger(__name__)
@@ -1129,6 +1137,24 @@ class Orchestrator:
                 }
 
             scraper = SOURCE_MAP[src](scraper_config)
+
+            # ACES-399: universal outer-boundary attempt evidence — every source
+            # and every path (registry-adapter or legacy) gets an attempt_id and
+            # a final status here, even paths with no live Page of their own.
+            # This attempt_id is independent of any inner one a registry-path
+            # adapter (ExternalApplySession) generates for its own rich
+            # forensic_phase evidence; the two are correlated by run_id/job_id/
+            # timestamp, not forced to share an id. Best-effort only: never
+            # raises, never changes `result`/outcomes/state below.
+            _outer_attempt_id = uuid.uuid4().hex
+            _outcomes_before = len(outcomes)
+            try:
+                _forensics.emit_universal_attempt_started(
+                    _get_run_log(), attempt_id=_outer_attempt_id,
+                    job_id=str(job.get("job_id") or ""), source=src,
+                )
+            except Exception:
+                pass
             try:
                 # One-shot same-run retry: when the adapter path reports it refreshed a
                 # session mid-attempt (analytics["reauth_refreshed"], set by
@@ -1303,6 +1329,22 @@ class Orchestrator:
                 await self._push_apply_attempt_to_cloud(job["job_id"])
                 failed_count += 1
                 outcomes.append({"job": job, "status": "error", "reason": str(exc)})
+            finally:
+                # ACES-399: always close the universal attempt record started
+                # above, however this iteration ended (success, every `except`
+                # branch above, a `continue`, or a `break` out of the loop —
+                # `finally` still runs). Read-only: only reads `outcomes`,
+                # never writes state or influences the next iteration.
+                try:
+                    _new_outcomes = outcomes[_outcomes_before:]
+                    _final_status = _new_outcomes[-1]["status"] if _new_outcomes else "unknown"
+                    _forensics.emit_universal_attempt_finished(
+                        _get_run_log(), attempt_id=_outer_attempt_id,
+                        job_id=str(job.get("job_id") or ""), source=src,
+                        status=_final_status, applied=(_final_status == "applied"),
+                    )
+                except Exception:
+                    pass
 
         record_run_stats(applied_count, failed_count, skipped_count)
         _log.info(
