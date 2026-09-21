@@ -30,6 +30,7 @@ import urllib.parse
 from typing import Any
 
 from .attempt import AttemptPhase
+from ...challenge_detect import HAS_VISIBLE_CHALLENGE_FRAME_JS
 
 # --------------------------------------------------------------------------- #
 # URL helpers (reused, not reinvented — see module docstring)
@@ -122,12 +123,18 @@ def redirect_count_of(resp: Any) -> int:
 # Single evaluate() call so one bounded round-trip covers auth/form/submit/
 # validation signals. Returns booleans and a short list of already-known HTML
 # input `type` values only — never labels, names, values, or free text.
+#
+# __HAS_VISIBLE_CHALLENGE_FRAME__ is a placeholder token, not JS — spliced in
+# below via .replace() rather than an f-string, since the surrounding JS has
+# enough of its own literal { } that hand-escaping all of them for an
+# f-string would be error-prone. See src/challenge_detect.py: a bare
+# iframe[src*="recaptcha"] match previously false-positived on invisible v3/
+# Enterprise scoring anchors present on ordinary, unblocked pages.
 _PROBE_JS = r"""() => {
     // sentinel: aces-399 forensic-probe harness
     try {
-        const capSel = 'iframe[src*="captcha" i], iframe[src*="recaptcha" i], iframe[src*="turnstile" i]';
         const body = (document.body && document.body.innerText || '').toLowerCase();
-        const captcha = !!document.querySelector(capSel)
+        const captcha = (__HAS_VISIBLE_CHALLENGE_FRAME__)
             || /verify you are human|checking your browser|cloudflare/i.test(body);
         const password = !!document.querySelector('input[type="password"]');
         const loginText = /(sign in|log in|login|create account|forgot password|sso|single sign-on)/i.test(body);
@@ -155,7 +162,7 @@ _PROBE_JS = r"""() => {
     } catch (e) {
         return null;
     }
-}"""
+}""".replace("__HAS_VISIBLE_CHALLENGE_FRAME__", HAS_VISIBLE_CHALLENGE_FRAME_JS)
 
 # Only HTML input `type` attribute values map through — anything else (an
 # arbitrary label, id, or name an attacker could control) is silently dropped,

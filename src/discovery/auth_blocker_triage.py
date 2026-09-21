@@ -69,20 +69,28 @@ from typing import Any, Dict, List, Optional
 from playwright.async_api import async_playwright
 
 from ..blocker_classifier import BlockerClass, classify
+from ..challenge_detect import HAS_VISIBLE_CHALLENGE_FRAME_JS
 from ..sources.adapters.auth_routing import external_ats_url
 from ..state_manager import parse_extra_json
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent.parent / "docs" / "benchmarks"
 
-# Same signal shape as GenericAtsAdapter._detect_blocker
-# (src/sources/adapters/generic.py:225-239) and patchright_spike.classify_outcome
-# — deliberately re-declared here rather than imported: the probe itself must
-# stay decoupled from the live apply/browser pipeline (src.sources.adapters.*
-# beyond the one pure URL-resolution helper above), not import from it.
+# The visible-challenge-iframe check is shared via src/challenge_detect.py
+# (a top-level, dependency-free module — importing it does not couple this
+# tool to src.sources.adapters.* internals, same as the existing
+# blocker_classifier import below). It used to be a fourth independent copy
+# of a bare iframe[src*="recaptcha"] selector, which false-positived on
+# invisible reCAPTCHA v3/Enterprise scoring anchors present on ordinary,
+# unblocked pages — confirmed live against jobs.northropgrumman.com: fully
+# loaded (8564 chars of real content) while the old bare selector alone
+# still reported a match.
+#
+# __HAS_VISIBLE_CHALLENGE_FRAME__ is a placeholder token, not JS — spliced
+# in below via .replace(), not an f-string (avoids hand-escaping the JS's
+# own literal braces).
 _PROBE_JS = r"""() => {
     const password = !!document.querySelector('input[type="password"]');
-    const challengeFrame = !!document.querySelector(
-        'iframe[src*="captcha" i], iframe[src*="recaptcha" i], iframe[src*="turnstile" i]');
+    const challengeFrame = (__HAS_VISIBLE_CHALLENGE_FRAME__);
     // Copilot review, PR #140: an iframe-only check misses a text-only
     // JS challenge (e.g. some Cloudflare "checking your browser"
     // interstitials render no iframe at all) — same signal generic.py's
@@ -90,7 +98,7 @@ _PROBE_JS = r"""() => {
     const bodyText = (document.body && document.body.innerText || '').toLowerCase();
     const challengeText = /attention required|access denied|security check|please confirm you are human|checking your browser|verify you are human|verify your connection|cloudflare/.test(bodyText);
     return { password, challenge: challengeFrame || challengeText };
-}"""
+}""".replace("__HAS_VISIBLE_CHALLENGE_FRAME__", HAS_VISIBLE_CHALLENGE_FRAME_JS)
 
 CLASSIFICATIONS = ("login_wall", "bot_interstitial", "no_wall_detected", "posting_expired", "error")
 

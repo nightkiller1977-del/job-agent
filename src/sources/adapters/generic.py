@@ -17,6 +17,7 @@ from .context import AtsApplyContext, AtsApplyResult
 from .receipt import capture_receipt_evidence, verify_receipt
 from .attempt import AttemptPhase
 from . import forensics
+from ...challenge_detect import HAS_VISIBLE_CHALLENGE_FRAME_JS
 
 console = Console()
 
@@ -286,15 +287,15 @@ class GenericAtsAdapter(AtsAdapter):
     async def _detect_blocker(self, page) -> str | None:
         try:
             return await page.evaluate(
-                """() => {
+                f"""() => {{
                     const body = (document.body?.innerText || '').toLowerCase();
-                    if (document.querySelector('iframe[src*="captcha" i], iframe[src*="recaptcha" i], iframe[src*="turnstile" i]')) return 'captcha';
+                    if ({HAS_VISIBLE_CHALLENGE_FRAME_JS}) return 'captcha';
                     if (/verify you are human|checking your browser|cloudflare/i.test(body)) return 'captcha';
                     const pw = document.querySelector('input[type="password"]');
                     const loginish = /(sign in|log in|create account|forgot password|sso|single sign-on)/i.test(body);
                     if (pw && loginish) return 'login_required';
                     return null;
-                }"""
+                }}"""
             )
         except Exception:
             return None
