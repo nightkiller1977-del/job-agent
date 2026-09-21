@@ -472,3 +472,47 @@ async def test_capture_failure_does_not_alter_adapter_result():
     assert baseline.verified == with_broken_capture.verified is True
     assert baseline.status == with_broken_capture.status == "applied"
     assert boom_page.clicked == baseline_page.clicked == ["#submit_app"]
+
+
+# --------------------------------------------------------------------------- #
+# Copilot review (PR #138) regression: _emit_forensic must use the LIVE page
+# URL, not the stale ctx.url snapshot taken before a CTA click / vendor
+# rewrite navigates further (context.py's own docstring calls ctx.url "a
+# convenience mirror of page.url at pick time" — it is not kept in sync).
+# --------------------------------------------------------------------------- #
+
+class _StaleUrlPage:
+    """Simulates a page that has navigated past the ctx.url snapshot."""
+    url = "https://jobs.example.com/apply/after-cta-handoff"
+
+
+def test_emit_forensic_prefers_live_page_url_over_stale_ctx_snapshot(tmp_path):
+    run_log = RunLog(agent="test", runs_dir=tmp_path / "runs")
+    ctx = AtsApplyContext(
+        page=_StaleUrlPage(), job={"job_id": "j1", "source": "test"}, profile=None,
+        auto_submit=True, url="https://careers.example.com/job/123",  # stale snapshot
+        attempt_id="a1", run_log=run_log,
+    )
+    GenericAtsAdapter()._emit_forensic(ctx, AttemptPhase.FORM_REACHED, "example")
+
+    events = read_run(run_log.run_id, runs_dir=run_log.dir)
+    evt = next(e for e in events if e["event"] == "forensic_phase")
+    assert evt["host"] == "jobs.example.com"
+    assert evt["host"] != "careers.example.com"
+
+
+def test_emit_forensic_falls_back_to_ctx_url_when_page_has_none(tmp_path):
+    class _NoUrlPage:
+        pass
+
+    run_log = RunLog(agent="test", runs_dir=tmp_path / "runs")
+    ctx = AtsApplyContext(
+        page=_NoUrlPage(), job={"job_id": "j1", "source": "test"}, profile=None,
+        auto_submit=True, url="https://careers.example.com/job/123",
+        attempt_id="a1", run_log=run_log,
+    )
+    GenericAtsAdapter()._emit_forensic(ctx, AttemptPhase.FORM_REACHED, "example")
+
+    events = read_run(run_log.run_id, runs_dir=run_log.dir)
+    evt = next(e for e in events if e["event"] == "forensic_phase")
+    assert evt["host"] == "careers.example.com"

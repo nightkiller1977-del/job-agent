@@ -175,7 +175,12 @@ class GenericAtsAdapter(AtsAdapter):
         if getattr(ctx, "run_log", None) is None:
             return
         try:
-            url = ctx.url or getattr(ctx.page, "url", "") or ""
+            # Prefer the LIVE page URL: ctx.url is a snapshot taken once, before
+            # any CTA click/vendor rewrite navigates further (session.py sets it
+            # right after the first goto). Falling back to it only when the page
+            # itself has none yet avoids recording a stale pre-handoff host on
+            # every later phase event (Copilot review, ACES-399 PR #138).
+            url = getattr(ctx.page, "url", "") or ctx.url or ""
             forensics.emit_forensic_phase(
                 ctx.run_log,
                 attempt_id=getattr(ctx, "attempt_id", "") or "",

@@ -76,8 +76,12 @@ def classify_forensic_evidence(events: list[dict]) -> dict:
     if any(e.get("auth_state") == "bot_challenge" for e in events if isinstance(e, dict)):
         return {"candidate": BROWSER_ENVIRONMENT_CANDIDATE, "capture_incomplete": any_incomplete}
 
-    # 2. session/auth: redirected to a sign-in wall.
-    if any(e.get("auth_state") == "redirected_to_signin" for e in events if isinstance(e, dict)):
+    # 2. session/auth: redirected to a sign-in wall, OR a bare login/password
+    #    prompt with no matching "sign in"-ish text nearby (forensics.py still
+    #    reports these as "logged_out" — a password field is a login wall
+    #    either way; see probe_page_evidence).
+    if any(e.get("auth_state") in ("redirected_to_signin", "logged_out")
+           for e in events if isinstance(e, dict)):
         return {"candidate": SESSION_AUTH_CANDIDATE, "capture_incomplete": any_incomplete}
 
     # 3. URL handoff: the host we actually landed on doesn't match the vendor

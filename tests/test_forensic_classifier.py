@@ -35,6 +35,16 @@ def test_redirected_to_signin_maps_to_session_auth_candidate():
     assert out["candidate"] == fc.SESSION_AUTH_CANDIDATE
 
 
+def test_logged_out_password_wall_maps_to_session_auth_candidate():
+    # Copilot review (PR #138): probe_page_evidence() reports "logged_out" for
+    # a password field with no matching "sign in"-ish text nearby (e.g. an SSO
+    # landing page) — that is still a login wall and must not fall through to
+    # navigation_adapter_candidate / unknown.
+    events = [_evt("form_reached", auth_state="logged_out", form_present=False)]
+    out = fc.classify_forensic_evidence(events)
+    assert out["candidate"] == fc.SESSION_AUTH_CANDIDATE
+
+
 def test_host_vendor_mismatch_maps_to_url_handoff_candidate():
     # Attempt was routed to "greenhouse" but the page we actually landed on
     # resolves (via the existing detect_vendor()) to lever.
