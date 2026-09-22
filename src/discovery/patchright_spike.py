@@ -138,9 +138,14 @@ async def _body_text(page, timeout_ms: int = 3000) -> str:
     try:
         return await page.locator("body").inner_text(timeout=timeout_ms)
     except Exception:
+        # The fallback needs its own deadline: page.evaluate() takes no timeout
+        # argument, so without wait_for an unresponsive renderer would hang the
+        # whole multi-domain benchmark despite this function's bounded-read
+        # contract. Same budget as the primary read.
         try:
-            return await page.evaluate(
-                "() => (document.body ? document.body.innerText : '')"
+            return await asyncio.wait_for(
+                page.evaluate("() => (document.body ? document.body.innerText : '')"),
+                timeout=timeout_ms / 1000,
             ) or ""
         except Exception:
             return ""
@@ -391,12 +396,15 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
             fortress_wins += 1
         elif pat_ok and not fort_ok:
             patchright_wins += 1
-        elif pat_chars and fort_chars and (fort_chars * 2 < pat_chars):
-            # Both cleared the floor, but one engine rendered far less of the
-            # page. Scoring that a tie hides the measured difference — see
-            # MIN_BODY_CHARS for the observed case.
+        elif pat_ok and fort_ok and (fort_chars * 2 <= pat_chars):
+            # Only reached when BOTH engines rendered a real page. Requiring
+            # pat_ok/fort_ok matters: challenge-page text volume must never
+            # score as an engine win (two blocked pages with 1,000 vs 100
+            # chars are a tie, not a Fortress loss). The comparison is
+            # inclusive so an exact 2x margin counts as a loss, matching the
+            # stated rule.
             patchright_wins += 1
-        elif pat_chars and fort_chars and (pat_chars * 2 < fort_chars):
+        elif pat_ok and fort_ok and (pat_chars * 2 <= fort_chars):
             fortress_wins += 1
         else:
             other_ties += 1

@@ -6,7 +6,9 @@ playwright/patchright installed at import time for the pure-logic pieces.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 import pytest
 
@@ -618,8 +620,88 @@ async def test_body_text_passes_a_bounded_timeout():
 
 
 # --------------------------------------------------------------------------- #
-# _redact_cdp_url — never persist credentials from FORTRESS_CDP_URL
+# _body_text fallback deadline + gate ratio guards (Copilot review, PR #142)
 # --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_body_text_fallback_is_time_bounded(monkeypatch):
+    """Copilot review, PR #142: page.evaluate() takes no timeout, so an
+    unresponsive renderer hung the whole benchmark via the fallback path."""
+    hung = {"cancelled": False}
+
+    class _HangingBody:
+        async def inner_text(self, timeout=None):
+            raise RuntimeError("no stable body")
+
+    class _HangingEvaluatePage:
+        def locator(self, selector):
+            return _HangingBody()
+
+        async def evaluate(self, script):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                hung["cancelled"] = True
+                raise
+            return "unreachable"
+
+    start = time.monotonic()
+    result = await spike._body_text(_HangingEvaluatePage(), timeout_ms=200)
+    elapsed = time.monotonic() - start
+
+    assert result == ""
+    assert elapsed < 5, f"fallback was not bounded (took {elapsed:.1f}s)"
+    assert hung["cancelled"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_benchmark_does_not_award_a_win_between_two_blocked_pages(monkeypatch, tmp_path):
+    """Copilot review, PR #142: the ratio branch used to run even when neither
+    engine loaded, so challenge-page text volume could score a false win."""
+    monkeypatch.setattr(spike, "TEST_DOMAINS", ["https://a.example.com"])
+    monkeypatch.setattr(spike, "RESULTS_DIR", tmp_path)
+
+    async def _fake_engine(playwright_engine, engine_name, url):
+        return {"engine": engine_name, "outcome": "captcha", "success": False,
+                "title": "", "body_chars": 1000, "webdriver_val": None, "error": None}
+
+    async def _fake_cdp(cdp_url, url):
+        return {"engine": "fortress-cdp", "outcome": "captcha", "success": False,
+                "title": "", "body_chars": 100, "webdriver_val": None, "error": None}
+
+    monkeypatch.setattr(spike, "test_domain_with_engine", _fake_engine)
+    monkeypatch.setattr(spike, "test_domain_with_cdp", _fake_cdp)
+
+    report = await spike.run_benchmark(fortress_cdp_url="http://localhost:9222")
+
+    assert report["fortress_wins"] == 0
+    assert report["patchright_wins"] == 0
+    assert report["ties"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_benchmark_treats_an_exact_double_as_a_loss(monkeypatch, tmp_path):
+    """Copilot review, PR #142: an exact 2x difference was scored a tie even
+    though the stated rule is a 2x margin."""
+    monkeypatch.setattr(spike, "TEST_DOMAINS", ["https://a.example.com"])
+    monkeypatch.setattr(spike, "RESULTS_DIR", tmp_path)
+
+    async def _fake_engine(playwright_engine, engine_name, url):
+        return {"engine": engine_name, "outcome": "ok", "success": True,
+                "title": "Real", "body_chars": 1000, "webdriver_val": None, "error": None}
+
+    async def _fake_cdp(cdp_url, url):
+        return {"engine": "fortress-cdp", "outcome": "ok", "success": True,
+                "title": "Half", "body_chars": 500, "webdriver_val": None, "error": None}
+
+    monkeypatch.setattr(spike, "test_domain_with_engine", _fake_engine)
+    monkeypatch.setattr(spike, "test_domain_with_cdp", _fake_cdp)
+
+    report = await spike.run_benchmark(fortress_cdp_url="http://localhost:9222")
+
+    assert report["patchright_wins"] == 1
+    assert report["ties"] == 0
+
 
 def test_redact_cdp_url_strips_userinfo():
     assert spike._redact_cdp_url("http://user:secrettoken@remote-fortress:9222") == \
