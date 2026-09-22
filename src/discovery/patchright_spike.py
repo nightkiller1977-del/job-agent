@@ -97,7 +97,7 @@ OUTCOMES = ("ok", "captcha", "waf_403", "timeout", "error")
 MIN_BODY_CHARS = 250
 
 
-async def classify_outcome(page, body_text: str, title: str, resp: Any) -> str:
+async def classify_outcome(page, body_text: Optional[str], title: str, resp: Any) -> str:
     """Return one of OUTCOMES for a page that loaded without raising.
 
     Order matters (Copilot review, PR #140): a WAF 403 page commonly says
@@ -117,7 +117,7 @@ async def classify_outcome(page, body_text: str, title: str, resp: Any) -> str:
     status = getattr(resp, "status", None)
     if status == 403:
         return "waf_403"
-    if _BLOCKED_TEXT_RE.search(f"{body_text} {title}"):
+    if _BLOCKED_TEXT_RE.search(f"{body_text or ''} {title}"):
         return "captcha"
     return "ok"
 
@@ -126,14 +126,18 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timeout" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
 
 
-async def _body_text(page, timeout_ms: int = 3000) -> str:
-    """Bounded body-text read.
+async def _body_text(page, timeout_ms: int = 3000) -> Optional[str]:
+    """Bounded body-text read. Returns None when the text could not be measured.
 
     An unbounded inner_text() raises when a page exposes no stable body — a
     gated page, or one still swapping its DOM. That surfaced as outcome
     "error" and so made an engine look worse than another for a purely
-    harness-side reason. Degrade to "" so classify_outcome() still runs and
-    the engine is judged on what the page actually contains.
+    harness-side reason.
+
+    The two reads are kept distinguishable on failure. `None` means "no
+    measurement", `""` means "measured, and the body really is empty". Folding
+    the first into the second would let a transient read failure be scored as a
+    zero-length body, which is the same harness-side bias in a new place.
     """
     try:
         return await page.locator("body").inner_text(timeout=timeout_ms)
@@ -148,7 +152,7 @@ async def _body_text(page, timeout_ms: int = 3000) -> str:
                 timeout=timeout_ms / 1000,
             ) or ""
         except Exception:
-            return ""
+            return None
 
 
 def _loaded(res: Dict[str, Any]) -> bool:
@@ -218,7 +222,9 @@ async def test_domain_with_engine(playwright_engine, engine_name: str, url: str)
                 webdriver_val = await page.evaluate("() => navigator.webdriver")
 
                 result["title"] = title
-                result["body_chars"] = len(body_text)
+                # None (not 0) when the read failed, so "could not measure"
+                # stays distinct from "measured empty" — see _body_text.
+                result["body_chars"] = len(body_text) if body_text is not None else None
                 result["webdriver_val"] = webdriver_val
                 result["outcome"] = await classify_outcome(page, body_text, title, resp)
                 result["success"] = result["outcome"] == "ok"
@@ -293,7 +299,9 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
                     webdriver_val = await page.evaluate("() => navigator.webdriver")
 
                     result["title"] = title
-                    result["body_chars"] = len(body_text)
+                    # None (not 0) when the read failed, so "could not measure"
+                    # stays distinct from "measured empty" — see _body_text.
+                    result["body_chars"] = len(body_text) if body_text is not None else None
                     result["webdriver_val"] = webdriver_val
                     result["outcome"] = await classify_outcome(page, body_text, title, resp)
                     result["success"] = result["outcome"] == "ok"
@@ -334,9 +342,11 @@ def _fmt(res: Dict[str, Any]) -> str:
     if res["outcome"] == "waf_403":
         return "BLOCKED (waf_403)"
     n = res.get("body_chars")
-    if n is not None and n < MIN_BODY_CHARS:
+    if n is None:
+        return "UNMEASURED"
+    if n < MIN_BODY_CHARS:
         return f"EMPTY ({n} chars)"
-    return f"OK ({n if n is not None else '?'} chars)"
+    return f"OK ({n} chars)"
 
 
 async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any]:
@@ -380,6 +390,7 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
     patchright_wins = 0
     other_ties = 0
     fortress_unavailable = False
+    unmeasured = 0
 
     for domain, res in results.items():
         std, pat, fort = res["playwright"], res["patchright"], res["fortress_cdp"]
@@ -387,6 +398,13 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
 
         if fort["outcome"] == "unavailable":
             fortress_unavailable = True
+            continue
+
+        # A domain where any engine's body could not be measured is excluded
+        # and counted separately. Scoring it would turn a harness limitation
+        # into an engine verdict — see _body_text.
+        if any(r.get("body_chars") is None for r in (std, pat, fort)):
+            unmeasured += 1
             continue
 
         pat_ok, fort_ok = _loaded(pat), _loaded(fort)
@@ -415,6 +433,8 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
               f"(tried {_redact_cdp_url(cdp_url)}) — gate cannot be fully evaluated this run.")
     print(f"Fortress-CDP wins over Patchright: {fortress_wins} | "
           f"Patchright wins over Fortress-CDP: {patchright_wins} | Ties: {other_ties}")
+    if unmeasured:
+        print(f"Excluded (body text could not be measured on both sides): {unmeasured} domain(s)")
     gate_passed = fortress_wins > 0
     print(f"ACES-402 gate (does Fortress beat Patchright on >=1 domain?): "
           f"{'PASS' if gate_passed else 'FAIL'}")
@@ -428,6 +448,7 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
         "fortress_wins": fortress_wins,
         "patchright_wins": patchright_wins,
         "ties": other_ties,
+        "unmeasured": unmeasured,
         "domains": results,
     }
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)

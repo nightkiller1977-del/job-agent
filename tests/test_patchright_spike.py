@@ -512,8 +512,8 @@ def test_fmt_reports_measured_chars_for_a_real_load():
     assert spike._fmt({"outcome": "ok", "success": True, "title": "x", "body_chars": 8595}) == "OK (8595 chars)"
 
 
-def test_fmt_does_not_claim_ok_for_an_unknown_char_count():
-    assert spike._fmt({"outcome": "ok", "success": True, "title": "x"}) == "OK (? chars)"
+def test_fmt_reports_unmeasured_instead_of_ok_for_an_unknown_char_count():
+    assert spike._fmt({"outcome": "ok", "success": True, "title": "x"}) == "UNMEASURED"
 
 
 @pytest.mark.asyncio
@@ -598,11 +598,12 @@ async def test_body_text_returns_content_when_available():
 
 
 @pytest.mark.asyncio
-async def test_body_text_degrades_to_empty_string_instead_of_raising():
-    """An unbounded inner_text() raises on a gated page; that used to surface
-    as outcome "error" and made one engine look worse for a harness reason."""
+async def test_body_text_reports_none_when_the_read_is_unavailable():
+    """A failed read means "not measured", which must stay distinct from a
+    measured-empty body: folding them together would let a transient harness
+    failure score as a zero-length page (Copilot review, PR #142)."""
     page = _FakeLocatorPage(_RaisingBody())
-    assert await spike._body_text(page) == ""
+    assert await spike._body_text(page) is None
 
 
 @pytest.mark.asyncio
@@ -649,7 +650,7 @@ async def test_body_text_fallback_is_time_bounded(monkeypatch):
     result = await spike._body_text(_HangingEvaluatePage(), timeout_ms=200)
     elapsed = time.monotonic() - start
 
-    assert result == ""
+    assert result is None
     assert elapsed < 5, f"fallback was not bounded (took {elapsed:.1f}s)"
     assert hung["cancelled"] is True
 
@@ -701,6 +702,65 @@ async def test_run_benchmark_treats_an_exact_double_as_a_loss(monkeypatch, tmp_p
 
     assert report["patchright_wins"] == 1
     assert report["ties"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_benchmark_excludes_a_domain_whose_body_could_not_be_measured(monkeypatch, tmp_path):
+    """Copilot review, PR #142: a failed measurement is not a zero-length body.
+
+    If an engine's read comes back unmeasured, scoring the domain would award
+    the other engine a win for a harness limitation — the bias this change is
+    meant to remove. The domain must be excluded and counted separately.
+    """
+    monkeypatch.setattr(spike, "TEST_DOMAINS", ["https://a.example.com"])
+    monkeypatch.setattr(spike, "RESULTS_DIR", tmp_path)
+
+    async def _fake_engine(playwright_engine, engine_name, url):
+        return {"engine": engine_name, "outcome": "ok", "success": True,
+                "title": "Real", "body_chars": None, "webdriver_val": None, "error": None}
+
+    async def _fake_cdp(cdp_url, url):
+        return {"engine": "fortress-cdp", "outcome": "ok", "success": True,
+                "title": "Real", "body_chars": 9000, "webdriver_val": None, "error": None}
+
+    monkeypatch.setattr(spike, "test_domain_with_engine", _fake_engine)
+    monkeypatch.setattr(spike, "test_domain_with_cdp", _fake_cdp)
+
+    report = await spike.run_benchmark(fortress_cdp_url="http://localhost:9222")
+
+    assert report["fortress_wins"] == 0
+    assert report["patchright_wins"] == 0
+    assert report["ties"] == 0
+    assert report["unmeasured"] == 1
+    assert report["gate_passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_benchmark_does_not_award_fortress_a_win_from_a_failed_measurement(monkeypatch, tmp_path):
+    """The asymmetric case: Fortress measured fine, Playwright's read failed.
+
+    Before this guard, Playwright's None became 0 chars, `_loaded()` returned
+    False for it, and Fortress collected a win it did not earn.
+    """
+    monkeypatch.setattr(spike, "TEST_DOMAINS", ["https://a.example.com"])
+    monkeypatch.setattr(spike, "RESULTS_DIR", tmp_path)
+
+    async def _fake_engine(playwright_engine, engine_name, url):
+        return {"engine": engine_name, "outcome": "ok", "success": True,
+                "title": "Real", "body_chars": None, "webdriver_val": None, "error": None}
+
+    async def _fake_cdp(cdp_url, url):
+        return {"engine": "fortress-cdp", "outcome": "ok", "success": True,
+                "title": "Fortress", "body_chars": 9000, "webdriver_val": None, "error": None}
+
+    monkeypatch.setattr(spike, "test_domain_with_engine", _fake_engine)
+    monkeypatch.setattr(spike, "test_domain_with_cdp", _fake_cdp)
+
+    report = await spike.run_benchmark(fortress_cdp_url="http://localhost:9222")
+
+    assert report["fortress_wins"] == 0
+    assert report["gate_passed"] is False
+    assert report["unmeasured"] == 1
 
 
 def test_redact_cdp_url_strips_userinfo():
