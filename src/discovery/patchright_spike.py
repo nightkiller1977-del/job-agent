@@ -400,10 +400,15 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
             fortress_unavailable = True
             continue
 
-        # A domain where any engine's body could not be measured is excluded
-        # and counted separately. Scoring it would turn a harness limitation
-        # into an engine verdict — see _body_text.
-        if any(r.get("body_chars") is None for r in (std, pat, fort)):
+        # A domain where either COMPARED engine's body could not be measured is
+        # excluded and counted separately. Scoring it would turn a harness
+        # limitation into an engine verdict — see _body_text.
+        #
+        # Only pat/fort are checked. The gate compares Fortress against
+        # Patchright; standard Playwright is informational, so requiring its
+        # read too would let an unmeasured Playwright leg suppress a real
+        # outcome between the two engines actually being compared.
+        if any(r.get("body_chars") is None for r in (pat, fort)):
             unmeasured += 1
             continue
 
@@ -434,7 +439,7 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
     print(f"Fortress-CDP wins over Patchright: {fortress_wins} | "
           f"Patchright wins over Fortress-CDP: {patchright_wins} | Ties: {other_ties}")
     if unmeasured:
-        print(f"Excluded (body text could not be measured on both sides): {unmeasured} domain(s)")
+        print(f"Excluded (body text could not be measured for one of the compared engines): {unmeasured} domain(s)")
     gate_passed = fortress_wins > 0
     print(f"ACES-402 gate (does Fortress beat Patchright on >=1 domain?): "
           f"{'PASS' if gate_passed else 'FAIL'}")
