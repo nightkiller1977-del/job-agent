@@ -418,15 +418,15 @@ async def test_run_benchmark_gate_passes_when_fortress_wins_a_domain(monkeypatch
 
     async def _fake_engine(playwright_engine, engine_name, url):
         return {"engine": engine_name, "outcome": "captcha", "success": False,
-                "title": "", "webdriver_val": None, "error": None}
+                "title": "", "webdriver_val": None, "body_chars": 0, "error": None}
 
     async def _fake_cdp(cdp_url, url):
         # Fortress clears the first domain, still blocked on the second.
         if "a.example.com" in url:
             return {"engine": "fortress-cdp", "outcome": "ok", "success": True,
-                    "title": "A Careers", "webdriver_val": None, "error": None}
+                    "title": "A Careers", "webdriver_val": None, "body_chars": 8000, "error": None}
         return {"engine": "fortress-cdp", "outcome": "captcha", "success": False,
-                "title": "", "webdriver_val": None, "error": None}
+                "title": "", "webdriver_val": None, "body_chars": 0, "error": None}
 
     monkeypatch.setattr(spike, "test_domain_with_engine", _fake_engine)
     monkeypatch.setattr(spike, "test_domain_with_cdp", _fake_cdp)
@@ -452,7 +452,7 @@ async def test_run_benchmark_gate_fails_and_flags_unavailable_when_fortress_neve
 
     async def _fake_engine(playwright_engine, engine_name, url):
         return {"engine": engine_name, "outcome": "ok", "success": True,
-                "title": "A", "webdriver_val": None, "error": None}
+                "title": "A", "webdriver_val": None, "body_chars": 8000, "error": None}
 
     async def _fake_cdp(cdp_url, url):
         return {"engine": "fortress-cdp", "outcome": "unavailable", "success": False,
@@ -465,6 +465,156 @@ async def test_run_benchmark_gate_fails_and_flags_unavailable_when_fortress_neve
 
     assert report["gate_passed"] is False
     assert report["fortress_unavailable"] is True
+
+
+# --------------------------------------------------------------------------- #
+# MIN_BODY_CHARS / _loaded — a load must show content, not just absence of error
+# --------------------------------------------------------------------------- #
+
+def test_loaded_rejects_ok_outcome_with_no_content():
+    """The observed Fortress failure mode: outcome "ok" on a cookie banner.
+
+    On jobs.northropgrumman.com Fortress-CDP returned outcome "ok" with 238
+    chars of body (a consent banner) while Patchright rendered ~8600 chars of
+    real navigation. `success` alone scored that a tie, hiding the difference.
+    """
+    shell = {"outcome": "ok", "success": True, "body_chars": 238}
+    assert spike._loaded(shell) is False
+
+
+def test_loaded_accepts_ok_outcome_with_real_content():
+    page = {"outcome": "ok", "success": True, "body_chars": 8595}
+    assert spike._loaded(page) is True
+
+
+def test_loaded_is_exactly_the_content_floor_boundary():
+    assert spike._loaded({"success": True, "body_chars": spike.MIN_BODY_CHARS}) is True
+    assert spike._loaded({"success": True, "body_chars": spike.MIN_BODY_CHARS - 1}) is False
+
+
+def test_loaded_rejects_blocked_or_unavailable_results():
+    assert spike._loaded({"outcome": "captcha", "success": False, "body_chars": 9000}) is False
+    assert spike._loaded({"outcome": "unavailable", "success": False, "body_chars": None}) is False
+
+
+def test_loaded_tolerates_missing_body_chars_key():
+    """Older result dicts and any hand-built fake must not raise."""
+    assert spike._loaded({"outcome": "ok", "success": True}) is False
+
+
+def test_fmt_reports_empty_when_ok_but_content_starved():
+    assert spike._fmt({"outcome": "ok", "success": True, "title": "x", "body_chars": 238}) == "EMPTY (238 chars)"
+
+
+def test_fmt_reports_measured_chars_for_a_real_load():
+    assert spike._fmt({"outcome": "ok", "success": True, "title": "x", "body_chars": 8595}) == "OK (8595 chars)"
+
+
+def test_fmt_does_not_claim_ok_for_an_unknown_char_count():
+    assert spike._fmt({"outcome": "ok", "success": True, "title": "x"}) == "OK (? chars)"
+
+
+@pytest.mark.asyncio
+async def test_run_benchmark_does_not_tie_a_content_starved_fortress_run(monkeypatch, tmp_path):
+    """Both engines report outcome "ok"; only one rendered the page.
+
+    Before the content floor this was counted a tie. The gate must reflect the
+    measured difference instead of scoring it neutral.
+    """
+    monkeypatch.setattr(spike, "TEST_DOMAINS", ["https://a.example.com"])
+    monkeypatch.setattr(spike, "RESULTS_DIR", tmp_path)
+
+    async def _fake_engine(playwright_engine, engine_name, url):
+        return {"engine": engine_name, "outcome": "ok", "success": True,
+                "title": "Real", "body_chars": 8595, "webdriver_val": None, "error": None}
+
+    async def _fake_cdp(cdp_url, url):
+        return {"engine": "fortress-cdp", "outcome": "ok", "success": True,
+                "title": "Banner", "body_chars": 238, "webdriver_val": None, "error": None}
+
+    monkeypatch.setattr(spike, "test_domain_with_engine", _fake_engine)
+    monkeypatch.setattr(spike, "test_domain_with_cdp", _fake_cdp)
+
+    report = await spike.run_benchmark(fortress_cdp_url="http://localhost:9222")
+
+    assert report["gate_passed"] is False
+    assert report["fortress_wins"] == 0
+    assert report["patchright_wins"] == 1
+    assert report["ties"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_benchmark_still_ties_when_both_render_comparable_pages(monkeypatch, tmp_path):
+    """The proportional rule must not turn a genuine tie into a loss."""
+    monkeypatch.setattr(spike, "TEST_DOMAINS", ["https://a.example.com"])
+    monkeypatch.setattr(spike, "RESULTS_DIR", tmp_path)
+
+    async def _fake_engine(playwright_engine, engine_name, url):
+        return {"engine": engine_name, "outcome": "ok", "success": True,
+                "title": "Real", "body_chars": 8595, "webdriver_val": None, "error": None}
+
+    async def _fake_cdp(cdp_url, url):
+        return {"engine": "fortress-cdp", "outcome": "ok", "success": True,
+                "title": "Real", "body_chars": 8600, "webdriver_val": None, "error": None}
+
+    monkeypatch.setattr(spike, "test_domain_with_engine", _fake_engine)
+    monkeypatch.setattr(spike, "test_domain_with_cdp", _fake_cdp)
+
+    report = await spike.run_benchmark(fortress_cdp_url="http://localhost:9222")
+
+    assert report["ties"] == 1
+    assert report["fortress_wins"] == 0
+    assert report["patchright_wins"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# _body_text — bounded read must degrade, never raise
+# --------------------------------------------------------------------------- #
+
+class _RaisingBody:
+    async def inner_text(self, timeout=None):
+        raise RuntimeError("no stable body element")
+
+
+class _OkBody:
+    async def inner_text(self, timeout=None):
+        return "real page content"
+
+
+class _FakeLocatorPage:
+    def __init__(self, locator):
+        self._locator = locator
+
+    def locator(self, selector):
+        return self._locator
+
+
+@pytest.mark.asyncio
+async def test_body_text_returns_content_when_available():
+    page = _FakeLocatorPage(_OkBody())
+    assert await spike._body_text(page) == "real page content"
+
+
+@pytest.mark.asyncio
+async def test_body_text_degrades_to_empty_string_instead_of_raising():
+    """An unbounded inner_text() raises on a gated page; that used to surface
+    as outcome "error" and made one engine look worse for a harness reason."""
+    page = _FakeLocatorPage(_RaisingBody())
+    assert await spike._body_text(page) == ""
+
+
+@pytest.mark.asyncio
+async def test_body_text_passes_a_bounded_timeout():
+    seen = {}
+
+    class _Recording:
+        async def inner_text(self, timeout=None):
+            seen["timeout"] = timeout
+            return "x"
+
+    page = _FakeLocatorPage(_Recording())
+    await spike._body_text(page, timeout_ms=1234)
+    assert seen["timeout"] == 1234
 
 
 # --------------------------------------------------------------------------- #
@@ -521,7 +671,7 @@ async def test_run_benchmark_never_persists_the_raw_cdp_url(monkeypatch, tmp_pat
 
     async def _fake_engine(playwright_engine, engine_name, url):
         return {"engine": engine_name, "outcome": "ok", "success": True,
-                "title": "A", "webdriver_val": None, "error": None}
+                "title": "A", "webdriver_val": None, "body_chars": 8000, "error": None}
 
     async def _fake_cdp(cdp_url, url):
         return {"engine": "fortress-cdp", "outcome": "unavailable", "success": False,

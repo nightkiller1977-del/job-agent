@@ -87,6 +87,15 @@ _BLOCKED_TEXT_RE = re.compile(
 
 OUTCOMES = ("ok", "captcha", "waf_403", "timeout", "error")
 
+# A page that classifies as `ok` but renders almost nothing did not really
+# load. Observed on jobs.northropgrumman.com: Fortress-CDP reported outcome
+# `ok` on a 238-character body (a cookie banner) where Patchright and
+# Playwright each rendered the real navigation (~8600 chars). The gate
+# compared only the `success` boolean, so that run scored as a tie and the
+# measured difference was invisible. This floor is what makes "ok" mean
+# "a page was actually rendered", not "nothing raised".
+MIN_BODY_CHARS = 250
+
 
 async def classify_outcome(page, body_text: str, title: str, resp: Any) -> str:
     """Return one of OUTCOMES for a page that loaded without raising.
@@ -115,6 +124,33 @@ async def classify_outcome(page, body_text: str, title: str, resp: Any) -> str:
 
 def _is_timeout_error(exc: Exception) -> bool:
     return "timeout" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
+
+
+async def _body_text(page, timeout_ms: int = 3000) -> str:
+    """Bounded body-text read.
+
+    An unbounded inner_text() raises when a page exposes no stable body — a
+    gated page, or one still swapping its DOM. That surfaced as outcome
+    "error" and so made an engine look worse than another for a purely
+    harness-side reason. Degrade to "" so classify_outcome() still runs and
+    the engine is judged on what the page actually contains.
+    """
+    try:
+        return await page.locator("body").inner_text(timeout=timeout_ms)
+    except Exception:
+        try:
+            return await page.evaluate(
+                "() => (document.body ? document.body.innerText : '')"
+            ) or ""
+        except Exception:
+            return ""
+
+
+def _loaded(res: Dict[str, Any]) -> bool:
+    """True only when the engine rendered a real page: classified ok AND
+    produced enough body text to be a page rather than a shell. `success`
+    alone is not sufficient evidence — see MIN_BODY_CHARS."""
+    return bool(res.get("success")) and (res.get("body_chars") or 0) >= MIN_BODY_CHARS
 
 
 def _redact_cdp_url(url: str) -> str:
@@ -157,6 +193,7 @@ async def test_domain_with_engine(playwright_engine, engine_name: str, url: str)
         "success": False,
         "webdriver_val": None,
         "title": "",
+        "body_chars": None,
         "error": None,
     }
 
@@ -172,10 +209,11 @@ async def test_domain_with_engine(playwright_engine, engine_name: str, url: str)
                 await asyncio.sleep(2)  # Let dynamic JS run
 
                 title = await page.title()
-                body_text = await page.locator("body").inner_text()
+                body_text = await _body_text(page)
                 webdriver_val = await page.evaluate("() => navigator.webdriver")
 
                 result["title"] = title
+                result["body_chars"] = len(body_text)
                 result["webdriver_val"] = webdriver_val
                 result["outcome"] = await classify_outcome(page, body_text, title, resp)
                 result["success"] = result["outcome"] == "ok"
@@ -211,6 +249,7 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
         "success": False,
         "webdriver_val": None,
         "title": "",
+        "body_chars": None,
         "error": None,
     }
     connected = False
@@ -245,10 +284,11 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
                     await asyncio.sleep(2)
 
                     title = await page.title()
-                    body_text = await page.locator("body").inner_text()
+                    body_text = await _body_text(page)
                     webdriver_val = await page.evaluate("() => navigator.webdriver")
 
                     result["title"] = title
+                    result["body_chars"] = len(body_text)
                     result["webdriver_val"] = webdriver_val
                     result["outcome"] = await classify_outcome(page, body_text, title, resp)
                     result["success"] = result["outcome"] == "ok"
@@ -288,7 +328,10 @@ def _fmt(res: Dict[str, Any]) -> str:
         return "BLOCKED (captcha)"
     if res["outcome"] == "waf_403":
         return "BLOCKED (waf_403)"
-    return f"OK ({res['title'][:20]})"
+    n = res.get("body_chars")
+    if n is not None and n < MIN_BODY_CHARS:
+        return f"EMPTY ({n} chars)"
+    return f"OK ({n if n is not None else '?'} chars)"
 
 
 async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any]:
@@ -341,11 +384,20 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
             fortress_unavailable = True
             continue
 
-        pat_ok, fort_ok = pat["success"], fort["success"]
+        pat_ok, fort_ok = _loaded(pat), _loaded(fort)
+        pat_chars = pat.get("body_chars") or 0
+        fort_chars = fort.get("body_chars") or 0
         if fort_ok and not pat_ok:
             fortress_wins += 1
         elif pat_ok and not fort_ok:
             patchright_wins += 1
+        elif pat_chars and fort_chars and (fort_chars * 2 < pat_chars):
+            # Both cleared the floor, but one engine rendered far less of the
+            # page. Scoring that a tie hides the measured difference — see
+            # MIN_BODY_CHARS for the observed case.
+            patchright_wins += 1
+        elif pat_chars and fort_chars and (pat_chars * 2 < fort_chars):
+            fortress_wins += 1
         else:
             other_ties += 1
 
