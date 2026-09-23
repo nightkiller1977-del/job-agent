@@ -765,8 +765,14 @@ class StateManager:
             extra["submitted"] = str(status).strip().lower() == "applied"
             # P2: stamp the control-flow class so the circuit breaker and dashboards
             # can reason about this outcome without re-deriving it.
-            from .blocker_classifier import classify
+            from .blocker_classifier import apply_path_fingerprint, classify
             extra["blocker_class"] = classify(status).value
+            # Stamp the build this outcome was produced by, so the circuit can
+            # re-arm when the apply path changes underneath a capped job
+            # (blocker_classifier.rearm_reason). Empty when undeterminable.
+            _fp = apply_path_fingerprint()
+            if _fp:
+                extra["apply_code_fingerprint"] = _fp
             if metadata:
                 extra.update(metadata)
             conn.execute(
@@ -811,6 +817,56 @@ class StateManager:
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
                 (json.dumps(extra), job_id),
             )
+
+    def rearm_circuit(self, job_id: str, reason: str, *, cooldown: bool = False) -> bool:
+        """Re-open a job's exhausted retry budget so the apply loop will try it again.
+
+        The counterpart to flag_circuit_break(). apply_attempt_count is the only
+        input to should_attempt()'s cap check and nothing else ever lowers it, so
+        an exhausted job stays skipped forever — including after a fix ships that
+        would have made it succeed. Resetting the count (rather than special-casing
+        the gate) keeps should_attempt() a pure function of "attempts on the
+        current build".
+
+        apply_last_status / apply_status_history / apply_last_attempt are left
+        intact: the funnel and the adaptive cap are built from them, and erasing
+        the history to grant a retry would launder away the evidence of why the
+        job failed. `apply_rearm_count` bounds the blast radius — a job that has
+        been re-armed repeatedly without ever succeeding is visible as such.
+
+        Returns True when a circuit was actually re-armed.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            extra = parse_extra_json(row["extra_json"]) if row["extra_json"] else {}
+            if not int(extra.get("apply_attempt_count", 0) or 0):
+                return False  # nothing to re-arm
+            extra["apply_attempt_count"] = 0
+            extra["apply_rearmed_at"] = now
+            extra["apply_rearm_reason"] = (reason or "")[:300]
+            extra["apply_rearm_count"] = int(extra.get("apply_rearm_count", 0) or 0) + 1
+            # Counted separately because only the cooldown path is bounded
+            # (blocker_classifier._MAX_COOLDOWN_REARMS). A code-change re-arm must
+            # not consume a budget meant to stop the clock retrying doomed jobs.
+            if cooldown:
+                extra["apply_cooldown_rearm_count"] = (
+                    int(extra.get("apply_cooldown_rearm_count", 0) or 0) + 1
+                )
+            # The open-circuit markers describe a state that no longer holds.
+            extra.pop("circuit_broken", None)
+            extra.pop("circuit_class", None)
+            extra.pop("circuit_reason", None)
+            extra.pop("circuit_broken_at", None)
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+        return True
 
     def merge_job_extra(self, job_id: str, updates: dict) -> None:
         """Merge fields into a job's extra_json without touching apply attempt

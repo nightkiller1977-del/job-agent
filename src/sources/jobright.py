@@ -2169,6 +2169,7 @@ class JobrightScraper(BaseScraper):
         *,
         total_timeout_ms: int = 20000,
         poll_interval_ms: int = 500,
+        per_query_timeout_ms: int = 1500,
     ):
         """First visible control matching ``selectors``, searched across all frames.
 
@@ -2188,18 +2189,41 @@ class JobrightScraper(BaseScraper):
         ``query_selector`` (no per-selector wait) and the whole sweep re-polls
         until ``total_timeout_ms``, preserving tolerance for late-rendering
         forms at a fraction of the worst-case cost.
+
+        ``total_timeout_ms`` is enforced *inside* the sweep, not only between
+        passes. One pass is ``len(selectors) x len(page.frames)`` queries — on a
+        real portal that is easily 36 x 9 ≈ 320 calls, and a single slow or
+        unresponsive frame (an ad iframe, a reCAPTCHA frame) can block for
+        seconds. Checking the deadline only between passes let a live CoreWeave
+        page overrun an 8s budget by more than 10x, so the deadline is also
+        checked per selector and each query carries its own
+        ``per_query_timeout_ms`` ceiling.
         """
         try:
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + (total_timeout_ms / 1000)
         except RuntimeError:  # no running loop (defensive; callers are async)
-            deadline = None
+            loop = None
+        deadline = (loop.time() + total_timeout_ms / 1000) if loop else None
+
+        def _expired() -> bool:
+            return deadline is not None and loop.time() >= deadline
 
         while True:
             for sel in selectors:
+                if _expired():
+                    return None
                 for frame in self._candidate_frames(page):
+                    if _expired():
+                        return None
                     try:
-                        el = await frame.query_selector(sel)
+                        # A frame that never answers must not consume the whole
+                        # budget — cap each individual query.
+                        el = await asyncio.wait_for(
+                            frame.query_selector(sel),
+                            timeout=per_query_timeout_ms / 1000,
+                        )
+                    except (TimeoutError, asyncio.TimeoutError):
+                        continue
                     except Exception:
                         # Frame detached or navigated mid-sweep — other frames
                         # may still hold the form, so keep going.
@@ -2207,7 +2231,9 @@ class JobrightScraper(BaseScraper):
                     if el is None:
                         continue
                     try:
-                        if await el.is_visible():
+                        if await asyncio.wait_for(
+                            el.is_visible(), timeout=per_query_timeout_ms / 1000
+                        ):
                             # Keep the owning frame with the handle. Receipt
                             # evidence after the click must be attributable to
                             # this ATS context, not to any frame that happens to
@@ -2218,9 +2244,15 @@ class JobrightScraper(BaseScraper):
                         continue
             if deadline is None or asyncio.get_running_loop().time() >= deadline:
                 return None
-            await asyncio.sleep(poll_interval_ms / 1000)
+            # Never sleep past the deadline: 100ms remaining with a 500ms poll
+            # interval would otherwise overshoot the advertised total timeout
+            # (Copilot review, PR #149).
+            remaining = deadline - asyncio.get_running_loop().time()
+            await asyncio.sleep(max(0.0, min(poll_interval_ms / 1000, remaining)))
 
-    async def _visible_controls_snapshot(self, page, limit: int = 40) -> list[dict]:
+    async def _visible_controls_snapshot(
+        self, page, limit: int = 40, *, frame_timeout_ms: int = 2000
+    ) -> list[dict]:
         """Return visible buttons/links/inputs to make ATS failures diagnosable.
 
         Sweeps the main frame *and* every child frame. Many ATS vendors embed the
@@ -2244,7 +2276,25 @@ class JobrightScraper(BaseScraper):
         per_frame: list[list[dict]] = []
         for frame in self._candidate_frames(page):
             try:
-                found = await self._frame_controls_snapshot(frame, limit)
+                # Reading EVERY frame (which the round-robin above requires)
+                # makes a per-frame timeout mandatory rather than defensive: the
+                # older fill-to-limit loop usually broke after the main frame and
+                # never touched the rest. A live CoreWeave job page carries an
+                # unresponsive third-party frame (reCAPTCHA / googleapis proxy)
+                # whose evaluate never returns, and this runs on the FAILURE
+                # path — so an apply that had already gone wrong would hang
+                # forever building its own diagnostic.
+                found = await asyncio.wait_for(
+                    self._frame_controls_snapshot(frame, limit),
+                    timeout=frame_timeout_ms / 1000,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                found = [{
+                    "tag": "FRAME",
+                    "role": "",
+                    "text": "(unresponsive frame: timed out)",
+                    "href": self._safe_frame_url(frame),
+                }]
             except Exception as exc:
                 found = [{
                     "tag": "FRAME",

@@ -637,6 +637,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show how many jobs would be reset without changing the database",
     )
 
+    # rearm-breakers
+    rearm_parser = subparsers.add_parser(
+        "rearm-breakers",
+        help="Re-arm open apply circuits so capped jobs get another attempt",
+    )
+    rearm_parser.add_argument(
+        "--class",
+        dest="blocker_class",
+        choices=["transient", "auth_required", "needs_human", "unknown"],
+        help="Only re-arm circuits in this blocker class (default: all re-armable)",
+    )
+    rearm_parser.add_argument(
+        "--job-id",
+        help="Re-arm a single job",
+    )
+    rearm_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be re-armed without changing the database",
+    )
+
     # rescore
     rescore_parser = subparsers.add_parser(
         "rescore",
@@ -844,6 +865,13 @@ async def main_async(args: argparse.Namespace) -> int:
     elif args.command == "reset-failures":
         orchestrator.reset_failures(
             reason=args.reason,
+            dry_run=args.dry_run,
+        )
+
+    elif args.command == "rearm-breakers":
+        orchestrator.rearm_breakers(
+            blocker_class=args.blocker_class,
+            job_id=args.job_id,
             dry_run=args.dry_run,
         )
 

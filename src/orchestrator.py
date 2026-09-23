@@ -35,7 +35,14 @@ from .job_expiry import check_job_alive
 from .notifier import notify_error, notify_info, notify_warning, record_run_stats, record_reauth_event
 from .reauth import ReauthManager, AUTOMATED_SOURCES
 from .resume_helper import ATSReadabilityError, KeywordCoverageError, PDFTextLayerError
-from .blocker_classifier import should_attempt, classify, needs_preflight_reauth, preflight_reauth_viable
+from .blocker_classifier import (
+    should_attempt,
+    classify,
+    needs_preflight_reauth,
+    preflight_reauth_viable,
+    rearm_reason,
+    Rearm,
+)
 from .resume_tailor import evaluate_resume_gate, ResumeTailor
 from .session_watchdog import (
     preflight_session_check,
@@ -1169,6 +1176,18 @@ class Orchestrator:
             # intact for telemetry, which is exactly why these gates can't see the
             # prep on their own.
             _session_prepared = bool(_extra.get("session_prepared_at"))
+            # Circuit re-arm: the attempt counter only ever climbs, so a job that
+            # exhausted its budget is skipped forever — even once the very thing
+            # that blocked it is fixed. rearm_reason() grants a fresh budget when
+            # the apply-path code has changed since this job's last attempt, or
+            # when an environmental blocker has aged past its cooldown. It never
+            # re-arms PERMANENT or SUCCESS.
+            _rearm = rearm_reason(_extra)
+            if _rearm and self.state.rearm_circuit(
+                job["job_id"], _rearm.reason, cooldown=_rearm.kind == Rearm.COOLDOWN
+            ):
+                console.print(f"[cyan]↻ Circuit re-armed — {_rearm.reason}[/cyan]")
+                _attempts = 0
             _ok, _skip_reason = should_attempt(_last, _attempts, source=job.get("source", ""))
             if not _ok and not _session_prepared:
                 _cls = classify(_last).value
@@ -1540,11 +1559,51 @@ class Orchestrator:
         if applied_count == 0 and (skipped_count or blocked):
             notify_warning(
                 "Apply run: nothing submitted",
-                f"0 submitted, {skipped_count} blocked, {len(blocked)} need session prep. "
-                f"Run: python src/main.py prepare-sessions",
+                self._nothing_submitted_detail(outcomes, len(blocked)),
                 dedupe_key="apply_nothing_submitted",
                 dedupe_seconds=21600,
             )
+
+    def _nothing_submitted_detail(self, outcomes: list[dict], session_blocked: int) -> str:
+        """Per-class breakdown of why a run submitted nothing, and whether it
+        self-heals (ACES-284).
+
+        The old text was a flat count plus "Run: prepare-sessions" — which named
+        the wrong lever whenever sessions were not the blocker, and gave no way to
+        tell a backlog that retries itself tomorrow from one that is waiting on a
+        code fix. Eight of these alerts fired against a human who had no lever to
+        pull.
+        """
+        from src.blocker_classifier import _MAX_COOLDOWN_REARMS, _cooldown_hours, classify
+
+        by_class: dict[str, int] = {}
+        self_healing = stuck = 0
+        for item in outcomes:
+            if item.get("status") != "circuit_open":
+                continue
+            extra = parse_extra_json(item["job"].get("extra_json"))
+            cls = classify(extra.get("apply_last_status")).value
+            by_class[cls] = by_class.get(cls, 0) + 1
+            spent = int(extra.get("apply_cooldown_rearm_count", 0) or 0)
+            if cls in ("success", "permanent") or spent >= _MAX_COOLDOWN_REARMS:
+                stuck += 1
+            else:
+                self_healing += 1
+
+        parts = [f"0 submitted, {len(outcomes)} attempted"]
+        if by_class:
+            parts.append(
+                "circuit-open by class: "
+                + ", ".join(f"{cls} {n}" for cls, n in sorted(by_class.items(), key=lambda kv: -kv[1]))
+            )
+        hours = _cooldown_hours()
+        if self_healing and hours:
+            parts.append(f"{self_healing} auto-retry within {hours}h")
+        if stuck:
+            parts.append(f"{stuck} need a code fix or a manual `rearm-breakers`")
+        if session_blocked:
+            parts.append(f"{session_blocked} need session prep — run: python src/main.py prepare-sessions")
+        return ". ".join(parts) + "."
 
     # ------------------------------------------------------------------
     # Job expiry sweep
@@ -1726,6 +1785,66 @@ class Orchestrator:
             f"{mode}={stats['reset'] if not dry_run else stats['matched']} "
             f"unmatched={stats['unmatched']}"
         )
+
+    def rearm_breakers(
+        self,
+        *,
+        blocker_class: str | None = None,
+        job_id: str | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Deliberately re-arm open circuits that automatic re-arm will not reach.
+
+        Automatic re-arm (blocker_classifier.rearm_reason) needs a recorded
+        fingerprint to compare against, so jobs whose last attempt predates that
+        field stay capped. This is the operator's one-off sweep for that backlog,
+        and the escape hatch when a fix lands outside the fingerprinted apply path.
+
+        PERMANENT and SUCCESS are never re-armed, by --class or by default: a
+        closed posting does not reopen on request. Pass --class to narrow further.
+        """
+        from src.blocker_classifier import BlockerClass
+
+        target = None
+        if blocker_class:
+            try:
+                target = BlockerClass(blocker_class)
+            except ValueError:
+                console.print(f"[red]Unknown blocker class:[/red] {blocker_class}")
+                return {"matched": 0, "rearmed": 0}
+            if target in (BlockerClass.SUCCESS, BlockerClass.PERMANENT):
+                console.print(
+                    f"[red]{target.value} circuits are never re-armed[/red] — "
+                    "the blocker is structural, not a retry budget."
+                )
+                return {"matched": 0, "rearmed": 0}
+
+        matched = rearmed = 0
+        by_status: dict[str, int] = {}
+        for job in self.state.get_jobs_by_status("approved"):
+            if job_id and job["job_id"] != job_id:
+                continue
+            extra = parse_extra_json(job.get("extra_json"))
+            last = extra.get("apply_last_status")
+            if not last or not int(extra.get("apply_attempt_count", 0) or 0):
+                continue
+            cls = classify(last)
+            if cls in (BlockerClass.SUCCESS, BlockerClass.PERMANENT):
+                continue
+            if target and cls is not target:
+                continue
+            matched += 1
+            by_status[last] = by_status.get(last, 0) + 1
+            if not dry_run and self.state.rearm_circuit(job["job_id"], "manual rearm-breakers"):
+                rearmed += 1
+
+        verb = "would re-arm" if dry_run else "re-armed"
+        console.print(f"[green]Circuit re-arm:[/green] {verb} {matched if dry_run else rearmed} job(s)")
+        for status, n in sorted(by_status.items(), key=lambda kv: -kv[1]):
+            console.print(f"  [dim]{n:>3}  {status} ({classify(status).value})[/dim]")
+        if not matched:
+            console.print("[dim]  no open circuits matched.[/dim]")
+        return {"matched": matched, "rearmed": rearmed}
 
     async def rescore_failed(self, limit: Optional[int] = None, dry_run: bool = False) -> dict:
         """Re-score jobs whose evaluation previously failed.
