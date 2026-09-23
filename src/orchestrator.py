@@ -41,7 +41,6 @@ from .session_watchdog import (
     preflight_session_check,
     preflight_session_check_with_reauth,
 )
-from .events import RunLog
 from .operational_failure import describe_failure, describe_http_failure, is_retry_authorized
 # ACES-399: universal (every source/path) apply-attempt evidence — observational
 # only, see sources/adapters/forensics.py. get_run_log() is the SAME
