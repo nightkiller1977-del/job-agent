@@ -764,31 +764,47 @@ def build_parser() -> argparse.ArgumentParser:
 def _scheduler_unit_statuses() -> list[tuple[str, str]]:
     """Installed/loaded state of the scheduled discover+apply units, per platform.
 
-    macOS schedules these as launchd agents (``launchd/*.plist``); every other
-    platform uses systemd user timers (``systemd/*.timer``). Returns
+    macOS schedules these as launchd agents (``launchd/*.plist``); Linux uses
+    systemd user timers (``systemd/*.timer``). Returns
     ``[(label, rich_status), ...]`` so the caller only renders.
+
+    This repo ships no scheduler units for any other platform, so Windows and
+    friends report an explicit "unsupported platform" rather than being probed
+    with systemctl and reported as merely unavailable (Copilot review, PR #147).
     """
     if sys.platform == "darwin":
         rows: list[tuple[str, str]] = []
         launchctl_out = ""
+        launchctl_ok = False
         try:
             res = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5, check=False)
-            if res.returncode == 0:
+            launchctl_ok = res.returncode == 0
+            if launchctl_ok:
                 launchctl_out = res.stdout
         except Exception:
-            pass
+            launchctl_ok = False
         for p in (
             Path.home() / "Library/LaunchAgents/com.jobagent.discover.plist",
             Path.home() / "Library/LaunchAgents/com.jobagent.apply.plist",
         ):
             label = p.stem
-            if p.exists() and label in launchctl_out:
-                rows.append((label, "[green]ACTIVE / LOADED[/green]"))
-            elif p.exists():
-                rows.append((label, "[yellow]INSTALLED (NOT LOADED)[/yellow]"))
-            else:
+            if not p.exists():
                 rows.append((label, "[dim]NOT INSTALLED[/dim]"))
+            elif not launchctl_ok:
+                # The plist is there but we could not read the load state —
+                # do not assert "NOT LOADED", which we have not established.
+                rows.append((label, "[dim]INSTALLED (load state UNKNOWN — launchctl unavailable)[/dim]"))
+            elif label in launchctl_out:
+                rows.append((label, "[green]ACTIVE / LOADED[/green]"))
+            else:
+                rows.append((label, "[yellow]INSTALLED (NOT LOADED)[/yellow]"))
         return rows
+
+    if not sys.platform.startswith("linux"):
+        return [
+            (unit, "[dim]UNKNOWN (no scheduler units ship for this platform)[/dim]")
+            for unit in ("jobagent-discover.timer", "jobagent-apply.timer")
+        ]
 
     rows = []
     for unit in ("jobagent-discover.timer", "jobagent-apply.timer"):
@@ -808,9 +824,15 @@ def _scheduler_unit_statuses() -> list[tuple[str, str]]:
             continue
         if active == "active":
             rows.append((unit, "[green]ACTIVE / LOADED[/green]"))
-        elif enabled in ("enabled", "static", "disabled"):
+        elif enabled == "masked":
+            # Masked units exist but are deliberately blocked — reporting them
+            # as NOT INSTALLED would send an operator looking for the wrong fix.
+            rows.append((unit, "[red]MASKED (will never run)[/red]"))
+        elif enabled in ("enabled", "static", "disabled", "indirect", "enabled-runtime"):
             rows.append((unit, "[yellow]INSTALLED (NOT ACTIVE)[/yellow]"))
         else:
+            # Verified on this host: a missing unit yields is-enabled="not-found"
+            # (rc=4) and is-active="inactive" (rc=4), so it lands here correctly.
             rows.append((unit, "[dim]NOT INSTALLED[/dim]"))
     return rows
 
