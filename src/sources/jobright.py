@@ -4231,7 +4231,7 @@ class JobrightScraper(BaseScraper):
             if submission_ledger is not None:
                 from uuid import uuid4
 
-                from .adapters.idempotency import canonical_key
+                from .adapters.idempotency import canonical_key, ledger_key_reference
 
                 ledger_job = dict(job)
                 ledger_url = (
@@ -4241,6 +4241,7 @@ class JobrightScraper(BaseScraper):
                 )
                 ledger_job["url"] = ledger_url
                 ledger_key = canonical_key(ledger_job)
+                ledger_key_ref = ledger_key_reference(ledger_key)
                 ledger_attempt_id = uuid4().hex
                 if not ledger_key:
                     return self._set_apply_outcome(
@@ -4295,21 +4296,21 @@ class JobrightScraper(BaseScraper):
                                 if owned_recovery
                                 else "duplicate_application_prevented"
                             ),
-                            f"A verified submission already exists for {ledger_key}; not resubmitting.",
+                            f"A verified submission already exists for {ledger_key_ref}; not resubmitting.",
                         )
                     if phase == PHASE_IN_PROGRESS:
                         return self._set_apply_outcome(
                             "submit_in_progress",
-                            f"A prior submit for {ledger_key} is unresolved; not resubmitting.",
+                            f"A prior submit for {ledger_key_ref} is unresolved; not resubmitting.",
                         )
                     if phase == PHASE_UNVERIFIED:
                         return self._set_apply_outcome(
                             "submit_unverified_unresolved",
-                            f"A prior submit for {ledger_key} was unconfirmed; reconcile before resubmitting.",
+                            f"A prior submit for {ledger_key_ref} was unconfirmed; reconcile before resubmitting.",
                         )
                     return self._set_apply_outcome(
                         "submission_ledger_unavailable",
-                        f"Submission ledger has an unknown phase for {ledger_key}; refusing to submit.",
+                        f"Submission ledger has an unknown phase for {ledger_key_ref}; refusing to submit.",
                     )
 
             # Use JS click to bypass Workday overlay divs that intercept pointer events.
@@ -4425,6 +4426,7 @@ class JobrightScraper(BaseScraper):
                 PHASE_UNVERIFIED,
                 PHASE_VERIFIED,
                 canonical_key,
+                ledger_key_reference,
             )
 
             ledger_job = dict(job)
@@ -4432,6 +4434,7 @@ class JobrightScraper(BaseScraper):
                 getattr(self, "last_apply_ats_url", "") or portal_url
             )
             ledger_key = canonical_key(ledger_job)
+            ledger_key_ref = ledger_key_reference(ledger_key)
             if not ledger_key:
                 return self._set_apply_outcome(
                     "submission_ledger_key_missing",
@@ -4469,21 +4472,21 @@ class JobrightScraper(BaseScraper):
                             if owned_recovery
                             else "duplicate_application_prevented"
                         ),
-                        f"A verified submission already exists for {ledger_key}; not resubmitting.",
+                        f"A verified submission already exists for {ledger_key_ref}; not resubmitting.",
                     )
                 if phase == PHASE_IN_PROGRESS:
                     return self._set_apply_outcome(
                         "submit_in_progress",
-                        f"A prior submit for {ledger_key} is unresolved; not resubmitting.",
+                        f"A prior submit for {ledger_key_ref} is unresolved; not resubmitting.",
                     )
                 if phase == PHASE_UNVERIFIED:
                     return self._set_apply_outcome(
                         "submit_unverified_unresolved",
-                        f"A prior submit for {ledger_key} was unconfirmed; reconcile before resubmitting.",
+                        f"A prior submit for {ledger_key_ref} was unconfirmed; reconcile before resubmitting.",
                     )
                 return self._set_apply_outcome(
                     "submission_ledger_unavailable",
-                    f"Submission ledger has an unknown phase for {ledger_key}; refusing to submit.",
+                    f"Submission ledger has an unknown phase for {ledger_key_ref}; refusing to submit.",
                 )
 
             console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")

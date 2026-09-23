@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import fcntl
+import hashlib
 import math
 import os
 import tempfile
@@ -64,6 +65,22 @@ def canonical_key(job: dict) -> str:
     return f"{vendor}|{norm}" if norm else ""
 
 
+def ledger_key_reference(key: str) -> str:
+    """Return an opaque, stable reference safe for external diagnostics.
+
+    Canonical keys deliberately include a normalized posting URL for exact
+    deduplication. That URL can contain userinfo or job-ID query values, so the
+    raw key must remain confined to the local ledger and never enter operator
+    notifications, apply-attempt details, or cloud state.
+    """
+    if not key:
+        return "submission|ref:unknown"
+    vendor, separator, _url = key.partition("|")
+    safe_vendor = vendor if separator and vendor.isalnum() else "submission"
+    digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{safe_vendor}|ref:{digest}"
+
+
 class SubmissionLedger:
     def __init__(self, path: Path | str | None = None):
         self.path = Path(path) if path else _DEFAULT_PATH
@@ -102,7 +119,8 @@ class SubmissionLedger:
                 or not valid_timestamp
             ):
                 raise LedgerUnreadableError(
-                    f"ledger at {self.path} has an invalid record for {key!r}"
+                    f"ledger at {self.path} has an invalid record for "
+                    f"{ledger_key_reference(str(key))}"
                 )
         return data
 
@@ -209,7 +227,8 @@ class SubmissionLedger:
                 or existing_attempt_id != str(attempt_id)
             ):
                 raise LedgerOwnershipError(
-                    f"submission key {key} cannot be cleared by {attempt_id}; "
+                    f"submission key {ledger_key_reference(key)} cannot be cleared "
+                    f"by {attempt_id}; "
                     f"current owner is {existing_attempt_id or '(unknown)'} "
                     f"in phase {existing.get('phase') or '(unknown)'}"
                 )
@@ -254,7 +273,7 @@ class SubmissionLedger:
         existing = self.claim(key, attempt_id)
         if existing is not None:
             raise LedgerOwnershipError(
-                f"submission key {key} is already owned by "
+                f"submission key {ledger_key_reference(key)} is already owned by "
                 f"{existing.get('attempt_id') or '(unknown)'}"
             )
 
@@ -266,12 +285,13 @@ class SubmissionLedger:
             existing = data.get(key) if isinstance(data.get(key), dict) else None
             if not existing:
                 raise LedgerOwnershipError(
-                    f"submission key {key} has no live claim for attempt {attempt_id}"
+                    f"submission key {ledger_key_reference(key)} has no live claim "
+                    f"for attempt {attempt_id}"
                 )
             existing_attempt_id = str(existing.get("attempt_id") or "")
             if existing_attempt_id != str(attempt_id):
                 raise LedgerOwnershipError(
-                    f"submission key {key} belongs to attempt "
+                    f"submission key {ledger_key_reference(key)} belongs to attempt "
                     f"{existing_attempt_id or '(unknown)'}, not {attempt_id}"
                 )
             existing_phase = existing.get("phase")
@@ -279,7 +299,8 @@ class SubmissionLedger:
                 return
             if existing_phase != PHASE_IN_PROGRESS:
                 raise LedgerOwnershipError(
-                    f"submission key {key} is already terminal in phase "
+                    f"submission key {ledger_key_reference(key)} is already terminal "
+                    "in phase "
                     f"{existing_phase or '(unknown)'}; attempt {attempt_id} "
                     "cannot rewrite it"
                 )

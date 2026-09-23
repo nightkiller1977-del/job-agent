@@ -18,6 +18,7 @@ from src.sources.adapters.idempotency import (
     LedgerOwnershipError,
     SubmissionLedger,
     canonical_key,
+    ledger_key_reference,
 )
 from src.sources.adapters.profile_lock import ProfileLock, ProfileLockError
 from src.sources.adapters.receipt import verify_receipt
@@ -430,8 +431,41 @@ async def test_session_notifies_for_preflight_reconciliation(
         expected_status,
         "greenhouse: reconciliation required",
         result.detail,
-        key=f"reconcile:{key}:{expected_status}",
+        key=f"reconcile:{ledger_key_reference(key)}:{expected_status}",
     )
+
+
+@pytest.mark.asyncio
+async def test_session_redacts_sensitive_ledger_key_from_external_details(
+    tmp_path, monkeypatch
+):
+    job = {
+        "url": (
+            "https://applicant:super-secret@boards.greenhouse.io/acme/jobs/1"
+            "?gh_jid=private-token"
+        )
+    }
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(job)
+    ledger.claim(key, "previous-attempt", job_id="another-job")
+    ledger.complete(key, "previous-attempt", verified=True)
+    sess, page, _ = _make_session(
+        tmp_path,
+        _RecordingAdapter(AtsApplyResult.ok(), raises=True),
+        monkeypatch,
+        ledger=ledger,
+    )
+    sess.dispatcher = MagicMock()
+
+    result = await sess.apply(job, auto_submit=True)
+
+    exposed = f"{result.detail} {sess.dispatcher.dispatch_event.call_args}"
+    assert result.status == "duplicate_application_prevented"
+    assert page.goto_called is False
+    assert key not in exposed
+    assert "applicant" not in exposed
+    assert "super-secret" not in exposed
+    assert "private-token" not in exposed
 
 
 @pytest.mark.asyncio

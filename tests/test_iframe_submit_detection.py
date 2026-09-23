@@ -1100,6 +1100,58 @@ async def test_unverified_dispatch_is_durably_blocked_from_retry(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_legacy_ledger_outcome_redacts_sensitive_canonical_key(
+    monkeypatch, tmp_path
+):
+    """Cloud-bound legacy details must never expose credentials or URL tokens."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    sensitive_url = (
+        "https://applicant:super-secret@boards.greenhouse.io/acme/jobs/1"
+        "?gh_jid=private-token"
+    )
+    job = {
+        "job_id": "job-sensitive-url",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": sensitive_url,
+    }
+    ledger = SubmissionLedger(path=tmp_path / "apply-ledger.json")
+    key = canonical_key(job)
+    ledger.claim(key, "previous-attempt", job_id="another-job")
+    ledger.complete(key, "previous-attempt", verified=True)
+
+    async def _capture_baseline(frame):
+        return frame
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+
+    submit_button = FakeElement("Submit Application")
+    frame = FakeFrame(
+        sensitive_url,
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    scraper = _scraper()
+    scraper._submission_ledger = ledger
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    submitted = await scraper._confirm_and_submit(
+        FakePage([frame], url=sensitive_url), job, auto_submit=True
+    )
+
+    detail = scraper.last_apply_detail
+    assert submitted is False
+    assert scraper.last_apply_status == "duplicate_application_prevented"
+    assert submit_button.evaluate_calls == 0
+    assert key not in detail
+    assert "applicant" not in detail
+    assert "super-secret" not in detail
+    assert "private-token" not in detail
+
+
+@pytest.mark.asyncio
 async def test_concurrent_legacy_attempts_dispatch_only_once(monkeypatch, tmp_path):
     """Two legacy workers racing the same job must share one atomic ledger claim."""
     from src.sources.adapters.idempotency import SubmissionLedger

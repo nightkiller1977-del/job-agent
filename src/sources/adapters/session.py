@@ -39,6 +39,7 @@ from .idempotency import (
     PHASE_VERIFIED,
     SubmissionLedger,
     canonical_key,
+    ledger_key_reference,
 )
 from .profile_lock import ProfileLock, ProfileLockError
 from .auth_routing import directive_for
@@ -214,6 +215,7 @@ class ExternalApplySession(BaseScraper):
         external_url = job.get("url") or job.get("external_url") or ""
         attempt_id = uuid.uuid4().hex
         key = canonical_key(job)
+        key_reference = ledger_key_reference(key)
         vendor = detect_vendor(external_url)
         job_id = str(job.get("job_id") or "")
         started = time.time()
@@ -237,7 +239,7 @@ class ExternalApplySession(BaseScraper):
                 outcome,
                 f"{vendor}: reconciliation required",
                 result.detail,
-                key=f"reconcile:{job_id or key}:{outcome}",
+                key=f"reconcile:{job_id or key_reference}:{outcome}",
             )
             return result
 
@@ -287,7 +289,7 @@ class ExternalApplySession(BaseScraper):
                 else "duplicate_application_prevented"
             )
             _event("duplicate_prevented", AttemptPhase.UNKNOWN, outcome=outcome)
-            detail = f"already applied to {key} — not resubmitting"
+            detail = f"already applied to {key_reference} — not resubmitting"
             if outcome == "duplicate_application_prevented":
                 return _reconciliation_block(outcome, detail)
             return AtsApplyResult.blocked(outcome, detail, attempt_id=attempt_id)
@@ -298,10 +300,10 @@ class ExternalApplySession(BaseScraper):
             self._maybe_notify("submit_in_progress_blocked", "submit_in_progress",
                                f"{vendor}: apply needs attention",
                                "A prior submit is unresolved — review before retrying.",
-                               key=f"{key or attempt_id}:submit_in_progress")
+                               key=f"{key_reference}:submit_in_progress")
             return AtsApplyResult.blocked(
                 "submit_in_progress",
-                f"a prior submit for {key} is unresolved "
+                f"a prior submit for {key_reference} is unresolved "
                 f"({'stale/crashed' if stale else 'in flight'}) — not resubmitting blindly",
                 attempt_id=attempt_id,
             )
@@ -312,7 +314,7 @@ class ExternalApplySession(BaseScraper):
                    outcome="submit_unverified_unresolved")
             return _reconciliation_block(
                 "submit_unverified_unresolved",
-                f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
+                f"a prior submit for {key_reference} was unconfirmed — reconcile before resubmitting",
             )
 
         policy: SubmissionPolicy = self._policy_override or AutoSubmitPolicy(allow=auto_submit)
@@ -326,7 +328,7 @@ class ExternalApplySession(BaseScraper):
             self._maybe_notify("profile_locked", "profile_locked",
                                f"{vendor}: apply blocked",
                                "Another Chrome holds the profile — close it and retry.",
-                               key=f"{key or attempt_id}:profile_locked")
+                               key=f"{key_reference}:profile_locked")
             return AtsApplyResult.blocked(
                 "profile_locked", str(e), attempt_id=attempt_id,
             )
@@ -416,7 +418,7 @@ class ExternalApplySession(BaseScraper):
                             if owned_recovery
                             else "duplicate_application_prevented"
                         )
-                        detail = f"already applied to {key} — not resubmitting"
+                        detail = f"already applied to {key_reference} — not resubmitting"
                         if outcome == "duplicate_application_prevented":
                             return _reconciliation_block(outcome, detail)
                         return AtsApplyResult.blocked(
@@ -425,17 +427,17 @@ class ExternalApplySession(BaseScraper):
                     if phase == PHASE_IN_PROGRESS:
                         return AtsApplyResult.blocked(
                             "submit_in_progress",
-                            f"a prior submit for {key} is unresolved — not resubmitting blindly",
+                            f"a prior submit for {key_reference} is unresolved — not resubmitting blindly",
                             attempt_id=attempt_id,
                         )
                     if phase == PHASE_UNVERIFIED:
                         return _reconciliation_block(
                             "submit_unverified_unresolved",
-                            f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
+                            f"a prior submit for {key_reference} was unconfirmed — reconcile before resubmitting",
                         )
                     return AtsApplyResult.blocked(
                         "ledger_unreadable",
-                        f"submission ledger has an unknown phase for {key} — refusing to submit",
+                        f"submission ledger has an unknown phase for {key_reference} — refusing to submit",
                         attempt_id=attempt_id,
                     )
                 marked = True
@@ -501,7 +503,7 @@ class ExternalApplySession(BaseScraper):
             self._emit_forensic_classification(attempt_id, job_id)
             self._maybe_notify("attempt_finished", res.status,
                                f"{vendor}: {res.status}", res.detail,
-                               key=f"{key or attempt_id}:{res.status}")
+                               key=f"{key_reference}:{res.status}")
             if not res.submitted and not res.verified:
                 # Coordinator incident reporting is strictly best-effort — it must
                 # never change the apply result or break the flow.
