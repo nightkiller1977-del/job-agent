@@ -140,3 +140,45 @@ def _attempt_scope_legacy_vendor_receipt_fakes(request, monkeypatch):
 
         monkeypatch.setattr(element_cls, "click", click)
         monkeypatch.setattr(page_cls, "evaluate", evaluate)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_notifier_side_effects(request, tmp_path, monkeypatch):
+    """No test may reach a real phone/desktop or the developer's live status file.
+
+    src.notifier.notify_error/notify_warning are not inert: notify_error
+    unconditionally sends a real Telegram message and fires a real Linux/macOS
+    desktop notification, and both write to the live, shared
+    state/agent_status.json alert ring buffer (capped at 50 entries).
+
+    Individual test files (test_notifier_hygiene.py, test_commander_feature.py,
+    test_commander_functional.py) already isolate STATUS_FILE themselves — this
+    fixture existing beforehand would have prevented the actual incident:
+    tests/test_cloud_sync_reliability.py constructs a real Orchestrator with a
+    genuinely missing config path and exercises real cloud-sync/model-cascade
+    failure paths to test their *local* error handling, without knowing those
+    same code paths also call notify_error(). Running the full suite on a
+    developer machine with real Telegram/notify-send configured — exactly this
+    machine — sent a real "job-agent config.json missing" (with the test's own
+    /tmp/pytest-.../missing.json path in the message body) and a real
+    "Model cascade total failure" push for every single run, and evicted 35 of
+    the last 50 entries in the live alert history with fabricated test noise
+    (discovered 2026-09-23; state/agent_status.json's alerts already carried
+    them before this fixture existed).
+
+    A test that explicitly wants to assert what notify_error/_send_telegram/
+    _desktop_notify were called with still can: its own monkeypatch.setattr
+    runs after this fixture and simply overrides these defaults, exactly as it
+    already does in the files above.
+    """
+    import src.notifier as _notifier_mod
+
+    monkeypatch.setattr(_notifier_mod, "STATUS_FILE", tmp_path / "agent_status.json")
+    monkeypatch.setattr(_notifier_mod, "_send_telegram", lambda message: None)
+
+    # test_desktop_notifications_are_rate_limited_after_sanitization tests
+    # _desktop_notify's OWN rate-limit/sanitization logic directly and already
+    # isolates the real OS call one layer down (notifier.subprocess.run) — it
+    # needs the genuine function, not this default no-op.
+    if request.node.name != "test_desktop_notifications_are_rate_limited_after_sanitization":
+        monkeypatch.setattr(_notifier_mod, "_desktop_notify", lambda *a, **k: None)
