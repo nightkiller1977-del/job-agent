@@ -353,7 +353,7 @@ class ExternalApplySession(BaseScraper):
             # claim the key before the adapter can dispatch (crash-safe).
             if key:
                 try:
-                    existing = self.ledger.claim(key, attempt_id)
+                    existing = self.ledger.claim(key, attempt_id, job_id=job_id)
                 except LedgerUnreadableError as exc:
                     return AtsApplyResult.blocked(
                         "ledger_unreadable",

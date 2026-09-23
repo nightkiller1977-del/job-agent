@@ -372,11 +372,37 @@ class StateManager:
 
         try:
             from .sources.adapters.idempotency import canonical_key, PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED
-            key = canonical_key(job)
-            if not key:
-                return job.get("confirmation_status")
 
-            record = ledger.record(key) if hasattr(ledger, "record") else ledger.get(key)
+            extra = parse_extra_json(job.get("extra_json"))
+            candidate_urls = [
+                job.get("ats_url"),
+                extra.get("ats_url"),
+                job.get("external_url"),
+                job.get("url"),
+            ]
+            keys = []
+            for url in candidate_urls:
+                key = canonical_key({"url": url}) if url else ""
+                if key and key not in keys:
+                    keys.append(key)
+
+            record = None
+            matched_key = ""
+            for key in keys:
+                candidate = ledger.record(key) if hasattr(ledger, "record") else ledger.get(key)
+                if candidate:
+                    matched_key = key
+                    record = candidate
+                    break
+
+            # Crash recovery cannot depend solely on extra_json.ats_url: the
+            # process may die after employer submission but before persisting
+            # that resolved portal URL. The atomic claim therefore carries the
+            # local job ID as a secondary durable lookup key.
+            if not record and hasattr(ledger, "record_for_job"):
+                job_record = ledger.record_for_job(str(job_id))
+                if job_record:
+                    matched_key, record = job_record
             if not record:
                 return job.get("confirmation_status")
 
@@ -388,7 +414,7 @@ class StateManager:
             elif phase == PHASE_UNVERIFIED:
                 target_status = "submission_unverified"
             elif phase == PHASE_IN_PROGRESS:
-                if hasattr(ledger, "is_stale_in_progress") and ledger.is_stale_in_progress(key):
+                if hasattr(ledger, "is_stale_in_progress") and ledger.is_stale_in_progress(matched_key):
                     target_status = "reconciliation_required"
                 else:
                     target_status = "submitting"
@@ -406,24 +432,32 @@ class StateManager:
 
         return job.get("confirmation_status")
 
-    def reconcile_active_jobs_from_ledger(self) -> int:
-        """Scans unconfirmed active applied jobs, projecting SubmissionLedger phase onto confirmation_status."""
-        try:
-            from .sources.adapters.idempotency import SubmissionLedger
-            ledger = SubmissionLedger()
-        except Exception:
-            return 0
+    def reconcile_active_jobs_from_ledger(self, ledger: Any = None) -> int:
+        """Project durable submit state onto unconfirmed approved/applied jobs.
+
+        A verified receipt promotes an approved row to applied before the apply
+        pool is built, preventing a restarted worker from reopening a browser
+        for an application that the employer already received.
+        """
+        if ledger is None:
+            try:
+                from .sources.adapters.idempotency import SubmissionLedger
+                ledger = SubmissionLedger()
+            except Exception:
+                return 0
 
         reconciled_count = 0
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT job_id FROM jobs WHERE status = 'applied' AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')"
+                "SELECT job_id, status FROM jobs WHERE status IN ('approved', 'applied') AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')"
             ).fetchall()
 
         for r in rows:
             jid = r["job_id"]
             new_status = self.sync_confirmation_from_ledger(jid, ledger=ledger)
             if new_status:
+                if r["status"] == "approved" and new_status == "submitted":
+                    self.set_status(jid, "applied")
                 reconciled_count += 1
 
         return reconciled_count

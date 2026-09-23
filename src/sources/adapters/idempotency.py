@@ -115,6 +115,26 @@ class SubmissionLedger:
             return None
         return self._load().get(key)
 
+    def record_for_job(self, job_id: str) -> tuple[str, dict] | None:
+        """Return the newest durable record associated with *job_id*.
+
+        The ATS key can differ from the discovery URL stored on the job row.
+        Keeping the local job identifier on the pre-submit claim lets startup
+        recovery find the receipt even if the process crashed before it could
+        persist the resolved ATS URL back to SQLite.
+        """
+        if not job_id:
+            return None
+        matches = [
+            (key, record)
+            for key, record in self._load().items()
+            if isinstance(record, dict) and str(record.get("job_id") or "") == job_id
+        ]
+        if not matches:
+            return None
+        key, record = max(matches, key=lambda item: float(item[1].get("ts", 0)))
+        return key, dict(record)
+
     def already_applied(self, key: str) -> bool:
         rec = self.record(key)
         return bool(rec and rec.get("phase") == PHASE_VERIFIED)
@@ -148,7 +168,7 @@ class SubmissionLedger:
         return (time.time() - float(rec.get("ts", 0))) > STALE_AFTER_S
 
     # ---- transitions ---------------------------------------------------------
-    def claim(self, key: str, attempt_id: str) -> dict | None:
+    def claim(self, key: str, attempt_id: str, *, job_id: str = "") -> dict | None:
         """Atomically claim *key* for one submit attempt.
 
         Returns ``None`` when this caller wrote the in-progress marker. If any
@@ -163,11 +183,14 @@ class SubmissionLedger:
             existing = data.get(key)
             if existing is not None:
                 return dict(existing)
-            data[key] = {
+            record = {
                 "phase": PHASE_IN_PROGRESS,
                 "attempt_id": attempt_id,
                 "ts": time.time(),
             }
+            if job_id:
+                record["job_id"] = job_id
+            data[key] = record
             self._save(data)
         return None
 
@@ -184,9 +207,13 @@ class SubmissionLedger:
             return
         with self._exclusive_lock():
             data = self._load()
-            data[key] = {
+            existing = data.get(key) if isinstance(data.get(key), dict) else {}
+            record = {
                 "phase": PHASE_VERIFIED if verified else PHASE_UNVERIFIED,
                 "attempt_id": attempt_id,
                 "ts": time.time(),
             }
+            if existing.get("job_id"):
+                record["job_id"] = existing["job_id"]
+            data[key] = record
             self._save(data)

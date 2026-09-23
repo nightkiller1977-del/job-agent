@@ -900,6 +900,33 @@ class Orchestrator:
         # Pull cloud-approved jobs into local SQLite first
         await self._pull_approved_from_cloud()
 
+        # Recover durable employer receipts before building the apply pool. A
+        # worker can crash after submit succeeds but before the resolved ATS URL
+        # or applied status reaches SQLite/cloud; reopening a browser in that
+        # state risks a duplicate application.
+        approved_before_reconcile = {
+            str(job.get("job_id") or "") for job in self.state.get_approved_unapplied()
+        }
+        try:
+            reconciled = self.state.reconcile_active_jobs_from_ledger()
+            if reconciled:
+                for recovered_job_id in approved_before_reconcile:
+                    recovered_job = self.state.get_job(recovered_job_id)
+                    if recovered_job and recovered_job.get("status") == "applied":
+                        try:
+                            await self._push_status_to_cloud(recovered_job_id, "applied")
+                        except Exception as exc:
+                            _log.warning(
+                                "apply.ledger_recovery_cloud_sync_failed job_id=%s error=%s",
+                                recovered_job_id,
+                                exc,
+                            )
+                console.print(
+                    f"[cyan]Ledger recovery: reconciled {reconciled} active job(s) before apply.[/cyan]"
+                )
+        except Exception as exc:
+            _log.warning("apply.ledger_recovery_failed error=%s", exc)
+
         # Expire dead/stale postings before selecting the apply pool, so an
         # approved-but-expired job is skipped (with a logged reason + status
         # change) instead of burning a browser attempt. Throttled internally.

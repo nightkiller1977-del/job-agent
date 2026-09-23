@@ -184,7 +184,11 @@ def test_ledger_claim_is_atomic_across_concurrent_owners(tmp_path):
 
     def _claim(index):
         gate.wait()
-        return ledgers[index].claim("greenhouse|https://example.test/job/1", f"att-{index}")
+        return ledgers[index].claim(
+            "greenhouse|https://example.test/job/1",
+            f"att-{index}",
+            job_id="job-1",
+        )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(_claim, range(2)))
@@ -286,7 +290,7 @@ async def test_session_rechecks_atomic_claim_before_adapter(tmp_path, monkeypatc
     monkeypatch.setattr(
         ledger,
         "claim",
-        lambda _key, _attempt_id: {
+        lambda _key, _attempt_id, job_id="": {
             "phase": "submit_in_progress",
             "attempt_id": "concurrent-owner",
         },

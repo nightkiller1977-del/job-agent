@@ -360,6 +360,39 @@ class TestApplyReauth:
         assert orchestrator.state.get_approved_unapplied() == []
 
     @pytest.mark.asyncio
+    async def test_apply_reconciles_verified_ledger_before_building_pool(
+        self, orchestrator, tmp_status
+    ):
+        """Cold-start ledger recovery must happen before any scraper is launched."""
+        job = _approved_job()
+        self._seed_job(orchestrator, job)
+
+        def _recover_before_selection():
+            orchestrator.state.set_status(job["job_id"], "applied")
+            orchestrator.state.recover_confirmation_from_ledger(
+                job["job_id"],
+                "submitted",
+                phase="receipt_verified",
+            )
+            return 1
+
+        scraper_cls = MagicMock()
+        with patch.dict("src.orchestrator.SOURCE_MAP", {"jobright": scraper_cls}), \
+             patch.object(
+                 orchestrator.state,
+                 "reconcile_active_jobs_from_ledger",
+                 side_effect=_recover_before_selection,
+             ) as reconcile, \
+             patch("src.orchestrator.ReauthManager"), \
+             patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
+            await orchestrator.apply_approved(auto_submit=True)
+
+        reconcile.assert_called_once_with()
+        scraper_cls.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_apply_auth_failure_reauth_attempted_once_per_source(self, orchestrator, tmp_status):
         """Repeated AuthFailedError for one source must not re-notify for every job."""
         job1 = _approved_job("job1", "usajobs")

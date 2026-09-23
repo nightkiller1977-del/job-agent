@@ -4168,7 +4168,11 @@ class JobrightScraper(BaseScraper):
 
                     # Atomic crash-safe boundary: only one worker can claim this
                     # key before the employer-facing side effect below.
-                    existing = submission_ledger.claim(ledger_key, ledger_attempt_id)
+                    existing = submission_ledger.claim(
+                        ledger_key,
+                        ledger_attempt_id,
+                        job_id=str(job.get("job_id") or ""),
+                    )
                 except LedgerUnreadableError as exc:
                     return self._set_apply_outcome(
                         "ledger_unreadable",
