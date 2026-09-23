@@ -14,6 +14,16 @@ def _client_context(client):
     return context
 
 
+def test_orchestrator_reuses_process_run_log(tmp_path):
+    from src.orchestrator import Orchestrator
+
+    shared = MagicMock()
+    with patch("src.orchestrator._get_run_log", return_value=shared):
+        orchestrator = Orchestrator(config_path=str(tmp_path / "missing.json"))
+
+    assert orchestrator.run_log is shared
+
+
 @pytest.mark.asyncio
 async def test_pull_retries_one_timeout_then_succeeds(tmp_path, monkeypatch):
     from src.orchestrator import Orchestrator

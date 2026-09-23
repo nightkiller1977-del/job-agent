@@ -32,6 +32,11 @@ _QUERY = re.compile(
     re.IGNORECASE,
 )
 _AUTH_HEADER = re.compile(r"\bauthorization\s*:\s*(?:basic|bearer)\s+[^\s,;]+", re.IGNORECASE)
+_SENSITIVE_HEADER = re.compile(
+    r"\b(?:cookie|set-cookie|proxy-authorization|authorization|x[-_]?api[-_]?key|x[-_]?auth[-_]?token)"
+    r"\s*(?::|=|\s)\s*(?:(?:basic|bearer)\s+)?(?:\"[^\"]*\"|'[^']*'|[^,]+)",
+    re.IGNORECASE,
+)
 _SECRET_WORD = re.compile(r"\b[\w.-]*(?:secret|token|password)[\w.-]*\b", re.IGNORECASE)
 
 
@@ -65,6 +70,7 @@ def _safe_message(exc: BaseException, kind: str) -> str:
         return kind
     message = "; ".join(pieces)
     message = _URL.sub("[redacted-url]", message)
+    message = _SENSITIVE_HEADER.sub("[redacted]", message)
     message = _AUTH_HEADER.sub("[redacted]", message)
     message = _QUERY.sub("[redacted]", message)
     message = _SECRET_WORD.sub("[redacted]", message)

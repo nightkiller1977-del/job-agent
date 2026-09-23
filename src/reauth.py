@@ -66,7 +66,9 @@ def classify_session_failure(
         kind = "captcha"
     elif "two-factor" in message or "2fa" in message or "verification code" in message:
         kind = "two_factor_required"
-    elif isinstance(exc, TimeoutError) or "mail" in message and "timeout" in message:
+    elif ("mail" in message or "email" in message) and (
+        isinstance(exc, TimeoutError) or "timeout" in message or "timed out" in message
+    ):
         kind = "email_code_timeout"
     elif "credential" in message or "password" in message or "login" in message:
         kind = "invalid_credentials"

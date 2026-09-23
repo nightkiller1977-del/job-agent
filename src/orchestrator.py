@@ -136,7 +136,9 @@ class Orchestrator:
             pass
         self.config = self._load_config(config_path)
         self.state = StateManager(self.config.get("state_db_path", "state/jobs.db"))
-        self.run_log = RunLog(agent="orchestrator")
+        # Use the process-scoped journal shared with application forensics so
+        # cloud-boundary failures and their apply attempts remain correlated.
+        self.run_log = _get_run_log()
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         self.scorer = JobScorer(config=self.config, api_key=api_key)
 

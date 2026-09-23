@@ -49,6 +49,26 @@ def test_redacts_basic_auth_and_common_secret_assignments():
     assert message.count("[redacted]") >= 4
 
 
+@pytest.mark.parametrize(
+    "secret_text",
+    [
+        "Cookie: sessionid=cookie-secret; csrftoken=csrf-secret",
+        "cookie=sessionid=cookie-secret",
+        "X-Api-Key whitespace-secret",
+        "X_Auth_Token: header-secret",
+    ],
+)
+def test_redacts_cookie_and_whitespace_header_secrets(secret_text):
+    message = describe_failure(
+        "cloud_sync_jobs", "dashboard_sync", RuntimeError(f"request failed: {secret_text}")
+    )["message"]
+
+    assert "cookie-secret" not in message
+    assert "csrf-secret" not in message
+    assert "whitespace-secret" not in message
+    assert "header-secret" not in message
+
+
 def _connect_error(message: str, *, cause: BaseException | None = None) -> httpx.ConnectError:
     exc = httpx.ConnectError(message, request=httpx.Request("GET", "https://dashboard.example/api"))
     if cause is not None:

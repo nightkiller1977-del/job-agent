@@ -29,6 +29,30 @@ def test_provider_failure_taxonomy_is_distinguishable():
 
 
 @pytest.mark.asyncio
+async def test_empty_provider_responses_are_recorded_in_cascade_history(monkeypatch):
+    from src.model_client import ModelCascadeError, reset_provider_status
+
+    reset_provider_status()
+    client = ModelClient(anthropic_api_key="test-anthropic-key")
+    monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result="local-model"))
+    monkeypatch.setattr(client, "_call_ollama", lambda *args, **kwargs: asyncio.sleep(0, result="  "))
+    monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-gateway-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "https://gateway.example")
+    monkeypatch.setattr(client, "_call_openrouter_gateway", lambda *args, **kwargs: asyncio.sleep(0, result=""))
+    monkeypatch.setattr(client, "_call_claude", lambda *args, **kwargs: asyncio.sleep(0, result="\n"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ModelCascadeError):
+        await client.complete([{"role": "user", "content": "test"}])
+
+    assert client.provider_attempt_history == [
+        {"provider": "ollama", "kind": "malformed_output", "exception_type": "ValueError"},
+        {"provider": "openrouter", "kind": "malformed_output", "exception_type": "ValueError"},
+        {"provider": "anthropic", "kind": "malformed_output", "exception_type": "ValueError"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ollama_calls_to_same_endpoint_serialize(monkeypatch):
     ModelClient.reset_semaphores()
     monkeypatch.setenv("OLLAMA_MAX_CONCURRENCY", "1")

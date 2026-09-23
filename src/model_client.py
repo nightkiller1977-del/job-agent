@@ -539,6 +539,8 @@ class ModelClient:
                 if text and text.strip():
                     _log.info("ModelClient: Ollama model=%s task=%s", ollama_model, task_type)
                     return text
+                self._record_provider_failure("ollama", ValueError("empty provider response"))
+                last_error = "ollama_empty_response"
                 _log.warning("ModelClient: Ollama returned empty — escalating to OpenRouter Gateway")
             except Exception as exc:
                 self._record_provider_failure("ollama", exc)
@@ -564,6 +566,8 @@ class ModelClient:
                 if text and text.strip():
                     _log.info("ModelClient: OpenRouter Gateway model=%s task=%s", model_name, task_type)
                     return text
+                self._record_provider_failure("openrouter", ValueError("empty provider response"))
+                last_error = "openrouter_empty_response"
                 _log.warning("ModelClient: OpenRouter returned empty — escalating to Direct Claude")
             except BudgetExceededError as exc:
                 self._record_provider_failure("openrouter", exc)
@@ -605,6 +609,8 @@ class ModelClient:
                 if text and text.strip():
                     _log.info("ModelClient: Claude model=%s task=%s", self._anthropic_model, task_type)
                     return text
+                self._record_provider_failure("anthropic", ValueError("empty provider response"))
+                last_error = "anthropic_empty_response"
                 _log.warning("ModelClient: Claude returned empty — escalating to OpenAI")
             except Exception as exc:
                 self._record_provider_failure("anthropic", exc)
@@ -623,8 +629,12 @@ class ModelClient:
             try:
                 with _model_span("openai", OPENAI_MODEL):
                     text = await self._call_openai(messages, system, max_tokens, temperature=temperature)
-                _log.info("ModelClient: OpenAI model=%s task=%s", OPENAI_MODEL, task_type)
-                return text
+                if text and text.strip():
+                    _log.info("ModelClient: OpenAI model=%s task=%s", OPENAI_MODEL, task_type)
+                    return text
+                self._record_provider_failure("openai", ValueError("empty provider response"))
+                last_error = "openai_empty_response"
+                _log.warning("ModelClient: OpenAI returned empty")
             except Exception as exc:
                 self._record_provider_failure("openai", exc)
                 last_error = str(exc)
