@@ -24,12 +24,14 @@ class FakeElement:
         visible=True,
         visible_raises=False,
         evaluate_raises=False,
+        evaluate_raises_after_callback=False,
         on_evaluate=None,
     ):
         self.name = name
         self._visible = visible
         self._visible_raises = visible_raises
         self._evaluate_raises = evaluate_raises
+        self._evaluate_raises_after_callback = evaluate_raises_after_callback
         self._on_evaluate = on_evaluate
         self.clicked = False
         self.evaluate_calls = 0
@@ -46,6 +48,8 @@ class FakeElement:
         self.clicked = True
         if self._on_evaluate:
             self._on_evaluate()
+        if self._evaluate_raises_after_callback:
+            raise RuntimeError("click evaluation failed after dispatch")
 
 
 class FakeFrame:
@@ -514,6 +518,55 @@ async def test_replacement_frame_reuses_submit_context_baseline(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_surviving_same_origin_frame_keeps_its_own_baseline(monkeypatch):
+    """A stale sibling receipt must not inherit the detached submit baseline."""
+    main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
+    stale_receipt = FakeFrame(
+        "https://boards.greenhouse.io/embed/confirmation",
+        evaluate_result=True,
+    )
+    page = None
+
+    def _detach_application():
+        page.frames = [main, stale_receipt]
+
+    submit_button = FakeElement("Submit Application", on_evaluate=_detach_application)
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([main, application, stale_receipt], url=main.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+    seen_baselines = []
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _stale_sibling_receipt(frame, *, baseline, **_kwargs):
+        if frame is stale_receipt:
+            seen_baselines.append(baseline)
+            if baseline is application:
+                return True, "t:application received"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _stale_sibling_receipt)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert seen_baselines
+    assert all(baseline is stale_receipt for baseline in seen_baselines)
+
+
+@pytest.mark.asyncio
 async def test_delayed_replacement_frame_is_reenumerated_during_receipt_polling(monkeypatch):
     """A replacement that appears after the first poll must still be inspected."""
     main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
@@ -561,9 +614,19 @@ async def test_delayed_replacement_frame_is_reenumerated_during_receipt_polling(
 
 
 @pytest.mark.asyncio
-async def test_both_click_evaluations_failing_never_records_submission(monkeypatch):
-    """Both click paths failing must stop before receipt or success bookkeeping."""
-    submit_button = FakeElement("Submit Application", evaluate_raises=True)
+async def test_click_exception_after_dispatch_is_not_retried(monkeypatch):
+    """An uncertain first dispatch must never trigger a blind second click."""
+    dispatches = 0
+
+    def _record_dispatch():
+        nonlocal dispatches
+        dispatches += 1
+
+    submit_button = FakeElement(
+        "Submit Application",
+        evaluate_raises_after_callback=True,
+        on_evaluate=_record_dispatch,
+    )
     frame = FakeFrame(
         "https://boards.greenhouse.io/acme/jobs/1",
         {"#submit_app": submit_button},
@@ -584,7 +647,8 @@ async def test_both_click_evaluations_failing_never_records_submission(monkeypat
         auto_submit=True,
     )
 
-    assert submit_button.evaluate_calls == 2
+    assert submit_button.evaluate_calls == 1
+    assert dispatches == 1
     assert submitted is False
-    assert scraper.last_apply_status == "submit_click_failed"
+    assert scraper.last_apply_status == "submission_unverified"
     assert not getattr(scraper, "_apply_analytics", {}).get("submitted", False)

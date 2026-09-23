@@ -2284,9 +2284,11 @@ class JobrightScraper(BaseScraper):
         Playwright keeps a frame object when it navigates, but an embedded ATS
         can replace its iframe entirely. A replacement is eligible only after
         the submit-owning frame disappears and only when it has the same origin.
-        It inherits the submit frame's pre-click baseline, so a remounted stale
-        confirmation cannot become fresh merely because its Python identity is
-        new. Frames are re-enumerated on every poll to catch delayed remounts.
+        A surviving frame keeps its own pre-click baseline. A genuinely new
+        replacement inherits the submit frame's baseline, so neither a stale
+        sibling nor a remounted confirmation can become fresh merely because
+        the submit frame disappeared. Frames are re-enumerated on every poll to
+        catch delayed remounts.
         """
         submit_baseline = next(
             (
@@ -2309,11 +2311,24 @@ class JobrightScraper(BaseScraper):
             if submit_frame_survives:
                 receipt_contexts = [(submit_frame, submit_baseline)]
             elif submit_origin:
-                receipt_contexts = [
-                    (current_frame, submit_baseline)
-                    for current_frame in current_frames
-                    if self._frame_origin(current_frame) == submit_origin
-                ]
+                receipt_contexts = []
+                for current_frame in current_frames:
+                    if self._frame_origin(current_frame) != submit_origin:
+                        continue
+                    saved_baseline = next(
+                        (
+                            (True, baseline)
+                            for baseline_frame, baseline in receipt_baselines
+                            if baseline_frame is current_frame
+                        ),
+                        (False, None),
+                    )
+                    receipt_contexts.append(
+                        (
+                            current_frame,
+                            saved_baseline[1] if saved_baseline[0] else submit_baseline,
+                        )
+                    )
             else:
                 # An opaque/about:blank replacement cannot be safely tied to
                 # the clicked ATS frame, so fail closed.
@@ -4095,23 +4110,15 @@ class JobrightScraper(BaseScraper):
             # Evaluate on the handle itself, not on `page`: the control may live in a
             # child frame, and a handle cannot be adopted into another frame's context
             # (ACES-428). ElementHandle.evaluate always runs in its own frame.
+            dispatch_error = None
             try:
                 await submit_btn.evaluate("btn => btn.click()")
-            except Exception:
-                # Fallback: dispatch a MouseEvent directly, same frame-local rule.
-                try:
-                    await submit_btn.evaluate(
-                        "btn => btn.dispatchEvent("
-                        "new MouseEvent('click', {bubbles: true, cancelable: true}))"
-                    )
-                except Exception as exc:
-                    # Neither click path landed — do not fall through to the
-                    # "submitted" bookkeeping below on an unproven click.
-                    return self._set_apply_outcome(
-                        "submit_click_failed",
-                        f"Found a submit control at {portal_url} but could not click it: "
-                        f"{type(exc).__name__}.",
-                    )
+            except Exception as exc:
+                # evaluate() can reject after btn.click() already dispatched
+                # (for example, when navigation destroys the execution context).
+                # Never issue a blind fallback click: reconcile the one uncertain
+                # dispatch against fresh receipt evidence instead.
+                dispatch_error = exc
             await self._delay(3, 5)
 
             receipt_signal = await self._verify_submit_receipt(
@@ -4121,10 +4128,16 @@ class JobrightScraper(BaseScraper):
                 receipt_baselines=receipt_baselines,
             )
             if not receipt_signal:
+                dispatch_detail = (
+                    f"submit dispatch raised {type(dispatch_error).__name__}; its "
+                    "outcome is uncertain, and no fresh "
+                    if dispatch_error is not None
+                    else "a final submit control was clicked, but no fresh "
+                )
                 return self._set_apply_outcome(
                     "submission_unverified",
-                    f"Clicked a final submit control at {portal_url}, but no fresh "
-                    "ATS acceptance receipt appeared. Reconcile the employer portal "
+                    f"At {portal_url}, {dispatch_detail}ATS acceptance receipt "
+                    "appeared. Reconcile the employer portal "
                     "before retrying to avoid a duplicate application.",
                 )
 
