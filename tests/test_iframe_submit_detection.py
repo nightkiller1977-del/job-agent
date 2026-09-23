@@ -18,11 +18,21 @@ from src.sources.jobright import JobrightScraper
 # ─── fakes ──────────────────────────────────────────────────────────────────
 
 class FakeElement:
-    def __init__(self, name, visible=True, visible_raises=False):
+    def __init__(
+        self,
+        name,
+        visible=True,
+        visible_raises=False,
+        evaluate_raises=False,
+        on_evaluate=None,
+    ):
         self.name = name
         self._visible = visible
         self._visible_raises = visible_raises
+        self._evaluate_raises = evaluate_raises
+        self._on_evaluate = on_evaluate
         self.clicked = False
+        self.evaluate_calls = 0
 
     async def is_visible(self):
         if self._visible_raises:
@@ -30,7 +40,12 @@ class FakeElement:
         return self._visible
 
     async def evaluate(self, _js):
+        self.evaluate_calls += 1
+        if self._evaluate_raises:
+            raise RuntimeError("click evaluation failed")
         self.clicked = True
+        if self._on_evaluate:
+            self._on_evaluate()
 
 
 class FakeFrame:
@@ -359,3 +374,78 @@ async def test_fresh_receipt_inside_submit_iframe_allows_success(monkeypatch):
 
     assert submitted is True
     assert scraper._apply_analytics["receiptSignal"] == "t:application received"
+
+
+@pytest.mark.asyncio
+async def test_replaced_submit_iframe_is_reenumerated_for_fresh_receipt(monkeypatch):
+    """A newly attached confirmation frame must replace the detached pre-click frame."""
+    main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
+    confirmation = FakeFrame(
+        "https://boards.greenhouse.io/embed/confirmation",
+        evaluate_result=True,
+    )
+    page = None
+
+    def _replace_iframe():
+        page.frames = [main, confirmation]
+
+    submit_button = FakeElement("Submit Application", on_evaluate=_replace_iframe)
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([main, application], url=main.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _receipt_only_in_replacement(frame, *, baseline, **_kwargs):
+        if frame is confirmation and baseline is None:
+            return True, "t:application received"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _receipt_only_in_replacement)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is True
+    assert scraper._apply_analytics["receiptSignal"] == "t:application received"
+
+
+@pytest.mark.asyncio
+async def test_both_click_evaluations_failing_never_records_submission(monkeypatch):
+    """Both click paths failing must stop before receipt or success bookkeeping."""
+    submit_button = FakeElement("Submit Application", evaluate_raises=True)
+    frame = FakeFrame(
+        "https://boards.greenhouse.io/acme/jobs/1",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _capture_baseline(receipt_frame):
+        return receipt_frame
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+
+    submitted = await scraper._confirm_and_submit(
+        FakePage([frame], url=frame.url),
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submit_button.evaluate_calls == 2
+    assert submitted is False
+    assert scraper.last_apply_status == "submit_click_failed"
+    assert not getattr(scraper, "_apply_analytics", {}).get("submitted", False)

@@ -4008,6 +4008,22 @@ class JobrightScraper(BaseScraper):
                     )
             await self._delay(3, 5)
 
+            # Submission can replace an embedded ATS iframe. Re-enumerate after
+            # dispatch rather than polling detached pre-click Frame objects.
+            # A newly attached frame has no pre-click state, so any receipt it
+            # exposes is necessarily fresh for this click boundary.
+            current_receipt_contexts = []
+            for current_frame in self._candidate_frames(page):
+                baseline = next(
+                    (
+                        saved_baseline
+                        for saved_frame, saved_baseline in receipt_baselines
+                        if saved_frame is current_frame
+                    ),
+                    None,
+                )
+                current_receipt_contexts.append((current_frame, baseline))
+
             receipt_checks = await asyncio.gather(
                 *(
                     verify_receipt(
@@ -4016,7 +4032,7 @@ class JobrightScraper(BaseScraper):
                         delay=0.4,
                         baseline=baseline,
                     )
-                    for receipt_frame, baseline in receipt_baselines
+                    for receipt_frame, baseline in current_receipt_contexts
                 ),
                 return_exceptions=True,
             )
