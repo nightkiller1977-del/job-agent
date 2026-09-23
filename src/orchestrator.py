@@ -1020,7 +1020,11 @@ class Orchestrator:
             s = j.get("score")
             if isinstance(s, (int, float)) and not isinstance(s, bool) and math.isfinite(s):
                 console.print(f"[dim]Auto-skipping low-score job ({s} < {min_apply_score}): {j.get('title')} @ {j.get('company')}[/dim]")
-                self.state.set_status(j["job_id"], "skipped")
+                self.state.set_status(
+                    j["job_id"],
+                    "skipped",
+                    queue_cloud_sync=True,
+                )
                 try:
                     await self._push_status_to_cloud(j["job_id"], "skipped")
                 except Exception:
@@ -1480,7 +1484,12 @@ class Orchestrator:
                     job["job_id"], job.get("title"), job.get("company"), reason,
                 )
                 self.state.record_apply_attempt(job["job_id"], "expired", reason[:400])
-                self.state.mark_expired(job["job_id"], reason=reason, signal="source")
+                self.state.mark_expired(
+                    job["job_id"],
+                    reason=reason,
+                    signal="source",
+                    queue_cloud_sync=True,
+                )
                 console.print(
                     f"[red]Job no longer active (expired) — skipped:[/red] {reason}"
                 )
@@ -1491,7 +1500,11 @@ class Orchestrator:
             except ATSReadabilityError as exc:
                 if isinstance(exc, KeywordCoverageError):
                     reason = f"Keyword coverage ({exc.result.coverage*100:.1f}%) is below 65% threshold. Doesn't meet criteria."
-                    self.state.set_status(job["job_id"], "skipped")
+                    self.state.set_status(
+                        job["job_id"],
+                        "skipped",
+                        queue_cloud_sync=True,
+                    )
                     self.state.update_score(job["job_id"], job.get("score", 0), reason, job.get("flags", ""))
                     self.state.record_apply_attempt(
                         job["job_id"],
@@ -1691,7 +1704,12 @@ class Orchestrator:
                 f"older than {cfg['max_age_days']} days "
                 f"(discovered {job.get('discovered_at', '?')[:10]})"
             )
-            self.state.mark_expired(job["job_id"], reason=reason, signal="ttl")
+            self.state.mark_expired(
+                job["job_id"],
+                reason=reason,
+                signal="ttl",
+                queue_cloud_sync=True,
+            )
             summary["expired_ttl"] += 1
             log = _log.warning if was_approved else _log.info
             log(
@@ -1714,7 +1732,12 @@ class Orchestrator:
                 alive, reason = await check_job_alive(url, timeout_s=cfg["probe_timeout_s"])
                 summary["probed"] += 1
                 if alive is False:
-                    self.state.mark_expired(job["job_id"], reason=reason, signal="probe")
+                    self.state.mark_expired(
+                        job["job_id"],
+                        reason=reason,
+                        signal="probe",
+                        queue_cloud_sync=True,
+                    )
                     summary["expired_probe"] += 1
                     _log.warning(
                         "expiry.probe.approved_skipped job_id=%s title=%r company=%r url=%s reason=%s",
@@ -2090,18 +2113,19 @@ class Orchestrator:
             ):
                 marker = dict(current_marker)
             else:
-                marker = None
+                # Every state-changing cloud write must be tied to a durable
+                # local transition marker. A markerless caller has neither an
+                # expected prior cloud state nor a generation to fence delayed
+                # requests, so fail closed before touching the network.
+                return False
 
-            if marker is not None:
-                generation = str(
-                    marker.get("generation")
-                    or marker.get("queued_at")
-                    or hashlib.sha256(
-                        json.dumps(marker, sort_keys=True).encode("utf-8")
-                    ).hexdigest()
-                )
-            else:
-                generation = uuid.uuid4().hex
+            generation = str(
+                marker.get("generation")
+                or marker.get("queued_at")
+                or hashlib.sha256(
+                    json.dumps(marker, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+            )
 
             payload = {
                 "job_id": job_id,
@@ -2112,15 +2136,15 @@ class Orchestrator:
                     generation,
                 ),
             }
-            if marker is not None:
-                expected_status = marker.get("expected_status")
-                if not expected_status and status == "applied":
-                    # Legacy markers predate the expected-status field. Applied
-                    # promotions originate from the approved queue; using that
-                    # baseline fails closed if the cloud has moved elsewhere.
-                    expected_status = "approved"
-                if expected_status:
-                    payload["expected_status"] = str(expected_status)
+            expected_status = marker.get("expected_status")
+            if not expected_status and status == "applied":
+                # Legacy markers predate the expected-status field. Applied
+                # promotions originate from the approved queue; using that
+                # baseline fails closed if the cloud has moved elsewhere.
+                expected_status = "approved"
+            if not expected_status:
+                return False
+            payload["expected_status"] = str(expected_status)
 
             r = await self._cloud_request(
                 "cloud_action",
@@ -2150,8 +2174,6 @@ class Orchestrator:
                     "[dim]Cloud status push did not confirm the requested status[/dim]"
                 )
                 return False
-            if marker is None:
-                return True
             return self.state.clear_pending_cloud_status_sync(
                 job_id,
                 status,

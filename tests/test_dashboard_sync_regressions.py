@@ -113,9 +113,14 @@ class TestActionIdempotency(unittest.TestCase):
         filt, update = mock_db.jobs.find_one_and_update.call_args.args
         operation_key = "applied:stable-key-1"
         self.assertEqual(filt["_action_idempotency_keys"], {"$ne": operation_key})
+        self.assertNotIn("$addToSet", update)
         self.assertEqual(
-            update["$addToSet"]["_action_idempotency_keys"],
-            operation_key,
+            update["$push"]["_action_idempotency_keys"]["$each"],
+            [operation_key],
+        )
+        self.assertLess(
+            update["$push"]["_action_idempotency_keys"]["$slice"],
+            0,
         )
 
     @patch("dashboard.main.get_db")
@@ -224,9 +229,14 @@ class TestActionIdempotency(unittest.TestCase):
         self.assertTrue(response.json()["deduplicated"])
         filt, update = mock_db.jobs.update_one.call_args.args
         self.assertEqual(filt["status"], "applied")
+        self.assertNotIn("$addToSet", update)
         self.assertEqual(
-            update["$addToSet"]["_action_idempotency_keys"],
-            "applied:stable-key-1",
+            update["$push"]["_action_idempotency_keys"]["$each"],
+            ["applied:stable-key-1"],
+        )
+        self.assertLess(
+            update["$push"]["_action_idempotency_keys"]["$slice"],
+            0,
         )
 
 

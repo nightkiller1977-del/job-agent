@@ -245,12 +245,17 @@ class StateManager:
         status: str,
         *,
         expected_cloud_status: Optional[str] = None,
+        queue_cloud_sync: bool = False,
     ) -> None:
         _log.info("job.status job_id=%s status=%s", job_id, status)
         if status == "expired":
             # Route through mark_expired so the row is retained (with reason
             # metadata) instead of silently vanishing from the dashboard.
-            self.mark_expired(job_id, reason="status set to expired")
+            self.mark_expired(
+                job_id,
+                reason="status set to expired",
+                queue_cloud_sync=queue_cloud_sync,
+            )
             return
 
         now = datetime.utcnow().isoformat()
@@ -268,7 +273,7 @@ class StateManager:
             ).fetchone()
             if row is not None:
                 extra = parse_extra_json(row["extra_json"])
-                if status == "applied":
+                if status == "applied" or queue_cloud_sync:
                     existing_marker = extra.get("cloud_status_sync_pending")
                     if not (
                         row["status"] == status
@@ -616,7 +621,14 @@ class StateManager:
 
         return reconciled_count
 
-    def mark_expired(self, job_id: str, reason: str, signal: str = "manual") -> bool:
+    def mark_expired(
+        self,
+        job_id: str,
+        reason: str,
+        signal: str = "manual",
+        *,
+        queue_cloud_sync: bool = False,
+    ) -> bool:
         """Mark a job as expired: dead posting, removed from the applyable pool.
 
         The row is KEPT in the jobs table with status='expired' (rather than
@@ -645,6 +657,13 @@ class StateManager:
             if prior_status != "expired":
                 extra["expired_prior_status"] = prior_status
             extra.pop("cloud_status_sync_pending", None)
+            if queue_cloud_sync:
+                extra["cloud_status_sync_pending"] = {
+                    "status": "expired",
+                    "expected_status": str(prior_status),
+                    "queued_at": now,
+                    "generation": uuid4().hex,
+                }
             extra["expired_at"] = now
             extra["expired_reason"] = (reason or "")[:300]
             extra["expired_signal"] = signal

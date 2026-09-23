@@ -58,6 +58,7 @@ _SYNC_SECRET_HEADER = "x-sync-secret"
 # so a cross-site request cannot ride it, Secure whenever the request is https.
 _SESSION_COOKIE = "ja_session"
 _SESSION_MAX_AGE = 12 * 60 * 60
+_ACTION_IDEMPOTENCY_KEY_LIMIT = 64
 # Browser navigations without a session are redirected here. Kept as a constant so
 # the middleware and the route cannot drift apart.
 _LOGIN_REDIRECT = "/login"
@@ -520,7 +521,12 @@ async def job_action(body: ActionRequest):
             action_filter,
             {
                 "$set": {"status": status, "updated_at": _utcnow()},
-                "$addToSet": {"_action_idempotency_keys": operation_key},
+                "$push": {
+                    "_action_idempotency_keys": {
+                        "$each": [operation_key],
+                        "$slice": -_ACTION_IDEMPOTENCY_KEY_LIMIT,
+                    }
+                },
             },
             return_document=ReturnDocument.AFTER,
         )
@@ -557,7 +563,14 @@ async def job_action(body: ActionRequest):
                         "status": status,
                         "_action_idempotency_keys": {"$ne": operation_key},
                     },
-                    {"$addToSet": {"_action_idempotency_keys": operation_key}},
+                    {
+                        "$push": {
+                            "_action_idempotency_keys": {
+                                "$each": [operation_key],
+                                "$slice": -_ACTION_IDEMPOTENCY_KEY_LIMIT,
+                            }
+                        }
+                    },
                 )
                 if recorded.matched_count:
                     return {

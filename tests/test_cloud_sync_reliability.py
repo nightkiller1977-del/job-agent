@@ -305,6 +305,92 @@ async def test_new_applied_generation_uses_a_new_cloud_action_key(
     assert second_key != first_key
 
 
+@pytest.mark.asyncio
+async def test_markerless_status_push_is_rejected_without_network(
+    tmp_path, monkeypatch
+):
+    from src.orchestrator import Orchestrator
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-markerless",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/markerless",
+        "status": "skipped",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator._cloud_request = AsyncMock()
+
+    result = await orchestrator._push_status_to_cloud(job["job_id"], "skipped")
+
+    assert result is False
+    orchestrator._cloud_request.assert_not_awaited()
+
+
+def test_requested_skipped_sync_gets_generation_and_expected_status(tmp_path):
+    from src.state_manager import StateManager, parse_extra_json
+
+    state = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "job-skipped-sync",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/skipped-sync",
+        "status": "approved",
+    }
+    state.upsert_job(job)
+
+    state.set_status(job["job_id"], "skipped", queue_cloud_sync=True)
+
+    marker = parse_extra_json(
+        state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+    assert marker["status"] == "skipped"
+    assert marker["expected_status"] == "approved"
+    assert marker["generation"]
+
+
+def test_requested_expiry_sync_replaces_prior_applied_generation(tmp_path):
+    from src.state_manager import StateManager, parse_extra_json
+
+    state = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "job-expired-sync",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/expired-sync",
+        "status": "approved",
+    }
+    state.upsert_job(job)
+    state.set_status(job["job_id"], "applied")
+    applied_marker = parse_extra_json(
+        state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+
+    state.mark_expired(
+        job["job_id"],
+        reason="posting removed",
+        signal="probe",
+        queue_cloud_sync=True,
+    )
+
+    marker = parse_extra_json(
+        state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+    assert marker["status"] == "expired"
+    assert marker["expected_status"] == "applied"
+    assert marker["generation"] != applied_marker["generation"]
+
+
 def test_expiry_clears_pending_applied_sync(tmp_path):
     from src.state_manager import StateManager, parse_extra_json
 
@@ -395,7 +481,26 @@ async def test_action_timeout_is_attempted_exactly_once(tmp_path, monkeypatch):
     client = MagicMock()
     client.post = AsyncMock(side_effect=httpx.ReadTimeout(""))
 
-    orchestrator = Orchestrator(config_path=str(tmp_path / "missing.json"))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    orchestrator.state.upsert_job(
+        {
+            "job_id": "job-1",
+            "source": "jobright",
+            "title": "Engineer",
+            "company": "Acme",
+            "url": "https://example.com/jobs/1",
+            "status": "approved",
+        }
+    )
+    orchestrator.state.mark_expired(
+        "job-1",
+        reason="posting removed",
+        queue_cloud_sync=True,
+    )
     with patch("httpx.AsyncClient", return_value=_client_context(client)):
         await orchestrator._push_status_to_cloud("job-1", "expired")
 

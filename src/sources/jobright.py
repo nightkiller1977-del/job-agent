@@ -39,11 +39,18 @@ RECEIPT_FRAME_TIMEOUT_MS = 1500
 
 
 class _ReceiptBaselines(list):
-    """Pre-click evidence plus origins whose snapshot was incomplete."""
+    """Pre-click evidence plus frames/origins whose snapshot was incomplete."""
 
-    def __init__(self, entries=(), *, incomplete_origins=()):
+    def __init__(
+        self,
+        entries=(),
+        *,
+        incomplete_origins=(),
+        incomplete_frames=(),
+    ):
         super().__init__(entries)
         self.incomplete_origins = frozenset(incomplete_origins)
+        self.incomplete_frames = tuple(incomplete_frames)
 
 
 class JobrightScraper(BaseScraper):
@@ -2410,9 +2417,10 @@ class JobrightScraper(BaseScraper):
                 ordered_frames.append(frame)
 
         selected_frames = ordered_frames[: max(0, max_frames)]
+        incomplete_frames = list(ordered_frames[len(selected_frames):])
         incomplete_origins = {
             origin
-            for frame in ordered_frames[len(selected_frames):]
+            for frame in incomplete_frames
             if (origin := self._frame_origin(frame))
         }
 
@@ -2424,11 +2432,15 @@ class JobrightScraper(BaseScraper):
                     timeout=per_frame_timeout_ms / 1000,
                 )
             except (TimeoutError, asyncio.TimeoutError):
+                if not any(existing is frame for existing in incomplete_frames):
+                    incomplete_frames.append(frame)
                 origin = self._frame_origin(frame)
                 if origin:
                     incomplete_origins.add(origin)
                 continue
             except Exception:
+                if not any(existing is frame for existing in incomplete_frames):
+                    incomplete_frames.append(frame)
                 origin = self._frame_origin(frame)
                 if origin:
                     incomplete_origins.add(origin)
@@ -2437,6 +2449,7 @@ class JobrightScraper(BaseScraper):
         return _ReceiptBaselines(
             baselines,
             incomplete_origins=incomplete_origins,
+            incomplete_frames=incomplete_frames,
         )
 
     async def _verify_submit_receipt(
@@ -2489,6 +2502,11 @@ class JobrightScraper(BaseScraper):
             "incomplete_origins",
             frozenset(),
         )
+        incomplete_baseline_frames = getattr(
+            receipt_baselines,
+            "incomplete_frames",
+            (),
+        )
 
         async def _verify_against_all_baselines(receipt_frame, baselines):
             signal = ""
@@ -2537,11 +2555,18 @@ class JobrightScraper(BaseScraper):
                     )
                     if (
                         not saved_baseline[0]
-                        and submit_origin in incomplete_baseline_origins
+                        and (
+                            submit_origin in incomplete_baseline_origins
+                            or any(
+                                incomplete_frame is current_frame
+                                for incomplete_frame in incomplete_baseline_frames
+                            )
+                        )
                     ):
-                        # A capped or timed-out pre-click frame at this origin
-                        # is indistinguishable from a genuinely new replacement.
-                        # Its pre-existing receipt signal cannot prove freshness.
+                        # A capped or timed-out pre-click frame is not a new
+                        # replacement merely because an opaque/about:blank URL
+                        # later becomes the submit origin. Its pre-existing
+                        # receipt signal cannot prove freshness.
                         continue
                     receipt_contexts.append(
                         (
