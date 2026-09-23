@@ -925,8 +925,18 @@ async def test_manual_submission_is_durably_parked_not_reported_success(
         def isatty():
             return True
 
-    answers = iter(["y", "", "y"])
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    def _answer(prompt=""):
+        if "Submit this application" in prompt:
+            return "y"
+        if "Press Enter" in prompt:
+            return ""
+        if "Did you click Submit" in prompt:
+            return "y"
+        if "successfully submit" in prompt:
+            return "n"
+        raise AssertionError(f"unexpected prompt: {prompt}")
+
+    monkeypatch.setattr("builtins.input", _answer)
     monkeypatch.setattr(jobright_module.sys, "stdin", _TTY())
 
     frame = FakeFrame(
@@ -956,3 +966,54 @@ async def test_manual_submission_is_durably_parked_not_reported_success(
     assert submitted is False
     assert scraper.last_apply_status == "submission_unverified"
     assert ledger.needs_reconciliation(canonical_key(job))
+
+
+@pytest.mark.asyncio
+async def test_manual_explicit_no_click_clears_submission_claim(monkeypatch, tmp_path):
+    """Only an explicit report that no click occurred releases the key."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    class _TTY:
+        @staticmethod
+        def isatty():
+            return True
+
+    def _answer(prompt=""):
+        if "Submit this application" in prompt:
+            return "y"
+        if "Press Enter" in prompt:
+            return ""
+        if "Did you click Submit" in prompt:
+            return "n"
+        raise AssertionError(f"unexpected prompt: {prompt}")
+
+    monkeypatch.setattr("builtins.input", _answer)
+    monkeypatch.setattr(jobright_module.sys, "stdin", _TTY())
+    frame = FakeFrame(
+        "https://boards.greenhouse.io/acme/jobs/manual-no-click",
+        evaluate_result=True,
+    )
+    ledger = SubmissionLedger(tmp_path / "apply-ledger.json")
+    scraper = _scraper()
+    scraper._submission_ledger = ledger
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _no_submit_control(_page, _selectors):
+        return None
+
+    scraper._find_submit_control = _no_submit_control
+    job = {
+        "job_id": "job-manual-no-click",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": frame.url,
+    }
+
+    submitted = await scraper._confirm_and_submit(
+        FakePage([frame], url=frame.url), job, auto_submit=False
+    )
+
+    assert submitted is False
+    assert scraper.last_apply_status == "submission_cancelled"
+    assert ledger.record(canonical_key(job)) is None

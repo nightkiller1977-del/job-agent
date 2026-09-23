@@ -4425,11 +4425,19 @@ class JobrightScraper(BaseScraper):
             console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")
             try:
                 input("  Press Enter after submitting (or to skip) > ")
-                answer = input("  Did you successfully submit? [y/N] > ").strip().lower()
+                dispatched = input("  Did you click Submit? [y/n] > ").strip().lower()
+                answer = (
+                    input("  Did you successfully submit? [y/N] > ").strip().lower()
+                    if dispatched == "y"
+                    else ""
+                )
             except (EOFError, KeyboardInterrupt):
-                answer = "n"
+                # Without an explicit no-click answer, preserve the claim: the
+                # external side effect may already have happened.
+                dispatched = "unknown"
+                answer = ""
 
-            if answer == "y":
+            if dispatched not in {"n", "no"}:
                 ledger_detail = ""
                 try:
                     submission_ledger.complete(
@@ -4442,8 +4450,10 @@ class JobrightScraper(BaseScraper):
                     )
                 return self._set_apply_outcome(
                     "submission_unverified",
-                    "A manual submission was reported, but no fresh receipt was "
-                    "verified. Reconcile the employer portal before retrying."
+                    "A manual submit click may have been dispatched"
+                    + (" and portal success was reported" if answer == "y" else "")
+                    + ", but no fresh receipt was verified. Reconcile the employer "
+                    "portal before retrying."
                     f"{ledger_detail}",
                 )
 
