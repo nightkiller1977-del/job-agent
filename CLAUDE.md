@@ -57,3 +57,4 @@ This repository is `job-agent`: Python/Playwright job discovery, scoring, tailor
 - Treat Tailscale as private transport, not authorization. Current operational uses are Job Agent noVNC re-auth and supported Code Review Agent Ollama tunnels; the wider Coordinator/worker mesh is not complete until verified.
 - Reuse Desktop/Coordinator/OpenRouter/Brain Memory/Model Intelligence/metrics authorities rather than recreating them in this repo.
 - Verify implemented versus planned behavior from current source, tests, deployment configuration, and runtime evidence.
+- Start delegated fix sessions (review-finding fixes, CI fixes, merging the base branch in) on Sonnet. Use Opus only for initial design/implementation or when the user asks for it.
