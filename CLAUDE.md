@@ -47,3 +47,13 @@ Applies equally to subagent investigation reports, GitHub Copilot Code Review, A
 ## Claude-specific side-effect rule
 
 Ask before irreversible/shared actions unless the user explicitly authorized that exact action in the current task: merging, force-pushing/history rewrite, production deploy/config changes, secret-store writes, live employer submissions/messages, destructive data changes, or permission/budget changes. Branch commits, tests, and opening a PR do not require an extra confirmation.
+
+## Ecosystem and tool boundary
+
+This repository is `job-agent`: Python/Playwright job discovery, scoring, tailoring, ATS automation, receipt verification, and duplicate-submission-safe reconciliation. Before cross-repository work, use the complete repository/ownership and infrastructure map in `AGENTS.md`.
+
+- Resolve managed credentials only through the authorized `aicc-secrets` SOPS+age flow; never reveal plaintext or reuse another service's scoped MongoDB credential.
+- Treat `aicc-secrets/render-sync-map.json` as the Render distribution allowlist, not as a catalog granting every service access. Its Job Agent mapping translates the store key `MONGODB_URI_JOB_AGENT_DASHBOARD` to the runtime name `MONGODB_URI`.
+- Treat Tailscale as private transport, not authorization. Current operational uses are Job Agent noVNC re-auth and supported Code Review Agent Ollama tunnels; the wider Coordinator/worker mesh is not complete until verified.
+- Reuse Desktop/Coordinator/OpenRouter/Brain Memory/Model Intelligence/metrics authorities rather than recreating them in this repo.
+- Verify implemented versus planned behavior from current source, tests, deployment configuration, and runtime evidence.
