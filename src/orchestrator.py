@@ -62,9 +62,13 @@ console = Console()
 _log = logging.getLogger(__name__)
 
 
-def _cloud_action_idempotency_key(job_id: str, status: str) -> str:
-    """Stable replay key for one logical dashboard status transition."""
-    material = f"job-agent:cloud-action:v1:{job_id}:{status}"
+def _cloud_action_idempotency_key(
+    job_id: str,
+    status: str,
+    generation: str,
+) -> str:
+    """Stable replay key for one generation of a dashboard transition."""
+    material = f"job-agent:cloud-action:v2:{job_id}:{status}:{generation}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -1965,7 +1969,11 @@ class Orchestrator:
                 )
                 cloud_job = {**job, "status": target_status}
                 self.state.upsert_job(cloud_job)
-                self.state.set_status(job["job_id"], target_status)
+                self.state.set_status(
+                    job["job_id"],
+                    target_status,
+                    expected_cloud_status=str(job.get("status") or "approved"),
+                )
                 pulled += 1
             console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")
         except Exception as e:
@@ -2024,17 +2032,28 @@ class Orchestrator:
     async def _retry_pending_cloud_status_sync(self) -> None:
         """Retry durable status promotions once per run until cloud confirms."""
         for pending in self.state.list_pending_cloud_status_sync():
+            marker = pending["marker"]
             current = self.state.get_job(pending["job_id"])
             if not current or current.get("status") != pending["status"]:
                 self.state.clear_pending_cloud_status_sync(
-                    pending["job_id"], pending["status"]
+                    pending["job_id"],
+                    pending["status"],
+                    expected_marker=marker,
                 )
                 continue
             await self._push_status_to_cloud(
-                pending["job_id"], pending["status"]
+                pending["job_id"],
+                pending["status"],
+                pending_marker=marker,
             )
 
-    async def _push_status_to_cloud(self, job_id: str, status: str) -> bool:
+    async def _push_status_to_cloud(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        pending_marker: Optional[dict] = None,
+    ) -> bool:
         """POST a status update and clear its durable obligation only on 200."""
         dashboard_url = os.environ.get("DASHBOARD_URL", "")
         sync_secret = os.environ.get("SYNC_SECRET", "")
@@ -2043,18 +2062,72 @@ class Orchestrator:
             # durable obligation so a later configured run can retry it.
             return False
         try:
+            current = self.state.get_job(job_id)
+            current_marker = (
+                parse_extra_json(current.get("extra_json")).get(
+                    "cloud_status_sync_pending"
+                )
+                if current
+                else None
+            )
+            if pending_marker is not None:
+                # Bind a retry to the exact local transition generation. This
+                # preflight avoids sending a marker already superseded before
+                # the request starts; the exact clear below closes the race for
+                # a transition that changes while the request is in flight.
+                if (
+                    not current
+                    or current.get("status") != status
+                    or current_marker != pending_marker
+                ):
+                    return False
+                marker = dict(pending_marker)
+            elif (
+                current
+                and current.get("status") == status
+                and isinstance(current_marker, dict)
+                and current_marker.get("status") == status
+            ):
+                marker = dict(current_marker)
+            else:
+                marker = None
+
+            if marker is not None:
+                generation = str(
+                    marker.get("generation")
+                    or marker.get("queued_at")
+                    or hashlib.sha256(
+                        json.dumps(marker, sort_keys=True).encode("utf-8")
+                    ).hexdigest()
+                )
+            else:
+                generation = uuid.uuid4().hex
+
+            payload = {
+                "job_id": job_id,
+                "action": status,
+                "idempotency_key": _cloud_action_idempotency_key(
+                    job_id,
+                    status,
+                    generation,
+                ),
+            }
+            if marker is not None:
+                expected_status = marker.get("expected_status")
+                if not expected_status and status == "applied":
+                    # Legacy markers predate the expected-status field. Applied
+                    # promotions originate from the approved queue; using that
+                    # baseline fails closed if the cloud has moved elsewhere.
+                    expected_status = "approved"
+                if expected_status:
+                    payload["expected_status"] = str(expected_status)
+
             r = await self._cloud_request(
                 "cloud_action",
                 "dashboard_action",
                 "post",
                 f"{dashboard_url}/api/action",
-                json={
-                    "job_id": job_id,
-                    "action": status,
-                    "idempotency_key": _cloud_action_idempotency_key(
-                        job_id, status
-                    ),
-                },
+                json=payload,
                 headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
                 # The dashboard atomically stores this operation key with the
                 # status transition. Transport policy still performs one
@@ -2077,8 +2150,13 @@ class Orchestrator:
                     "[dim]Cloud status push did not confirm the requested status[/dim]"
                 )
                 return False
-            self.state.clear_pending_cloud_status_sync(job_id, status)
-            return True
+            if marker is None:
+                return True
+            return self.state.clear_pending_cloud_status_sync(
+                job_id,
+                status,
+                expected_marker=marker,
+            )
         except Exception as e:
             console.print(f"[dim]Cloud status push failed (non-fatal): {e}[/dim]")
             _log.warning("cloud_sync.push_status_failed error=%s", e)

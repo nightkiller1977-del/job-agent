@@ -269,6 +269,7 @@ class ActionRequest(BaseModel):
     job_id: str
     action: str
     idempotency_key: Optional[str] = None
+    expected_status: Optional[str] = None
 
 
 class ExternalJobRequest(BaseModel):
@@ -481,6 +482,20 @@ async def job_action(body: ActionRequest):
     status = "skipped" if body.action == "archive" else body.action
     jobs = get_db().jobs
     idempotency_key = body.idempotency_key
+    expected_status = body.expected_status
+    if expected_status is not None:
+        allowed_status_chars = set(
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "0123456789-_"
+        )
+        if (
+            not expected_status
+            or expected_status != expected_status.strip()
+            or len(expected_status) > 64
+            or any(char not in allowed_status_chars for char in expected_status)
+        ):
+            raise HTTPException(status_code=400, detail="invalid expected_status")
     if idempotency_key is not None:
         allowed = set(
             "abcdefghijklmnopqrstuvwxyz"
@@ -495,11 +510,14 @@ async def job_action(body: ActionRequest):
         ):
             raise HTTPException(status_code=400, detail="invalid idempotency_key")
         operation_key = f"{status}:{idempotency_key}"
+        action_filter = {
+            "job_id": body.job_id,
+            "_action_idempotency_keys": {"$ne": operation_key},
+        }
+        if expected_status is not None:
+            action_filter["status"] = expected_status
         result = jobs.find_one_and_update(
-            {
-                "job_id": body.job_id,
-                "_action_idempotency_keys": {"$ne": operation_key},
-            },
+            action_filter,
             {
                 "$set": {"status": status, "updated_at": _utcnow()},
                 "$addToSet": {"_action_idempotency_keys": operation_key},
@@ -513,22 +531,78 @@ async def job_action(body: ActionRequest):
             )
             if not current:
                 raise HTTPException(status_code=404, detail="Job not found")
-            if operation_key not in current.get("_action_idempotency_keys", []):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Action could not be atomically deduplicated",
-                )
-            if current.get("status") != status:
+            operation_recorded = operation_key in current.get(
+                "_action_idempotency_keys", []
+            )
+            if operation_recorded and current.get("status") != status:
                 raise HTTPException(
                     status_code=409,
                     detail="Current status no longer matches action",
                 )
-            return {
-                "ok": True,
-                "job_id": body.job_id,
-                "status": status,
-                "deduplicated": True,
-            }
+            if operation_recorded:
+                return {
+                    "ok": True,
+                    "job_id": body.job_id,
+                    "status": status,
+                    "deduplicated": True,
+                }
+            if current.get("status") == status:
+                # The target state itself is sufficient confirmation, but the
+                # key still has to be recorded atomically. Otherwise a delayed
+                # duplicate could become eligible again after a later status
+                # cycle returns the row to expected_status.
+                recorded = jobs.update_one(
+                    {
+                        "job_id": body.job_id,
+                        "status": status,
+                        "_action_idempotency_keys": {"$ne": operation_key},
+                    },
+                    {"$addToSet": {"_action_idempotency_keys": operation_key}},
+                )
+                if recorded.matched_count:
+                    return {
+                        "ok": True,
+                        "job_id": body.job_id,
+                        "status": status,
+                        "deduplicated": True,
+                    }
+                current = jobs.find_one(
+                    {"job_id": body.job_id},
+                    {"status": 1, "_action_idempotency_keys": 1},
+                )
+                if not current:
+                    raise HTTPException(status_code=404, detail="Job not found")
+                if (
+                    operation_key in current.get("_action_idempotency_keys", [])
+                    and current.get("status") == status
+                ):
+                    return {
+                        "ok": True,
+                        "job_id": body.job_id,
+                        "status": status,
+                        "deduplicated": True,
+                    }
+                if current.get("status") != status:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Current status no longer matches action",
+                    )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Action could not be atomically deduplicated",
+                )
+            if (
+                expected_status is not None
+                and current.get("status") != expected_status
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Current status no longer matches expected status",
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="Action could not be atomically deduplicated",
+            )
         return {
             "ok": True,
             "job_id": body.job_id,
@@ -536,13 +610,24 @@ async def job_action(body: ActionRequest):
             "deduplicated": False,
         }
 
+    action_filter = {"job_id": body.job_id}
+    if expected_status is not None:
+        action_filter["status"] = expected_status
     result = jobs.find_one_and_update(
-        {"job_id": body.job_id},
+        action_filter,
         {"$set": {"status": status, "updated_at": _utcnow()}},
         return_document=ReturnDocument.AFTER,
     )
     if not result:
-        raise HTTPException(status_code=404, detail="Job not found")
+        current = jobs.find_one({"job_id": body.job_id}, {"status": 1})
+        if not current:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if current.get("status") == status:
+            return {"ok": True, "job_id": body.job_id, "status": status}
+        raise HTTPException(
+            status_code=409,
+            detail="Current status no longer matches expected status",
+        )
     return {"ok": True, "job_id": body.job_id, "status": status}
 
 

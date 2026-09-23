@@ -9,6 +9,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Any
+from uuid import uuid4
 
 from src.scorer import SCORING_FAILED_FLAG
 
@@ -238,7 +239,13 @@ class StateManager:
             )
             return True
 
-    def set_status(self, job_id: str, status: str) -> None:
+    def set_status(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        expected_cloud_status: Optional[str] = None,
+    ) -> None:
         _log.info("job.status job_id=%s status=%s", job_id, status)
         if status == "expired":
             # Route through mark_expired so the row is retained (with reason
@@ -257,21 +264,31 @@ class StateManager:
             extra_json = None
             extra_json_changed = False
             row = conn.execute(
-                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+                "SELECT status, extra_json FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
             if row is not None:
                 extra = parse_extra_json(row["extra_json"])
                 if status == "applied":
-                    # Queue this in the same transaction as the local status
-                    # promotion. A crash or ambiguous network failure can then
-                    # be retried safely until the cloud confirms the idempotent
-                    # target state.
-                    extra["cloud_status_sync_pending"] = {
-                        "status": status,
-                        "queued_at": now,
-                    }
-                    extra_json = json.dumps(extra)
-                    extra_json_changed = True
+                    existing_marker = extra.get("cloud_status_sync_pending")
+                    if not (
+                        row["status"] == status
+                        and isinstance(existing_marker, dict)
+                        and existing_marker.get("status") == status
+                    ):
+                        # Queue this in the same transaction as the local status
+                        # promotion. The generation uniquely identifies this
+                        # transition so an older in-flight retry cannot clear a
+                        # newer obligation after the status changes away/back.
+                        extra["cloud_status_sync_pending"] = {
+                            "status": status,
+                            "expected_status": (
+                                expected_cloud_status or str(row["status"])
+                            ),
+                            "queued_at": now,
+                            "generation": uuid4().hex,
+                        }
+                        extra_json = json.dumps(extra)
+                        extra_json_changed = True
                 elif "cloud_status_sync_pending" in extra:
                     # A newer local status supersedes the older cloud repair.
                     # Remove both the marker and its ability to overwrite the
@@ -315,11 +332,23 @@ class StateManager:
             )
             status = marker.get("status") if isinstance(marker, dict) else ""
             if status:
-                pending.append({"job_id": row["job_id"], "status": str(status)})
+                pending.append(
+                    {
+                        "job_id": row["job_id"],
+                        "status": str(status),
+                        "marker": dict(marker),
+                    }
+                )
         return pending
 
-    def clear_pending_cloud_status_sync(self, job_id: str, status: str) -> bool:
-        """Clear only the cloud-sync obligation matching a confirmed status."""
+    def clear_pending_cloud_status_sync(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        expected_marker: dict,
+    ) -> bool:
+        """Clear only the exact cloud-sync generation that was confirmed."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
@@ -329,7 +358,7 @@ class StateManager:
             extra = parse_extra_json(row["extra_json"])
             marker = extra.get("cloud_status_sync_pending")
             marker_status = marker.get("status") if isinstance(marker, dict) else ""
-            if marker_status != status:
+            if marker_status != status or marker != expected_marker:
                 return False
             extra.pop("cloud_status_sync_pending", None)
             conn.execute(
@@ -615,6 +644,7 @@ class StateManager:
             extra = parse_extra_json(row["extra_json"])
             if prior_status != "expired":
                 extra["expired_prior_status"] = prior_status
+            extra.pop("cloud_status_sync_pending", None)
             extra["expired_at"] = now
             extra["expired_reason"] = (reason or "")[:300]
             extra["expired_signal"] = signal
@@ -648,6 +678,9 @@ class StateManager:
             if not row:
                 return None
             job = dict(row)
+            extra = parse_extra_json(job.get("extra_json"))
+            extra.pop("cloud_status_sync_pending", None)
+            job["extra_json"] = json.dumps(extra) if extra else None
             conn.execute(
                 """
                 INSERT OR REPLACE INTO archived_jobs

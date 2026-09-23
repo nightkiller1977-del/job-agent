@@ -167,6 +167,68 @@ class TestActionIdempotency(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["detail"], "Current status no longer matches action")
 
+    @patch("dashboard.main.get_db")
+    def test_first_keyed_action_uses_expected_status_compare_and_set(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "skipped",
+            "_action_idempotency_keys": [],
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+                "expected_status": "approved",
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"],
+            "Current status no longer matches expected status",
+        )
+        filt = mock_db.jobs.find_one_and_update.call_args.args[0]
+        self.assertEqual(filt["status"], "approved")
+
+    @patch("dashboard.main.get_db")
+    def test_already_targeted_action_still_records_operation_key(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "applied",
+            "_action_idempotency_keys": [],
+        }
+        mock_db.jobs.update_one.return_value.matched_count = 1
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+                "expected_status": "approved",
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["deduplicated"])
+        filt, update = mock_db.jobs.update_one.call_args.args
+        self.assertEqual(filt["status"], "applied")
+        self.assertEqual(
+            update["$addToSet"]["_action_idempotency_keys"],
+            "applied:stable-key-1",
+        )
+
 
 class TestExternalJobScorePlaceholder(unittest.TestCase):
     def setUp(self):

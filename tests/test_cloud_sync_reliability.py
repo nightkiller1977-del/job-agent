@@ -118,6 +118,7 @@ async def test_pending_applied_sync_retries_until_cloud_confirms(tmp_path, monke
     retry_payload = orchestrator._cloud_request.await_args_list[1].kwargs["json"]
     assert first_payload["idempotency_key"]
     assert retry_payload["idempotency_key"] == first_payload["idempotency_key"]
+    assert first_payload["expected_status"] == "approved"
     cleared = parse_extra_json(
         orchestrator.state.get_job(job["job_id"])["extra_json"]
     )
@@ -220,6 +221,134 @@ async def test_retry_drops_legacy_marker_when_local_status_has_changed(
     current = orchestrator.state.get_job(job["job_id"])
     assert "cloud_status_sync_pending" not in parse_extra_json(
         current["extra_json"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_old_retry_cannot_clear_new_applied_generation(tmp_path, monkeypatch):
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-generation-race",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/generation-race",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator.state.set_status(job["job_id"], "applied")
+    old_marker = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+
+    async def _concurrent_new_generation(*_args, **_kwargs):
+        orchestrator.state.set_status(job["job_id"], "skipped")
+        orchestrator.state.set_status(job["job_id"], "applied")
+        return MagicMock(
+            status_code=200,
+            json=lambda: {"status": "applied", "deduplicated": False},
+        )
+
+    orchestrator._cloud_request = AsyncMock(side_effect=_concurrent_new_generation)
+
+    await orchestrator._retry_pending_cloud_status_sync()
+
+    current_marker = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+    assert current_marker["generation"] != old_marker["generation"]
+
+
+@pytest.mark.asyncio
+async def test_new_applied_generation_uses_a_new_cloud_action_key(
+    tmp_path, monkeypatch
+):
+    from src.orchestrator import Orchestrator
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-new-generation-key",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/new-generation-key",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator._cloud_request = AsyncMock(return_value=MagicMock(status_code=503))
+
+    orchestrator.state.set_status(job["job_id"], "applied")
+    await orchestrator._push_status_to_cloud(job["job_id"], "applied")
+    first_key = orchestrator._cloud_request.await_args.kwargs["json"][
+        "idempotency_key"
+    ]
+    orchestrator.state.set_status(job["job_id"], "skipped")
+    orchestrator.state.set_status(job["job_id"], "applied")
+    await orchestrator._push_status_to_cloud(job["job_id"], "applied")
+    second_key = orchestrator._cloud_request.await_args.kwargs["json"][
+        "idempotency_key"
+    ]
+
+    assert second_key != first_key
+
+
+def test_expiry_clears_pending_applied_sync(tmp_path):
+    from src.state_manager import StateManager, parse_extra_json
+
+    state = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "job-expired-after-applied",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/expired-after-applied",
+        "status": "approved",
+    }
+    state.upsert_job(job)
+    state.set_status(job["job_id"], "applied")
+
+    state.mark_expired(job["job_id"], reason="posting removed", signal="probe")
+
+    current = state.get_job(job["job_id"])
+    assert current["status"] == "expired"
+    assert "cloud_status_sync_pending" not in parse_extra_json(
+        current["extra_json"]
+    )
+
+
+def test_archive_clears_pending_applied_sync(tmp_path):
+    from src.state_manager import StateManager, parse_extra_json
+
+    state = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "job-archived-after-applied",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/archived-after-applied",
+        "status": "approved",
+    }
+    state.upsert_job(job)
+    state.set_status(job["job_id"], "applied")
+
+    archived = state.archive_job(job["job_id"], reason="posting removed")
+
+    assert archived is not None
+    assert "cloud_status_sync_pending" not in parse_extra_json(
+        archived["extra_json"]
     )
 
 
