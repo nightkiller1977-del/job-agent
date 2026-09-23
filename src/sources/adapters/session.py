@@ -233,6 +233,7 @@ class ExternalApplySession(BaseScraper):
             already_applied = key and self.ledger.already_applied(key)
             in_progress = key and self.ledger.in_progress(key)
             needs_reconciliation = key and self.ledger.needs_reconciliation(key)
+            verified_record = self.ledger.record(key) if already_applied else None
         except LedgerUnreadableError as exc:
             # History we can't read must never be treated as "no prior submission" —
             # that would let a duplicate-application check silently pass through.
@@ -243,9 +244,19 @@ class ExternalApplySession(BaseScraper):
                 attempt_id=attempt_id,
             )
         if already_applied:
-            _event("duplicate_prevented", AttemptPhase.UNKNOWN, outcome="duplicate_application_prevented")
+            owned_recovery = bool(
+                job_id
+                and verified_record
+                and str(verified_record.get("job_id") or "") == job_id
+            )
+            outcome = (
+                "verified_submission_recovered"
+                if owned_recovery
+                else "duplicate_application_prevented"
+            )
+            _event("duplicate_prevented", AttemptPhase.UNKNOWN, outcome=outcome)
             return AtsApplyResult.blocked(
-                "duplicate_application_prevented",
+                outcome,
                 f"already applied to {key} — not resubmitting", attempt_id=attempt_id,
             )
         if in_progress:
@@ -363,8 +374,16 @@ class ExternalApplySession(BaseScraper):
                 if existing is not None:
                     phase = existing.get("phase")
                     if phase == PHASE_VERIFIED:
+                        owned_recovery = bool(
+                            job_id
+                            and str(existing.get("job_id") or "") == job_id
+                        )
                         return AtsApplyResult.blocked(
-                            "duplicate_application_prevented",
+                            (
+                                "verified_submission_recovered"
+                                if owned_recovery
+                                else "duplicate_application_prevented"
+                            ),
                             f"already applied to {key} — not resubmitting",
                             attempt_id=attempt_id,
                         )

@@ -268,13 +268,31 @@ async def test_session_honors_authorized_verified_submit(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_session_prevents_duplicate_without_launching(tmp_path, monkeypatch):
     led = SubmissionLedger(tmp_path / "l.json")
-    led.complete(canonical_key(JOB), "prev", verified=True)
+    key = canonical_key(JOB)
+    led.claim(key, "prev", job_id="another-local-row")
+    led.complete(key, "prev", verified=True)
     adapter = _RecordingAdapter(AtsApplyResult.ok())
     sess, page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=led)
     res = await sess.apply(JOB, auto_submit=True)
     assert res.status == "duplicate_application_prevented"
     assert page.goto_called is False                  # never even launched
     assert sess._closed is False
+
+
+@pytest.mark.asyncio
+async def test_session_recovers_only_verified_record_owned_by_same_job(tmp_path, monkeypatch):
+    led = SubmissionLedger(tmp_path / "l.json")
+    owned_job = {**JOB, "job_id": "job-1"}
+    key = canonical_key(owned_job)
+    led.claim(key, "prev", job_id=owned_job["job_id"])
+    led.complete(key, "prev", verified=True)
+    adapter = _RecordingAdapter(AtsApplyResult.ok())
+    sess, page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=led)
+
+    res = await sess.apply(owned_job, auto_submit=True)
+
+    assert res.status == "verified_submission_recovered"
+    assert page.goto_called is False
 
 
 @pytest.mark.asyncio

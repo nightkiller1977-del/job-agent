@@ -4186,8 +4186,17 @@ class JobrightScraper(BaseScraper):
                 if existing is not None:
                     phase = existing.get("phase")
                     if phase == PHASE_VERIFIED:
+                        owned_recovery = bool(
+                            job.get("job_id")
+                            and str(existing.get("job_id") or "")
+                            == str(job.get("job_id"))
+                        )
                         return self._set_apply_outcome(
-                            "duplicate_application_prevented",
+                            (
+                                "verified_submission_recovered"
+                                if owned_recovery
+                                else "duplicate_application_prevented"
+                            ),
                             f"A verified submission already exists for {ledger_key}; not resubmitting.",
                         )
                     if phase == PHASE_IN_PROGRESS:

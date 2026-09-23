@@ -301,7 +301,7 @@ class TestApplyReauth:
 
         scraper = AsyncMock()
         scraper.apply = AsyncMock(return_value=False)
-        scraper.last_apply_status = "duplicate_application_prevented"
+        scraper.last_apply_status = "verified_submission_recovered"
         scraper.last_apply_detail = "A verified receipt already exists in the ledger."
         scraper._apply_analytics = None
         scraper._apply_validation_metrics = {}
@@ -336,7 +336,7 @@ class TestApplyReauth:
 
         retry_scraper = AsyncMock()
         retry_scraper.apply = AsyncMock(return_value=False)
-        retry_scraper.last_apply_status = "duplicate_application_prevented"
+        retry_scraper.last_apply_status = "verified_submission_recovered"
         retry_scraper.last_apply_detail = "A verified receipt already exists in the ledger."
         retry_scraper._apply_analytics = None
         retry_scraper._apply_validation_metrics = {}
@@ -358,6 +358,35 @@ class TestApplyReauth:
         assert recovered["status"] == "applied"
         assert recovered["confirmation_status"] == "submitted"
         assert orchestrator.state.get_approved_unapplied() == []
+
+    @pytest.mark.asyncio
+    async def test_cross_job_duplicate_is_not_recorded_as_applied(
+        self, orchestrator, tmp_status
+    ):
+        """A canonical duplicate is blocked without inheriting another job's success."""
+        job = _approved_job()
+        self._seed_job(orchestrator, job)
+
+        scraper = AsyncMock()
+        scraper.apply = AsyncMock(return_value=False)
+        scraper.last_apply_status = "duplicate_application_prevented"
+        scraper.last_apply_detail = "The canonical posting was already submitted by another row."
+        scraper._apply_analytics = None
+        scraper._apply_validation_metrics = {}
+        scraper.last_apply_ats_url = ""
+        scraper_cls = MagicMock(return_value=scraper)
+
+        with patch.dict("src.orchestrator.SOURCE_MAP", {"jobright": scraper_cls}), \
+             patch("src.orchestrator.ReauthManager"), \
+             patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
+            await orchestrator.apply_approved(auto_submit=True)
+
+        untouched = orchestrator.state.get_job(job["job_id"])
+        assert untouched["status"] == "approved"
+        assert untouched["confirmation_status"] is None
 
     @pytest.mark.asyncio
     async def test_apply_reconciles_verified_ledger_before_building_pool(
@@ -390,6 +419,27 @@ class TestApplyReauth:
             await orchestrator.apply_approved(auto_submit=True)
 
         reconcile.assert_called_once_with()
+        scraper_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_apply_fails_closed_when_ledger_reconciliation_raises(
+        self, orchestrator, tmp_status
+    ):
+        """An unreadable recovery boundary must stop before scraper construction."""
+        from src.sources.adapters.idempotency import LedgerUnreadableError
+
+        self._seed_job(orchestrator, _approved_job())
+        scraper_cls = MagicMock()
+        with patch.dict("src.orchestrator.SOURCE_MAP", {"jobright": scraper_cls}), \
+             patch.object(
+                 orchestrator.state,
+                 "reconcile_active_jobs_from_ledger",
+                 side_effect=LedgerUnreadableError("corrupt ledger"),
+             ), \
+             patch("src.orchestrator.ReauthManager"), \
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
+            await orchestrator.apply_approved(auto_submit=True)
+
         scraper_cls.assert_not_called()
 
     @pytest.mark.asyncio

@@ -350,7 +350,13 @@ class StateManager:
             )
             return target_status
 
-    def sync_confirmation_from_ledger(self, job_id: str, ledger: Any = None) -> Optional[str]:
+    def sync_confirmation_from_ledger(
+        self,
+        job_id: str,
+        ledger: Any = None,
+        *,
+        raise_on_error: bool = False,
+    ) -> Optional[str]:
         """Projects SubmissionLedger attempt state onto the job's confirmation_status lifecycle.
 
         Handles:
@@ -391,6 +397,15 @@ class StateManager:
             for key in keys:
                 candidate = ledger.record(key) if hasattr(ledger, "record") else ledger.get(key)
                 if candidate:
+                    # An approved row may share a canonical ATS URL with a
+                    # different local discovery row. That record still blocks
+                    # duplicate dispatch, but it is not evidence that *this*
+                    # row was submitted and must not promote it to applied.
+                    candidate_job_id = str(candidate.get("job_id") or "")
+                    if candidate_job_id != str(job_id) and (
+                        candidate_job_id or job.get("status") == "approved"
+                    ):
+                        continue
                     matched_key = key
                     record = candidate
                     break
@@ -429,6 +444,8 @@ class StateManager:
 
         except Exception as exc:
             _log.warning("Error syncing confirmation from ledger for %s: %s", job_id, exc)
+            if raise_on_error:
+                raise
 
         return job.get("confirmation_status")
 
@@ -454,7 +471,11 @@ class StateManager:
 
         for r in rows:
             jid = r["job_id"]
-            new_status = self.sync_confirmation_from_ledger(jid, ledger=ledger)
+            new_status = self.sync_confirmation_from_ledger(
+                jid,
+                ledger=ledger,
+                raise_on_error=True,
+            )
             if new_status:
                 if r["status"] == "approved" and new_status == "submitted":
                     self.set_status(jid, "applied")

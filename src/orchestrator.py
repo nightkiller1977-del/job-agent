@@ -926,6 +926,11 @@ class Orchestrator:
                 )
         except Exception as exc:
             _log.warning("apply.ledger_recovery_failed error=%s", exc)
+            console.print(
+                "[red]Apply blocked: submission ledger reconciliation failed; "
+                "refusing to risk a duplicate submission.[/red]"
+            )
+            return
 
         # Expire dead/stale postings before selecting the apply pool, so an
         # approved-but-expired job is skipped (with a logged reason + status
@@ -1273,7 +1278,7 @@ class Orchestrator:
                 else:
                     reason = getattr(scraper, "last_apply_detail", "") or "not submitted"
                     code   = getattr(scraper, "last_apply_status",  "") or "blocked"
-                    if code == "duplicate_application_prevented":
+                    if code == "verified_submission_recovered":
                         self._recover_verified_ledger_submission(job["job_id"])
                         self.state.record_apply_attempt(
                             job["job_id"],
@@ -1351,7 +1356,7 @@ class Orchestrator:
                         else:
                             reason = getattr(scraper2, "last_apply_detail", "") or "not submitted"
                             code   = getattr(scraper2, "last_apply_status",  "") or "blocked"
-                            if code == "duplicate_application_prevented":
+                            if code == "verified_submission_recovered":
                                 self._recover_verified_ledger_submission(job["job_id"])
                                 self.state.record_apply_attempt(
                                     job["job_id"],
