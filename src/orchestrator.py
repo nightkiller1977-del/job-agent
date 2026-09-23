@@ -113,6 +113,16 @@ _OWN_SESSION_STATUSES = {
     "usajobs": {"usajobs_login_required"},
 }
 
+# Outcomes where a submit may already have reached the employer. They must be
+# projected onto confirmation_status before the next scheduler pass so an
+# approved row cannot be selected repeatedly while durable reconciliation is
+# still required.
+_AMBIGUOUS_SUBMISSION_STATUSES = {
+    "submit_in_progress",
+    "submission_unverified",
+    "submit_unverified_unresolved",
+}
+
 # Path to the file written by the Claude-in-Chrome MCP scraper
 MCP_SCRAPED_FILE = Path(__file__).parent.parent / "state" / "mcp_scraped.json"
 
@@ -630,15 +640,22 @@ class Orchestrator:
 
     def _mark_confirmation_unverified(self, job_id: str) -> None:
         """Durably park an ambiguous submit so a later run cannot re-dispatch it."""
+        self._mark_confirmation_ambiguous(job_id, "submission_unverified")
+
+    def _mark_confirmation_ambiguous(self, job_id: str, outcome: str) -> None:
+        """Project a durable ambiguous-submit outcome onto scheduler-visible state."""
+        target_status = (
+            "submitting" if outcome == "submit_in_progress" else "submission_unverified"
+        )
         try:
             self.state.recover_confirmation_from_ledger(
                 job_id,
-                "submission_unverified",
-                phase="submission_unverified",
+                target_status,
+                phase=outcome,
             )
         except Exception as exc:
             console.print(
-                f"[dim]unverified confirmation bookkeeping skipped for {job_id}: {exc}[/dim]"
+                f"[dim]ambiguous confirmation bookkeeping skipped for {job_id}: {exc}[/dim]"
             )
 
     def _apply_validation_metadata(self, scraper=None, exc: Exception | None = None) -> dict:
@@ -1220,8 +1237,8 @@ class Orchestrator:
                 else:
                     reason = getattr(scraper, "last_apply_detail", "") or "not submitted"
                     code   = getattr(scraper, "last_apply_status",  "") or "blocked"
-                    if code in {"submission_unverified", "submit_unverified_unresolved"}:
-                        self._mark_confirmation_unverified(job["job_id"])
+                    if code in _AMBIGUOUS_SUBMISSION_STATUSES:
+                        self._mark_confirmation_ambiguous(job["job_id"], code)
                     console.print(f"[yellow]Application not submitted ({code}) — status unchanged.[/yellow]")
                     if reason:
                         console.print(f"[dim]{reason}[/dim]")
@@ -1278,8 +1295,8 @@ class Orchestrator:
                         else:
                             reason = getattr(scraper2, "last_apply_detail", "") or "not submitted"
                             code   = getattr(scraper2, "last_apply_status",  "") or "blocked"
-                            if code in {"submission_unverified", "submit_unverified_unresolved"}:
-                                self._mark_confirmation_unverified(job["job_id"])
+                            if code in _AMBIGUOUS_SUBMISSION_STATUSES:
+                                self._mark_confirmation_ambiguous(job["job_id"], code)
                             self.state.record_apply_attempt(
                                 job["job_id"],
                                 code,
