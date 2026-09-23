@@ -65,6 +65,7 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     "credentials_missing": BlockerClass.PERMANENT,
     # needs human — retrying without a code/profile fix won't help
     "submit_not_found": BlockerClass.NEEDS_HUMAN,
+    "submit_click_failed": BlockerClass.NEEDS_HUMAN,  # control located but click did not land
     "form_not_reached": BlockerClass.NEEDS_HUMAN,
     "linkedin_stuck_on_required_field": BlockerClass.NEEDS_HUMAN,
     "linkedin_external_apply_not_found": BlockerClass.NEEDS_HUMAN,
