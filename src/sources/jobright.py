@@ -2125,6 +2125,7 @@ class JobrightScraper(BaseScraper):
         *,
         total_timeout_ms: int = 20000,
         poll_interval_ms: int = 500,
+        per_query_timeout_ms: int = 1500,
     ):
         """First visible control matching ``selectors``, searched across all frames.
 
@@ -2144,18 +2145,41 @@ class JobrightScraper(BaseScraper):
         ``query_selector`` (no per-selector wait) and the whole sweep re-polls
         until ``total_timeout_ms``, preserving tolerance for late-rendering
         forms at a fraction of the worst-case cost.
+
+        ``total_timeout_ms`` is enforced *inside* the sweep, not only between
+        passes. One pass is ``len(selectors) x len(page.frames)`` queries — on a
+        real portal that is easily 36 x 9 ≈ 320 calls, and a single slow or
+        unresponsive frame (an ad iframe, a reCAPTCHA frame) can block for
+        seconds. Checking the deadline only between passes let a live CoreWeave
+        page overrun an 8s budget by more than 10x, so the deadline is also
+        checked per selector and each query carries its own
+        ``per_query_timeout_ms`` ceiling.
         """
         try:
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + (total_timeout_ms / 1000)
         except RuntimeError:  # no running loop (defensive; callers are async)
-            deadline = None
+            loop = None
+        deadline = (loop.time() + total_timeout_ms / 1000) if loop else None
+
+        def _expired() -> bool:
+            return deadline is not None and loop.time() >= deadline
 
         while True:
             for sel in selectors:
+                if _expired():
+                    return None
                 for frame in self._candidate_frames(page):
+                    if _expired():
+                        return None
                     try:
-                        el = await frame.query_selector(sel)
+                        # A frame that never answers must not consume the whole
+                        # budget — cap each individual query.
+                        el = await asyncio.wait_for(
+                            frame.query_selector(sel),
+                            timeout=per_query_timeout_ms / 1000,
+                        )
+                    except (TimeoutError, asyncio.TimeoutError):
+                        continue
                     except Exception:
                         # Frame detached or navigated mid-sweep — other frames
                         # may still hold the form, so keep going.
@@ -2163,7 +2187,9 @@ class JobrightScraper(BaseScraper):
                     if el is None:
                         continue
                     try:
-                        if await el.is_visible():
+                        if await asyncio.wait_for(
+                            el.is_visible(), timeout=per_query_timeout_ms / 1000
+                        ):
                             return el
                     except Exception:
                         continue
@@ -2184,12 +2210,20 @@ class JobrightScraper(BaseScraper):
         than skipped, so "no controls anywhere" stays distinguishable from
         "controls exist in a frame we could not read".
         """
+        frames = self._candidate_frames(page)
+        # Budget the limit per frame instead of first-come-first-served. The
+        # host page's marketing nav alone exceeded limit=40 on a live CoreWeave
+        # job page, so the embedded Greenhouse form's controls never appeared in
+        # the failure detail — the one thing the diagnostic exists to show.
+        per_frame = max(5, limit // max(1, len(frames)))
         controls: list[dict] = []
-        for frame in self._candidate_frames(page):
+        for frame in frames:
             if len(controls) >= limit:
                 break
             try:
-                found = await self._frame_controls_snapshot(frame, limit - len(controls))
+                found = await self._frame_controls_snapshot(
+                    frame, min(per_frame, limit - len(controls))
+                )
             except Exception as exc:
                 controls.append({
                     "tag": "FRAME",

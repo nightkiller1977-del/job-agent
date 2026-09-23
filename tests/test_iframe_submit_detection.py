@@ -49,6 +49,11 @@ class FakeFrame:
     async def evaluate(self, _js, *args):
         if self._evaluate_raises:
             raise RuntimeError("cross-origin frame")
+        # The real snapshot JS applies `.slice(0, limit)`; the fake must too,
+        # or a per-frame budget looks like it is being ignored.
+        limit = args[0] if args else None
+        if isinstance(limit, int):
+            return self._evaluate_result[:limit]
         return self._evaluate_result
 
 
@@ -202,3 +207,76 @@ async def test_snapshot_respects_limit():
 
     controls = await _scraper()._visible_controls_snapshot(page, limit=40)
     assert len(controls) == 40
+
+
+# ─── ACES-428 follow-up: defects found by a live probe, not by the fakes ─────
+#
+# A real CoreWeave/Greenhouse page exposed 9 frames (host, the Greenhouse
+# job_app embed, a googleapis proxy, a reCAPTCHA frame, several about:blank).
+# Two problems the instant-returning fakes above could never surface:
+#   1. the deadline was only checked BETWEEN passes, so one slow frame let an
+#      8s budget overrun by more than 10x;
+#   2. the host page's ~40 marketing links consumed the whole snapshot limit,
+#      so the embedded form's controls never reached the failure detail.
+
+
+class SlowFrame(FakeFrame):
+    """Frame that never answers — models an ad/reCAPTCHA frame wedging the sweep."""
+
+    def __init__(self, url, delay=30.0):
+        super().__init__(url)
+        self._delay = delay
+
+    async def query_selector(self, sel):
+        await asyncio.sleep(self._delay)
+
+
+@pytest.mark.asyncio
+async def test_unresponsive_frame_cannot_blow_the_total_budget():
+    """One wedged frame must not extend the sweep past total_timeout_ms."""
+    page = FakePage([SlowFrame("https://recaptcha.example"),
+                     FakeFrame("https://host", {})])
+    selectors = [f"#sel{i}" for i in range(36)]
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    found = await _scraper()._find_submit_control(
+        page, selectors,
+        total_timeout_ms=1000, poll_interval_ms=50, per_query_timeout_ms=100,
+    )
+    elapsed = loop.time() - start
+
+    assert found is None
+    assert elapsed < 5.0, f"budget overrun: {elapsed:.1f}s for a 1s budget"
+
+
+@pytest.mark.asyncio
+async def test_slow_frame_does_not_hide_a_control_in_a_healthy_frame():
+    btn = FakeElement("real-submit")
+    page = FakePage([SlowFrame("https://ads.example"),
+                     FakeFrame("https://embed", {"#submit_app": btn})])
+
+    found = await _scraper()._find_submit_control(
+        page, ["#submit_app"],
+        total_timeout_ms=3000, poll_interval_ms=50, per_query_timeout_ms=100,
+    )
+    assert found is btn
+
+
+@pytest.mark.asyncio
+async def test_iframe_controls_survive_a_chatty_host_page():
+    """The live regression: host nav must not crowd the embedded form out."""
+    host_nav = [{"tag": "A", "text": f"nav{i}"} for i in range(60)]
+    page = FakePage([
+        FakeFrame("https://coreweave.com/careers/job", evaluate_result=host_nav),
+        FakeFrame("https://job-boards.greenhouse.io/embed/job_app",
+                  evaluate_result=[{"tag": "BUTTON", "text": "Submit Application"}]),
+    ])
+
+    controls = await _scraper()._visible_controls_snapshot(page, limit=40)
+    texts = [c.get("text") for c in controls]
+
+    assert "Submit Application" in texts, (
+        "embedded form controls were crowded out by host-page navigation"
+    )
+    assert len(controls) <= 40
