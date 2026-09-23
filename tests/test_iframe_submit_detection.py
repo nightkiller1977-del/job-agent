@@ -518,6 +518,61 @@ async def test_replacement_frame_reuses_submit_context_baseline(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_remounted_same_origin_sibling_keeps_stale_evidence(monkeypatch):
+    """A remounted stale sibling must be checked against every origin baseline."""
+    main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
+    stale_sibling = FakeFrame(
+        "https://boards.greenhouse.io/embed/confirmation",
+        evaluate_result=True,
+    )
+    remounted_stale = FakeFrame(
+        "https://boards.greenhouse.io/embed/confirmation",
+        evaluate_result=True,
+    )
+    page = None
+
+    def _remount_stale_sibling():
+        page.frames = [main, remounted_stale]
+
+    submit_button = FakeElement("Submit Application", on_evaluate=_remount_stale_sibling)
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([main, application, stale_sibling], url=main.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+    seen_baselines = []
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _receipt_against_each_baseline(frame, *, baseline, **_kwargs):
+        if frame is remounted_stale:
+            seen_baselines.append(baseline)
+            if baseline is application:
+                return True, "t:application received"
+            if baseline is stale_sibling:
+                return False, ""
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _receipt_against_each_baseline)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert application in seen_baselines
+    assert stale_sibling in seen_baselines
+
+
+@pytest.mark.asyncio
 async def test_surviving_same_origin_frame_keeps_its_own_baseline(monkeypatch):
     """A stale sibling receipt must not inherit the detached submit baseline."""
     main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
@@ -652,3 +707,63 @@ async def test_click_exception_after_dispatch_is_not_retried(monkeypatch):
     assert submitted is False
     assert scraper.last_apply_status == "submission_unverified"
     assert not getattr(scraper, "_apply_analytics", {}).get("submitted", False)
+
+
+@pytest.mark.asyncio
+async def test_unverified_dispatch_is_durably_blocked_from_retry(monkeypatch, tmp_path):
+    """Legacy submission ambiguity must survive process-level scraper recreation."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    ledger = SubmissionLedger(path=tmp_path / "apply-ledger.json")
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _no_receipt(_frame, **_kwargs):
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _no_receipt)
+
+    first_button = FakeElement("Submit Application")
+    first_frame = FakeFrame(
+        "https://boards.greenhouse.io/acme/jobs/1",
+        {"#submit_app": first_button},
+        evaluate_result=True,
+    )
+    first = _scraper()
+    first._submission_ledger = ledger
+    first._delay = _no_delay
+    first._run_pre_submission_validation = _no_delay
+
+    first_result = await first._confirm_and_submit(
+        FakePage([first_frame], url=first_frame.url),
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    key = canonical_key({"url": first_frame.url})
+    assert first_result is False
+    assert first_button.evaluate_calls == 1
+    assert ledger.needs_reconciliation(key)
+
+    second_button = FakeElement("Submit Application")
+    second_frame = FakeFrame(
+        first_frame.url,
+        {"#submit_app": second_button},
+        evaluate_result=True,
+    )
+    second = _scraper()
+    second._submission_ledger = ledger
+    second._delay = _no_delay
+    second._run_pre_submission_validation = _no_delay
+
+    second_result = await second._confirm_and_submit(
+        FakePage([second_frame], url=second_frame.url),
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert second_result is False
+    assert second.last_apply_status == "submit_unverified_unresolved"
+    assert second_button.evaluate_calls == 0

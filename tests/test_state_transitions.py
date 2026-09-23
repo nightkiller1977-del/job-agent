@@ -96,6 +96,30 @@ def test_orchestrator_stamps_confirmation_status_on_apply_success(state_mgr):
     assert state_mgr.get_job("test_job_4")["confirmation_status"] == "submitted"
 
 
+def test_orchestrator_parks_unverified_submission_before_next_run(state_mgr):
+    """An ambiguous dispatch stays out of the scheduler until reconciliation."""
+    job = {
+        "job_id": "test_job_unverified",
+        "title": "Staff Engineer",
+        "company": "Acme Corp",
+        "source": "jobright",
+        "url": "https://boards.greenhouse.io/acme/jobs/1",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.config = {}
+    orch.state = state_mgr
+    orch._mark_confirmation_unverified(job["job_id"])
+
+    parked = state_mgr.get_job(job["job_id"])
+    assert parked["confirmation_status"] == "submission_unverified"
+    readiness, detail = orch._classify_apply_readiness(parked)
+    assert readiness == "needs-review"
+    assert "unverified" in detail.lower()
+
+
 def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
     from src.sources.adapters.idempotency import SubmissionLedger, canonical_key, PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED
     ledger_path = tmp_path / "apply_ledger.json"

@@ -42,6 +42,15 @@ class JobrightScraper(BaseScraper):
     # all subsequent jobs instead of waiting 2-4 minutes per job on timeouts.
     _orion_tailoring_available: bool = True
 
+    def __init__(self, config: dict):
+        super().__init__(config)
+        # The registry path owns its own ledger through ExternalApplySession.
+        # Keep the same durable boundary on the legacy/Jobright-native path so
+        # an ambiguous click cannot be retried by a later scheduled process.
+        from .adapters.idempotency import SubmissionLedger
+
+        self._submission_ledger = SubmissionLedger()
+
     @classmethod
     def reset_orion_availability(cls) -> None:
         """Re-enable Orion resume tailoring after a successful session reauth.
@@ -2302,6 +2311,25 @@ class JobrightScraper(BaseScraper):
             # Freshness cannot be proven without a pre-click snapshot.
             return ""
 
+        submit_origin_baselines = [
+            baseline
+            for baseline_frame, baseline in receipt_baselines
+            if self._frame_origin(baseline_frame) == submit_origin
+        ] or [submit_baseline]
+
+        async def _verify_against_all_baselines(receipt_frame, baselines):
+            signal = ""
+            for baseline in baselines:
+                verified, current_signal = await verify_receipt(
+                    receipt_frame,
+                    retries=0,
+                    baseline=baseline,
+                )
+                if not verified:
+                    return False, ""
+                signal = signal or current_signal
+            return bool(signal), signal
+
         for attempt in range(retries + 1):
             current_frames = self._candidate_frames(page)
             submit_frame_survives = any(
@@ -2309,7 +2337,7 @@ class JobrightScraper(BaseScraper):
             )
 
             if submit_frame_survives:
-                receipt_contexts = [(submit_frame, submit_baseline)]
+                receipt_contexts = [(submit_frame, [submit_baseline])]
             elif submit_origin:
                 receipt_contexts = []
                 for current_frame in current_frames:
@@ -2326,7 +2354,9 @@ class JobrightScraper(BaseScraper):
                     receipt_contexts.append(
                         (
                             current_frame,
-                            saved_baseline[1] if saved_baseline[0] else submit_baseline,
+                            [saved_baseline[1]]
+                            if saved_baseline[0]
+                            else submit_origin_baselines,
                         )
                     )
             else:
@@ -2336,12 +2366,11 @@ class JobrightScraper(BaseScraper):
 
             receipt_checks = await asyncio.gather(
                 *(
-                    verify_receipt(
+                    _verify_against_all_baselines(
                         receipt_frame,
-                        retries=0,
-                        baseline=baseline,
+                        baselines,
                     )
-                    for receipt_frame, baseline in receipt_contexts
+                    for receipt_frame, baselines in receipt_contexts
                 ),
                 return_exceptions=True,
             )
@@ -4098,6 +4127,50 @@ class JobrightScraper(BaseScraper):
                     except Exception:
                         submit_frame = page
             submit_origin = self._frame_origin(submit_frame)
+            submission_ledger = getattr(self, "_submission_ledger", None)
+            ledger_key = ""
+            ledger_attempt_id = ""
+            if submission_ledger is not None:
+                from uuid import uuid4
+
+                from .adapters.idempotency import canonical_key, LedgerUnreadableError
+
+                ledger_job = dict(job)
+                ledger_url = (
+                    getattr(self, "last_apply_ats_url", "")
+                    or self._safe_frame_url(submit_frame)
+                    or portal_url
+                )
+                ledger_job["url"] = ledger_url
+                ledger_key = canonical_key(ledger_job)
+                ledger_attempt_id = uuid4().hex
+                if not ledger_key:
+                    return self._set_apply_outcome(
+                        "submission_ledger_key_missing",
+                        "Could not derive a durable submission key; refusing to click submit.",
+                    )
+                try:
+                    if submission_ledger.already_applied(ledger_key):
+                        return self._set_apply_outcome(
+                            "duplicate_application_prevented",
+                            f"A verified submission already exists for {ledger_key}; not resubmitting.",
+                        )
+                    if submission_ledger.in_progress(ledger_key):
+                        return self._set_apply_outcome(
+                            "submit_in_progress",
+                            f"A prior submit for {ledger_key} is unresolved; not resubmitting.",
+                        )
+                    if submission_ledger.needs_reconciliation(ledger_key):
+                        return self._set_apply_outcome(
+                            "submit_unverified_unresolved",
+                            f"A prior submit for {ledger_key} was unconfirmed; reconcile before resubmitting.",
+                        )
+                except LedgerUnreadableError as exc:
+                    return self._set_apply_outcome(
+                        "ledger_unreadable",
+                        f"Submission ledger could not be read ({exc}); refusing to submit.",
+                    )
+
             receipt_baselines = []
             for receipt_frame in self._candidate_frames(page):
                 try:
@@ -4105,6 +4178,17 @@ class JobrightScraper(BaseScraper):
                 except Exception:
                     continue
                 receipt_baselines.append((receipt_frame, baseline))
+
+            if submission_ledger is not None:
+                try:
+                    # Crash-safe boundary: this marker lands before the only
+                    # employer-facing side effect below.
+                    submission_ledger.begin(ledger_key, ledger_attempt_id)
+                except Exception as exc:
+                    return self._set_apply_outcome(
+                        "submission_ledger_unavailable",
+                        f"Could not persist the pre-submit marker ({type(exc).__name__}); refusing to submit.",
+                    )
 
             # Use JS click to bypass Workday overlay divs that intercept pointer events.
             # Evaluate on the handle itself, not on `page`: the control may live in a
@@ -4128,6 +4212,19 @@ class JobrightScraper(BaseScraper):
                 receipt_baselines=receipt_baselines,
             )
             if not receipt_signal:
+                ledger_detail = ""
+                if submission_ledger is not None:
+                    try:
+                        submission_ledger.complete(
+                            ledger_key, ledger_attempt_id, verified=False
+                        )
+                    except Exception as exc:
+                        # begin() already persisted submit_in_progress, which is
+                        # still a fail-closed duplicate guard if completion fails.
+                        ledger_detail = (
+                            f" Ledger completion raised {type(exc).__name__}; "
+                            "the in-progress marker remains for reconciliation."
+                        )
                 dispatch_detail = (
                     f"submit dispatch raised {type(dispatch_error).__name__}; its "
                     "outcome is uncertain, and no fresh "
@@ -4138,8 +4235,18 @@ class JobrightScraper(BaseScraper):
                     "submission_unverified",
                     f"At {portal_url}, {dispatch_detail}ATS acceptance receipt "
                     "appeared. Reconcile the employer portal "
-                    "before retrying to avoid a duplicate application.",
+                    f"before retrying to avoid a duplicate application.{ledger_detail}",
                 )
+
+            if submission_ledger is not None:
+                try:
+                    submission_ledger.complete(
+                        ledger_key, ledger_attempt_id, verified=True
+                    )
+                except Exception:
+                    # The durable begin marker still prevents a blind retry; the
+                    # fresh receipt remains authoritative for this return value.
+                    pass
 
             # ── Record analytics for orchestrator to persist via extra_json ──
             self._apply_analytics = {

@@ -526,6 +526,17 @@ class Orchestrator:
             ats_url = ""
         all_urls = url + " " + ats_url
 
+        confirmation_status = str(job.get("confirmation_status") or "")
+        if confirmation_status in {
+            "submitting",
+            "submission_unverified",
+            "reconciliation_required",
+        }:
+            return (
+                "needs-review",
+                "A prior submission is still unverified or in progress; reconcile it before retrying.",
+            )
+
         # A missing/malformed job URL is a precondition no session prep can fix, so
         # check it before the session-prepared marker and the source blocks — a
         # prepared job with a broken URL must still route to hydration rather than
@@ -616,6 +627,19 @@ class Orchestrator:
             self.state.transition_confirmation(job_id, "submitted")
         except Exception as exc:
             console.print(f"[dim]confirmation_status bookkeeping skipped for {job_id}: {exc}[/dim]")
+
+    def _mark_confirmation_unverified(self, job_id: str) -> None:
+        """Durably park an ambiguous submit so a later run cannot re-dispatch it."""
+        try:
+            self.state.recover_confirmation_from_ledger(
+                job_id,
+                "submission_unverified",
+                phase="submission_unverified",
+            )
+        except Exception as exc:
+            console.print(
+                f"[dim]unverified confirmation bookkeeping skipped for {job_id}: {exc}[/dim]"
+            )
 
     def _apply_validation_metadata(self, scraper=None, exc: Exception | None = None) -> dict:
         metrics = getattr(scraper, "_apply_validation_metrics", None) if scraper else None
@@ -1196,6 +1220,8 @@ class Orchestrator:
                 else:
                     reason = getattr(scraper, "last_apply_detail", "") or "not submitted"
                     code   = getattr(scraper, "last_apply_status",  "") or "blocked"
+                    if code in {"submission_unverified", "submit_unverified_unresolved"}:
+                        self._mark_confirmation_unverified(job["job_id"])
                     console.print(f"[yellow]Application not submitted ({code}) — status unchanged.[/yellow]")
                     if reason:
                         console.print(f"[dim]{reason}[/dim]")
@@ -1252,6 +1278,8 @@ class Orchestrator:
                         else:
                             reason = getattr(scraper2, "last_apply_detail", "") or "not submitted"
                             code   = getattr(scraper2, "last_apply_status",  "") or "blocked"
+                            if code in {"submission_unverified", "submit_unverified_unresolved"}:
+                                self._mark_confirmation_unverified(job["job_id"])
                             self.state.record_apply_attempt(
                                 job["job_id"],
                                 code,
