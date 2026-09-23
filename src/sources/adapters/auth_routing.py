@@ -113,12 +113,33 @@ def external_ats_url(job: dict | None) -> str:
     Checks the top-level key first (callers may stamp it), then the persisted
     ``extra_json.ats_url`` that record_apply_attempt stores after an external
     apply attempt discovers the portal URL.
+
+    The recorded URL is frequently the employer's *marketing* page rather than
+    the application itself — e.g. ``valon.ai/about?ashby_jid=<uuid>#careers`` or
+    ``coreweave.com/careers/job?...&board=coreweave&gh_jid=<id>``. Those pages
+    carry no application form, which is why apply runs reported
+    ``form_not_reached`` / ``submit_not_found`` having never reached an
+    application at all (ACES-436). When the vendor's own URL is derivable from
+    identifiers already present, return that instead; ``canonical_ats_url``
+    returns '' whenever it cannot do so confidently, leaving the recorded URL
+    untouched.
+
+    Job identity is unaffected: ``job_id`` is derived from the discovery
+    ``url``, not from ``ats_url`` (see BaseScraper._make_job_id).
     """
     job = job or {}
     url = str(job.get("ats_url") or "").strip()
     if not url:
         url = str(_job_extra(job).get("ats_url") or "").strip()
-    return url if url.lower().startswith(("http://", "https://")) else ""
+    if not url.lower().startswith(("http://", "https://")):
+        return ""
+    try:
+        from src.url_utils import canonical_ats_url
+        return canonical_ats_url(url) or url
+    except Exception:
+        # Canonicalization is an improvement, never a dependency — a failure
+        # here must not strand a job that has a usable recorded URL.
+        return url
 
 
 def needs_external_portal_prep(readiness: str, job: dict | None) -> bool:
