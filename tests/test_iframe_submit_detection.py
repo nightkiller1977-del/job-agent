@@ -404,12 +404,151 @@ async def test_replaced_submit_iframe_is_reenumerated_for_fresh_receipt(monkeypa
         return frame
 
     async def _receipt_only_in_replacement(frame, *, baseline, **_kwargs):
-        if frame is confirmation and baseline is None:
+        if frame is confirmation and baseline is application:
             return True, "t:application received"
         return False, ""
 
     monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
     monkeypatch.setattr(jobright_module, "verify_receipt", _receipt_only_in_replacement)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is True
+    assert scraper._apply_analytics["receiptSignal"] == "t:application received"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_new_frame_cannot_validate_receipt(monkeypatch):
+    """An injected non-ATS iframe must not prove that the submit click succeeded."""
+    main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
+    unrelated = FakeFrame(
+        "https://analytics.example/confirmation",
+        evaluate_result=True,
+    )
+    page = None
+
+    def _inject_unrelated_frame():
+        page.frames.append(unrelated)
+
+    submit_button = FakeElement("Submit Application", on_evaluate=_inject_unrelated_frame)
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([main, application], url=main.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _receipt_only_in_unrelated_frame(frame, **_kwargs):
+        if frame is unrelated:
+            return True, "url:https://analytics.example/confirmation"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _receipt_only_in_unrelated_frame)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert scraper.last_apply_status == "submission_unverified"
+
+
+@pytest.mark.asyncio
+async def test_replacement_frame_reuses_submit_context_baseline(monkeypatch):
+    """A remounted stale receipt is compared with the pre-click ATS state."""
+    main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
+    replacement = FakeFrame(
+        "https://boards.greenhouse.io/embed/confirmation",
+        evaluate_result=True,
+    )
+    page = None
+
+    def _replace_iframe():
+        page.frames = [main, replacement]
+
+    submit_button = FakeElement("Submit Application", on_evaluate=_replace_iframe)
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([main, application], url=main.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+    seen_baselines = []
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _stale_receipt(frame, *, baseline, **_kwargs):
+        if frame is replacement:
+            seen_baselines.append(baseline)
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _stale_receipt)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert seen_baselines
+    assert all(baseline is application for baseline in seen_baselines)
+
+
+@pytest.mark.asyncio
+async def test_delayed_replacement_frame_is_reenumerated_during_receipt_polling(monkeypatch):
+    """A replacement that appears after the first poll must still be inspected."""
+    main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
+    confirmation = FakeFrame(
+        "https://boards.greenhouse.io/embed/confirmation",
+        evaluate_result=True,
+    )
+    submit_button = FakeElement("Submit Application")
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([main, application], url=main.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+    application_checks = 0
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _delayed_receipt(frame, *, baseline, **_kwargs):
+        nonlocal application_checks
+        if frame is application:
+            application_checks += 1
+            if application_checks == 1:
+                page.frames = [main, confirmation]
+            return False, ""
+        if frame is confirmation and baseline is application:
+            return True, "t:application received"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _delayed_receipt)
 
     submitted = await scraper._confirm_and_submit(
         page,

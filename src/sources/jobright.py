@@ -2165,6 +2165,11 @@ class JobrightScraper(BaseScraper):
                         continue
                     try:
                         if await el.is_visible():
+                            # Keep the owning frame with the handle. Receipt
+                            # evidence after the click must be attributable to
+                            # this ATS context, not to any frame that happens to
+                            # appear elsewhere on the page.
+                            self._last_submit_frame = frame
                             return el
                     except Exception:
                         continue
@@ -2250,6 +2255,96 @@ class JobrightScraper(BaseScraper):
             if f not in ordered:
                 ordered.append(f)
         return ordered or [page]
+
+    @staticmethod
+    def _frame_origin(frame) -> str:
+        """Return a stable origin used to attribute a replacement ATS frame."""
+        from urllib.parse import urlsplit
+
+        try:
+            parsed = urlsplit(frame.url or "")
+        except Exception:
+            return ""
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+    async def _verify_submit_receipt(
+        self,
+        page,
+        *,
+        submit_frame,
+        submit_origin: str,
+        receipt_baselines: list[tuple[object, object]],
+        retries: int = 5,
+        delay: float = 0.4,
+    ) -> str:
+        """Poll only receipt contexts attributable to the clicked submit.
+
+        Playwright keeps a frame object when it navigates, but an embedded ATS
+        can replace its iframe entirely. A replacement is eligible only after
+        the submit-owning frame disappears and only when it has the same origin.
+        It inherits the submit frame's pre-click baseline, so a remounted stale
+        confirmation cannot become fresh merely because its Python identity is
+        new. Frames are re-enumerated on every poll to catch delayed remounts.
+        """
+        submit_baseline = next(
+            (
+                baseline
+                for baseline_frame, baseline in receipt_baselines
+                if baseline_frame is submit_frame
+            ),
+            None,
+        )
+        if submit_baseline is None:
+            # Freshness cannot be proven without a pre-click snapshot.
+            return ""
+
+        for attempt in range(retries + 1):
+            current_frames = self._candidate_frames(page)
+            submit_frame_survives = any(
+                current_frame is submit_frame for current_frame in current_frames
+            )
+
+            if submit_frame_survives:
+                receipt_contexts = [(submit_frame, submit_baseline)]
+            elif submit_origin:
+                receipt_contexts = [
+                    (current_frame, submit_baseline)
+                    for current_frame in current_frames
+                    if self._frame_origin(current_frame) == submit_origin
+                ]
+            else:
+                # An opaque/about:blank replacement cannot be safely tied to
+                # the clicked ATS frame, so fail closed.
+                receipt_contexts = []
+
+            receipt_checks = await asyncio.gather(
+                *(
+                    verify_receipt(
+                        receipt_frame,
+                        retries=0,
+                        baseline=baseline,
+                    )
+                    for receipt_frame, baseline in receipt_contexts
+                ),
+                return_exceptions=True,
+            )
+            receipt_signal = next(
+                (
+                    signal
+                    for result in receipt_checks
+                    if not isinstance(result, BaseException)
+                    for verified, signal in [result]
+                    if verified
+                ),
+                "",
+            )
+            if receipt_signal:
+                return receipt_signal
+            if attempt < retries:
+                await self._delay(delay, delay)
+        return ""
 
     async def _frame_controls_snapshot(self, frame, limit: int) -> list[dict]:
         """Visible-control snapshot for exactly one frame."""
@@ -3855,6 +3950,7 @@ class JobrightScraper(BaseScraper):
         except Exception:
             pass
 
+        self._last_submit_frame = None
         submit_btn = await self._find_submit_control(page, submit_selectors)
 
         try:
@@ -3977,6 +4073,16 @@ class JobrightScraper(BaseScraper):
             # A click is an ambiguous external side effect. Snapshot every frame
             # immediately before dispatch so only fresh ATS acceptance evidence
             # can move this job to the submitted state.
+            submit_frame = self._last_submit_frame
+            if submit_frame is None:
+                try:
+                    submit_frame = await submit_btn.owner_frame()
+                except Exception:
+                    try:
+                        submit_frame = page.main_frame
+                    except Exception:
+                        submit_frame = page
+            submit_origin = self._frame_origin(submit_frame)
             receipt_baselines = []
             for receipt_frame in self._candidate_frames(page):
                 try:
@@ -4008,43 +4114,11 @@ class JobrightScraper(BaseScraper):
                     )
             await self._delay(3, 5)
 
-            # Submission can replace an embedded ATS iframe. Re-enumerate after
-            # dispatch rather than polling detached pre-click Frame objects.
-            # A newly attached frame has no pre-click state, so any receipt it
-            # exposes is necessarily fresh for this click boundary.
-            current_receipt_contexts = []
-            for current_frame in self._candidate_frames(page):
-                baseline = next(
-                    (
-                        saved_baseline
-                        for saved_frame, saved_baseline in receipt_baselines
-                        if saved_frame is current_frame
-                    ),
-                    None,
-                )
-                current_receipt_contexts.append((current_frame, baseline))
-
-            receipt_checks = await asyncio.gather(
-                *(
-                    verify_receipt(
-                        receipt_frame,
-                        retries=5,
-                        delay=0.4,
-                        baseline=baseline,
-                    )
-                    for receipt_frame, baseline in current_receipt_contexts
-                ),
-                return_exceptions=True,
-            )
-            receipt_signal = next(
-                (
-                    signal
-                    for result in receipt_checks
-                    if not isinstance(result, BaseException)
-                    for verified, signal in [result]
-                    if verified
-                ),
-                "",
+            receipt_signal = await self._verify_submit_receipt(
+                page,
+                submit_frame=submit_frame,
+                submit_origin=submit_origin,
+                receipt_baselines=receipt_baselines,
             )
             if not receipt_signal:
                 return self._set_apply_outcome(
