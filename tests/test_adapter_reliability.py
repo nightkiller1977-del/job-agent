@@ -355,6 +355,21 @@ async def test_session_clears_marker_on_non_submit_outcome(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_session_dry_run_exception_never_creates_submit_marker(
+    tmp_path, monkeypatch
+):
+    """A review-only adapter call cannot dispatch, so it must not claim."""
+    led = SubmissionLedger(tmp_path / "l.json")
+    adapter = _RecordingAdapter(AtsApplyResult.ok(), raises=True)
+    sess, _page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=led)
+
+    with pytest.raises(RuntimeError, match="boom during apply"):
+        await sess.apply(JOB, auto_submit=False)
+
+    assert led.record(canonical_key(JOB)) is None
+
+
+@pytest.mark.asyncio
 async def test_session_refuses_when_profile_locked(tmp_path, monkeypatch):
     adapter = _RecordingAdapter(AtsApplyResult.ok())
     sess, page, _ = _make_session(tmp_path, adapter, monkeypatch)

@@ -360,9 +360,11 @@ class ExternalApplySession(BaseScraper):
                 run_log=self.run_log,
             )
 
-            # A submit may happen in either auto or confirmed-interactive mode:
-            # claim the key before the adapter can dispatch (crash-safe).
-            if key:
+            # A review-only call cannot dispatch: adapters and the policy both
+            # withhold submission when auto_submit is false.  Do not strand an
+            # in-progress marker if a dry-run adapter raises.  Submit-capable
+            # calls still claim atomically before the adapter can dispatch.
+            if key and auto_submit:
                 try:
                     existing = self.ledger.claim(key, attempt_id, job_id=job_id)
                 except LedgerUnreadableError as exc:

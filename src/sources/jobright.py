@@ -324,6 +324,26 @@ class JobrightScraper(BaseScraper):
                 self._apply_analytics = _res.analytics
             return _res.submitted
 
+        # The registry path performs this check in ExternalApplySession.  The
+        # opt-out legacy path must do the same before opening an employer-facing
+        # browser; treating unreadable durable history as empty could duplicate
+        # a prior or unresolved application.
+        from .adapters.idempotency import LedgerUnreadableError
+
+        try:
+            self._submission_ledger.validate()
+        except LedgerUnreadableError as exc:
+            return self._set_apply_outcome(
+                "ledger_unreadable",
+                f"Submission ledger could not be read ({exc}); refusing to launch the browser.",
+            )
+        except Exception as exc:
+            return self._set_apply_outcome(
+                "submission_ledger_unavailable",
+                f"Submission ledger could not be validated ({type(exc).__name__}); "
+                "refusing to launch the browser.",
+            )
+
         self.auto_submit = auto_submit
         self.last_apply_status = "started"
         self.last_apply_detail = ""

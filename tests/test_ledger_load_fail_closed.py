@@ -41,3 +41,36 @@ async def test_corrupt_ledger_blocks_session_pre_flight(tmp_path):
 
     assert result.status == "ledger_unreadable"
     assert result.submitted is False
+
+
+@pytest.mark.asyncio
+async def test_corrupt_ledger_blocks_legacy_flow_before_browser(
+    tmp_path, monkeypatch
+):
+    """The legacy Jobright path must validate durable history pre-launch."""
+    from src.sources.jobright import JobrightScraper
+
+    path = tmp_path / "apply_ledger.json"
+    path.write_text("{not valid json")
+    scraper = JobrightScraper.__new__(JobrightScraper)
+    scraper.config = {}
+    scraper._submission_ledger = SubmissionLedger(path=path)
+    browser_starts = 0
+
+    async def _start_browser(**_kwargs):
+        nonlocal browser_starts
+        browser_starts += 1
+        raise AssertionError("browser must not start with an unreadable ledger")
+
+    scraper._start_browser = _start_browser
+    monkeypatch.setenv("USE_ADAPTER_REGISTRY", "0")
+
+    submitted = await scraper.apply_external_ats_job(
+        {"job_id": "job-1", "title": "Engineer", "company": "Acme"},
+        "https://boards.greenhouse.io/acme/jobs/1",
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert scraper.last_apply_status == "ledger_unreadable"
+    assert browser_starts == 0

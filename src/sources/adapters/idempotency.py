@@ -115,6 +115,15 @@ class SubmissionLedger:
             return None
         return self._load().get(key)
 
+    def validate(self) -> None:
+        """Verify durable history is readable and its lock is available.
+
+        A missing first-run file is valid empty history.  Existing corrupt or
+        inaccessible state must fail before an employer-facing browser starts.
+        """
+        with self._exclusive_lock():
+            self._load()
+
     def record_for_job(self, job_id: str) -> tuple[str, dict] | None:
         """Return the newest durable record associated with *job_id*.
 

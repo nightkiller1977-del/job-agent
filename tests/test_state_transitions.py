@@ -122,6 +122,34 @@ def test_orchestrator_parks_unverified_submission_before_next_run(state_mgr):
     assert "unverified" in detail.lower()
 
 
+@pytest.mark.parametrize("confirmation_status", ["submitted", "receipt_pending"])
+def test_orchestrator_parks_receipt_states_without_durable_recovery(
+    state_mgr, confirmation_status
+):
+    """Approved rows with receipt-state labels must not become apply-ready."""
+    job = {
+        "job_id": f"job_{confirmation_status}",
+        "title": "Staff Engineer",
+        "company": "Acme Corp",
+        "source": "jobright",
+        "url": "https://boards.greenhouse.io/acme/jobs/receipt-state",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    state_mgr.transition_confirmation(job["job_id"], "submitting")
+    state_mgr.transition_confirmation(job["job_id"], "submitted")
+    if confirmation_status == "receipt_pending":
+        state_mgr.transition_confirmation(job["job_id"], "receipt_pending")
+
+    parked = state_mgr.get_job(job["job_id"])
+    readiness, detail = Orchestrator.__new__(Orchestrator)._classify_apply_readiness(
+        parked
+    )
+
+    assert readiness == "needs-review"
+    assert "reconcile" in detail.lower()
+
+
 def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
     from src.sources.adapters.idempotency import SubmissionLedger, canonical_key, PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED
     ledger_path = tmp_path / "apply_ledger.json"

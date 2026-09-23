@@ -541,10 +541,13 @@ class Orchestrator:
             "submitting",
             "submission_unverified",
             "reconciliation_required",
+            "submitted",
+            "receipt_pending",
         }:
             return (
                 "needs-review",
-                "A prior submission is still unverified or in progress; reconcile it before retrying.",
+                "A prior submission is unverified, in progress, or awaiting durable "
+                "receipt reconciliation; reconcile it before retrying.",
             )
 
         # A missing/malformed job URL is a precondition no session prep can fix, so
