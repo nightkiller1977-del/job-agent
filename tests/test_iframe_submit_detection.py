@@ -54,6 +54,11 @@ class FakeFrame:
     async def evaluate(self, _js, *args):
         if self._evaluate_raises:
             raise RuntimeError("cross-origin frame")
+        # The real snapshot JS applies `.slice(0, limit)`; the fake must too,
+        # or a per-frame budget looks like it is being ignored.
+        limit = args[0] if args else None
+        if isinstance(limit, int):
+            return self._evaluate_result[:limit]
         return self._evaluate_result
 
 
@@ -215,6 +220,154 @@ async def test_snapshot_respects_limit():
     assert len(controls) == 40
 
 
+# ─── ACES-428 follow-up: defects found by a live probe, not by the fakes ─────
+#
+# A real CoreWeave/Greenhouse page exposed 9 frames (host, the Greenhouse
+# job_app embed, a googleapis proxy, a reCAPTCHA frame, several about:blank).
+# Two problems the instant-returning fakes above could never surface:
+#   1. the deadline was only checked BETWEEN passes, so one slow frame let an
+#      8s budget overrun by more than 10x;
+#   2. the host page's ~40 marketing links consumed the whole snapshot limit,
+#      so the embedded form's controls never reached the failure detail.
+
+
+class SlowFrame(FakeFrame):
+    """Frame that never answers — models an ad/reCAPTCHA frame wedging the sweep."""
+
+    def __init__(self, url, delay=30.0):
+        super().__init__(url)
+        self._delay = delay
+
+    async def query_selector(self, sel):
+        await asyncio.sleep(self._delay)
+
+
+@pytest.mark.asyncio
+async def test_unresponsive_frame_cannot_blow_the_total_budget():
+    """One wedged frame must not extend the sweep past total_timeout_ms."""
+    page = FakePage([SlowFrame("https://recaptcha.example"),
+                     FakeFrame("https://host", {})])
+    selectors = [f"#sel{i}" for i in range(36)]
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    found = await _scraper()._find_submit_control(
+        page, selectors,
+        total_timeout_ms=1000, poll_interval_ms=50, per_query_timeout_ms=100,
+    )
+    elapsed = loop.time() - start
+
+    assert found is None
+    assert elapsed < 5.0, f"budget overrun: {elapsed:.1f}s for a 1s budget"
+
+
+@pytest.mark.asyncio
+async def test_slow_frame_does_not_hide_a_control_in_a_healthy_frame():
+    btn = FakeElement("real-submit")
+    page = FakePage([SlowFrame("https://ads.example"),
+                     FakeFrame("https://embed", {"#submit_app": btn})])
+
+    found = await _scraper()._find_submit_control(
+        page, ["#submit_app"],
+        total_timeout_ms=3000, poll_interval_ms=50, per_query_timeout_ms=100,
+    )
+    assert found is btn
+
+
+@pytest.mark.asyncio
+async def test_iframe_controls_survive_a_chatty_host_page():
+    """The live regression: host nav must not crowd the embedded form out."""
+    host_nav = [{"tag": "A", "text": f"nav{i}"} for i in range(60)]
+    page = FakePage([
+        FakeFrame("https://coreweave.com/careers/job", evaluate_result=host_nav),
+        FakeFrame("https://job-boards.greenhouse.io/embed/job_app",
+                  evaluate_result=[{"tag": "BUTTON", "text": "Submit Application"}]),
+    ])
+
+    controls = await _scraper()._visible_controls_snapshot(page, limit=40)
+    texts = [c.get("text") for c in controls]
+
+    assert "Submit Application" in texts, (
+        "embedded form controls were crowded out by host-page navigation"
+    )
+    assert len(controls) <= 40
+
+
+class HangingEvaluateFrame(FakeFrame):
+    """Frame whose evaluate never returns — models the live reCAPTCHA frame.
+
+    Per-frame budgeting made this reachable: the old fill-to-limit loop usually
+    broke after the main frame and never evaluated the rest.
+    """
+
+    def __init__(self, url, delay=30.0):
+        super().__init__(url)
+        self._delay = delay
+
+    async def evaluate(self, _js, *args):
+        await asyncio.sleep(self._delay)
+        return []
+
+
+@pytest.mark.asyncio
+async def test_snapshot_cannot_hang_on_an_unresponsive_frame():
+    """This runs on the FAILURE path — hanging here stalls the whole apply run."""
+    page = FakePage([
+        FakeFrame("https://host", evaluate_result=[{"tag": "A", "text": "home"}]),
+        HangingEvaluateFrame("https://www.recaptcha.net/recaptcha/enterprise/anchor"),
+        FakeFrame("https://job-boards.greenhouse.io/embed/job_app",
+                  evaluate_result=[{"tag": "BUTTON", "text": "Submit Application"}]),
+    ])
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    controls = await _scraper()._visible_controls_snapshot(page, frame_timeout_ms=200)
+    elapsed = loop.time() - start
+
+    assert elapsed < 5.0, f"snapshot hung for {elapsed:.1f}s"
+    texts = [c.get("text") for c in controls]
+    # the wedged frame is reported, not silently dropped...
+    assert any("unresponsive frame" in (t or "") for t in texts), texts
+    # ...and it must not prevent the real form's controls being collected
+    assert "Submit Application" in texts, texts
+
+
+# ─── Copilot review findings on PR #149 ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_last_frame_is_not_crowded_out_by_earlier_frames():
+    """9 chatty frames + limit 40: a floor of 5 allocated 45 and dropped frame 9.
+
+    The embedded form is frequently enumerated last, so losing the final frame
+    loses exactly what the budgeting exists to preserve.
+    """
+    chatty = [{"tag": "A", "text": f"nav{i}"} for i in range(30)]
+    frames = [FakeFrame(f"https://noise{i}", evaluate_result=chatty) for i in range(8)]
+    frames.append(FakeFrame("https://job-boards.greenhouse.io/embed/job_app",
+                            evaluate_result=[{"tag": "BUTTON", "text": "Submit Application"}]))
+
+    controls = await _scraper()._visible_controls_snapshot(FakePage(frames), limit=40)
+    texts = [c.get("text") for c in controls]
+
+    assert "Submit Application" in texts, "the LAST frame must still get a slot"
+    assert len(controls) <= 40
+
+
+@pytest.mark.asyncio
+async def test_poll_sleep_never_overshoots_the_deadline():
+    """100ms remaining with a 500ms poll interval must not overshoot."""
+    page = FakePage([FakeFrame("https://host", {})])
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    found = await _scraper()._find_submit_control(
+        page, ["#nope"],
+        total_timeout_ms=100, poll_interval_ms=500, per_query_timeout_ms=50,
+    )
+    elapsed = loop.time() - start
+
+    assert found is None
+    assert elapsed < 0.45, f"overshot a 100ms budget by sleeping a full poll: {elapsed:.2f}s"
 @pytest.mark.asyncio
 async def test_snapshot_budget_cannot_be_exhausted_by_main_frame():
     """Marketing links in the host page must not starve the embedded ATS frame."""
