@@ -280,6 +280,21 @@ class JobrightScraper(BaseScraper):
         This is used by LinkedIn jobs that do not expose Easy Apply. It reuses
         the persistent Jobright profile so the autofill extension is available.
         """
+        # Canonicalize here, not only at each caller's own extraction site.
+        # LinkedIn/Indeed/TheMuse each discover external_url from a live page
+        # (a clicked "Apply" tab, a scraped anchor) and hand it straight to
+        # this function — none of them ran it through canonical_ats_url(), so
+        # a marketing page slipping through any one of them reached the
+        # browser unchanged and reproduced the exact form_not_reached /
+        # submit_not_found this exists to fix (ACES-436 review). Every
+        # external-apply caller funnels through this one function (see the
+        # USE_ADAPTER_REGISTRY comment below), so fixing it here fixes all of
+        # them at once instead of duplicating the call at each call site.
+        try:
+            from src.url_utils import canonical_ats_url
+            external_url = canonical_ats_url(external_url) or external_url
+        except Exception:
+            pass
         # Expose the portal URL for the orchestrator to persist (extra_json.ats_url)
         # so prepare-sessions can reopen this portal directly for any-origin jobs.
         self.last_apply_ats_url = external_url
@@ -1752,6 +1767,16 @@ class JobrightScraper(BaseScraper):
                 if ext_url and "teamtailor.com" in ext_url.lower() and "/applications/new" not in ext_url.lower():
                     base_url = ext_url.split('?')[0].rstrip('/')
                     ext_url = f"{base_url}/applications/new"
+                # Jobright's own DOM extraction (_extract_external_url /
+                # _dismiss_jobright_popups above) never ran through
+                # canonical_ats_url — this native path was one of the
+                # call sites the Codex P1 review finding named as still
+                # navigating a marketing page unchanged (ACES-436).
+                try:
+                    from src.url_utils import canonical_ats_url
+                    ext_url = canonical_ats_url(ext_url) or ext_url
+                except Exception:
+                    pass
                 console.print(f"[magenta]Jobright:[/magenta] Opening company portal: {ext_url[:80]}")
                 company_page = await self._context.new_page()
                 await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
@@ -2013,6 +2038,11 @@ class JobrightScraper(BaseScraper):
                 if not ext_url:
                     console.print("[red]Jobright:[/red] Could not find company ATS URL for session prep.")
                     return False
+                try:
+                    from src.url_utils import canonical_ats_url
+                    ext_url = canonical_ats_url(ext_url) or ext_url
+                except Exception:
+                    pass
 
                 company_page = await self._context.new_page()
                 await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)

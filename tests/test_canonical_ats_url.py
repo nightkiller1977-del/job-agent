@@ -141,10 +141,100 @@ def test_external_ats_url_survives_a_canonicalizer_failure(monkeypatch):
 
 
 def test_job_identity_is_not_derived_from_ats_url():
-    """Canonicalizing ats_url must not re-ingest an existing job as new."""
+    """Canonicalizing ats_url must not re-ingest an existing job as new.
+
+    The previous version of this test compared ``make(None, url) ==
+    make(None, url)`` — the identical call on both sides, so it could not fail
+    regardless of what _make_job_id does with ats_url (review finding).
+    _make_job_id's signature is inspected directly: it structurally cannot see
+    ats_url at all, since it is not one of its parameters. That is a stronger
+    guarantee than exercising two job dicts with the same discovery url and
+    different ats_url values would be, since such a test still only proves
+    today's call sites happen not to pass ats_url in — it would not catch a
+    future call site that starts doing so.
+    """
+    import inspect
+
     from src.sources.base import BaseScraper
 
-    make = BaseScraper._make_job_id
-    discovery_url = "https://www.linkedin.com/jobs/view/4366516601/"
-    # Same discovery URL, different ats_url -> identical job_id.
-    assert make(None, discovery_url) == make(None, discovery_url)
+    params = list(inspect.signature(BaseScraper._make_job_id).parameters)
+    assert params == ["self", "url"], (
+        f"_make_job_id's signature changed to {params} — if it now accepts "
+        "ats_url, job_id would change whenever canonicalization rewrites the "
+        "URL, silently re-ingesting every existing row as a new job."
+    )
+
+
+# ─── Copilot review findings on PR #150 ─────────────────────────────────────
+
+def test_two_label_public_suffix_uk():
+    """careers.acme.co.uk previously selected 'co' as the org slug, not 'acme'."""
+    url = "https://careers.acme.co.uk/job?ashby_jid=32fc3fab-87e3-4fed-9b92-db050da6fa40"
+    assert canonical_ats_url(url) == (
+        "https://jobs.ashbyhq.com/acme/32fc3fab-87e3-4fed-9b92-db050da6fa40"
+    )
+
+
+def test_two_label_public_suffix_au():
+    """careers.example.com.au previously selected 'com', not 'example'."""
+    url = "https://careers.example.com.au/job?gh_jid=4709378006"
+    assert canonical_ats_url(url) == "https://boards.greenhouse.io/example/jobs/4709378006"
+
+
+@pytest.mark.parametrize("host", ["co.uk", "com.au", "co.jp"])
+def test_bare_two_label_suffix_has_no_employer_label(host):
+    """The host IS the suffix, with nothing registrable under it."""
+    url = f"https://{host}/job?ashby_jid=32fc3fab-87e3-4fed-9b92-db050da6fa40"
+    assert canonical_ats_url(url) == ""
+
+
+def test_ordinary_single_label_suffix_still_works_with_a_subdomain():
+    """Regression guard: the two-label-suffix branch must not misfire on a
+    plain three-label .com host."""
+    url = "https://careers.acme.com/job?gh_jid=4709378006"
+    assert canonical_ats_url(url) == "https://boards.greenhouse.io/acme/jobs/4709378006"
+
+
+# ─── Codex P1 finding on PR #150: wired into the actual dispatch seam ───────
+
+@pytest.mark.asyncio
+async def test_apply_external_ats_job_canonicalizes_before_dispatch(monkeypatch):
+    """The seam every external caller (LinkedIn/Indeed/TheMuse/BuiltIn) funnels
+    through must itself canonicalize — not just auth_routing.external_ats_url,
+    which only session-prep/diagnostics consulted. Before this fix, a
+    marketing URL freshly extracted mid-run by e.g. Indeed's own browser
+    extraction reached the ATS navigation completely unchanged (Codex P1
+    review finding on PR #150), reproducing form_not_reached/submit_not_found
+    even though ACES-436 had "fixed" this.
+
+    Stops the real function at its earliest reachable seam (get_run_log, the
+    first call after canonicalization) rather than mocking deep into
+    ExternalApplySession/the submission ledger/a browser.
+    """
+    import src.sources.jobright as jobright_module
+
+    class _Sentinel(Exception):
+        pass
+
+    def _boom():
+        raise _Sentinel("stop here — this is as far as the test needs to go")
+
+    monkeypatch.setattr(
+        jobright_module.JobrightScraper, "__init__", lambda self, *a, **k: None
+    )
+    scraper = jobright_module.JobrightScraper()
+    scraper.last_apply_ats_url = ""
+    scraper.config = {}
+
+    monkeypatch.setattr("src.sources.adapters.runtime.get_run_log", _boom)
+    monkeypatch.setenv("USE_ADAPTER_REGISTRY", "1")
+
+    marketing_url = (
+        "https://www.valon.ai/about?ashby_jid=32fc3fab-87e3-4fed-9b92-db050da6fa40#careers"
+    )
+    with pytest.raises(_Sentinel):
+        await scraper.apply_external_ats_job({"job_id": "j1"}, marketing_url)
+
+    assert scraper.last_apply_ats_url == (
+        "https://jobs.ashbyhq.com/valon/32fc3fab-87e3-4fed-9b92-db050da6fa40"
+    ), "external_url must be canonicalized before it reaches the dispatch seam"
