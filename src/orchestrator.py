@@ -1907,8 +1907,9 @@ class Orchestrator:
         dashboard_url = os.environ.get("DASHBOARD_URL", "")
         sync_secret = os.environ.get("SYNC_SECRET", "")
         if not dashboard_url:
-            self.state.clear_pending_cloud_status_sync(job_id, status)
-            return True
+            # Missing configuration is not cloud confirmation. Keep the
+            # durable obligation so a later configured run can retry it.
+            return False
         try:
             r = await self._cloud_request(
                 "cloud_action",

@@ -118,6 +118,40 @@ async def test_pending_applied_sync_retries_until_cloud_confirms(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_pending_applied_sync_survives_missing_dashboard_url(
+    tmp_path, monkeypatch
+):
+    """No dashboard configuration is not confirmation of cloud state."""
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.delenv("DASHBOARD_URL", raising=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-offline",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/offline",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator.state.set_status(job["job_id"], "applied")
+
+    result = await orchestrator._push_status_to_cloud(job["job_id"], "applied")
+
+    assert result is False
+    pending = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )
+    assert pending["cloud_status_sync_pending"]["status"] == "applied"
+
+
+@pytest.mark.asyncio
 async def test_action_timeout_is_attempted_exactly_once(tmp_path, monkeypatch):
     from src.orchestrator import Orchestrator
 
