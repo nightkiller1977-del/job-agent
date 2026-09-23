@@ -1,5 +1,6 @@
 """Cloud-sync transport tests: diagnostic retries never repeat state actions."""
 
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,6 +39,36 @@ async def test_pull_retries_one_timeout_then_succeeds(tmp_path, monkeypatch):
         await orchestrator._pull_approved_from_cloud()
 
     assert client.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_pull_approved_preserves_local_applied_state(tmp_path, monkeypatch):
+    """A stale cloud approval must not make a submitted job eligible again."""
+    from src.orchestrator import Orchestrator
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    local_job = {
+        "job_id": "job-applied",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/1",
+        "status": "applied",
+    }
+    orchestrator.state.upsert_job(local_job)
+    cloud_job = {**local_job, "status": "approved"}
+    orchestrator._cloud_request = AsyncMock(
+        return_value=MagicMock(status_code=200, json=lambda: [cloud_job])
+    )
+
+    await orchestrator._pull_approved_from_cloud()
+
+    assert orchestrator.state.get_job("job-applied")["status"] == "applied"
 
 
 @pytest.mark.asyncio

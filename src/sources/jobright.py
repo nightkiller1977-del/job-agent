@@ -2366,11 +2366,20 @@ class JobrightScraper(BaseScraper):
 
         for attempt in range(retries + 1):
             current_frames = self._candidate_frames(page)
-            submit_frame_survives = any(
+            submit_frame_present = any(
                 current_frame is submit_frame for current_frame in current_frames
-            ) and self._frame_origin(submit_frame) == submit_origin
+            )
 
-            if submit_frame_survives:
+            if (
+                submit_frame_present
+                and self._frame_origin(submit_frame) != submit_origin
+            ):
+                # The original owner is still attached but has left the ATS
+                # origin. Treat that as a poisoned context: a same-origin
+                # sibling must not be mistaken for a replacement receipt.
+                return ""
+
+            if submit_frame_present:
                 receipt_contexts = [(submit_frame, [submit_baseline])]
             elif submit_origin:
                 receipt_contexts = []

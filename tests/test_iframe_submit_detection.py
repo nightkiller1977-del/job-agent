@@ -558,6 +558,61 @@ async def test_submit_frame_redirected_off_origin_cannot_validate_receipt(monkey
 
 
 @pytest.mark.asyncio
+async def test_off_origin_submit_owner_cannot_fall_back_to_same_origin_sibling(
+    monkeypatch,
+):
+    """A still-attached owner that leaves the ATS origin poisons the poll.
+
+    A same-origin sibling appearing after dispatch cannot stand in for the
+    redirected owner; replacement-frame recovery is allowed only after the
+    original owner actually detaches.
+    """
+    application = None
+    page = None
+    sibling = FakeFrame(
+        "https://boards.greenhouse.io/embed/confirmation",
+        evaluate_result=True,
+    )
+
+    def _redirect_owner_and_add_sibling():
+        application.url = "https://analytics.example/confirmation"
+        page.frames = [application, sibling]
+
+    submit_button = FakeElement(
+        "Submit Application", on_evaluate=_redirect_owner_and_add_sibling
+    )
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([application], url=application.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _sibling_receipt(frame, **_kwargs):
+        if frame is sibling:
+            return True, "t:application received"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _sibling_receipt)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert scraper.last_apply_status == "submission_unverified"
+
+
+@pytest.mark.asyncio
 async def test_replacement_frame_reuses_submit_context_baseline(monkeypatch):
     """A remounted stale receipt is compared with the pre-click ATS state."""
     main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)

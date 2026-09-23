@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import fcntl
+import math
 import os
 import tempfile
 import time
@@ -86,7 +87,20 @@ class SubmissionLedger:
             )
         known_phases = {PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED}
         for key, record in data.items():
-            if not isinstance(record, dict) or record.get("phase") not in known_phases:
+            attempt_id = record.get("attempt_id") if isinstance(record, dict) else None
+            timestamp = record.get("ts") if isinstance(record, dict) else None
+            valid_timestamp = (
+                isinstance(timestamp, (int, float))
+                and not isinstance(timestamp, bool)
+                and math.isfinite(timestamp)
+            )
+            if (
+                not isinstance(record, dict)
+                or record.get("phase") not in known_phases
+                or not isinstance(attempt_id, str)
+                or not attempt_id.strip()
+                or not valid_timestamp
+            ):
                 raise LedgerUnreadableError(
                     f"ledger at {self.path} has an invalid record for {key!r}"
                 )

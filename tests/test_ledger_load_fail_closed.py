@@ -27,6 +27,10 @@ def test_corrupt_json_raises_instead_of_empty(tmp_path):
     [
         "[]",
         '{"vendor|https://example.com/job/1":{"phase":"unknown"}}',
+        '{"vendor|https://example.com/job/1":{"phase":"receipt_verified","job_id":"job-1"}}',
+        '{"vendor|https://example.com/job/1":{"phase":"receipt_verified","attempt_id":" ","ts":1}}',
+        '{"vendor|https://example.com/job/1":{"phase":"receipt_verified","attempt_id":"attempt-1","ts":true}}',
+        '{"vendor|https://example.com/job/1":{"phase":"receipt_verified","attempt_id":"attempt-1","ts":"now"}}',
     ],
 )
 def test_structurally_invalid_ledger_raises(tmp_path, payload):

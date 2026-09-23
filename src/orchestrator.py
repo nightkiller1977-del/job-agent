@@ -1789,11 +1789,18 @@ class Orchestrator:
                 return
             pulled = 0
             for job in jobs:
-                # Insert if new, then always force status to "approved"
-                # (upsert_job skips existing rows, so set_status does the update)
-                job["status"] = "approved"
-                self.state.upsert_job(job)
-                self.state.set_status(job["job_id"], "approved")
+                # The dashboard can remain "approved" after a local submission
+                # when the status push crashes. Never downgrade that durable
+                # local applied state back into the eligible apply pool.
+                existing = self.state.get_job(job["job_id"])
+                target_status = (
+                    "applied"
+                    if existing and existing.get("status") == "applied"
+                    else "approved"
+                )
+                cloud_job = {**job, "status": target_status}
+                self.state.upsert_job(cloud_job)
+                self.state.set_status(job["job_id"], target_status)
                 pulled += 1
             console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")
         except Exception as e:
