@@ -226,10 +226,10 @@ class TestApplyReauth:
         assert extra.get("apply_last_status") == "reauth_failed"
 
     @pytest.mark.asyncio
-    async def test_submit_in_progress_is_parked_for_reconciliation(
+    async def test_submit_in_progress_remains_transient_until_ledger_resolves(
         self, orchestrator, tmp_status
     ):
-        """A crash-recovery ledger marker must remove the job from apply-ready work."""
+        """A live owner must not leave durable scheduler state after release."""
         job = _approved_job()
         self._seed_job(orchestrator, job)
 
@@ -249,16 +249,16 @@ class TestApplyReauth:
              patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
             await orchestrator.apply_approved(auto_submit=True)
 
-        parked = orchestrator.state.get_job("job1")
-        assert parked["confirmation_status"] == "submitting"
-        readiness, _ = orchestrator._classify_apply_readiness(parked)
-        assert readiness == "needs-review"
+        transient = orchestrator.state.get_job("job1")
+        assert transient["confirmation_status"] is None
+        readiness, _ = orchestrator._classify_apply_readiness(transient)
+        assert readiness == "ready"
 
     @pytest.mark.asyncio
-    async def test_submit_in_progress_after_reauth_is_parked_for_reconciliation(
+    async def test_submit_in_progress_after_reauth_remains_transient(
         self, orchestrator, tmp_status
     ):
-        """The reauth retry branch must park the same ambiguous ledger outcome."""
+        """The reauth retry branch must not persist another worker's live claim."""
         job = _approved_job()
         self._seed_job(orchestrator, job)
 
@@ -286,10 +286,32 @@ class TestApplyReauth:
             MockReauthMgr.return_value.handle = mock_reauth
             await orchestrator.apply_approved(auto_submit=True)
 
-        parked = orchestrator.state.get_job("job1")
-        assert parked["confirmation_status"] == "submitting"
-        readiness, _ = orchestrator._classify_apply_readiness(parked)
-        assert readiness == "needs-review"
+        transient = orchestrator.state.get_job("job1")
+        assert transient["confirmation_status"] is None
+        readiness, _ = orchestrator._classify_apply_readiness(transient)
+        assert readiness == "ready"
+
+    @pytest.mark.parametrize(
+        "outcome",
+        ["submission_unverified", "submit_in_progress"],
+    )
+    def test_legacy_reconciliation_outcomes_notify_human(self, outcome):
+        """Legacy results without a dispatcher still surface human action."""
+        job = _approved_job()
+
+        with patch("src.orchestrator.notify_warning") as notify_warning:
+            Orchestrator._notify_reconciliation_required(
+                job,
+                outcome,
+                "Employer submission state needs reconciliation.",
+            )
+
+        notify_warning.assert_called_once_with(
+            "Application requires reconciliation",
+            "Director of Engineering @ Acme: Employer submission state needs reconciliation.",
+            dedupe_key=f"reconcile:{job['job_id']}:{outcome}",
+            dedupe_seconds=21600,
+        )
 
     @pytest.mark.asyncio
     async def test_verified_ledger_recovery_marks_approved_job_applied(

@@ -119,13 +119,14 @@ _OWN_SESSION_STATUSES = {
 # still required.
 _AMBIGUOUS_SUBMISSION_STATUSES = {
     "duplicate_application_prevented",
-    "submit_in_progress",
     "submission_unverified",
     "submit_unverified_unresolved",
 }
 
 _RECONCILIATION_NOTIFICATION_OUTCOMES = {
     "duplicate_application_prevented",
+    "submission_unverified",
+    "submit_in_progress",
     "submit_unverified_unresolved",
 }
 
@@ -654,7 +655,11 @@ class Orchestrator:
     def _mark_confirmation_ambiguous(self, job_id: str, outcome: str) -> None:
         """Project a durable ambiguous-submit outcome onto scheduler-visible state."""
         if outcome == "submit_in_progress":
-            target_status = "submitting"
+            # This is another worker's temporary ownership claim. The ledger
+            # blocks duplicates while it is live and stale claims reconcile on
+            # the next preflight; copying it into SQLite can park the job after
+            # the owner safely releases the claim without submitting.
+            return
         elif outcome == "duplicate_application_prevented":
             target_status = "reconciliation_required"
         else:

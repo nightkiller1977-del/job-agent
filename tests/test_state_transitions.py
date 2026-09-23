@@ -166,11 +166,12 @@ def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
     state_mgr.upsert_job(job)
     key = canonical_key(job)
 
-    # 1. Live in-progress -> 'submitting'
+    # 1. A live claim belongs to another active worker. It must block at the
+    # ledger boundary without becoming durable scheduler state.
     ledger.begin(key, "att_1")
     res1 = state_mgr.sync_confirmation_from_ledger("job_ledger_1", ledger=ledger)
-    assert res1 == "submitting"
-    assert state_mgr.get_job("job_ledger_1")["confirmation_status"] == "submitting"
+    assert res1 is None
+    assert state_mgr.get_job("job_ledger_1")["confirmation_status"] is None
 
     # 2. Complete verified -> 'submitted'
     ledger.complete(key, "att_1", verified=True)
@@ -195,6 +196,39 @@ def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
     res3 = state_mgr.sync_confirmation_from_ledger("job_ledger_2", ledger=ledger)
     assert res3 == "submission_unverified"
     assert state_mgr.get_job("job_ledger_2")["confirmation_status"] == "submission_unverified"
+
+
+def test_reconcile_live_claim_does_not_permanently_park_approved_job(
+    state_mgr, tmp_path
+):
+    """A released live claim must leave the approved row retryable."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    job = {
+        "job_id": "job-live-owner",
+        "title": "Principal Engineer",
+        "company": "Acme",
+        "url": "https://boards.greenhouse.io/acme/jobs/live-owner",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    ledger = SubmissionLedger(tmp_path / "live-ledger.json")
+    key = canonical_key(job)
+    ledger.claim(key, "live-attempt", job_id=job["job_id"])
+
+    count = state_mgr.reconcile_active_jobs_from_ledger(ledger=ledger)
+
+    assert count == 0
+    assert state_mgr.get_job(job["job_id"])["confirmation_status"] is None
+
+    ledger.clear(key, "live-attempt")
+    state_mgr.reconcile_active_jobs_from_ledger(ledger=ledger)
+    released = state_mgr.get_job(job["job_id"])
+    readiness, _reason = Orchestrator.__new__(Orchestrator)._classify_apply_readiness(
+        released
+    )
+    assert readiness == "ready"
 
 
 def test_sync_confirmation_uses_persisted_ats_url_key(state_mgr, tmp_path):

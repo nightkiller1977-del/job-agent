@@ -361,7 +361,8 @@ class StateManager:
 
         Handles:
           - receipt_verified -> 'submitted'
-          - submit_in_progress (live) -> 'submitting'
+          - submit_in_progress (live) -> no durable projection; the ledger
+            itself blocks competing workers until the owner resolves it
           - submit_in_progress (stale) -> 'reconciliation_required'
           - submission_unverified -> 'submission_unverified'
         """
@@ -432,7 +433,10 @@ class StateManager:
                 if hasattr(ledger, "is_stale_in_progress") and ledger.is_stale_in_progress(matched_key):
                     target_status = "reconciliation_required"
                 else:
-                    target_status = "submitting"
+                    # A live claim is temporary ownership, not durable evidence
+                    # that this job submitted. Persisting it can strand the row
+                    # after the owner releases a pre-submit claim.
+                    return job.get("confirmation_status")
 
             curr_conf = job.get("confirmation_status")
             # Never downgrade terminal verified state
