@@ -46,6 +46,10 @@ class LedgerUnreadableError(Exception):
     can't be read must never be treated as empty history, or a prior
     unresolved/verified submission could be silently forgotten."""
 
+
+class LedgerOwnershipError(RuntimeError):
+    """A stale attempt tried to mutate a key now owned by another attempt."""
+
 # An in-progress marker older than this (seconds) is treated as a crashed attempt,
 # not a live one — it still blocks a *blind* resubmit but is reported as stale.
 STALE_AFTER_S = 6 * 60 * 60
@@ -217,6 +221,12 @@ class SubmissionLedger:
         with self._exclusive_lock():
             data = self._load()
             existing = data.get(key) if isinstance(data.get(key), dict) else {}
+            existing_attempt_id = str(existing.get("attempt_id") or "")
+            if existing and existing_attempt_id != str(attempt_id):
+                raise LedgerOwnershipError(
+                    f"submission key {key} belongs to attempt "
+                    f"{existing_attempt_id or '(unknown)'}, not {attempt_id}"
+                )
             record = {
                 "phase": PHASE_VERIFIED if verified else PHASE_UNVERIFIED,
                 "attempt_id": attempt_id,

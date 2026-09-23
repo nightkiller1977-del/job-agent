@@ -2354,7 +2354,7 @@ class JobrightScraper(BaseScraper):
             current_frames = self._candidate_frames(page)
             submit_frame_survives = any(
                 current_frame is submit_frame for current_frame in current_frames
-            )
+            ) and self._frame_origin(submit_frame) == submit_origin
 
             if submit_frame_survives:
                 receipt_contexts = [(submit_frame, [submit_baseline])]
@@ -4332,13 +4332,119 @@ class JobrightScraper(BaseScraper):
                         + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
                     ),
                 )
+            submission_ledger = getattr(self, "_submission_ledger", None)
+            if submission_ledger is None:
+                return self._set_apply_outcome(
+                    "submission_ledger_unavailable",
+                    "Cannot guard a manual submission without a durable ledger; refusing to report success.",
+                )
+
+            from uuid import uuid4
+
+            from .adapters.idempotency import (
+                LedgerUnreadableError,
+                PHASE_IN_PROGRESS,
+                PHASE_UNVERIFIED,
+                PHASE_VERIFIED,
+                canonical_key,
+            )
+
+            ledger_job = dict(job)
+            ledger_job["url"] = (
+                getattr(self, "last_apply_ats_url", "") or portal_url
+            )
+            ledger_key = canonical_key(ledger_job)
+            if not ledger_key:
+                return self._set_apply_outcome(
+                    "submission_ledger_key_missing",
+                    "Could not derive a durable submission key; refusing to request a manual submit.",
+                )
+            ledger_attempt_id = uuid4().hex
+            try:
+                existing = submission_ledger.claim(
+                    ledger_key,
+                    ledger_attempt_id,
+                    job_id=str(job.get("job_id") or ""),
+                )
+            except LedgerUnreadableError as exc:
+                return self._set_apply_outcome(
+                    "ledger_unreadable",
+                    f"Submission ledger could not be read ({exc}); refusing a manual submit.",
+                )
+            except Exception as exc:
+                return self._set_apply_outcome(
+                    "submission_ledger_unavailable",
+                    f"Could not persist the pre-submit marker ({type(exc).__name__}); "
+                    "refusing a manual submit.",
+                )
+            if existing is not None:
+                phase = existing.get("phase")
+                if phase == PHASE_VERIFIED:
+                    owned_recovery = bool(
+                        job.get("job_id")
+                        and str(existing.get("job_id") or "")
+                        == str(job.get("job_id"))
+                    )
+                    return self._set_apply_outcome(
+                        (
+                            "verified_submission_recovered"
+                            if owned_recovery
+                            else "duplicate_application_prevented"
+                        ),
+                        f"A verified submission already exists for {ledger_key}; not resubmitting.",
+                    )
+                if phase == PHASE_IN_PROGRESS:
+                    return self._set_apply_outcome(
+                        "submit_in_progress",
+                        f"A prior submit for {ledger_key} is unresolved; not resubmitting.",
+                    )
+                if phase == PHASE_UNVERIFIED:
+                    return self._set_apply_outcome(
+                        "submit_unverified_unresolved",
+                        f"A prior submit for {ledger_key} was unconfirmed; reconcile before resubmitting.",
+                    )
+                return self._set_apply_outcome(
+                    "submission_ledger_unavailable",
+                    f"Submission ledger has an unknown phase for {ledger_key}; refusing to submit.",
+                )
+
             console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")
             try:
                 input("  Press Enter after submitting (or to skip) > ")
                 answer = input("  Did you successfully submit? [y/N] > ").strip().lower()
-                return answer == "y"
             except (EOFError, KeyboardInterrupt):
-                return False
+                answer = "n"
+
+            if answer == "y":
+                ledger_detail = ""
+                try:
+                    submission_ledger.complete(
+                        ledger_key, ledger_attempt_id, verified=False
+                    )
+                except Exception as exc:
+                    ledger_detail = (
+                        f" Ledger completion raised {type(exc).__name__}; the "
+                        "in-progress marker remains for reconciliation."
+                    )
+                return self._set_apply_outcome(
+                    "submission_unverified",
+                    "A manual submission was reported, but no fresh receipt was "
+                    "verified. Reconcile the employer portal before retrying."
+                    f"{ledger_detail}",
+                )
+
+            try:
+                submission_ledger.clear(ledger_key)
+            except Exception as exc:
+                return self._set_apply_outcome(
+                    "submission_ledger_unavailable",
+                    f"Manual submission was cancelled, but its ledger marker could "
+                    f"not be cleared ({type(exc).__name__}); reconcile before retrying.",
+                )
+            return self._set_apply_outcome(
+                "submission_cancelled",
+                "Manual submission was not confirmed.",
+            )
 
 
 def _infer_remote_type(remote_raw: str, location: str) -> str:

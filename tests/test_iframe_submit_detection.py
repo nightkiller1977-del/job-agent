@@ -516,6 +516,48 @@ async def test_unrelated_new_frame_cannot_validate_receipt(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_submit_frame_redirected_off_origin_cannot_validate_receipt(monkeypatch):
+    """A surviving Frame object is untrusted after it leaves the ATS origin."""
+    application = None
+
+    def _redirect_off_origin():
+        application.url = "https://analytics.example/confirmation"
+
+    submit_button = FakeElement(
+        "Submit Application", on_evaluate=_redirect_off_origin
+    )
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([application], url=application.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _redirect_receipt(frame, **_kwargs):
+        if frame is application:
+            return True, "url:https://analytics.example/confirmation"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _redirect_receipt)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert scraper.last_apply_status == "submission_unverified"
+
+
+@pytest.mark.asyncio
 async def test_replacement_frame_reuses_submit_context_baseline(monkeypatch):
     """A remounted stale receipt is compared with the pre-click ATS state."""
     main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
@@ -869,3 +911,48 @@ async def test_concurrent_legacy_attempts_dispatch_only_once(monkeypatch, tmp_pa
     statuses = {scraper.last_apply_status for scraper in scrapers}
     assert "submission_unverified" in statuses
     assert statuses & {"submit_in_progress", "submit_unverified_unresolved"}
+
+
+@pytest.mark.asyncio
+async def test_manual_submission_is_durably_parked_not_reported_success(
+    monkeypatch, tmp_path
+):
+    """A user-reported click without receipt evidence remains ambiguous."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    class _TTY:
+        @staticmethod
+        def isatty():
+            return True
+
+    answers = iter(["y", "", "y"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    monkeypatch.setattr(jobright_module.sys, "stdin", _TTY())
+
+    frame = FakeFrame(
+        "https://boards.greenhouse.io/acme/jobs/manual",
+        evaluate_result=True,
+    )
+    page = FakePage([frame], url=frame.url)
+    ledger = SubmissionLedger(tmp_path / "apply-ledger.json")
+    scraper = _scraper()
+    scraper._submission_ledger = ledger
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _no_submit_control(_page, _selectors):
+        return None
+
+    scraper._find_submit_control = _no_submit_control
+
+    job = {
+        "job_id": "job-manual",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": frame.url,
+    }
+    submitted = await scraper._confirm_and_submit(page, job, auto_submit=False)
+
+    assert submitted is False
+    assert scraper.last_apply_status == "submission_unverified"
+    assert ledger.needs_reconciliation(canonical_key(job))

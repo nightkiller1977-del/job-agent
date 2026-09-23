@@ -13,7 +13,11 @@ from src.sources.adapters.base import AtsAdapter
 from src.sources.adapters.registry import AtsAdapterRegistry
 from src.sources.adapters.session import ExternalApplySession
 from src.sources.adapters.policy import AutoSubmitPolicy, DenyAllPolicy
-from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+from src.sources.adapters.idempotency import (
+    LedgerOwnershipError,
+    SubmissionLedger,
+    canonical_key,
+)
 from src.sources.adapters.profile_lock import ProfileLock, ProfileLockError
 from src.sources.adapters.receipt import verify_receipt
 
@@ -198,6 +202,23 @@ def test_ledger_claim_is_atomic_across_concurrent_owners(tmp_path):
     winner = ledgers[0].record("greenhouse|https://example.test/job/1")
     assert blocked == winner
     assert winner["phase"] == "submit_in_progress"
+
+
+def test_stale_attempt_cannot_overwrite_newer_completion(tmp_path):
+    """Completion is conditional on the current atomic-claim owner."""
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(JOB)
+    ledger.claim(key, "old-attempt", job_id="job-1")
+    ledger.clear(key)
+    ledger.claim(key, "new-attempt", job_id="job-1")
+    ledger.complete(key, "new-attempt", verified=True)
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.complete(key, "old-attempt", verified=False)
+
+    record = ledger.record(key)
+    assert record["attempt_id"] == "new-attempt"
+    assert record["phase"] == "receipt_verified"
 
 
 def test_ledger_stale_in_progress(tmp_path):
