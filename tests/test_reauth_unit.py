@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src import session_watchdog
 from src.sources.base import AuthFailedError, BaseScraper
 from src.notifier import record_reauth_event
 
@@ -720,7 +721,8 @@ class TestReauthHuman:
 
         with patch("src.reauth._is_interactive", return_value=False), \
              patch("src.notifier._send_telegram"), \
-             patch("src.session_watchdog._stage_prepare_sessions", return_value=True), \
+             patch("src.session_watchdog._stage_prepare_sessions",
+                   return_value=session_watchdog.StagingResult(staged=True, supported=True)), \
              patch("src.notifier._desktop_notify") as mock_desktop:
             result = await mgr._reauth_human("usajobs", "2FA required", timeout_minutes=30)
 
@@ -741,15 +743,68 @@ class TestReauthHuman:
         monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
         from src import reauth
 
+        # Pin the platform: "NOTIFY_PHONE is unset" is only actionable remediation
+        # on macOS, so the assertion must not depend on the host running the suite.
+        monkeypatch.setattr("src.reauth.sys.platform", "darwin")
         desktop = []
         monkeypatch.setattr("src.notifier._desktop_notify", lambda *args, **kwargs: desktop.append(args))
         monkeypatch.setattr("src.notifier._send_telegram", lambda *args, **kwargs: None)
 
-        reauth._send_imessage("", "prepare-sessions")
+        assert reauth._send_imessage("", "prepare-sessions") is False
 
         assert desktop == []
         data = json.loads((tmp_path / "status.json").read_text())
         assert data["alerts"][-1]["title"] == "iMessage not configured"
+
+    def test_imessage_is_skipped_off_darwin_without_misleading_remediation(self, tmp_path, monkeypatch):
+        """On Linux/Windows iMessage cannot exist. Calling osascript there raised
+        [Errno 2]; telling the operator to set NOTIFY_PHONE is advice they cannot
+        act on. Record the capability gap instead and leave the primary failure."""
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src import reauth
+
+        for platform_name in ("linux", "win32"):
+            monkeypatch.setattr("src.reauth.sys.platform", platform_name)
+            with patch("src.reauth.subprocess.run") as mock_run, \
+                 patch("src.notifier._send_telegram"), \
+                 patch("src.notifier._desktop_notify"):
+                assert reauth._send_imessage("+13055551234", "prepare-sessions") is False
+            mock_run.assert_not_called()
+
+        data = json.loads((tmp_path / "status.json").read_text())
+        # Deduped to one bounded record, and never an "iMessage not configured" alert.
+        conditions = data["secondary_conditions"]
+        assert [c["kind"] for c in conditions] == ["imessage_unavailable"]
+        assert conditions[0]["primary_kind"] == "session_recovery_required"
+        assert "iMessage not configured" not in json.dumps(data.get("alerts", []))
+
+    def test_imessage_reports_failure_when_osascript_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src import reauth
+
+        monkeypatch.setattr("src.reauth.sys.platform", "darwin")
+        monkeypatch.setattr("src.reauth.shutil.which", lambda name, *a, **k: None)
+        with patch("src.reauth.subprocess.run") as mock_run:
+            assert reauth._send_imessage("+13055551234", "prepare-sessions") is False
+        mock_run.assert_not_called()
+
+    def test_imessage_send_uses_resolved_osascript_and_reports_success(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src import reauth
+
+        monkeypatch.setattr("src.reauth.sys.platform", "darwin")
+        monkeypatch.setattr("src.reauth.shutil.which", lambda name, *a, **k: f"/usr/bin/{name}")
+        ok = MagicMock()
+        ok.returncode = 0
+        with patch("src.reauth.subprocess.run", return_value=ok) as mock_run:
+            assert reauth._send_imessage("+13055551234", "prepare-sessions") is True
+        argv = mock_run.call_args[0][0]
+        assert argv[:2] == ["/usr/bin/osascript", "-e"]
+
+        failed = MagicMock()
+        failed.returncode = 1
+        with patch("src.reauth.subprocess.run", return_value=failed):
+            assert reauth._send_imessage("+13055551234", "prepare-sessions") is False
 
 
 # ── _write_regression_test & _notify_correction ────────────────────────────────

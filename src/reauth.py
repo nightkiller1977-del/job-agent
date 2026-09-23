@@ -7,9 +7,11 @@ Automated path (jobright, indeed, linkedin, usajobs):
     2FA), verifies the result, saves the refreshed session, returns True/False.
 
 Human-assisted fallback (usajobs):
-    Only after the automated path has failed. Sends an iMessage to NOTIFY_PHONE
-    with the exact terminal command to run, then polls the session file mtime
-    until the user completes the interactive login (or the timeout expires).
+    Only after the automated path has failed. Escalates with the exact terminal
+    command to run — over iMessage to NOTIFY_PHONE on macOS, and over Telegram
+    plus the desktop on every platform via session_watchdog — then polls the
+    session file mtime until the user completes the interactive login (or the
+    timeout expires). iMessage is macOS-only and never the sole delivery path.
     Non-interactive runs notify and return immediately — they never block.
 
     Until ACES-283 usajobs was human-ONLY: every expiry became a notification
@@ -27,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -35,7 +38,14 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from .sources.base import SESSIONS_DIR
-from .notifier import notify_error, notify_info, notify_success, notify_warning, record_reauth_event
+from .notifier import (
+    notify_error,
+    notify_info,
+    notify_success,
+    notify_warning,
+    record_reauth_event,
+    record_secondary_condition,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -329,18 +339,22 @@ class ReauthManager:
             else "Agent is running in the background — it won't wait now. Refresh the "
                  "session when you can and it'll be used on the next run."
         )
+        # Reuse the watchdog's builder so the manual command matches what staging
+        # runs, resolves this checkout's real path, and uses the right venv
+        # activation for the host OS instead of a hard-coded ~/Dev path.
+        from .session_watchdog import _prepare_sessions_command
+        manual_cmd, _ = _prepare_sessions_command(source)
         msg = (
             f"Job agent: {source.upper()} session expired.\n"
             f"{detail}\n\n"
             f"Tap the link below to open Terminal automatically:\n"
             f"jobagent://prepare-sessions?source={source}\n\n"
             f"Or run manually:\n"
-            f"  cd ~/Dev/Projects/job-agent\n"
-            f"  python src/main.py prepare-sessions --source {source}\n\n"
+            f"  {manual_cmd}\n\n"
             f"Log in / complete 2FA in the browser, then close it.\n"
             f"{retry_line}"
         )
-        _send_imessage(self.notify_phone, msg)
+        imessage_sent = _send_imessage(self.notify_phone, msg)
         # Also send via Telegram for the clickable deep-link
         try:
             from .session_watchdog import _send_deep_link_notification
@@ -351,8 +365,8 @@ class ReauthManager:
         except Exception:
             pass
         _log.info(
-            "reauth.human_notified source=%s timeout_min=%d phone_set=%s interactive=%s",
-            source, timeout_minutes, bool(self.notify_phone), interactive,
+            "reauth.human_notified source=%s timeout_min=%d phone_set=%s interactive=%s imessage_sent=%s",
+            source, timeout_minutes, bool(self.notify_phone), interactive, imessage_sent,
         )
         record_reauth_event(source, "human_notified", "waiting", detail)
 
@@ -483,14 +497,46 @@ async def test_regression_{source}_{ts_slug}():
 # Helpers
 # ------------------------------------------------------------------
 
-def _send_imessage(phone: str, message: str) -> None:
+def _send_imessage(phone: str, message: str) -> bool:
+    """Deliver an auth alert over iMessage. macOS-only.
+
+    Messages.app and AppleScript exist only on macOS, so anywhere else this is a
+    capability gap rather than a misconfiguration — telling a Linux operator to
+    "set NOTIFY_PHONE" would be remediation they cannot act on. The gap is
+    recorded as a bounded secondary condition instead, leaving the primary
+    session failure intact.
+
+    This is never the only delivery path: `_reauth_human` also escalates through
+    `session_watchdog._send_deep_link_notification`, which reaches Telegram and
+    the desktop on every platform.
+
+    Returns True only when Messages accepted the send.
+    """
+    if sys.platform != "darwin":
+        _log.info("reauth.imessage_unsupported platform=%s", sys.platform)
+        try:
+            record_secondary_condition(
+                "session_recovery_required",
+                "imessage_unavailable",
+                "imessage_notify",
+                dedupe_key="imessage-platform",
+            )
+        except Exception:
+            pass
+        return False
+
     if not phone:
         notify_warning(
             "iMessage not configured",
             "Set NOTIFY_PHONE in .env to receive auth alerts via iMessage",
             desktop=False,
         )
-        return
+        return False
+
+    osascript = shutil.which("osascript")
+    if not osascript:
+        _log.warning("reauth.imessage_unavailable reason=osascript_missing")
+        return False
 
     # Escape for AppleScript string literal
     safe_msg = message.replace('"', '\\"').replace("\n", "\\n")
@@ -502,9 +548,14 @@ def _send_imessage(phone: str, message: str) -> None:
         f'end tell'
     )
     try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+        result = subprocess.run([osascript, "-e", script], capture_output=True, timeout=10)
     except Exception as exc:
         _log.warning("iMessage send failed: %s", exc)
+        return False
+    if result.returncode != 0:
+        _log.warning("reauth.imessage_failed returncode=%s", result.returncode)
+        return False
+    return True
 
 
 async def _dom_says_logged_in(scraper, page) -> bool:
