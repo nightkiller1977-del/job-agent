@@ -12,6 +12,7 @@ grouping for the success report. This is the retry-decision authority.
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from enum import Enum
 from typing import NamedTuple
 
@@ -361,7 +362,7 @@ def rearm_reason(
     extra: dict,
     *,
     current_fingerprint: str | None = None,
-    now: "datetime | None" = None,
+    now: datetime | None = None,
 ) -> Rearm | None:
     """Why this job's open circuit should re-arm now, or None to leave it open.
 
@@ -369,8 +370,6 @@ def rearm_reason(
     caller decides what to do with the verdict, so the policy stays testable
     without a database.
     """
-    from datetime import datetime as _dt
-
     last_status = extra.get("apply_last_status")
     if not last_status:
         return None  # never attempted — no circuit to re-arm
@@ -405,7 +404,7 @@ def rearm_reason(
             return None  # repeatedly retried across days — not an environmental blip
         if hours and last_at:
             try:
-                elapsed = (now or _dt.utcnow()) - _dt.fromisoformat(str(last_at))
+                elapsed = (now or datetime.utcnow()) - datetime.fromisoformat(str(last_at))
             except (TypeError, ValueError):
                 return None
             if elapsed.total_seconds() >= hours * 3600:
