@@ -322,7 +322,17 @@ class BuiltInScraper(BaseScraper):
 
         job_blob = post_init.get("job") if isinstance(post_init.get("job"), dict) else post_init
         fresh_url = (job_blob.get("howToApply") or "").strip()
-        return fresh_url or stashed
+        resolved = fresh_url or stashed
+        # BuiltIn's howToApply is often the employer's careers/marketing page,
+        # which carries no application form — the cause of builtin_no_ats_url /
+        # form_not_reached (ACES-436). Rewrite to the vendor's own application
+        # URL when it is derivable; canonical_ats_url returns '' otherwise, so
+        # an underivable URL is left exactly as resolved.
+        try:
+            from src.url_utils import canonical_ats_url
+            return canonical_ats_url(resolved) or resolved
+        except Exception:
+            return resolved
 
     @staticmethod
     def _stashed_ats_url(job: dict) -> str:
