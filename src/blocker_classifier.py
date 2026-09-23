@@ -63,6 +63,10 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     "session_expired": BlockerClass.AUTH_REQUIRED,
     "usajobs_login_required": BlockerClass.AUTH_REQUIRED,  # historic rows; apply now raises AuthFailedError instead
     "needs_session_prep": BlockerClass.AUTH_REQUIRED,  # P3: human source, run prepare-sessions
+    # BuiltIn holds the employer URL behind sign-in; previously mis-reported as
+    # builtin_no_ats_url (UNKNOWN), which retried a URL that cannot change
+    # without a session and hid the credentials gap (ACES-437).
+    "builtin_login_required": BlockerClass.AUTH_REQUIRED,
     # config — user must fix .env / creds; never auto-retry
     "credentials_missing": BlockerClass.PERMANENT,
     # needs human — retrying without a code/profile fix won't help

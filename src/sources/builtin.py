@@ -3,12 +3,20 @@ BuiltIn (builtin.com) scraper.
 
 Discovery is a pure httpx fetch of builtin.com's plain server-rendered HTML —
 no browser needed. Each job-detail page embeds two structured JSON blobs:
-a `Builtin.jobPostInit({...})` JS-call argument (companyName, howToApply, id)
+a `Builtin.jobPostInit({...})` JS-call argument (companyName, applyUrl, id)
 and a schema.org `application/ld+json` JobPosting (title, description,
-jobLocation, baseSalary). BuiltIn never hosts applications itself — every
-listing's `howToApply` points off-site — so apply() re-fetches the detail
-page and delegates to JobrightScraper.apply_external_ats_job(), the same
-Workday/Greenhouse/Lever/etc. filler already used by indeed.py/themuse.py.
+jobLocation, baseSalary). BuiltIn never hosts applications itself, so apply()
+re-fetches the detail page and delegates to
+JobrightScraper.apply_external_ats_job(), the same Workday/Greenhouse/Lever/etc.
+filler already used by indeed.py/themuse.py.
+
+Field drift (ACES-437): this module was written against a `howToApply` key
+holding the off-site URL directly. BuiltIn no longer returns that field; the
+blob now carries `applyUrl`, a *site-relative* redirect handler
+(`/job/<slug>/<id>?handler=ApplyRedirect`). For an anonymous caller that
+handler does not hand off to the employer — it redirects back to BuiltIn with
+`applyRequired=true`. Both keys are read (applyUrl first), and the login-wall
+bounce is reported as `builtin_login_required` rather than a missing URL.
 
 Cloudflare bot-management is active on this site: every request uses a
 realistic User-Agent plus the existing self._delay() pacing, and any response
@@ -20,6 +28,7 @@ from __future__ import annotations
 import html as _html_mod
 import json
 import re
+import urllib.parse
 from datetime import datetime
 
 import httpx
@@ -266,7 +275,10 @@ class BuiltInScraper(BaseScraper):
         location_str = _format_location(ld.get("jobLocation"))
         description = _html_to_text(ld.get("description") or "")
         salary_raw = _format_salary(ld.get("baseSalary"))
-        how_to_apply = (job_blob.get("howToApply") or "").strip()
+        # Same field drift as the apply path: read applyUrl (BuiltIn's current
+        # key) with howToApply as a fallback, resolved against the detail page
+        # since applyUrl is site-relative (ACES-437).
+        how_to_apply = self._apply_url_from_blob(job_blob, base_url=url)
 
         return {
             "job_id": self._make_job_id(url),
@@ -321,7 +333,7 @@ class BuiltInScraper(BaseScraper):
             post_init = _extract_job_post_init(resp.text) or {}
 
         job_blob = post_init.get("job") if isinstance(post_init.get("job"), dict) else post_init
-        fresh_url = (job_blob.get("howToApply") or "").strip()
+        fresh_url = self._apply_url_from_blob(job_blob, base_url=str(resp.url))
         resolved = fresh_url or stashed
         # BuiltIn's howToApply is often the employer's careers/marketing page,
         # which carries no application form — the cause of builtin_no_ats_url /
@@ -333,6 +345,54 @@ class BuiltInScraper(BaseScraper):
             return canonical_ats_url(resolved) or resolved
         except Exception:
             return resolved
+
+    @staticmethod
+    def _apply_url_from_blob(job_blob: dict, *, base_url: str) -> str:
+        """Application URL from a BuiltIn job blob, '' when it exposes none.
+
+        BuiltIn renamed this field. The module docstring above still describes
+        ``howToApply``, which is what this code read at both call sites — but a
+        live fetch on 2026-09-23 returned a blob keyed
+        ``id, drupalId, isSaved, applyUrl, applyText, companyName, title,
+        isEasyApply, resolvedBidId`` with no ``howToApply`` at all. Every
+        BuiltIn job therefore resolved to '' and was reported
+        ``builtin_no_ats_url`` regardless of whether an application existed
+        (ACES-437). ``howToApply`` is still read as a fallback so the older
+        shape keeps working if BuiltIn serves it again.
+
+        ``applyUrl`` is site-relative (``/job/<slug>/<id>?handler=ApplyRedirect``),
+        so it is resolved against the page URL rather than returned as-is.
+        """
+        if not isinstance(job_blob, dict):
+            return ""
+        raw = (job_blob.get("applyUrl") or job_blob.get("howToApply") or "").strip()
+        if not raw:
+            return ""
+        try:
+            absolute = urllib.parse.urljoin(base_url, raw)
+        except Exception:
+            return ""
+        return absolute if absolute.lower().startswith(("http://", "https://")) else ""
+
+    @staticmethod
+    def _is_builtin_login_wall(url: str) -> bool:
+        """True when a resolved apply URL is BuiltIn's own login wall.
+
+        ``?handler=ApplyRedirect`` does not hand off to the employer for an
+        anonymous caller: it redirects back to BuiltIn with
+        ``applyRequired=true``. All 11 approved BuiltIn jobs behaved this way
+        when checked, every one ``isEasyApply=False``. Landing back on BuiltIn
+        is an authentication outcome, not a missing URL, and must be reported
+        as such so the job is not retried as though the posting were broken.
+        """
+        try:
+            parsed = urllib.parse.urlparse(url or "")
+        except Exception:
+            return False
+        if "builtin.com" not in parsed.netloc.lower():
+            return False
+        qs = {k.lower() for k, _ in urllib.parse.parse_qsl(parsed.query)}
+        return "applyrequired" in qs or "handler" in qs
 
     @staticmethod
     def _stashed_ats_url(job: dict) -> str:
@@ -360,6 +420,19 @@ class BuiltInScraper(BaseScraper):
             return self._set_apply_outcome(
                 "builtin_no_ats_url",
                 f"Could not resolve an external company ATS URL from {job.get('url', '')}.",
+            )
+
+        if self._is_builtin_login_wall(ext_url):
+            # Distinct from "no URL found": BuiltIn has the employer's URL and
+            # is withholding it pending sign-in. Reporting this as a missing URL
+            # hid a credentials gap behind what looked like a broken posting,
+            # and burned the retry budget re-resolving a URL that cannot change
+            # without a session (ACES-437).
+            return self._set_apply_outcome(
+                "builtin_login_required",
+                "BuiltIn requires a signed-in session before it will reveal the employer's "
+                f"application URL for {job.get('url', '')} (apply redirect returned to "
+                "BuiltIn with applyRequired=true). No BuiltIn credentials are configured.",
             )
 
         from .jobright import JobrightScraper
