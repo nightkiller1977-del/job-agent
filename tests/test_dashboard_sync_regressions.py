@@ -143,6 +143,30 @@ class TestActionIdempotency(unittest.TestCase):
         self.assertTrue(response.json()["deduplicated"])
         mock_db.jobs.find_one.assert_called_once()
 
+    @patch("dashboard.main.get_db")
+    def test_action_replay_conflicts_when_current_status_changed(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "approved",
+            "_action_idempotency_keys": ["applied:stable-key-1"],
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], "Current status no longer matches action")
+
 
 class TestExternalJobScorePlaceholder(unittest.TestCase):
     def setUp(self):

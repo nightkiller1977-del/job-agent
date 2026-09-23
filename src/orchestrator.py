@@ -2024,6 +2024,12 @@ class Orchestrator:
     async def _retry_pending_cloud_status_sync(self) -> None:
         """Retry durable status promotions once per run until cloud confirms."""
         for pending in self.state.list_pending_cloud_status_sync():
+            current = self.state.get_job(pending["job_id"])
+            if not current or current.get("status") != pending["status"]:
+                self.state.clear_pending_cloud_status_sync(
+                    pending["job_id"], pending["status"]
+                )
+                continue
             await self._push_status_to_cloud(
                 pending["job_id"], pending["status"]
             )
@@ -2061,6 +2067,15 @@ class Orchestrator:
                 return False
             if r.status_code != 200:
                 console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
+                return False
+            try:
+                response_status = r.json().get("status")
+            except (AttributeError, TypeError, ValueError):
+                response_status = None
+            if response_status != status:
+                console.print(
+                    "[dim]Cloud status push did not confirm the requested status[/dim]"
+                )
                 return False
             self.state.clear_pending_cloud_status_sync(job_id, status)
             return True

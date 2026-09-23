@@ -97,7 +97,10 @@ async def test_pending_applied_sync_retries_until_cloud_confirms(tmp_path, monke
     orchestrator.state.upsert_job(job)
     orchestrator.state.set_status(job["job_id"], "applied")
     failed = MagicMock(status_code=503)
-    confirmed = MagicMock(status_code=200)
+    confirmed = MagicMock(
+        status_code=200,
+        json=lambda: {"status": "applied", "deduplicated": True},
+    )
     orchestrator._cloud_request = AsyncMock(side_effect=[failed, confirmed])
 
     first_result = await orchestrator._push_status_to_cloud(job["job_id"], "applied")
@@ -119,6 +122,105 @@ async def test_pending_applied_sync_retries_until_cloud_confirms(tmp_path, monke
         orchestrator.state.get_job(job["job_id"])["extra_json"]
     )
     assert "cloud_status_sync_pending" not in cleared
+
+
+@pytest.mark.asyncio
+async def test_status_push_keeps_obligation_when_200_reports_wrong_status(
+    tmp_path, monkeypatch
+):
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-status-mismatch",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/status-mismatch",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator.state.set_status(job["job_id"], "applied")
+    orchestrator._cloud_request = AsyncMock(
+        return_value=MagicMock(
+            status_code=200,
+            json=lambda: {"status": "approved", "deduplicated": True},
+        )
+    )
+
+    result = await orchestrator._push_status_to_cloud(job["job_id"], "applied")
+
+    assert result is False
+    extra = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )
+    assert extra["cloud_status_sync_pending"]["status"] == "applied"
+
+
+def test_later_local_status_clears_pending_applied_sync(tmp_path):
+    from src.state_manager import StateManager, parse_extra_json
+
+    state = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "job-reclassified",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/reclassified",
+        "status": "approved",
+    }
+    state.upsert_job(job)
+    state.set_status(job["job_id"], "applied")
+
+    state.set_status(job["job_id"], "skipped")
+
+    current = state.get_job(job["job_id"])
+    assert current["status"] == "skipped"
+    assert "cloud_status_sync_pending" not in parse_extra_json(
+        current["extra_json"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_drops_legacy_marker_when_local_status_has_changed(
+    tmp_path, monkeypatch
+):
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-legacy-stale-marker",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/legacy-stale-marker",
+        "status": "skipped",
+        "extra_json": json.dumps(
+            {"cloud_status_sync_pending": {"status": "applied"}}
+        ),
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator._cloud_request = AsyncMock()
+
+    await orchestrator._retry_pending_cloud_status_sync()
+
+    orchestrator._cloud_request.assert_not_awaited()
+    current = orchestrator.state.get_job(job["job_id"])
+    assert "cloud_status_sync_pending" not in parse_extra_json(
+        current["extra_json"]
+    )
 
 
 @pytest.mark.asyncio

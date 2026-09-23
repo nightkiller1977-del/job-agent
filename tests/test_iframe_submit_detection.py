@@ -698,6 +698,48 @@ async def test_receipt_baseline_capture_is_bounded_and_timeout_safe(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_unbaselined_same_origin_frame_cannot_become_fresh_replacement(
+    monkeypatch,
+):
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        evaluate_result=False,
+    )
+    stale_confirmation = FakeFrame(
+        "https://boards.greenhouse.io/embed/already-confirmed",
+        evaluate_result=True,
+    )
+
+    async def _capture(frame):
+        return frame
+
+    async def _receipt(frame, **_kwargs):
+        if frame is stale_confirmation:
+            return True, "t:application received"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _receipt)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    baselines = await scraper._capture_receipt_baselines(
+        FakePage([application, stale_confirmation]),
+        required_frame=application,
+        max_frames=1,
+    )
+
+    signal = await scraper._verify_submit_receipt(
+        FakePage([stale_confirmation]),
+        submit_frame=application,
+        submit_origin="https://boards.greenhouse.io",
+        receipt_baselines=baselines,
+        retries=0,
+    )
+
+    assert signal == ""
+
+
+@pytest.mark.asyncio
 async def test_receipt_poll_times_out_one_frame_without_hiding_healthy_sibling(
     monkeypatch,
 ):
