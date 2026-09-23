@@ -18,6 +18,7 @@ from typing import Optional
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 from rich.console import Console
 
+from .adapters.receipt import capture_receipt_evidence, verify_receipt
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_success
 from src.resume_helper import ResumeFieldFixer, resolve_resume_path, check_ats_readability, ATSReadabilityError, KeywordCoverageError, PDFTextLayerError, load_profile
@@ -2184,22 +2185,41 @@ class JobrightScraper(BaseScraper):
         than skipped, so "no controls anywhere" stays distinguishable from
         "controls exist in a frame we could not read".
         """
-        controls: list[dict] = []
+        if limit <= 0:
+            return []
+
+        # Read a bounded sample from every frame before applying the global
+        # limit.  Otherwise a host page with 40 marketing links consumes the
+        # entire budget and hides the one useful Submit control in its ATS
+        # iframe.  Round-robin assembly preserves a deterministic main-first
+        # order while ensuring later frames contribute promptly.
+        per_frame: list[list[dict]] = []
         for frame in self._candidate_frames(page):
-            if len(controls) >= limit:
-                break
             try:
-                found = await self._frame_controls_snapshot(frame, limit - len(controls))
+                found = await self._frame_controls_snapshot(frame, limit)
             except Exception as exc:
-                controls.append({
+                found = [{
                     "tag": "FRAME",
                     "role": "",
                     "text": f"(unreadable frame: {type(exc).__name__})",
                     "href": self._safe_frame_url(frame),
-                })
-                continue
-            controls.extend(found)
-        return controls[:limit]
+                }]
+            per_frame.append(found)
+
+        controls: list[dict] = []
+        item_index = 0
+        while len(controls) < limit:
+            contributed = False
+            for frame_controls in per_frame:
+                if item_index < len(frame_controls):
+                    controls.append(frame_controls[item_index])
+                    contributed = True
+                    if len(controls) >= limit:
+                        break
+            if not contributed:
+                break
+            item_index += 1
+        return controls
 
     @staticmethod
     def _safe_frame_url(frame) -> str:
@@ -2406,8 +2426,10 @@ class JobrightScraper(BaseScraper):
         try:
             if await self._looks_like_login_wall(page):
                 return False
-            return await page.evaluate(
-                """
+            for frame in self._candidate_frames(page):
+                try:
+                    is_form = await frame.evaluate(
+                        """
                 () => {
                     const url = location.href.toLowerCase();
                     const body = (document.body?.innerText || '').toLowerCase();
@@ -2419,7 +2441,14 @@ class JobrightScraper(BaseScraper):
                     return reviewText || formish >= 3 || (workflowUrl && formish > 0);
                 }
                 """
-            )
+                    )
+                except Exception:
+                    # Detached or unreadable frame; another frame may still own
+                    # the application workflow.
+                    continue
+                if is_form:
+                    return True
+            return False
         except Exception:
             return False
 
@@ -3772,7 +3801,6 @@ class JobrightScraper(BaseScraper):
         """
         submit_selectors = [
             # Workday final-step submit (data-automation-id) — highly specific, safe
-            '[data-automation-id="bottom-navigation-next-button"]',
             '[data-automation-id*="submit" i]',
             'input[type="submit"][value*="Submit" i]',
             'input[type="button"][value*="Submit" i]',
@@ -3803,10 +3831,20 @@ class JobrightScraper(BaseScraper):
         # the false-submit risk the empty-form guard below still backstops.
         try:
             from ..adapters_patterns.ats_selectors import SELECTORS as _VENDOR_SEL
+            # These controls can advance a multi-step wizard but do not prove a
+            # final submission. Broad button[type=submit] selectors have the
+            # same ambiguity on embedded React forms. Keep them out of the
+            # final-submit boundary; the dedicated ATS adapters own traversal.
+            _unsafe_final_selectors = {
+                "[data-automation-id='bottom-navigation-next-button']",
+                "button[data-automation-id='nextButton']",
+                "button[type='submit']",
+            }
             _vendor_submits = [
                 s
                 for vendor in _VENDOR_SEL.values()
                 for s in vendor.get("submit_button", [])
+                if s not in _unsafe_final_selectors
             ]
             # vendor-specific first, then the existing list; dedupe preserving order
             _seen: set[str] = set()
@@ -3936,6 +3974,17 @@ class JobrightScraper(BaseScraper):
             )
 
         if submit_btn:
+            # A click is an ambiguous external side effect. Snapshot every frame
+            # immediately before dispatch so only fresh ATS acceptance evidence
+            # can move this job to the submitted state.
+            receipt_baselines = []
+            for receipt_frame in self._candidate_frames(page):
+                try:
+                    baseline = await capture_receipt_evidence(receipt_frame)
+                except Exception:
+                    continue
+                receipt_baselines.append((receipt_frame, baseline))
+
             # Use JS click to bypass Workday overlay divs that intercept pointer events.
             # Evaluate on the handle itself, not on `page`: the control may live in a
             # child frame, and a handle cannot be adopted into another frame's context
@@ -3958,9 +4007,41 @@ class JobrightScraper(BaseScraper):
                         f"{type(exc).__name__}.",
                     )
             await self._delay(3, 5)
+
+            receipt_checks = await asyncio.gather(
+                *(
+                    verify_receipt(
+                        receipt_frame,
+                        retries=5,
+                        delay=0.4,
+                        baseline=baseline,
+                    )
+                    for receipt_frame, baseline in receipt_baselines
+                ),
+                return_exceptions=True,
+            )
+            receipt_signal = next(
+                (
+                    signal
+                    for result in receipt_checks
+                    if not isinstance(result, BaseException)
+                    for verified, signal in [result]
+                    if verified
+                ),
+                "",
+            )
+            if not receipt_signal:
+                return self._set_apply_outcome(
+                    "submission_unverified",
+                    f"Clicked a final submit control at {portal_url}, but no fresh "
+                    "ATS acceptance receipt appeared. Reconcile the employer portal "
+                    "before retrying to avoid a duplicate application.",
+                )
+
             # ── Record analytics for orchestrator to persist via extra_json ──
             self._apply_analytics = {
                 "submitted": True,
+                "receiptSignal": receipt_signal,
                 "submissionTime": datetime.utcnow().isoformat(),
                 "applicationMethod": getattr(self, "_last_application_method", "Unknown"),
                 "atsScore": getattr(self, "_last_ats_score", None),
