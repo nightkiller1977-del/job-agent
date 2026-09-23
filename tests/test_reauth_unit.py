@@ -788,6 +788,13 @@ class TestReauthHuman:
             assert reauth._send_imessage("+13055551234", "prepare-sessions") is False
         mock_run.assert_not_called()
 
+        # A macOS host without osascript is a real capability gap and gets the
+        # same operator-visible record as the non-darwin branch, not just a log.
+        data = json.loads((tmp_path / "status.json").read_text())
+        conditions = data["secondary_conditions"]
+        assert [c["kind"] for c in conditions] == ["imessage_unavailable"]
+        assert conditions[0]["operation"] == "imessage_osascript_missing"
+
     def test_imessage_send_uses_resolved_osascript_and_reports_success(self, tmp_path, monkeypatch):
         monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
         from src import reauth

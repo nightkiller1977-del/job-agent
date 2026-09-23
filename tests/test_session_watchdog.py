@@ -17,6 +17,7 @@ from src.session_watchdog import (
     _prepare_sessions_command,
     _stage_prepare_sessions,
     _venv_activate_parts,
+    _shell_quote,
     StagingResult,
 )
 
@@ -360,8 +361,9 @@ def test_stage_prepare_sessions_uses_windows_console(monkeypatch):
 
     argv = mock_run.call_args[0][0]
     assert argv[:6] == [r"C:\Windows\System32\cmd.exe", "/c", "start", "", "cmd", "/k"]
-    assert r".venv\Scripts\activate.bat" in argv[6]
-    assert "prepare-sessions --source linkedin" in argv[6]
+    assert r"call .venv\Scripts\activate.bat" in argv[6]
+    assert argv[6].endswith('prepare-sessions --source "linkedin"')
+    assert "'" not in argv[6]
 
 
 def test_stage_prepare_sessions_unsupported_on_windows_without_comspec(monkeypatch):
@@ -379,7 +381,42 @@ def test_venv_activate_parts_are_platform_specific(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
     assert _venv_activate_parts() == ["source", ".venv/bin/activate"]
     monkeypatch.setattr(sys, "platform", "win32")
-    assert _venv_activate_parts() == [r".venv\Scripts\activate.bat"]
+    # `call` so control returns to the chained `&& python ...`.
+    assert _venv_activate_parts() == ["call", r".venv\Scripts\activate.bat"]
+
+
+def test_shell_quote_uses_cmd_rules_on_windows(monkeypatch):
+    """shlex.quote wraps anything containing a backslash in SINGLE quotes, which
+    cmd.exe does not strip. Every Windows path has backslashes, so using it there
+    produced a command that always failed, not just one that broke on spaces."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert _shell_quote(r"C:\Users\me\job agent") == '"C:\\Users\\me\\job agent"'
+    assert "'" not in _shell_quote(r"C:\Users\me\job-agent")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert _shell_quote("/home/me/job agent") == "'/home/me/job agent'"
+
+
+def test_prepare_sessions_command_is_cmd_compatible_on_windows(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    cmd, mapped = _prepare_sessions_command("linkedin")
+
+    assert mapped == "linkedin"
+    # `cd` alone does not switch drive on Windows.
+    assert cmd.startswith('cd /d "')
+    assert "'" not in cmd
+    assert r"call .venv\Scripts\activate.bat" in cmd
+    assert cmd.endswith('prepare-sessions --source "linkedin"')
+
+
+def test_prepare_sessions_command_keeps_posix_form_off_windows(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    cmd, _ = _prepare_sessions_command("linkedin")
+
+    assert cmd.startswith("cd ")
+    assert "/d" not in cmd.split("&&")[0]
+    assert "source .venv/bin/activate" in cmd
+    assert cmd.endswith("prepare-sessions --source linkedin")
 
 
 def test_send_deep_link_notification_includes_novnc_link_when_available(tmp_path):

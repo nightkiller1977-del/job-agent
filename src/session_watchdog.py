@@ -417,26 +417,43 @@ def _prepare_sessions_source(source: str) -> Optional[str]:
 def _venv_activate_parts() -> list[str]:
     """Shell tokens that activate the project venv for the current platform.
 
-    POSIX shells source `.venv/bin/activate`; Windows `cmd.exe` calls
-    `.venv\\Scripts\\activate.bat` directly. Hard-coding the POSIX form produced
-    a command the human could not run on Windows.
+    POSIX shells source `.venv/bin/activate`; `cmd.exe` uses `call` so control
+    returns to the chained command instead of stopping at the batch file.
     """
     if sys.platform == "win32":
-        return [r".venv\Scripts\activate.bat"]
+        return ["call", r".venv\Scripts\activate.bat"]
     return ["source", ".venv/bin/activate"]
 
 
+def _shell_quote(value: str) -> str:
+    """Quote one argument for the shell that will actually run the command.
+
+    `shlex.quote` is POSIX-only: it wraps anything containing a backslash in
+    single quotes, and `cmd.exe` does not treat single quotes as quoting. Since
+    every Windows path contains backslashes, using it there produced a command
+    that always failed — `cd 'C:\\Users\\me\\job-agent'` — not just one that
+    broke on spaces. cmd quotes with double quotes, inside which `&`, `|` and
+    `^` are literal.
+    """
+    if sys.platform == "win32":
+        return '"' + str(value).replace('"', '""') + '"'
+    return shlex.quote(str(value))
+
+
 def _prepare_sessions_command(source: str) -> tuple[str, Optional[str]]:
-    """Build a safe shell command for Terminal staging.
+    """Build a safe shell command for terminal staging.
 
     The second tuple item is the normalized prepare-sessions source, or None
     when no safe source filter should be sent.
     """
     project_dir = Path(__file__).parent.parent
     prepare_source = _prepare_sessions_source(source)
+    # `cd` alone does not switch drive on Windows, so a checkout on D: would
+    # silently leave cmd in the C: working directory.
+    cd_parts = ["cd", "/d"] if sys.platform == "win32" else ["cd"]
     parts = [
-        "cd",
-        shlex.quote(str(project_dir)),
+        *cd_parts,
+        _shell_quote(str(project_dir)),
         "&&",
         *_venv_activate_parts(),
         "&&",
@@ -445,7 +462,7 @@ def _prepare_sessions_command(source: str) -> tuple[str, Optional[str]]:
         "prepare-sessions",
     ]
     if prepare_source:
-        parts.extend(["--source", shlex.quote(prepare_source)])
+        parts.extend(["--source", _shell_quote(prepare_source)])
     return " ".join(parts), prepare_source
 
 

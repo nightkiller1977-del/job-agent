@@ -535,7 +535,19 @@ def _send_imessage(phone: str, message: str) -> bool:
 
     osascript = shutil.which("osascript")
     if not osascript:
+        # A macOS host that cannot find osascript is a real capability gap, so it
+        # gets the same operator-visible record as the non-darwin branch rather
+        # than a log line nobody reads. The operation distinguishes the cause.
         _log.warning("reauth.imessage_unavailable reason=osascript_missing")
+        try:
+            record_secondary_condition(
+                "session_recovery_required",
+                "imessage_unavailable",
+                "imessage_osascript_missing",
+                dedupe_key="imessage-osascript-missing",
+            )
+        except Exception:
+            pass
         return False
 
     # Same home-path redaction every other channel applies, so the staging
