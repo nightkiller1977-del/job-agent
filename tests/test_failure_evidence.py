@@ -99,7 +99,10 @@ def test_blocker_derivation_and_challenge_flag():
 def test_blocker_class_stamped():
     assert _build().blocker_class == "permanent"
     unv = AtsApplyResult.unverified("clicked, no receipt")
-    assert _build(result=unv).blocker_class == "unknown"
+    # Was "unknown" — which is auto-retryable (ACES-434). unverified() means a
+    # submit was clicked with no receipt confirmation, so a fresh classification
+    # must never fall back to something the circuit breaker will blindly retry.
+    assert _build(result=unv).blocker_class == "reconciliation_required"
 
 
 def test_detail_truncated_to_2000():

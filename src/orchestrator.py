@@ -43,6 +43,8 @@ from .blocker_classifier import (
     preflight_reauth_viable,
     rearm_reason,
     Rearm,
+    AMBIGUOUS_SUBMISSION_STATUSES,
+    BlockerClass,
 )
 from .resume_tailor import evaluate_resume_gate, ResumeTailor
 from .session_watchdog import (
@@ -131,11 +133,14 @@ _OWN_SESSION_STATUSES = {
 # projected onto confirmation_status before the next scheduler pass so an
 # approved row cannot be selected repeatedly while durable reconciliation is
 # still required.
-_AMBIGUOUS_SUBMISSION_STATUSES = {
-    "duplicate_application_prevented",
-    "submission_unverified",
-    "submit_unverified_unresolved",
-}
+#
+# Single source of truth is blocker_classifier.AMBIGUOUS_SUBMISSION_STATUSES —
+# imported, not redefined. Two independent copies of "which statuses are
+# ambiguous" is exactly how ACES-434 happened: this set said a status was
+# ambiguous, blocker_classifier had never heard of it and classified it
+# UNKNOWN, and UNKNOWN was — and still would be — eligible for automatic
+# circuit re-arm.
+_AMBIGUOUS_SUBMISSION_STATUSES = AMBIGUOUS_SUBMISSION_STATUSES
 
 _RECONCILIATION_NOTIFICATION_OUTCOMES = {
     "duplicate_application_prevented",
@@ -1809,8 +1814,18 @@ class Orchestrator:
 
         PERMANENT and SUCCESS are never re-armed, by --class or by default: a
         closed posting does not reopen on request. Pass --class to narrow further.
+
+        RECONCILIATION_REQUIRED (ambiguous submissions — the click may already
+        have reached the employer) is never re-armed either, by --class or by
+        default, and not even by a --job-id targeted at one directly (ACES-434).
+        Unlike PERMANENT/SUCCESS this is not a silent skip: it is counted and
+        reported separately so an operator sweeping the backlog can see these
+        jobs are being deliberately held back, not silently dropped. The only
+        path back to retryable is durable ledger reconciliation resolving the
+        prior attempt to a definite outcome — never an operator's request that
+        "this one is probably fine."
         """
-        from src.blocker_classifier import BlockerClass
+        never_rearm = (BlockerClass.SUCCESS, BlockerClass.PERMANENT, BlockerClass.RECONCILIATION_REQUIRED)
 
         target = None
         if blocker_class:
@@ -1818,16 +1833,22 @@ class Orchestrator:
                 target = BlockerClass(blocker_class)
             except ValueError:
                 console.print(f"[red]Unknown blocker class:[/red] {blocker_class}")
-                return {"matched": 0, "rearmed": 0}
-            if target in (BlockerClass.SUCCESS, BlockerClass.PERMANENT):
+                return {"matched": 0, "rearmed": 0, "held_back": 0}
+            if target in never_rearm:
                 console.print(
                     f"[red]{target.value} circuits are never re-armed[/red] — "
-                    "the blocker is structural, not a retry budget."
+                    + (
+                        "the blocker is structural, not a retry budget."
+                        if target is not BlockerClass.RECONCILIATION_REQUIRED
+                        else "a prior submit may have already reached the employer; "
+                        "only durable ledger reconciliation can clear it."
+                    )
                 )
-                return {"matched": 0, "rearmed": 0}
+                return {"matched": 0, "rearmed": 0, "held_back": 0}
 
-        matched = rearmed = 0
+        matched = rearmed = held_back = 0
         by_status: dict[str, int] = {}
+        held_back_by_status: dict[str, int] = {}
         for job in self.state.get_jobs_by_status("approved"):
             if job_id and job["job_id"] != job_id:
                 continue
@@ -1836,6 +1857,19 @@ class Orchestrator:
             if not last or not int(extra.get("apply_attempt_count", 0) or 0):
                 continue
             cls = classify(last)
+            if cls is BlockerClass.RECONCILIATION_REQUIRED:
+                # An operator scoped to some OTHER class (--class needs_human)
+                # is not asking about ambiguous jobs at all — reporting them
+                # there is noise unrelated to that query, not the visibility
+                # this exists for. Only surface them on an unfiltered sweep or
+                # a --job-id query, where "ambiguous" is a possible answer to
+                # what the operator actually asked. Either way the job is never
+                # re-armed — target is never RECONCILIATION_REQUIRED here, that
+                # case already returned above before this loop started.
+                if target is None:
+                    held_back += 1
+                    held_back_by_status[last] = held_back_by_status.get(last, 0) + 1
+                continue
             if cls in (BlockerClass.SUCCESS, BlockerClass.PERMANENT):
                 continue
             if target and cls is not target:
@@ -1849,9 +1883,16 @@ class Orchestrator:
         console.print(f"[green]Circuit re-arm:[/green] {verb} {matched if dry_run else rearmed} job(s)")
         for status, n in sorted(by_status.items(), key=lambda kv: -kv[1]):
             console.print(f"  [dim]{n:>3}  {status} ({classify(status).value})[/dim]")
-        if not matched:
+        if held_back:
+            console.print(
+                f"[yellow]Held back (not re-armed):[/yellow] {held_back} job(s) with an "
+                "ambiguous prior submission — reconcile via the submission ledger first"
+            )
+            for status, n in sorted(held_back_by_status.items(), key=lambda kv: -kv[1]):
+                console.print(f"  [dim]{n:>3}  {status} (reconciliation_required)[/dim]")
+        if not matched and not held_back:
             console.print("[dim]  no open circuits matched.[/dim]")
-        return {"matched": matched, "rearmed": rearmed}
+        return {"matched": matched, "rearmed": rearmed, "held_back": held_back}
 
     async def rescore_failed(self, limit: Optional[int] = None, dry_run: bool = False) -> dict:
         """Re-score jobs whose evaluation previously failed.

@@ -40,6 +40,29 @@ class BlockerClass(str, Enum):
     NEEDS_HUMAN = "needs_human"   # page-structure/field/submit issue — surface, don't blind-retry
     PERMANENT = "permanent"       # bad url / unknown source — never retry
     UNKNOWN = "unknown"           # unmapped status — cautious retry
+    # A submit may already have reached the employer and durable evidence has
+    # not (yet) resolved it either way — retrying blind risks a duplicate
+    # application. Distinct from UNKNOWN so it can never inherit UNKNOWN's
+    # retry/re-arm eligibility by omission (ACES-434): a status only lands here
+    # by deliberate listing in AMBIGUOUS_SUBMISSION_STATUSES below, never by
+    # falling through an unclassified default the way UNKNOWN does. Retryable
+    # only once durable reconciliation (the submission ledger) resolves the
+    # prior attempt to a definite outcome — never by code-change re-arm,
+    # cooldown re-arm, or an unfiltered `rearm-breakers` sweep.
+    RECONCILIATION_REQUIRED = "reconciliation_required"
+
+
+# Outcomes where a submit may already have reached the employer and must not be
+# blindly retried. Single source of truth: src.orchestrator projects these onto
+# confirmation_status from the same set, so the "is this ambiguous?" question is
+# answered identically everywhere instead of two lists that can silently drift
+# apart, which is how ACES-434 happened (submission_unverified was ambiguous to
+# the orchestrator but unclassified — and therefore retryable — here).
+AMBIGUOUS_SUBMISSION_STATUSES = frozenset({
+    "duplicate_application_prevented",
+    "submission_unverified",
+    "submit_unverified_unresolved",
+})
 
 
 # Explicit status → class map (statuses observed in the live DB + known emitters).
@@ -89,6 +112,11 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     "bad_ats_url": BlockerClass.PERMANENT,
     "unknown_source": BlockerClass.PERMANENT,
     "expired": BlockerClass.PERMANENT,  # posting is gone/closed — never retry
+    # ambiguous submission outcomes (ACES-434) — never blind-retried; see
+    # AMBIGUOUS_SUBMISSION_STATUSES and BlockerClass.RECONCILIATION_REQUIRED
+    # above. Generated from the shared set rather than listed by hand so this
+    # map and the set can't drift apart from each other.
+    **{status: BlockerClass.RECONCILIATION_REQUIRED for status in AMBIGUOUS_SUBMISSION_STATUSES},
 }
 
 # Per-class attempt caps. Once apply_attempt_count reaches the cap for a job's
@@ -100,6 +128,7 @@ _MAX_ATTEMPTS: dict[BlockerClass, int] = {
     BlockerClass.NEEDS_HUMAN: 1,     # surface immediately; don't blind-retry
     BlockerClass.PERMANENT: 0,       # never retry
     BlockerClass.UNKNOWN: 2,
+    BlockerClass.RECONCILIATION_REQUIRED: 0,  # never blind-retry; reconcile first
 }
 
 
@@ -251,6 +280,10 @@ _CODE_REARM_CLASSES = frozenset({
     BlockerClass.AUTH_REQUIRED,
     BlockerClass.NEEDS_HUMAN,
     BlockerClass.UNKNOWN,
+    # RECONCILIATION_REQUIRED is deliberately absent (ACES-434): a code change
+    # elsewhere in the apply path is not evidence about whether a specific
+    # prior submission reached the employer, so it must never grant this class
+    # a fresh attempt. Only durable ledger reconciliation may.
 })
 
 # Classes the cooldown can re-arm. Deliberately the same set as the code-change
