@@ -806,6 +806,24 @@ class TestReauthHuman:
         with patch("src.reauth.subprocess.run", return_value=failed):
             assert reauth._send_imessage("+13055551234", "prepare-sessions") is False
 
+    def test_imessage_redacts_home_path_like_every_other_channel(self, tmp_path, monkeypatch):
+        """The staging command now carries this checkout's real path; iMessage must
+        redact $HOME the way Telegram and the desktop already do."""
+        monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+        from src import reauth
+
+        monkeypatch.setattr("src.reauth.sys.platform", "darwin")
+        monkeypatch.setattr("src.reauth.shutil.which", lambda name, *a, **k: f"/usr/bin/{name}")
+        ok = MagicMock()
+        ok.returncode = 0
+        home = str(Path.home())
+        with patch("src.reauth.subprocess.run", return_value=ok) as mock_run:
+            reauth._send_imessage("+13055551234", f"run: cd {home}/Dev/Projects/job-agent")
+
+        script = mock_run.call_args[0][0][2]
+        assert home not in script
+        assert "~/Dev/Projects/job-agent" in script
+
 
 # ── _write_regression_test & _notify_correction ────────────────────────────────
 

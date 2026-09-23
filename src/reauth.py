@@ -538,8 +538,12 @@ def _send_imessage(phone: str, message: str) -> bool:
         _log.warning("reauth.imessage_unavailable reason=osascript_missing")
         return False
 
+    # Same home-path redaction every other channel applies, so the staging
+    # command reaches the phone as `~/...` rather than an absolute home path.
+    from .notifier import _sanitize_notification_text
+
     # Escape for AppleScript string literal
-    safe_msg = message.replace('"', '\\"').replace("\n", "\\n")
+    safe_msg = _sanitize_notification_text(message).replace('"', '\\"').replace("\n", "\\n")
     script = (
         f'tell application "Messages"\n'
         f'    set t to first service whose service type = iMessage\n'
