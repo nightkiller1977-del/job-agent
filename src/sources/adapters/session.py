@@ -229,7 +229,24 @@ class ExternalApplySession(BaseScraper):
         _event("attempt_started", AttemptPhase.STARTED, auto_submit=auto_submit)
 
         # --- 0.2 pre-flight duplicate/interrupted checks (before launching Chrome) ---
+        if auto_submit and not key:
+            _event(
+                "ledger_key_missing_blocked",
+                AttemptPhase.UNKNOWN,
+                outcome="submission_ledger_key_missing",
+            )
+            return AtsApplyResult.blocked(
+                "submission_ledger_key_missing",
+                "could not derive a durable submission key — refusing to open a "
+                "submit-capable browser",
+                attempt_id=attempt_id,
+            )
         try:
+            if auto_submit:
+                # A readable JSON file is insufficient: prove the lock/storage
+                # boundary is available before reaching the employer portal.
+                # The atomic claim still runs immediately before dispatch.
+                self.ledger.validate()
             already_applied = key and self.ledger.already_applied(key)
             in_progress = key and self.ledger.in_progress(key)
             needs_reconciliation = key and self.ledger.needs_reconciliation(key)
@@ -464,7 +481,7 @@ class ExternalApplySession(BaseScraper):
                 elif res.status == "submission_unverified":
                     self.ledger.complete(key, attempt_id, verified=False)
                 else:
-                    self.ledger.clear(key)
+                    self.ledger.clear(key, attempt_id)
             _event("attempt_finished", _phase_for(res), outcome=res.status, verified=res.verified)
             self._emit_forensic_classification(attempt_id, job_id)
             self._maybe_notify("attempt_finished", res.status,

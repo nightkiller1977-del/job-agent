@@ -209,7 +209,7 @@ def test_stale_attempt_cannot_overwrite_newer_completion(tmp_path):
     ledger = SubmissionLedger(tmp_path / "l.json")
     key = canonical_key(JOB)
     ledger.claim(key, "old-attempt", job_id="job-1")
-    ledger.clear(key)
+    ledger.clear(key, "old-attempt")
     ledger.claim(key, "new-attempt", job_id="job-1")
     ledger.complete(key, "new-attempt", verified=True)
 
@@ -219,6 +219,41 @@ def test_stale_attempt_cannot_overwrite_newer_completion(tmp_path):
     record = ledger.record(key)
     assert record["attempt_id"] == "new-attempt"
     assert record["phase"] == "receipt_verified"
+
+
+def test_stale_clear_cannot_delete_newer_or_verified_record(tmp_path):
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(JOB)
+    ledger.claim(key, "old-attempt", job_id="job-1")
+    ledger.clear(key, "old-attempt")
+    ledger.claim(key, "new-attempt", job_id="job-1")
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.clear(key, "old-attempt")
+
+    assert ledger.record(key)["attempt_id"] == "new-attempt"
+    ledger.complete(key, "new-attempt", verified=True)
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.clear(key, "new-attempt")
+
+    assert ledger.already_applied(key) is True
+
+
+def test_complete_requires_live_claim_and_cannot_downgrade_verified(tmp_path):
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(JOB)
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.complete(key, "attempt-1", verified=False)
+
+    ledger.claim(key, "attempt-1", job_id="job-1")
+    ledger.complete(key, "attempt-1", verified=True)
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.complete(key, "attempt-1", verified=False)
+
+    assert ledger.already_applied(key) is True
 
 
 def test_ledger_stale_in_progress(tmp_path):
@@ -354,11 +389,42 @@ async def test_session_blocks_unresolved_in_progress(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_session_blocks_unverified_until_reconciled(tmp_path, monkeypatch):
     led = SubmissionLedger(tmp_path / "l.json")
+    led.claim(canonical_key(JOB), "prev")
     led.complete(canonical_key(JOB), "prev", verified=False)   # a prior unconfirmed submit
     sess, page, _ = _make_session(tmp_path, _RecordingAdapter(AtsApplyResult.ok()), monkeypatch, ledger=led)
     res = await sess.apply(JOB, auto_submit=True)
     assert res.status == "submit_unverified_unresolved"
     assert page.goto_called is False                            # never resubmits blindly
+
+
+@pytest.mark.asyncio
+async def test_session_rejects_missing_durable_key_before_browser(tmp_path, monkeypatch):
+    adapter = _RecordingAdapter(AtsApplyResult.ok(), raises=True)
+    sess, page, _ = _make_session(tmp_path, adapter, monkeypatch)
+
+    res = await sess.apply({"job_id": "job-without-url"}, auto_submit=True)
+
+    assert res.status == "submission_ledger_key_missing"
+    assert page.goto_called is False
+
+
+@pytest.mark.asyncio
+async def test_session_validates_ledger_lock_before_browser(tmp_path, monkeypatch):
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    adapter = _RecordingAdapter(AtsApplyResult.ok(), raises=True)
+    sess, page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=ledger)
+
+    def _unavailable_lock():
+        from src.sources.adapters.idempotency import LedgerUnreadableError
+
+        raise LedgerUnreadableError("lock unavailable")
+
+    monkeypatch.setattr(ledger, "validate", _unavailable_lock)
+
+    res = await sess.apply(JOB, auto_submit=True)
+
+    assert res.status == "ledger_unreadable"
+    assert page.goto_called is False
 
 
 @pytest.mark.asyncio

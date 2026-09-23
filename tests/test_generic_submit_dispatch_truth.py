@@ -405,6 +405,7 @@ async def test_prior_unverified_ledger_blocks_next_attempt_before_click(tmp_path
     # Seed the ledger BEFORE the session runs.
     key = canonical_key(JOB)
     ledger = SubmissionLedger(tmp_path / "ledger.json")
+    ledger.claim(key, "prior-attempt-id")
     ledger.complete(key, "prior-attempt-id", verified=False)
     seeded_ts = ledger.record(key).get("ts")
 
@@ -493,6 +494,7 @@ def test_unverified_ledger_persistence_across_fresh_python_process(tmp_path):
     key = canonical_key(JOB)
     ledger_path = tmp_path / "ledger.json"
     ledger = SubmissionLedger(ledger_path)
+    ledger.claim(key, "attempt-id-from-prior-process")
     ledger.complete(key, "attempt-id-from-prior-process", verified=False)
     assert ledger.record(key)["phase"] == PHASE_UNVERIFIED  # sanity
 
@@ -547,6 +549,7 @@ def test_unverified_ledger_blocks_session_in_fresh_python_process(tmp_path):
     key = canonical_key(JOB)
     ledger_path = tmp_path / "ledger.json"
     ledger = SubmissionLedger(ledger_path)
+    ledger.claim(key, "attempt-id-from-prior-process")
     ledger.complete(key, "attempt-id-from-prior-process", verified=False)
     assert ledger.record(key)["phase"] == PHASE_UNVERIFIED  # sanity
 

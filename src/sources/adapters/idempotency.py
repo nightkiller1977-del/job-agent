@@ -187,17 +187,34 @@ class SubmissionLedger:
         rec = self.record(key)
         return bool(rec and rec.get("phase") == PHASE_UNVERIFIED)
 
-    def clear(self, key: str) -> None:
+    def clear(self, key: str, attempt_id: str) -> None:
         """Drop a marker entirely — used when an attempt ended WITHOUT a submit
         click (e.g. a login wall or blocker), so the in-progress marker must not
-        linger as unverified and block future attempts."""
+        linger as unverified and block future attempts.
+
+        Clearing is a compare-and-delete transition: only the attempt that owns
+        the current in-progress claim may release it. A delayed worker must not
+        erase a newer claim or terminal receipt evidence.
+        """
         if not key:
             return
         with self._exclusive_lock():
             data = self._load()
-            if key in data:
-                del data[key]
-                self._save(data)
+            existing = data.get(key)
+            if existing is None:
+                return
+            existing_attempt_id = str(existing.get("attempt_id") or "")
+            if (
+                existing.get("phase") != PHASE_IN_PROGRESS
+                or existing_attempt_id != str(attempt_id)
+            ):
+                raise LedgerOwnershipError(
+                    f"submission key {key} cannot be cleared by {attempt_id}; "
+                    f"current owner is {existing_attempt_id or '(unknown)'} "
+                    f"in phase {existing.get('phase') or '(unknown)'}"
+                )
+            del data[key]
+            self._save(data)
 
     def is_stale_in_progress(self, key: str) -> bool:
         rec = self.record(key)
@@ -233,24 +250,38 @@ class SubmissionLedger:
         return None
 
     def begin(self, key: str, attempt_id: str) -> None:
-        if not key:
-            return
-        with self._exclusive_lock():
-            data = self._load()
-            data[key] = {"phase": PHASE_IN_PROGRESS, "attempt_id": attempt_id, "ts": time.time()}
-            self._save(data)
+        """Backward-compatible claiming helper used by tests and migrations."""
+        existing = self.claim(key, attempt_id)
+        if existing is not None:
+            raise LedgerOwnershipError(
+                f"submission key {key} is already owned by "
+                f"{existing.get('attempt_id') or '(unknown)'}"
+            )
 
     def complete(self, key: str, attempt_id: str, verified: bool) -> None:
         if not key:
             return
         with self._exclusive_lock():
             data = self._load()
-            existing = data.get(key) if isinstance(data.get(key), dict) else {}
+            existing = data.get(key) if isinstance(data.get(key), dict) else None
+            if not existing:
+                raise LedgerOwnershipError(
+                    f"submission key {key} has no live claim for attempt {attempt_id}"
+                )
             existing_attempt_id = str(existing.get("attempt_id") or "")
-            if existing and existing_attempt_id != str(attempt_id):
+            if existing_attempt_id != str(attempt_id):
                 raise LedgerOwnershipError(
                     f"submission key {key} belongs to attempt "
                     f"{existing_attempt_id or '(unknown)'}, not {attempt_id}"
+                )
+            existing_phase = existing.get("phase")
+            if existing_phase == PHASE_VERIFIED and verified:
+                return
+            if existing_phase != PHASE_IN_PROGRESS:
+                raise LedgerOwnershipError(
+                    f"submission key {key} is already terminal in phase "
+                    f"{existing_phase or '(unknown)'}; attempt {attempt_id} "
+                    "cannot rewrite it"
                 )
             record = {
                 "phase": PHASE_VERIFIED if verified else PHASE_UNVERIFIED,

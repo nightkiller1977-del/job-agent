@@ -386,7 +386,9 @@ class TestApplyReauth:
 
         untouched = orchestrator.state.get_job(job["job_id"])
         assert untouched["status"] == "approved"
-        assert untouched["confirmation_status"] is None
+        assert untouched["confirmation_status"] == "reconciliation_required"
+        readiness, _reason = orchestrator._classify_apply_readiness(untouched)
+        assert readiness == "needs-review"
 
     @pytest.mark.asyncio
     async def test_apply_reconciles_verified_ledger_before_building_pool(

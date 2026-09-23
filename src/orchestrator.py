@@ -118,6 +118,7 @@ _OWN_SESSION_STATUSES = {
 # approved row cannot be selected repeatedly while durable reconciliation is
 # still required.
 _AMBIGUOUS_SUBMISSION_STATUSES = {
+    "duplicate_application_prevented",
     "submit_in_progress",
     "submission_unverified",
     "submit_unverified_unresolved",
@@ -647,9 +648,12 @@ class Orchestrator:
 
     def _mark_confirmation_ambiguous(self, job_id: str, outcome: str) -> None:
         """Project a durable ambiguous-submit outcome onto scheduler-visible state."""
-        target_status = (
-            "submitting" if outcome == "submit_in_progress" else "submission_unverified"
-        )
+        if outcome == "submit_in_progress":
+            target_status = "submitting"
+        elif outcome == "duplicate_application_prevented":
+            target_status = "reconciliation_required"
+        else:
+            target_status = "submission_unverified"
         try:
             self.state.recover_confirmation_from_ledger(
                 job_id,

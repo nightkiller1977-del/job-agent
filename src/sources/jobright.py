@@ -4467,7 +4467,7 @@ class JobrightScraper(BaseScraper):
                 )
 
             try:
-                submission_ledger.clear(ledger_key)
+                submission_ledger.clear(ledger_key, ledger_attempt_id)
             except Exception as exc:
                 return self._set_apply_outcome(
                     "submission_ledger_unavailable",
