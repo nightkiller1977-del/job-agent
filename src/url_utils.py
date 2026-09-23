@@ -69,7 +69,7 @@ _GREENHOUSE_HOSTS = ("greenhouse.io",)
 
 # Ashby posting ids are UUIDs; requiring the shape keeps a stray ashby_jid from
 # producing a nonsense path.
-_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _GH_ID_RE = re.compile(r"^\d{4,}$")
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
