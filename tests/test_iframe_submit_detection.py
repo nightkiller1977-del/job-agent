@@ -12,6 +12,7 @@ import asyncio
 
 import pytest
 
+import src.sources.jobright as jobright_module
 from src.sources.jobright import JobrightScraper
 
 # ─── fakes ──────────────────────────────────────────────────────────────────
@@ -21,11 +22,15 @@ class FakeElement:
         self.name = name
         self._visible = visible
         self._visible_raises = visible_raises
+        self.clicked = False
 
     async def is_visible(self):
         if self._visible_raises:
             raise RuntimeError("element detached")
         return self._visible
+
+    async def evaluate(self, _js):
+        self.clicked = True
 
 
 class FakeFrame:
@@ -58,9 +63,15 @@ class FakeFrame:
 
 
 class FakePage:
-    def __init__(self, frames):
+    def __init__(self, frames, url=None):
         self.frames = frames
         self.main_frame = frames[0] if frames else None
+        self.url = url or (self.main_frame.url if self.main_frame else "")
+
+    async def evaluate(self, js, *args):
+        if self.main_frame is None:
+            return None
+        return await self.main_frame.evaluate(js, *args)
 
 
 def _scraper():
@@ -357,3 +368,147 @@ async def test_poll_sleep_never_overshoots_the_deadline():
 
     assert found is None
     assert elapsed < 0.45, f"overshot a 100ms budget by sleeping a full poll: {elapsed:.2f}s"
+@pytest.mark.asyncio
+async def test_snapshot_budget_cannot_be_exhausted_by_main_frame():
+    """Marketing links in the host page must not starve the embedded ATS frame."""
+    marketing = [{"tag": "A", "text": f"marketing-link-{i}"} for i in range(40)]
+    submit = {"tag": "BUTTON", "text": "Submit Application"}
+    page = FakePage([
+        FakeFrame("https://host.example/jobs/1", evaluate_result=marketing),
+        FakeFrame("https://boards.greenhouse.io/embed/1", evaluate_result=[submit]),
+    ])
+
+    controls = await _scraper()._visible_controls_snapshot(page, limit=40)
+
+    assert len(controls) == 40
+    assert submit in controls
+
+
+# ─── frame-aware form gate ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_iframe_only_form_satisfies_application_form_gate():
+    """A host page with no fields must not hide a real form in its ATS iframe."""
+    main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
+    embed = FakeFrame("https://boards.greenhouse.io/embed/1", evaluate_result=True)
+
+    assert await _scraper()._looks_like_application_form(FakePage([main, embed])) is True
+
+
+# ─── final-submit safety ──────────────────────────────────────────────────────
+
+async def _no_delay(*_args, **_kwargs):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_workday_next_control_is_not_treated_as_final_submit():
+    """An intermediate Workday Next button must stay outside the submit boundary."""
+    next_button = FakeElement("Next")
+    frame = FakeFrame(
+        "https://acme.myworkdayjobs.com/job/1",
+        {
+            "[data-automation-id='bottom-navigation-next-button']": next_button,
+            "[data-automation-id=\"bottom-navigation-next-button\"]": next_button,
+            "button[data-automation-id='nextButton']": next_button,
+            "button[type='submit']": next_button,
+        },
+        evaluate_result=True,
+    )
+    page = FakePage([frame], url=frame.url)
+    scraper = _scraper()
+    original_find = scraper._find_submit_control
+
+    async def _find_without_wait(candidate_page, selectors):
+        return await original_find(candidate_page, selectors, total_timeout_ms=0)
+
+    async def _empty_snapshot(*_args, **_kwargs):
+        return []
+
+    scraper._find_submit_control = _find_without_wait
+    scraper._visible_controls_snapshot = _empty_snapshot
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert next_button.clicked is False
+    assert scraper.last_apply_status == "workday_submit_not_found"
+
+
+@pytest.mark.asyncio
+async def test_clicked_submit_without_fresh_receipt_is_unverified(monkeypatch):
+    """A successful DOM click is ambiguous until fresh ATS acceptance evidence appears."""
+    submit_button = FakeElement("Submit Application")
+    frame = FakeFrame(
+        "https://boards.greenhouse.io/acme/jobs/1",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([frame], url=frame.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _capture_baseline(_page):
+        return object()
+
+    async def _no_fresh_receipt(_page, **_kwargs):
+        return False, ""
+
+    monkeypatch.setattr(
+        jobright_module, "capture_receipt_evidence", _capture_baseline, raising=False
+    )
+    monkeypatch.setattr(jobright_module, "verify_receipt", _no_fresh_receipt, raising=False)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submit_button.clicked is True
+    assert submitted is False
+    assert scraper.last_apply_status == "submission_unverified"
+    assert not getattr(scraper, "_apply_analytics", {}).get("submitted", False)
+
+
+@pytest.mark.asyncio
+async def test_fresh_receipt_inside_submit_iframe_allows_success(monkeypatch):
+    """Receipt verification must inspect the frame that owns the final submit."""
+    submit_button = FakeElement("Submit Application")
+    main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
+    embed = FakeFrame(
+        "https://boards.greenhouse.io/embed/1",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([main, embed], url=main.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _receipt_for_embed_only(frame, **_kwargs):
+        if frame is embed:
+            return True, "t:application received"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _receipt_for_embed_only)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is True
+    assert scraper._apply_analytics["receiptSignal"] == "t:application received"
