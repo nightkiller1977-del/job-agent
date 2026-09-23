@@ -3,6 +3,8 @@ containment, and profile lifecycle. All exercised with fakes; no browser needed.
 """
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -174,6 +176,26 @@ def test_ledger_unverified_is_not_applied(tmp_path):
     assert led.needs_reconciliation(key) is True   # must block a blind resubmit
 
 
+def test_ledger_claim_is_atomic_across_concurrent_owners(tmp_path):
+    """Exactly one process-equivalent owner can claim a clear submission key."""
+    path = tmp_path / "l.json"
+    ledgers = [SubmissionLedger(path), SubmissionLedger(path)]
+    gate = Barrier(2)
+
+    def _claim(index):
+        gate.wait()
+        return ledgers[index].claim("greenhouse|https://example.test/job/1", f"att-{index}")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(_claim, range(2)))
+
+    assert sum(existing is None for existing in results) == 1
+    blocked = next(existing for existing in results if existing is not None)
+    winner = ledgers[0].record("greenhouse|https://example.test/job/1")
+    assert blocked == winner
+    assert winner["phase"] == "submit_in_progress"
+
+
 def test_ledger_stale_in_progress(tmp_path):
     led = SubmissionLedger(tmp_path / "l.json")
     key = canonical_key(JOB)
@@ -249,6 +271,31 @@ async def test_session_prevents_duplicate_without_launching(tmp_path, monkeypatc
     assert res.status == "duplicate_application_prevented"
     assert page.goto_called is False                  # never even launched
     assert sess._closed is False
+
+
+@pytest.mark.asyncio
+async def test_session_rechecks_atomic_claim_before_adapter(tmp_path, monkeypatch):
+    """A race after preflight must still stop before any adapter can submit."""
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    adapter = _RecordingAdapter(AtsApplyResult.ok(), raises=True)
+    sess, page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=ledger)
+
+    monkeypatch.setattr(ledger, "already_applied", lambda _key: False)
+    monkeypatch.setattr(ledger, "in_progress", lambda _key: False)
+    monkeypatch.setattr(ledger, "needs_reconciliation", lambda _key: False)
+    monkeypatch.setattr(
+        ledger,
+        "claim",
+        lambda _key, _attempt_id: {
+            "phase": "submit_in_progress",
+            "attempt_id": "concurrent-owner",
+        },
+    )
+
+    res = await sess.apply(JOB, auto_submit=True)
+
+    assert page.goto_called is True
+    assert res.status == "submit_in_progress"
 
 
 @pytest.mark.asyncio

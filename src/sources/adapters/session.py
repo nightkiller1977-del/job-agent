@@ -32,7 +32,14 @@ from .registry import AtsAdapterRegistry
 from .generic import GenericAtsAdapter, detect_vendor
 from .attempt import AttemptPhase
 from .policy import AutoSubmitPolicy, SubmissionPolicy
-from .idempotency import SubmissionLedger, canonical_key, LedgerUnreadableError
+from .idempotency import (
+    LedgerUnreadableError,
+    PHASE_IN_PROGRESS,
+    PHASE_UNVERIFIED,
+    PHASE_VERIFIED,
+    SubmissionLedger,
+    canonical_key,
+)
 from .profile_lock import ProfileLock, ProfileLockError
 from .auth_routing import directive_for
 from . import forensics
@@ -342,9 +349,42 @@ class ExternalApplySession(BaseScraper):
                 run_log=self.run_log,
             )
 
-            # A submit may happen -> write the in-progress marker BEFORE it (crash-safe).
-            if key and auto_submit:
-                self.ledger.begin(key, attempt_id)
+            # A submit may happen in either auto or confirmed-interactive mode:
+            # claim the key before the adapter can dispatch (crash-safe).
+            if key:
+                try:
+                    existing = self.ledger.claim(key, attempt_id)
+                except LedgerUnreadableError as exc:
+                    return AtsApplyResult.blocked(
+                        "ledger_unreadable",
+                        f"submission ledger could not be claimed ({exc}) — refusing to submit",
+                        attempt_id=attempt_id,
+                    )
+                if existing is not None:
+                    phase = existing.get("phase")
+                    if phase == PHASE_VERIFIED:
+                        return AtsApplyResult.blocked(
+                            "duplicate_application_prevented",
+                            f"already applied to {key} — not resubmitting",
+                            attempt_id=attempt_id,
+                        )
+                    if phase == PHASE_IN_PROGRESS:
+                        return AtsApplyResult.blocked(
+                            "submit_in_progress",
+                            f"a prior submit for {key} is unresolved — not resubmitting blindly",
+                            attempt_id=attempt_id,
+                        )
+                    if phase == PHASE_UNVERIFIED:
+                        return AtsApplyResult.blocked(
+                            "submit_unverified_unresolved",
+                            f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
+                            attempt_id=attempt_id,
+                        )
+                    return AtsApplyResult.blocked(
+                        "ledger_unreadable",
+                        f"submission ledger has an unknown phase for {key} — refusing to submit",
+                        attempt_id=attempt_id,
+                    )
                 marked = True
 
             adapter = await self.registry.pick(ctx)
@@ -513,4 +553,3 @@ class ExternalApplySession(BaseScraper):
                 **(res.analytics or {}),
             )
         return res
-

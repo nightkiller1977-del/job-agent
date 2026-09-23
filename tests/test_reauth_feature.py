@@ -292,6 +292,74 @@ class TestApplyReauth:
         assert readiness == "needs-review"
 
     @pytest.mark.asyncio
+    async def test_verified_ledger_recovery_marks_approved_job_applied(
+        self, orchestrator, tmp_status
+    ):
+        """A receipt-verified crash window must be recovered, not reselected."""
+        job = _approved_job()
+        self._seed_job(orchestrator, job)
+
+        scraper = AsyncMock()
+        scraper.apply = AsyncMock(return_value=False)
+        scraper.last_apply_status = "duplicate_application_prevented"
+        scraper.last_apply_detail = "A verified receipt already exists in the ledger."
+        scraper._apply_analytics = None
+        scraper._apply_validation_metrics = {}
+        scraper.last_apply_ats_url = ""
+        scraper_cls = MagicMock(return_value=scraper)
+
+        with patch.dict("src.orchestrator.SOURCE_MAP", {"jobright": scraper_cls}), \
+             patch("src.orchestrator.ReauthManager"), \
+             patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
+            await orchestrator.apply_approved(auto_submit=True)
+
+        recovered = orchestrator.state.get_job("job1")
+        assert recovered["status"] == "applied"
+        assert recovered["confirmation_status"] == "submitted"
+        assert orchestrator.state.get_approved_unapplied() == []
+
+    @pytest.mark.asyncio
+    async def test_verified_ledger_recovery_after_reauth_marks_job_applied(
+        self, orchestrator, tmp_status
+    ):
+        """The post-reauth branch must recover the same durable verified receipt."""
+        job = _approved_job()
+        self._seed_job(orchestrator, job)
+
+        first_scraper = AsyncMock()
+        first_scraper.apply = AsyncMock(
+            side_effect=AuthFailedError("jobright", "session expired")
+        )
+
+        retry_scraper = AsyncMock()
+        retry_scraper.apply = AsyncMock(return_value=False)
+        retry_scraper.last_apply_status = "duplicate_application_prevented"
+        retry_scraper.last_apply_detail = "A verified receipt already exists in the ledger."
+        retry_scraper._apply_analytics = None
+        retry_scraper._apply_validation_metrics = {}
+        retry_scraper.last_apply_ats_url = ""
+
+        scraper_cls = MagicMock(side_effect=[first_scraper, retry_scraper])
+        mock_reauth = AsyncMock(return_value=True)
+
+        with patch.dict("src.orchestrator.SOURCE_MAP", {"jobright": scraper_cls}), \
+             patch("src.orchestrator.ReauthManager") as MockReauthMgr, \
+             patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
+            MockReauthMgr.return_value.handle = mock_reauth
+            await orchestrator.apply_approved(auto_submit=True)
+
+        recovered = orchestrator.state.get_job("job1")
+        assert recovered["status"] == "applied"
+        assert recovered["confirmation_status"] == "submitted"
+        assert orchestrator.state.get_approved_unapplied() == []
+
+    @pytest.mark.asyncio
     async def test_apply_auth_failure_reauth_attempted_once_per_source(self, orchestrator, tmp_status):
         """Repeated AuthFailedError for one source must not re-notify for every job."""
         job1 = _approved_job("job1", "usajobs")

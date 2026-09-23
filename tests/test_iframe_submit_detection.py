@@ -767,3 +767,60 @@ async def test_unverified_dispatch_is_durably_blocked_from_retry(monkeypatch, tm
     assert second_result is False
     assert second.last_apply_status == "submit_unverified_unresolved"
     assert second_button.evaluate_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_legacy_attempts_dispatch_only_once(monkeypatch, tmp_path):
+    """Two legacy workers racing the same job must share one atomic ledger claim."""
+    from src.sources.adapters.idempotency import SubmissionLedger
+
+    ledger_path = tmp_path / "apply-ledger.json"
+
+    baseline_count = 0
+    both_at_boundary = asyncio.Event()
+
+    async def _capture_baseline(frame):
+        nonlocal baseline_count
+        baseline_count += 1
+        if baseline_count == 2:
+            both_at_boundary.set()
+        await both_at_boundary.wait()
+        return frame
+
+    async def _no_receipt(_frame, **_kwargs):
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _no_receipt)
+
+    buttons = [FakeElement("Submit Application"), FakeElement("Submit Application")]
+    scrapers = []
+    pages = []
+    for button in buttons:
+        frame = FakeFrame(
+            "https://boards.greenhouse.io/acme/jobs/1",
+            {"#submit_app": button},
+            evaluate_result=True,
+        )
+        scraper = _scraper()
+        scraper._submission_ledger = SubmissionLedger(path=ledger_path)
+        scraper._delay = _no_delay
+        scraper._run_pre_submission_validation = _no_delay
+        scrapers.append(scraper)
+        pages.append(FakePage([frame], url=frame.url))
+
+    await asyncio.gather(
+        *(
+            scraper._confirm_and_submit(
+                page,
+                {"title": "Engineer", "company": "Acme"},
+                auto_submit=True,
+            )
+            for scraper, page in zip(scrapers, pages)
+        )
+    )
+
+    assert sum(button.evaluate_calls for button in buttons) == 1
+    statuses = {scraper.last_apply_status for scraper in scrapers}
+    assert "submission_unverified" in statuses
+    assert statuses & {"submit_in_progress", "submit_unverified_unresolved"}

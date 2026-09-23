@@ -5,22 +5,24 @@ a duplicate application. Keyed by a canonical (vendor, normalized-URL) key so th
 same posting reached via two different tracking URLs is still recognised as one.
 
 Lifecycle per attempt:
-    begin(key, attempt_id)  -> writes a "submit_in_progress" marker BEFORE the click
+    claim(key, attempt_id)  -> atomically writes "submit_in_progress" iff clear
     complete(key, attempt_id, verified) -> "receipt_verified" | "submission_unverified"
 
 Reads before launching a browser:
     already_applied(key)  -> a prior attempt reached receipt_verified  -> skip, do not resubmit
     in_progress(key)      -> a prior attempt died mid-submit           -> do not blindly resubmit
 
-Backed by a small JSON file under state/ so it is self-contained and does not touch
-the concurrently-edited state_manager.py. Full jobs.db integration is a later step.
+Backed by a small JSON file under state/. Read-modify-write transitions use an OS
+file lock so independent scheduler processes cannot both claim the same posting.
 """
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .generic import detect_vendor
@@ -90,6 +92,23 @@ class SubmissionLedger:
                 pass
             raise
 
+    @contextmanager
+    def _exclusive_lock(self):
+        """Serialize read-modify-write transitions across worker processes."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f"{self.path.name}.lock")
+        try:
+            with open(lock_path, "a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            raise LedgerUnreadableError(
+                f"ledger lock at {lock_path} could not be acquired: {exc}"
+            ) from exc
+
     # ---- queries -------------------------------------------------------------
     def record(self, key: str) -> dict | None:
         if not key:
@@ -116,10 +135,11 @@ class SubmissionLedger:
         linger as unverified and block future attempts."""
         if not key:
             return
-        data = self._load()
-        if key in data:
-            del data[key]
-            self._save(data)
+        with self._exclusive_lock():
+            data = self._load()
+            if key in data:
+                del data[key]
+                self._save(data)
 
     def is_stale_in_progress(self, key: str) -> bool:
         rec = self.record(key)
@@ -128,20 +148,45 @@ class SubmissionLedger:
         return (time.time() - float(rec.get("ts", 0))) > STALE_AFTER_S
 
     # ---- transitions ---------------------------------------------------------
+    def claim(self, key: str, attempt_id: str) -> dict | None:
+        """Atomically claim *key* for one submit attempt.
+
+        Returns ``None`` when this caller wrote the in-progress marker. If any
+        prior marker already exists, returns that record without modifying it.
+        The compare-and-set and write share one OS file lock, so concurrent
+        processes cannot both pass the duplicate gate.
+        """
+        if not key:
+            return None
+        with self._exclusive_lock():
+            data = self._load()
+            existing = data.get(key)
+            if existing is not None:
+                return dict(existing)
+            data[key] = {
+                "phase": PHASE_IN_PROGRESS,
+                "attempt_id": attempt_id,
+                "ts": time.time(),
+            }
+            self._save(data)
+        return None
+
     def begin(self, key: str, attempt_id: str) -> None:
         if not key:
             return
-        data = self._load()
-        data[key] = {"phase": PHASE_IN_PROGRESS, "attempt_id": attempt_id, "ts": time.time()}
-        self._save(data)
+        with self._exclusive_lock():
+            data = self._load()
+            data[key] = {"phase": PHASE_IN_PROGRESS, "attempt_id": attempt_id, "ts": time.time()}
+            self._save(data)
 
     def complete(self, key: str, attempt_id: str, verified: bool) -> None:
         if not key:
             return
-        data = self._load()
-        data[key] = {
-            "phase": PHASE_VERIFIED if verified else PHASE_UNVERIFIED,
-            "attempt_id": attempt_id,
-            "ts": time.time(),
-        }
-        self._save(data)
+        with self._exclusive_lock():
+            data = self._load()
+            data[key] = {
+                "phase": PHASE_VERIFIED if verified else PHASE_UNVERIFIED,
+                "attempt_id": attempt_id,
+                "ts": time.time(),
+            }
+            self._save(data)

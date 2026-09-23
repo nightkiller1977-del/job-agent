@@ -658,6 +658,15 @@ class Orchestrator:
                 f"[dim]ambiguous confirmation bookkeeping skipped for {job_id}: {exc}[/dim]"
             )
 
+    def _recover_verified_ledger_submission(self, job_id: str) -> None:
+        """Recover the DB state after a receipt was durable before process exit."""
+        self.state.set_status(job_id, "applied")
+        self.state.recover_confirmation_from_ledger(
+            job_id,
+            "submitted",
+            phase="receipt_verified",
+        )
+
     def _apply_validation_metadata(self, scraper=None, exc: Exception | None = None) -> dict:
         metrics = getattr(scraper, "_apply_validation_metrics", None) if scraper else None
         if not metrics and exc is not None:
@@ -1237,21 +1246,41 @@ class Orchestrator:
                 else:
                     reason = getattr(scraper, "last_apply_detail", "") or "not submitted"
                     code   = getattr(scraper, "last_apply_status",  "") or "blocked"
-                    if code in _AMBIGUOUS_SUBMISSION_STATUSES:
-                        self._mark_confirmation_ambiguous(job["job_id"], code)
-                    console.print(f"[yellow]Application not submitted ({code}) — status unchanged.[/yellow]")
-                    if reason:
-                        console.print(f"[dim]{reason}[/dim]")
-                    # Persist the specific block reason
-                    self.state.record_apply_attempt(
-                        job["job_id"],
-                        code,
-                        reason,
-                        metadata=self._apply_validation_metadata(scraper),
-                    )
-                    await self._push_apply_attempt_to_cloud(job["job_id"])
-                    skipped_count += 1
-                    outcomes.append({"job": job, "status": code, "reason": reason})
+                    if code == "duplicate_application_prevented":
+                        self._recover_verified_ledger_submission(job["job_id"])
+                        self.state.record_apply_attempt(
+                            job["job_id"],
+                            "applied",
+                            f"Recovered verified submission from durable ledger. {reason}",
+                            metadata=self._apply_validation_metadata(scraper),
+                        )
+                        applied_count += 1
+                        outcomes.append({
+                            "job": job,
+                            "status": "applied",
+                            "reason": "recovered verified ledger receipt",
+                        })
+                        console.print(
+                            "[green]Recovered verified submission from durable ledger; status updated.[/green]"
+                        )
+                        await self._push_status_to_cloud(job["job_id"], "applied")
+                        await self._push_apply_attempt_to_cloud(job["job_id"])
+                    else:
+                        if code in _AMBIGUOUS_SUBMISSION_STATUSES:
+                            self._mark_confirmation_ambiguous(job["job_id"], code)
+                        console.print(f"[yellow]Application not submitted ({code}) — status unchanged.[/yellow]")
+                        if reason:
+                            console.print(f"[dim]{reason}[/dim]")
+                        # Persist the specific block reason
+                        self.state.record_apply_attempt(
+                            job["job_id"],
+                            code,
+                            reason,
+                            metadata=self._apply_validation_metadata(scraper),
+                        )
+                        await self._push_apply_attempt_to_cloud(job["job_id"])
+                        skipped_count += 1
+                        outcomes.append({"job": job, "status": code, "reason": reason})
             except AuthFailedError as auth_exc:
                 console.print(f"[yellow]{src} apply: session expired — attempting reauth…[/yellow]")
                 if src in reauthed_this_run:
@@ -1295,17 +1324,38 @@ class Orchestrator:
                         else:
                             reason = getattr(scraper2, "last_apply_detail", "") or "not submitted"
                             code   = getattr(scraper2, "last_apply_status",  "") or "blocked"
-                            if code in _AMBIGUOUS_SUBMISSION_STATUSES:
-                                self._mark_confirmation_ambiguous(job["job_id"], code)
-                            self.state.record_apply_attempt(
-                                job["job_id"],
-                                code,
-                                reason,
-                                metadata=self._apply_validation_metadata(scraper2),
-                            )
-                            await self._push_apply_attempt_to_cloud(job["job_id"])
-                            skipped_count += 1
-                            outcomes.append({"job": job, "status": code, "reason": reason})
+                            if code == "duplicate_application_prevented":
+                                self._recover_verified_ledger_submission(job["job_id"])
+                                self.state.record_apply_attempt(
+                                    job["job_id"],
+                                    "applied",
+                                    "Recovered verified submission from durable ledger "
+                                    f"after reauth. {reason}",
+                                    metadata=self._apply_validation_metadata(scraper2),
+                                )
+                                applied_count += 1
+                                outcomes.append({
+                                    "job": job,
+                                    "status": "applied",
+                                    "reason": "recovered verified ledger receipt after reauth",
+                                })
+                                console.print(
+                                    "[green]Recovered verified submission after reauth; status updated.[/green]"
+                                )
+                                await self._push_status_to_cloud(job["job_id"], "applied")
+                                await self._push_apply_attempt_to_cloud(job["job_id"])
+                            else:
+                                if code in _AMBIGUOUS_SUBMISSION_STATUSES:
+                                    self._mark_confirmation_ambiguous(job["job_id"], code)
+                                self.state.record_apply_attempt(
+                                    job["job_id"],
+                                    code,
+                                    reason,
+                                    metadata=self._apply_validation_metadata(scraper2),
+                                )
+                                await self._push_apply_attempt_to_cloud(job["job_id"])
+                                skipped_count += 1
+                                outcomes.append({"job": job, "status": code, "reason": reason})
                     except Exception as retry_exc:
                         console.print(f"[red]{src} apply failed after reauth:[/red] {retry_exc}")
                         self.state.record_apply_attempt(job["job_id"], "reauth_retry_error", str(retry_exc)[:400])

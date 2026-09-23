@@ -4133,7 +4133,7 @@ class JobrightScraper(BaseScraper):
             if submission_ledger is not None:
                 from uuid import uuid4
 
-                from .adapters.idempotency import canonical_key, LedgerUnreadableError
+                from .adapters.idempotency import canonical_key
 
                 ledger_job = dict(job)
                 ledger_url = (
@@ -4149,28 +4149,6 @@ class JobrightScraper(BaseScraper):
                         "submission_ledger_key_missing",
                         "Could not derive a durable submission key; refusing to click submit.",
                     )
-                try:
-                    if submission_ledger.already_applied(ledger_key):
-                        return self._set_apply_outcome(
-                            "duplicate_application_prevented",
-                            f"A verified submission already exists for {ledger_key}; not resubmitting.",
-                        )
-                    if submission_ledger.in_progress(ledger_key):
-                        return self._set_apply_outcome(
-                            "submit_in_progress",
-                            f"A prior submit for {ledger_key} is unresolved; not resubmitting.",
-                        )
-                    if submission_ledger.needs_reconciliation(ledger_key):
-                        return self._set_apply_outcome(
-                            "submit_unverified_unresolved",
-                            f"A prior submit for {ledger_key} was unconfirmed; reconcile before resubmitting.",
-                        )
-                except LedgerUnreadableError as exc:
-                    return self._set_apply_outcome(
-                        "ledger_unreadable",
-                        f"Submission ledger could not be read ({exc}); refusing to submit.",
-                    )
-
             receipt_baselines = []
             for receipt_frame in self._candidate_frames(page):
                 try:
@@ -4181,13 +4159,46 @@ class JobrightScraper(BaseScraper):
 
             if submission_ledger is not None:
                 try:
-                    # Crash-safe boundary: this marker lands before the only
-                    # employer-facing side effect below.
-                    submission_ledger.begin(ledger_key, ledger_attempt_id)
+                    from .adapters.idempotency import (
+                        LedgerUnreadableError,
+                        PHASE_IN_PROGRESS,
+                        PHASE_UNVERIFIED,
+                        PHASE_VERIFIED,
+                    )
+
+                    # Atomic crash-safe boundary: only one worker can claim this
+                    # key before the employer-facing side effect below.
+                    existing = submission_ledger.claim(ledger_key, ledger_attempt_id)
+                except LedgerUnreadableError as exc:
+                    return self._set_apply_outcome(
+                        "ledger_unreadable",
+                        f"Submission ledger could not be read ({exc}); refusing to submit.",
+                    )
                 except Exception as exc:
                     return self._set_apply_outcome(
                         "submission_ledger_unavailable",
                         f"Could not persist the pre-submit marker ({type(exc).__name__}); refusing to submit.",
+                    )
+                if existing is not None:
+                    phase = existing.get("phase")
+                    if phase == PHASE_VERIFIED:
+                        return self._set_apply_outcome(
+                            "duplicate_application_prevented",
+                            f"A verified submission already exists for {ledger_key}; not resubmitting.",
+                        )
+                    if phase == PHASE_IN_PROGRESS:
+                        return self._set_apply_outcome(
+                            "submit_in_progress",
+                            f"A prior submit for {ledger_key} is unresolved; not resubmitting.",
+                        )
+                    if phase == PHASE_UNVERIFIED:
+                        return self._set_apply_outcome(
+                            "submit_unverified_unresolved",
+                            f"A prior submit for {ledger_key} was unconfirmed; reconcile before resubmitting.",
+                        )
+                    return self._set_apply_outcome(
+                        "submission_ledger_unavailable",
+                        f"Submission ledger has an unknown phase for {ledger_key}; refusing to submit.",
                     )
 
             # Use JS click to bypass Workday overlay divs that intercept pointer events.
