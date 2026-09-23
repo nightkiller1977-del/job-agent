@@ -596,16 +596,29 @@ def _send_deep_link_notification(source: str, message: str) -> None:
             manual_cmd, _ = _prepare_sessions_command(source)
             link_lines.append(f"No terminal on this host — run manually:\n  {manual_cmd}")
             full_msg = f"{message}\n\n" + "\n".join(link_lines)
-            record_secondary_condition(
-                "session_recovery_required",
-                "terminal_staging_unavailable",
-                "prepare_sessions_terminal",
-                dedupe_key=f"session-stage:{source}",
-            )
 
+        # Deliver before any status-file bookkeeping. `_save_status` does not
+        # catch write errors, so recording the secondary condition first meant a
+        # full or unwritable disk raised into the handler below and dropped the
+        # alert entirely — recreating the exact failure this function exists to
+        # prevent. The desktop channel gets the full text too, so an operator on
+        # a graphical host still sees the manual command when Telegram is
+        # unconfigured or unreachable.
         _send_telegram(full_msg)
-        _desktop_notify(f"{source} session needs refresh", message)
+        _desktop_notify(f"{source} session needs refresh", full_msg)
         record_notification_dedupe(key)
+        if not staging.supported:
+            try:
+                record_secondary_condition(
+                    "session_recovery_required",
+                    "terminal_staging_unavailable",
+                    "prepare_sessions_terminal",
+                    dedupe_key=f"session-stage:{source}",
+                )
+            except Exception as exc:  # noqa: BLE001 — evidence must not undo delivery
+                _log.warning(
+                    "session_watchdog.secondary_condition_failed source=%s error=%s", source, exc
+                )
     except Exception as exc:
         _log.warning("session_watchdog.notify_failed source=%s error=%s", source, exc)
         console.print(f"[yellow]Session alert ({source}):[/yellow] {message}\n{full_msg}")

@@ -234,6 +234,10 @@ def test_headless_session_notification_still_delivers_with_manual_command(tmp_pa
     assert desktop.call_count == 1
     assert "python src/main.py prepare-sessions --source linkedin" in sent[0]
     assert "No terminal on this host" in sent[0]
+    # The desktop popup carries the manual command too, so an operator on a
+    # graphical host is not left with an unactionable popup when Telegram is
+    # unconfigured.
+    assert "prepare-sessions --source linkedin" in desktop.call_args.args[1]
 
     status = json.loads((tmp_path / "status.json").read_text())
     conditions = status["secondary_conditions"]
@@ -241,6 +245,28 @@ def test_headless_session_notification_still_delivers_with_manual_command(tmp_pa
     assert conditions[0]["primary_kind"] == "session_recovery_required"
     assert conditions[0]["kind"] == "terminal_staging_unavailable"
     assert conditions[0]["operation"] == "prepare_sessions_terminal"
+
+
+def test_unwritable_status_file_cannot_suppress_the_alert(tmp_path, monkeypatch):
+    """Bookkeeping must never undo delivery. `_save_status` does not catch write
+    errors, so recording the secondary condition before sending meant a full or
+    unwritable disk dropped the alert — the very failure this path prevents."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    _headless(monkeypatch)
+    monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+    sent = []
+    with patch("src.session_watchdog._novnc_link", return_value=None), \
+         patch("src.session_watchdog.subprocess.run"), \
+         patch("src.notifier.record_secondary_condition",
+               side_effect=OSError("No space left on device")), \
+         patch("src.notifier._send_telegram", side_effect=lambda m: sent.append(m)), \
+         patch("src.notifier._desktop_notify") as desktop, \
+         patch("src.notifier._last_notification_times", {}):
+        _send_deep_link_notification("linkedin", "session expired")
+
+    assert len(sent) == 1
+    assert "prepare-sessions --source linkedin" in sent[0]
+    assert desktop.call_count == 1
 
 
 def test_stage_prepare_sessions_keeps_supported_source_filter(monkeypatch):
