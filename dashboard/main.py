@@ -518,10 +518,15 @@ async def job_action(body: ActionRequest):
                     status_code=409,
                     detail="Action could not be atomically deduplicated",
                 )
+            if current.get("status") != status:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Current status no longer matches action",
+                )
             return {
                 "ok": True,
                 "job_id": body.job_id,
-                "status": current.get("status", status),
+                "status": status,
                 "deduplicated": True,
             }
         return {

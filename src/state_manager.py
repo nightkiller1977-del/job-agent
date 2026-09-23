@@ -255,12 +255,13 @@ class StateManager:
         }.get(status)
         with self._connect() as conn:
             extra_json = None
-            if status == "applied":
-                row = conn.execute(
-                    "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
-                ).fetchone()
-                if row is not None:
-                    extra = parse_extra_json(row["extra_json"])
+            extra_json_changed = False
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is not None:
+                extra = parse_extra_json(row["extra_json"])
+                if status == "applied":
                     # Queue this in the same transaction as the local status
                     # promotion. A crash or ambiguous network failure can then
                     # be retried safely until the cloud confirms the idempotent
@@ -270,7 +271,15 @@ class StateManager:
                         "queued_at": now,
                     }
                     extra_json = json.dumps(extra)
-            if ts_field and extra_json is not None:
+                    extra_json_changed = True
+                elif "cloud_status_sync_pending" in extra:
+                    # A newer local status supersedes the older cloud repair.
+                    # Remove both the marker and its ability to overwrite the
+                    # newer state during a later retry pass.
+                    extra.pop("cloud_status_sync_pending", None)
+                    extra_json = json.dumps(extra) if extra else None
+                    extra_json_changed = True
+            if ts_field and extra_json_changed:
                 conn.execute(
                     f"UPDATE jobs SET status = ?, {ts_field} = ?, extra_json = ? "
                     "WHERE job_id = ?",
@@ -280,6 +289,11 @@ class StateManager:
                 conn.execute(
                     f"UPDATE jobs SET status = ?, {ts_field} = ? WHERE job_id = ?",
                     (status, now, job_id),
+                )
+            elif extra_json_changed:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, extra_json = ? WHERE job_id = ?",
+                    (status, extra_json, job_id),
                 )
             else:
                 conn.execute(
