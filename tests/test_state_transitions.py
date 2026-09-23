@@ -285,6 +285,47 @@ def test_reconcile_propagates_unreadable_ledger_for_fail_closed_apply(
         )
 
 
+def test_reconcile_propagates_ledger_constructor_failure(state_mgr, monkeypatch):
+    from src.sources.adapters.idempotency import LedgerUnreadableError
+
+    def _broken_ledger():
+        raise OSError("ledger path unavailable")
+
+    monkeypatch.setattr(
+        "src.sources.adapters.idempotency.SubmissionLedger",
+        _broken_ledger,
+    )
+
+    with pytest.raises(LedgerUnreadableError):
+        state_mgr.reconcile_active_jobs_from_ledger()
+
+
+def test_reconcile_does_not_promote_existing_submitted_state_without_receipt(
+    state_mgr, tmp_path
+):
+    from src.sources.adapters.idempotency import SubmissionLedger
+
+    job = {
+        "job_id": "job-state-only",
+        "title": "Principal Engineer",
+        "company": "Acme",
+        "url": "https://boards.greenhouse.io/acme/jobs/state-only",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    state_mgr.transition_confirmation(job["job_id"], "submitting")
+    state_mgr.transition_confirmation(job["job_id"], "submitted")
+
+    state_mgr.reconcile_active_jobs_from_ledger(
+        ledger=SubmissionLedger(tmp_path / "empty-ledger.json")
+    )
+
+    untouched = state_mgr.get_job(job["job_id"])
+    assert untouched["status"] == "approved"
+    assert untouched["confirmation_status"] == "submitted"
+
+
 def test_cold_start_ledger_recovery_from_crash(state_mgr, tmp_path):
     """After a process crash/restart, a job with confirmation_status=None successfully
     recovers directly to 'submitted' or 'reconciliation_required' from durable ledger state."""

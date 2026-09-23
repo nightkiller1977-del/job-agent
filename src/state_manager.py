@@ -458,10 +458,22 @@ class StateManager:
         """
         if ledger is None:
             try:
-                from .sources.adapters.idempotency import SubmissionLedger
+                from .sources.adapters.idempotency import (
+                    LedgerUnreadableError,
+                    SubmissionLedger,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "submission ledger could not be imported for reconciliation"
+                ) from exc
+            try:
                 ledger = SubmissionLedger()
-            except Exception:
-                return 0
+            except LedgerUnreadableError:
+                raise
+            except Exception as exc:
+                raise LedgerUnreadableError(
+                    f"submission ledger could not be initialized: {exc}"
+                ) from exc
 
         reconciled_count = 0
         with self._connect() as conn:
@@ -478,7 +490,20 @@ class StateManager:
             )
             if new_status:
                 if r["status"] == "approved" and new_status == "submitted":
-                    self.set_status(jid, "applied")
+                    # ``sync_confirmation_from_ledger`` preserves an existing
+                    # higher-ranked DB status even when no ledger record was
+                    # found. Promotion requires separate proof that this pass
+                    # found a receipt-verified record owned by this exact job.
+                    owned_record = (
+                        ledger.record_for_job(str(jid))
+                        if hasattr(ledger, "record_for_job")
+                        else None
+                    )
+                    if (
+                        owned_record
+                        and owned_record[1].get("phase") == "receipt_verified"
+                    ):
+                        self.set_status(jid, "applied")
                 reconciled_count += 1
 
         return reconciled_count
