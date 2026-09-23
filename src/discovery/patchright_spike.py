@@ -87,8 +87,17 @@ _BLOCKED_TEXT_RE = re.compile(
 
 OUTCOMES = ("ok", "captcha", "waf_403", "timeout", "error")
 
+# A page that classifies as `ok` but renders almost nothing did not really
+# load. Observed on jobs.northropgrumman.com: Fortress-CDP reported outcome
+# `ok` on a 238-character body (a cookie banner) where Patchright and
+# Playwright each rendered the real navigation (~8600 chars). The gate
+# compared only the `success` boolean, so that run scored as a tie and the
+# measured difference was invisible. This floor is what makes "ok" mean
+# "a page was actually rendered", not "nothing raised".
+MIN_BODY_CHARS = 250
 
-async def classify_outcome(page, body_text: str, title: str, resp: Any) -> str:
+
+async def classify_outcome(page, body_text: Optional[str], title: str, resp: Any) -> str:
     """Return one of OUTCOMES for a page that loaded without raising.
 
     Order matters (Copilot review, PR #140): a WAF 403 page commonly says
@@ -108,13 +117,49 @@ async def classify_outcome(page, body_text: str, title: str, resp: Any) -> str:
     status = getattr(resp, "status", None)
     if status == 403:
         return "waf_403"
-    if _BLOCKED_TEXT_RE.search(f"{body_text} {title}"):
+    if _BLOCKED_TEXT_RE.search(f"{body_text or ''} {title}"):
         return "captcha"
     return "ok"
 
 
 def _is_timeout_error(exc: Exception) -> bool:
     return "timeout" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
+
+
+async def _body_text(page, timeout_ms: int = 3000) -> Optional[str]:
+    """Bounded body-text read. Returns None when the text could not be measured.
+
+    An unbounded inner_text() raises when a page exposes no stable body — a
+    gated page, or one still swapping its DOM. That surfaced as outcome
+    "error" and so made an engine look worse than another for a purely
+    harness-side reason.
+
+    The two reads are kept distinguishable on failure. `None` means "no
+    measurement", `""` means "measured, and the body really is empty". Folding
+    the first into the second would let a transient read failure be scored as a
+    zero-length body, which is the same harness-side bias in a new place.
+    """
+    try:
+        return await page.locator("body").inner_text(timeout=timeout_ms)
+    except Exception:
+        # The fallback needs its own deadline: page.evaluate() takes no timeout
+        # argument, so without wait_for an unresponsive renderer would hang the
+        # whole multi-domain benchmark despite this function's bounded-read
+        # contract. Same budget as the primary read.
+        try:
+            return await asyncio.wait_for(
+                page.evaluate("() => (document.body ? document.body.innerText : '')"),
+                timeout=timeout_ms / 1000,
+            ) or ""
+        except Exception:
+            return None
+
+
+def _loaded(res: Dict[str, Any]) -> bool:
+    """True only when the engine rendered a real page: classified ok AND
+    produced enough body text to be a page rather than a shell. `success`
+    alone is not sufficient evidence — see MIN_BODY_CHARS."""
+    return bool(res.get("success")) and (res.get("body_chars") or 0) >= MIN_BODY_CHARS
 
 
 def _redact_cdp_url(url: str) -> str:
@@ -157,6 +202,7 @@ async def test_domain_with_engine(playwright_engine, engine_name: str, url: str)
         "success": False,
         "webdriver_val": None,
         "title": "",
+        "body_chars": None,
         "error": None,
     }
 
@@ -172,10 +218,13 @@ async def test_domain_with_engine(playwright_engine, engine_name: str, url: str)
                 await asyncio.sleep(2)  # Let dynamic JS run
 
                 title = await page.title()
-                body_text = await page.locator("body").inner_text()
+                body_text = await _body_text(page)
                 webdriver_val = await page.evaluate("() => navigator.webdriver")
 
                 result["title"] = title
+                # None (not 0) when the read failed, so "could not measure"
+                # stays distinct from "measured empty" — see _body_text.
+                result["body_chars"] = len(body_text) if body_text is not None else None
                 result["webdriver_val"] = webdriver_val
                 result["outcome"] = await classify_outcome(page, body_text, title, resp)
                 result["success"] = result["outcome"] == "ok"
@@ -211,6 +260,7 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
         "success": False,
         "webdriver_val": None,
         "title": "",
+        "body_chars": None,
         "error": None,
     }
     connected = False
@@ -245,10 +295,13 @@ async def test_domain_with_cdp(cdp_url: str, url: str) -> Dict[str, Any]:
                     await asyncio.sleep(2)
 
                     title = await page.title()
-                    body_text = await page.locator("body").inner_text()
+                    body_text = await _body_text(page)
                     webdriver_val = await page.evaluate("() => navigator.webdriver")
 
                     result["title"] = title
+                    # None (not 0) when the read failed, so "could not measure"
+                    # stays distinct from "measured empty" — see _body_text.
+                    result["body_chars"] = len(body_text) if body_text is not None else None
                     result["webdriver_val"] = webdriver_val
                     result["outcome"] = await classify_outcome(page, body_text, title, resp)
                     result["success"] = result["outcome"] == "ok"
@@ -288,7 +341,12 @@ def _fmt(res: Dict[str, Any]) -> str:
         return "BLOCKED (captcha)"
     if res["outcome"] == "waf_403":
         return "BLOCKED (waf_403)"
-    return f"OK ({res['title'][:20]})"
+    n = res.get("body_chars")
+    if n is None:
+        return "UNMEASURED"
+    if n < MIN_BODY_CHARS:
+        return f"EMPTY ({n} chars)"
+    return f"OK ({n} chars)"
 
 
 async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any]:
@@ -332,6 +390,7 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
     patchright_wins = 0
     other_ties = 0
     fortress_unavailable = False
+    unmeasured = 0
 
     for domain, res in results.items():
         std, pat, fort = res["playwright"], res["patchright"], res["fortress_cdp"]
@@ -341,11 +400,35 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
             fortress_unavailable = True
             continue
 
-        pat_ok, fort_ok = pat["success"], fort["success"]
+        # A domain where either COMPARED engine's body could not be measured is
+        # excluded and counted separately. Scoring it would turn a harness
+        # limitation into an engine verdict — see _body_text.
+        #
+        # Only pat/fort are checked. The gate compares Fortress against
+        # Patchright; standard Playwright is informational, so requiring its
+        # read too would let an unmeasured Playwright leg suppress a real
+        # outcome between the two engines actually being compared.
+        if any(r.get("body_chars") is None for r in (pat, fort)):
+            unmeasured += 1
+            continue
+
+        pat_ok, fort_ok = _loaded(pat), _loaded(fort)
+        pat_chars = pat.get("body_chars") or 0
+        fort_chars = fort.get("body_chars") or 0
         if fort_ok and not pat_ok:
             fortress_wins += 1
         elif pat_ok and not fort_ok:
             patchright_wins += 1
+        elif pat_ok and fort_ok and (fort_chars * 2 <= pat_chars):
+            # Only reached when BOTH engines rendered a real page. Requiring
+            # pat_ok/fort_ok matters: challenge-page text volume must never
+            # score as an engine win (two blocked pages with 1,000 vs 100
+            # chars are a tie, not a Fortress loss). The comparison is
+            # inclusive so an exact 2x margin counts as a loss, matching the
+            # stated rule.
+            patchright_wins += 1
+        elif pat_ok and fort_ok and (pat_chars * 2 <= fort_chars):
+            fortress_wins += 1
         else:
             other_ties += 1
 
@@ -355,6 +438,8 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
               f"(tried {_redact_cdp_url(cdp_url)}) — gate cannot be fully evaluated this run.")
     print(f"Fortress-CDP wins over Patchright: {fortress_wins} | "
           f"Patchright wins over Fortress-CDP: {patchright_wins} | Ties: {other_ties}")
+    if unmeasured:
+        print(f"Excluded (body text could not be measured for one of the compared engines): {unmeasured} domain(s)")
     gate_passed = fortress_wins > 0
     print(f"ACES-402 gate (does Fortress beat Patchright on >=1 domain?): "
           f"{'PASS' if gate_passed else 'FAIL'}")
@@ -368,6 +453,7 @@ async def run_benchmark(fortress_cdp_url: Optional[str] = None) -> Dict[str, Any
         "fortress_wins": fortress_wins,
         "patchright_wins": patchright_wins,
         "ties": other_ties,
+        "unmeasured": unmeasured,
         "domains": results,
     }
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
