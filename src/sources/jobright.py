@@ -2118,10 +2118,124 @@ class JobrightScraper(BaseScraper):
             default=False,
         )
 
-    async def _visible_controls_snapshot(self, page, limit: int = 40) -> list[dict]:
-        """Return visible buttons/links/inputs to make ATS failures diagnosable."""
+    async def _find_submit_control(
+        self,
+        page,
+        selectors: list[str],
+        *,
+        total_timeout_ms: int = 20000,
+        poll_interval_ms: int = 500,
+    ):
+        """First visible control matching ``selectors``, searched across all frames.
+
+        Replaces a main-frame-only sweep that called ``page.wait_for_selector``
+        once per selector. Playwright resolves a selector within a single frame,
+        so an application form embedded in an iframe (Greenhouse
+        ``#grnhse_iframe``, SmartRecruiters oneclick-ui, Workday embeds) was
+        invisible and reported as ``submit_not_found`` (ACES-428).
+
+        Ordering is selector-major so the curated per-vendor selectors that
+        ``_confirm_and_submit`` prepends keep their precedence over the generic
+        text matches — a generic match in the main frame must not beat a
+        vendor-specific match inside the form's own frame.
+
+        The old loop paid a full 8s timeout per *missing* selector (~36
+        selectors ≈ 288s to conclude "not found"). Here each pass uses
+        ``query_selector`` (no per-selector wait) and the whole sweep re-polls
+        until ``total_timeout_ms``, preserving tolerance for late-rendering
+        forms at a fraction of the worst-case cost.
+        """
         try:
-            return await page.evaluate(
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + (total_timeout_ms / 1000)
+        except RuntimeError:  # no running loop (defensive; callers are async)
+            deadline = None
+
+        while True:
+            for sel in selectors:
+                for frame in self._candidate_frames(page):
+                    try:
+                        el = await frame.query_selector(sel)
+                    except Exception:
+                        # Frame detached or navigated mid-sweep — other frames
+                        # may still hold the form, so keep going.
+                        continue
+                    if el is None:
+                        continue
+                    try:
+                        if await el.is_visible():
+                            return el
+                    except Exception:
+                        continue
+            if deadline is None or asyncio.get_running_loop().time() >= deadline:
+                return None
+            await asyncio.sleep(poll_interval_ms / 1000)
+
+    async def _visible_controls_snapshot(self, page, limit: int = 40) -> list[dict]:
+        """Return visible buttons/links/inputs to make ATS failures diagnosable.
+
+        Sweeps the main frame *and* every child frame. Many ATS vendors embed the
+        application form in an iframe (Greenhouse ``#grnhse_iframe``,
+        SmartRecruiters oneclick-ui, Workday embeds); a top-document-only snapshot
+        reports the host page's marketing nav or a cookie banner and makes a
+        reachable form look like ``submit_not_found`` (ACES-428).
+
+        A frame that cannot be evaluated is recorded as an explicit entry rather
+        than skipped, so "no controls anywhere" stays distinguishable from
+        "controls exist in a frame we could not read".
+        """
+        controls: list[dict] = []
+        for frame in self._candidate_frames(page):
+            if len(controls) >= limit:
+                break
+            try:
+                found = await self._frame_controls_snapshot(frame, limit - len(controls))
+            except Exception as exc:
+                controls.append({
+                    "tag": "FRAME",
+                    "role": "",
+                    "text": f"(unreadable frame: {type(exc).__name__})",
+                    "href": self._safe_frame_url(frame),
+                })
+                continue
+            controls.extend(found)
+        return controls[:limit]
+
+    @staticmethod
+    def _safe_frame_url(frame) -> str:
+        try:
+            return frame.url or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _candidate_frames(page) -> list:
+        """Main frame first, then child frames, de-duplicated and detach-safe.
+
+        Main frame first keeps the pre-ACES-428 ordering for pages that never
+        used an iframe, so existing snapshots do not reorder.
+        """
+        try:
+            frames = list(page.frames)
+        except Exception:
+            return [page]
+        ordered = []
+        try:
+            main = page.main_frame
+            if main is not None:
+                ordered.append(main)
+        except Exception:
+            pass
+        for f in frames:
+            if f not in ordered:
+                ordered.append(f)
+        return ordered or [page]
+
+    async def _frame_controls_snapshot(self, frame, limit: int) -> list[dict]:
+        """Visible-control snapshot for exactly one frame."""
+        if limit <= 0:
+            return []
+        return await frame.evaluate(
                 """
                 (limit) => {
                     const candidates = Array.from(document.querySelectorAll([
@@ -2154,10 +2268,8 @@ class JobrightScraper(BaseScraper):
                     }));
                 }
                 """,
-                limit,
-            )
-        except Exception:
-            return []
+            limit,
+        )
 
     def _format_controls_snapshot(self, controls: list[dict]) -> str:
         if not controls:
@@ -3705,15 +3817,7 @@ class JobrightScraper(BaseScraper):
         except Exception:
             pass
 
-        submit_btn = None
-        for sel in submit_selectors:
-            try:
-                btn = await page.wait_for_selector(sel, timeout=8000)
-                if btn and await btn.is_visible():
-                    submit_btn = btn
-                    break
-            except Exception:
-                continue
+        submit_btn = await self._find_submit_control(page, submit_selectors)
 
         try:
             portal_url = page.url
@@ -3727,7 +3831,15 @@ class JobrightScraper(BaseScraper):
         # button selectors above can match entry CTAs on listing pages.
         if submit_btn:
             try:
-                has_filled_fields = await page.evaluate("""
+                # Per-frame sweep: the in-page recursion below reaches same-origin
+                # child documents, but now that _find_submit_control can match a
+                # control inside a cross-origin frame, the guard has to be able to
+                # read that frame's fields too — otherwise a correctly filled
+                # embedded form would be refused as "empty" (ACES-428).
+                has_filled_fields = False
+                for _frame in self._candidate_frames(page):
+                    try:
+                        if await _frame.evaluate("""
                     () => {
                         const checkDoc = (d) => {
                             try {
@@ -3756,7 +3868,12 @@ class JobrightScraper(BaseScraper):
                         };
                         return checkDoc(document);
                     }
-                """)
+                """):
+                            has_filled_fields = True
+                            break
+                    except Exception:
+                        # Unreadable/detached frame — fall through to the next one.
+                        continue
             except Exception:
                 has_filled_fields = True  # assume filled if we can't check
 
@@ -3819,14 +3936,27 @@ class JobrightScraper(BaseScraper):
             )
 
         if submit_btn:
-            # Use JS click to bypass Workday overlay divs that intercept pointer events
+            # Use JS click to bypass Workday overlay divs that intercept pointer events.
+            # Evaluate on the handle itself, not on `page`: the control may live in a
+            # child frame, and a handle cannot be adopted into another frame's context
+            # (ACES-428). ElementHandle.evaluate always runs in its own frame.
             try:
-                await page.evaluate("btn => btn.click()", submit_btn)
+                await submit_btn.evaluate("btn => btn.click()")
             except Exception:
-                # Fallback: dispatch a MouseEvent directly
-                await self._safe_evaluate(page, """btn => {
-                    btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-                }""", submit_btn, default=None)
+                # Fallback: dispatch a MouseEvent directly, same frame-local rule.
+                try:
+                    await submit_btn.evaluate(
+                        "btn => btn.dispatchEvent("
+                        "new MouseEvent('click', {bubbles: true, cancelable: true}))"
+                    )
+                except Exception as exc:
+                    # Neither click path landed — do not fall through to the
+                    # "submitted" bookkeeping below on an unproven click.
+                    return self._set_apply_outcome(
+                        "submit_click_failed",
+                        f"Found a submit control at {portal_url} but could not click it: "
+                        f"{type(exc).__name__}.",
+                    )
             await self._delay(3, 5)
             # ── Record analytics for orchestrator to persist via extra_json ──
             self._apply_analytics = {
