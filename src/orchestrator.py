@@ -124,6 +124,11 @@ _AMBIGUOUS_SUBMISSION_STATUSES = {
     "submit_unverified_unresolved",
 }
 
+_RECONCILIATION_NOTIFICATION_OUTCOMES = {
+    "duplicate_application_prevented",
+    "submit_unverified_unresolved",
+}
+
 # Path to the file written by the Claude-in-Chrome MCP scraper
 MCP_SCRAPED_FILE = Path(__file__).parent.parent / "state" / "mcp_scraped.json"
 
@@ -663,6 +668,28 @@ class Orchestrator:
         except Exception as exc:
             console.print(
                 f"[dim]ambiguous confirmation bookkeeping skipped for {job_id}: {exc}[/dim]"
+            )
+
+    @staticmethod
+    def _notify_reconciliation_required(job: dict, outcome: str, reason: str) -> None:
+        """Surface parked outcomes that otherwise disappear into a later run."""
+        if outcome not in _RECONCILIATION_NOTIFICATION_OUTCOMES:
+            return
+        job_id = str(job.get("job_id") or "unknown")
+        try:
+            notify_warning(
+                "Application requires reconciliation",
+                f"{job.get('title') or 'Job'} @ {job.get('company') or 'unknown'}: "
+                f"{reason or outcome}",
+                dedupe_key=f"reconcile:{job_id}:{outcome}",
+                dedupe_seconds=21600,
+            )
+        except Exception as exc:
+            _log.warning(
+                "reconciliation.notification_failed job_id=%s outcome=%s error=%s",
+                job_id,
+                outcome,
+                exc,
             )
 
     def _recover_verified_ledger_submission(self, job_id: str) -> None:
@@ -1307,6 +1334,7 @@ class Orchestrator:
                     else:
                         if code in _AMBIGUOUS_SUBMISSION_STATUSES:
                             self._mark_confirmation_ambiguous(job["job_id"], code)
+                        self._notify_reconciliation_required(job, code, reason)
                         console.print(f"[yellow]Application not submitted ({code}) — status unchanged.[/yellow]")
                         if reason:
                             console.print(f"[dim]{reason}[/dim]")
@@ -1386,6 +1414,7 @@ class Orchestrator:
                             else:
                                 if code in _AMBIGUOUS_SUBMISSION_STATUSES:
                                     self._mark_confirmation_ambiguous(job["job_id"], code)
+                                self._notify_reconciliation_required(job, code, reason)
                                 self.state.record_apply_attempt(
                                     job["job_id"],
                                     code,

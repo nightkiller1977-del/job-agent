@@ -226,6 +226,21 @@ class ExternalApplySession(BaseScraper):
                 duration_ms=int((time.time() - started) * 1000), **extra,
             )
 
+        def _reconciliation_block(outcome: str, detail: str) -> AtsApplyResult:
+            result = AtsApplyResult.blocked(
+                outcome,
+                detail,
+                attempt_id=attempt_id,
+            )
+            self._maybe_notify(
+                "reconciliation_required",
+                outcome,
+                f"{vendor}: reconciliation required",
+                result.detail,
+                key=f"reconcile:{job_id or key}:{outcome}",
+            )
+            return result
+
         _event("attempt_started", AttemptPhase.STARTED, auto_submit=auto_submit)
 
         # --- 0.2 pre-flight duplicate/interrupted checks (before launching Chrome) ---
@@ -272,10 +287,10 @@ class ExternalApplySession(BaseScraper):
                 else "duplicate_application_prevented"
             )
             _event("duplicate_prevented", AttemptPhase.UNKNOWN, outcome=outcome)
-            return AtsApplyResult.blocked(
-                outcome,
-                f"already applied to {key} — not resubmitting", attempt_id=attempt_id,
-            )
+            detail = f"already applied to {key} — not resubmitting"
+            if outcome == "duplicate_application_prevented":
+                return _reconciliation_block(outcome, detail)
+            return AtsApplyResult.blocked(outcome, detail, attempt_id=attempt_id)
         if in_progress:
             stale = self.ledger.is_stale_in_progress(key)
             _event("submit_in_progress_blocked", AttemptPhase.UNKNOWN,
@@ -295,10 +310,9 @@ class ExternalApplySession(BaseScraper):
             # blindly risks a duplicate. Hold until reconciled (human/receipt re-check).
             _event("submit_unverified_blocked", AttemptPhase.UNKNOWN,
                    outcome="submit_unverified_unresolved")
-            return AtsApplyResult.blocked(
+            return _reconciliation_block(
                 "submit_unverified_unresolved",
                 f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
-                attempt_id=attempt_id,
             )
 
         policy: SubmissionPolicy = self._policy_override or AutoSubmitPolicy(allow=auto_submit)
@@ -397,14 +411,16 @@ class ExternalApplySession(BaseScraper):
                             job_id
                             and str(existing.get("job_id") or "") == job_id
                         )
+                        outcome = (
+                            "verified_submission_recovered"
+                            if owned_recovery
+                            else "duplicate_application_prevented"
+                        )
+                        detail = f"already applied to {key} — not resubmitting"
+                        if outcome == "duplicate_application_prevented":
+                            return _reconciliation_block(outcome, detail)
                         return AtsApplyResult.blocked(
-                            (
-                                "verified_submission_recovered"
-                                if owned_recovery
-                                else "duplicate_application_prevented"
-                            ),
-                            f"already applied to {key} — not resubmitting",
-                            attempt_id=attempt_id,
+                            outcome, detail, attempt_id=attempt_id
                         )
                     if phase == PHASE_IN_PROGRESS:
                         return AtsApplyResult.blocked(
@@ -413,10 +429,9 @@ class ExternalApplySession(BaseScraper):
                             attempt_id=attempt_id,
                         )
                     if phase == PHASE_UNVERIFIED:
-                        return AtsApplyResult.blocked(
+                        return _reconciliation_block(
                             "submit_unverified_unresolved",
                             f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
-                            attempt_id=attempt_id,
                         )
                     return AtsApplyResult.blocked(
                         "ledger_unreadable",

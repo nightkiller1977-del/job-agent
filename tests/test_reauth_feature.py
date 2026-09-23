@@ -381,6 +381,7 @@ class TestApplyReauth:
              patch("src.orchestrator.Orchestrator._sync_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_status_to_cloud", new_callable=AsyncMock), \
              patch("src.orchestrator.Orchestrator._push_apply_attempt_to_cloud", new_callable=AsyncMock), \
+             patch("src.orchestrator.notify_warning") as notify_warning, \
              patch("src.orchestrator.Orchestrator._pull_approved_from_cloud", new_callable=AsyncMock):
             await orchestrator.apply_approved(auto_submit=True)
 
@@ -389,6 +390,11 @@ class TestApplyReauth:
         assert untouched["confirmation_status"] == "reconciliation_required"
         readiness, _reason = orchestrator._classify_apply_readiness(untouched)
         assert readiness == "needs-review"
+        assert any(
+            call.kwargs.get("dedupe_key")
+            == f"reconcile:{job['job_id']}:duplicate_application_prevented"
+            for call in notify_warning.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_apply_reconciles_verified_ledger_before_building_pool(

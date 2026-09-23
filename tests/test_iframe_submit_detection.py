@@ -613,6 +613,41 @@ async def test_off_origin_submit_owner_cannot_fall_back_to_same_origin_sibling(
 
 
 @pytest.mark.asyncio
+async def test_opaque_submit_owner_cannot_validate_receipt(monkeypatch):
+    """An about:blank owner has no trustworthy ATS origin attribution."""
+    submit_button = FakeElement("Submit Application")
+    application = FakeFrame(
+        "about:blank",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    page = FakePage([application], url=application.url)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _opaque_receipt(frame, **_kwargs):
+        if frame is application:
+            return True, "t:application received"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _opaque_receipt)
+
+    submitted = await scraper._confirm_and_submit(
+        page,
+        {"title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert scraper.last_apply_status == "submission_unverified"
+
+
+@pytest.mark.asyncio
 async def test_replacement_frame_reuses_submit_context_baseline(monkeypatch):
     """A remounted stale receipt is compared with the pre-click ATS state."""
     main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)

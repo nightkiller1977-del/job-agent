@@ -2344,6 +2344,11 @@ class JobrightScraper(BaseScraper):
         if submit_baseline is None:
             # Freshness cannot be proven without a pre-click snapshot.
             return ""
+        if not submit_origin:
+            # about:blank, data:, and other opaque owners cannot be tied to an
+            # ATS origin. Neither a surviving opaque owner nor its future
+            # replacement may supply trusted receipt evidence.
+            return ""
 
         submit_origin_baselines = [
             baseline

@@ -5,6 +5,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -395,6 +396,42 @@ async def test_session_blocks_unverified_until_reconciled(tmp_path, monkeypatch)
     res = await sess.apply(JOB, auto_submit=True)
     assert res.status == "submit_unverified_unresolved"
     assert page.goto_called is False                            # never resubmits blindly
+
+
+@pytest.mark.parametrize(
+    ("verified", "expected_status"),
+    [
+        (True, "duplicate_application_prevented"),
+        (False, "submit_unverified_unresolved"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_session_notifies_for_preflight_reconciliation(
+    tmp_path, monkeypatch, verified, expected_status
+):
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(JOB)
+    ledger.claim(key, "previous-attempt", job_id="another-job")
+    ledger.complete(key, "previous-attempt", verified=verified)
+    sess, page, _ = _make_session(
+        tmp_path,
+        _RecordingAdapter(AtsApplyResult.ok(), raises=True),
+        monkeypatch,
+        ledger=ledger,
+    )
+    sess.dispatcher = MagicMock()
+
+    result = await sess.apply(JOB, auto_submit=True)
+
+    assert result.status == expected_status
+    assert page.goto_called is False
+    sess.dispatcher.dispatch_event.assert_called_once_with(
+        "reconciliation_required",
+        expected_status,
+        "greenhouse: reconciliation required",
+        result.detail,
+        key=f"reconcile:{key}:{expected_status}",
+    )
 
 
 @pytest.mark.asyncio
