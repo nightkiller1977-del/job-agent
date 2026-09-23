@@ -19,6 +19,8 @@ a missing URL, and these tests pin both halves.
 
 Pure functions and fakes; no network, no browser, no employer contact.
 """
+import json
+
 import pytest
 
 from src.blocker_classifier import BlockerClass, classify
@@ -142,3 +144,105 @@ async def test_apply_still_reports_no_ats_url_when_there_really_is_none():
 
     assert result is False
     assert sc.last_apply_status == "builtin_no_ats_url"
+
+
+# ─── Copilot review findings on PR #151 ─────────────────────────────────────
+
+@pytest.mark.parametrize("url", [
+    "https://notbuiltin.com/?handler=ApplyRedirect",
+    "https://notbuiltin.com/job/x?applyRequired=true",
+    "https://evilbuiltin.com.attacker.example/?handler=ApplyRedirect",
+])
+def test_lookalike_hosts_are_not_the_wall(url):
+    """'builtin.com' was a netloc SUBSTRING check — 'notbuiltin.com' contains
+    it and was misclassified as the wall (review finding)."""
+    assert BuiltInScraper._is_builtin_login_wall(url) is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://builtin.com/job/x?applyRequired=false",
+    "https://builtin.com/job/x?applyRequired=0",
+    "https://builtin.com/job/x?handler=SomethingElse",
+])
+def test_wrong_parameter_values_are_not_the_wall(url):
+    """Presence of the key was checked, not its value — applyRequired=false
+    was misclassified as the wall (review finding)."""
+    assert BuiltInScraper._is_builtin_login_wall(url) is False
+
+
+def test_subdomain_of_builtin_is_still_the_wall():
+    assert BuiltInScraper._is_builtin_login_wall(
+        "https://www.builtin.com/job/x?applyRequired=true"
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_ats_url_prefers_a_real_stashed_url_over_a_fresh_wall(monkeypatch):
+    """A successful refresh must not discard a usable stashed URL just because
+    BuiltIn's applyUrl is (as observed on all 11 approved BuiltIn jobs) always
+    its own login-wall redirect for an anonymous caller (review finding)."""
+    sc = BuiltInScraper.__new__(BuiltInScraper)
+
+    class _Resp:
+        status_code = 200
+        headers = {}
+        text = "Builtin.jobPostInit(" + json.dumps({
+            "job": {"applyUrl": "/job/x/1?handler=ApplyRedirect"},
+        }) + ")"
+        url = DETAIL
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, _url):
+            return _Resp()
+
+    monkeypatch.setattr(
+        "src.sources.builtin.httpx.AsyncClient", lambda *a, **k: _Client()
+    )
+    job = {
+        "url": DETAIL,
+        "extra_json": {"ats_url": "https://jobs.smartrecruiters.com/ServiceNow/x"},
+    }
+
+    resolved = await sc._resolve_ats_url(job)
+
+    assert resolved == "https://jobs.smartrecruiters.com/ServiceNow/x"
+
+
+@pytest.mark.asyncio
+async def test_resolve_ats_url_still_uses_the_fresh_wall_when_nothing_better_exists(monkeypatch):
+    """Control: without a usable stashed URL, the wall is still returned (it
+    is at least evidence of *which* job, and downstream classifies it)."""
+    sc = BuiltInScraper.__new__(BuiltInScraper)
+
+    class _Resp:
+        status_code = 200
+        headers = {}
+        text = "Builtin.jobPostInit(" + json.dumps({
+            "job": {"applyUrl": "/job/x/1?handler=ApplyRedirect"},
+        }) + ")"
+        url = DETAIL
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, _url):
+            return _Resp()
+
+    monkeypatch.setattr(
+        "src.sources.builtin.httpx.AsyncClient", lambda *a, **k: _Client()
+    )
+    job = {"url": DETAIL, "extra_json": {}}
+
+    resolved = await sc._resolve_ats_url(job)
+
+    assert BuiltInScraper._is_builtin_login_wall(resolved) is True
