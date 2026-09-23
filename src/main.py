@@ -761,6 +761,60 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _scheduler_unit_statuses() -> list[tuple[str, str]]:
+    """Installed/loaded state of the scheduled discover+apply units, per platform.
+
+    macOS schedules these as launchd agents (``launchd/*.plist``); every other
+    platform uses systemd user timers (``systemd/*.timer``). Returns
+    ``[(label, rich_status), ...]`` so the caller only renders.
+    """
+    if sys.platform == "darwin":
+        rows: list[tuple[str, str]] = []
+        launchctl_out = ""
+        try:
+            res = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5, check=False)
+            if res.returncode == 0:
+                launchctl_out = res.stdout
+        except Exception:
+            pass
+        for p in (
+            Path.home() / "Library/LaunchAgents/com.jobagent.discover.plist",
+            Path.home() / "Library/LaunchAgents/com.jobagent.apply.plist",
+        ):
+            label = p.stem
+            if p.exists() and label in launchctl_out:
+                rows.append((label, "[green]ACTIVE / LOADED[/green]"))
+            elif p.exists():
+                rows.append((label, "[yellow]INSTALLED (NOT LOADED)[/yellow]"))
+            else:
+                rows.append((label, "[dim]NOT INSTALLED[/dim]"))
+        return rows
+
+    rows = []
+    for unit in ("jobagent-discover.timer", "jobagent-apply.timer"):
+        try:
+            enabled = subprocess.run(
+                ["systemctl", "--user", "is-enabled", unit],
+                capture_output=True, text=True, timeout=5, check=False,
+            ).stdout.strip()
+            active = subprocess.run(
+                ["systemctl", "--user", "is-active", unit],
+                capture_output=True, text=True, timeout=5, check=False,
+            ).stdout.strip()
+        except Exception:
+            # systemctl absent (container, minimal image) — say so rather than
+            # implying the unit is simply not installed.
+            rows.append((unit, "[dim]UNKNOWN (systemctl unavailable)[/dim]"))
+            continue
+        if active == "active":
+            rows.append((unit, "[green]ACTIVE / LOADED[/green]"))
+        elif enabled in ("enabled", "static", "disabled"):
+            rows.append((unit, "[yellow]INSTALLED (NOT ACTIVE)[/yellow]"))
+        else:
+            rows.append((unit, "[dim]NOT INSTALLED[/dim]"))
+    return rows
+
+
 async def main_async(args: argparse.Namespace) -> int:
     if args.command == "questions":
         from src.answers.unanswered_tracker import tracker
@@ -888,29 +942,15 @@ async def main_async(args: argparse.Namespace) -> int:
         lock_status = f"[{status_color}]LOCKED (PID {pid})[/{status_color}]" if (pid and alive) else "[green]FREE[/green]"
         console.print(f"[bold cyan]Autopilot Execution Lock:[/bold cyan] {lock_status}")
 
-        console.print("\n[bold cyan]Launchd Background Daemons:[/bold cyan]")
-        plist_paths = [
-            Path.home() / "Library/LaunchAgents/com.jobagent.discover.plist",
-            Path.home() / "Library/LaunchAgents/com.jobagent.apply.plist",
-        ]
-        launchctl_out = ""
-        try:
-            res = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-            if res.returncode == 0:
-                launchctl_out = res.stdout
-        except Exception:
-            pass
-
-        for p in plist_paths:
-            installed = p.exists()
-            label = p.stem
-            is_loaded = label in launchctl_out
-            if installed and is_loaded:
-                status_str = "[green]ACTIVE / LOADED[/green]"
-            elif installed:
-                status_str = "[yellow]INSTALLED (NOT LOADED)[/yellow]"
-            else:
-                status_str = "[dim]NOT INSTALLED[/dim]"
+        _sched_kind = "Launchd" if sys.platform == "darwin" else "Systemd"
+        console.print(f"\n[bold cyan]{_sched_kind} Background Schedulers:[/bold cyan]")
+        # Scheduled background runs are launchd units on macOS and systemd user
+        # timers elsewhere (see launchd/ and systemd/ in this repo). Reporting
+        # launchd unconditionally told every Linux/Windows operator their
+        # schedulers were "NOT INSTALLED" while the systemd timers that actually
+        # drive the agent went unreported — ACES-430. Mirrors the platform split
+        # already used by operational_status._scheduler_last_result().
+        for label, status_str in _scheduler_unit_statuses():
             console.print(f"  • {label}: {status_str}")
         return 0
 
