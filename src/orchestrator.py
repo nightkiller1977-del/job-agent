@@ -4,6 +4,7 @@ Orchestrator — coordinates scraping, scoring, review, and application flow.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -59,6 +60,12 @@ from .sources.adapters.runtime import get_run_log as _get_run_log
 
 console = Console()
 _log = logging.getLogger(__name__)
+
+
+def _cloud_action_idempotency_key(job_id: str, status: str) -> str:
+    """Stable replay key for one logical dashboard status transition."""
+    material = f"job-agent:cloud-action:v1:{job_id}:{status}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def meets_min_apply_score(score, min_apply_score: int) -> bool:
@@ -118,6 +125,23 @@ _OWN_SESSION_STATUSES_ANY = {"reauth_failed", "needs_session_prep"}
 _OWN_SESSION_STATUSES = {
     "linkedin": {"linkedin_authwall", "linkedin_login_required"},
     "usajobs": {"usajobs_login_required"},
+}
+
+# Outcomes where a submit may already have reached the employer. They must be
+# projected onto confirmation_status before the next scheduler pass so an
+# approved row cannot be selected repeatedly while durable reconciliation is
+# still required.
+_AMBIGUOUS_SUBMISSION_STATUSES = {
+    "duplicate_application_prevented",
+    "submission_unverified",
+    "submit_unverified_unresolved",
+}
+
+_RECONCILIATION_NOTIFICATION_OUTCOMES = {
+    "duplicate_application_prevented",
+    "submission_unverified",
+    "submit_in_progress",
+    "submit_unverified_unresolved",
 }
 
 # Path to the file written by the Claude-in-Chrome MCP scraper
@@ -533,6 +557,20 @@ class Orchestrator:
             ats_url = ""
         all_urls = url + " " + ats_url
 
+        confirmation_status = str(job.get("confirmation_status") or "")
+        if confirmation_status in {
+            "submitting",
+            "submission_unverified",
+            "reconciliation_required",
+            "submitted",
+            "receipt_pending",
+        }:
+            return (
+                "needs-review",
+                "A prior submission is unverified, in progress, or awaiting durable "
+                "receipt reconciliation; reconcile it before retrying.",
+            )
+
         # A missing/malformed job URL is a precondition no session prep can fix, so
         # check it before the session-prepared marker and the source blocks — a
         # prepared job with a broken URL must still route to hydration rather than
@@ -623,6 +661,64 @@ class Orchestrator:
             self.state.transition_confirmation(job_id, "submitted")
         except Exception as exc:
             console.print(f"[dim]confirmation_status bookkeeping skipped for {job_id}: {exc}[/dim]")
+
+    def _mark_confirmation_unverified(self, job_id: str) -> None:
+        """Durably park an ambiguous submit so a later run cannot re-dispatch it."""
+        self._mark_confirmation_ambiguous(job_id, "submission_unverified")
+
+    def _mark_confirmation_ambiguous(self, job_id: str, outcome: str) -> None:
+        """Project a durable ambiguous-submit outcome onto scheduler-visible state."""
+        if outcome == "submit_in_progress":
+            # This is another worker's temporary ownership claim. The ledger
+            # blocks duplicates while it is live and stale claims reconcile on
+            # the next preflight; copying it into SQLite can park the job after
+            # the owner safely releases the claim without submitting.
+            return
+        elif outcome == "duplicate_application_prevented":
+            target_status = "reconciliation_required"
+        else:
+            target_status = "submission_unverified"
+        try:
+            self.state.recover_confirmation_from_ledger(
+                job_id,
+                target_status,
+                phase=outcome,
+            )
+        except Exception as exc:
+            console.print(
+                f"[dim]ambiguous confirmation bookkeeping skipped for {job_id}: {exc}[/dim]"
+            )
+
+    @staticmethod
+    def _notify_reconciliation_required(job: dict, outcome: str, reason: str) -> None:
+        """Surface parked outcomes that otherwise disappear into a later run."""
+        if outcome not in _RECONCILIATION_NOTIFICATION_OUTCOMES:
+            return
+        job_id = str(job.get("job_id") or "unknown")
+        try:
+            notify_warning(
+                "Application requires reconciliation",
+                f"{job.get('title') or 'Job'} @ {job.get('company') or 'unknown'}: "
+                f"{reason or outcome}",
+                dedupe_key=f"reconcile:{job_id}:{outcome}",
+                dedupe_seconds=21600,
+            )
+        except Exception as exc:
+            _log.warning(
+                "reconciliation.notification_failed job_id=%s outcome=%s error=%s",
+                job_id,
+                outcome,
+                exc,
+            )
+
+    def _recover_verified_ledger_submission(self, job_id: str) -> None:
+        """Recover the DB state after a receipt was durable before process exit."""
+        self.state.set_status(job_id, "applied")
+        self.state.recover_confirmation_from_ledger(
+            job_id,
+            "submitted",
+            phase="receipt_verified",
+        )
 
     def _apply_validation_metadata(self, scraper=None, exc: Exception | None = None) -> dict:
         metrics = getattr(scraper, "_apply_validation_metrics", None) if scraper else None
@@ -856,6 +952,39 @@ class Orchestrator:
 
         # Pull cloud-approved jobs into local SQLite first
         await self._pull_approved_from_cloud()
+        await self._retry_pending_cloud_status_sync()
+
+        # Recover durable employer receipts before building the apply pool. A
+        # worker can crash after submit succeeds but before the resolved ATS URL
+        # or applied status reaches SQLite/cloud; reopening a browser in that
+        # state risks a duplicate application.
+        approved_before_reconcile = {
+            str(job.get("job_id") or "") for job in self.state.get_approved_unapplied()
+        }
+        try:
+            reconciled = self.state.reconcile_active_jobs_from_ledger()
+            if reconciled:
+                for recovered_job_id in approved_before_reconcile:
+                    recovered_job = self.state.get_job(recovered_job_id)
+                    if recovered_job and recovered_job.get("status") == "applied":
+                        try:
+                            await self._push_status_to_cloud(recovered_job_id, "applied")
+                        except Exception as exc:
+                            _log.warning(
+                                "apply.ledger_recovery_cloud_sync_failed job_id=%s error=%s",
+                                recovered_job_id,
+                                exc,
+                            )
+                console.print(
+                    f"[cyan]Ledger recovery: reconciled {reconciled} active job(s) before apply.[/cyan]"
+                )
+        except Exception as exc:
+            _log.warning("apply.ledger_recovery_failed error=%s", exc)
+            console.print(
+                "[red]Apply blocked: submission ledger reconciliation failed; "
+                "refusing to risk a duplicate submission.[/red]"
+            )
+            return
 
         # Expire dead/stale postings before selecting the apply pool, so an
         # approved-but-expired job is skipped (with a logged reason + status
@@ -1215,19 +1344,42 @@ class Orchestrator:
                 else:
                     reason = getattr(scraper, "last_apply_detail", "") or "not submitted"
                     code   = getattr(scraper, "last_apply_status",  "") or "blocked"
-                    console.print(f"[yellow]Application not submitted ({code}) — status unchanged.[/yellow]")
-                    if reason:
-                        console.print(f"[dim]{reason}[/dim]")
-                    # Persist the specific block reason
-                    self.state.record_apply_attempt(
-                        job["job_id"],
-                        code,
-                        reason,
-                        metadata=self._apply_validation_metadata(scraper),
-                    )
-                    await self._push_apply_attempt_to_cloud(job["job_id"])
-                    skipped_count += 1
-                    outcomes.append({"job": job, "status": code, "reason": reason})
+                    if code == "verified_submission_recovered":
+                        self._recover_verified_ledger_submission(job["job_id"])
+                        self.state.record_apply_attempt(
+                            job["job_id"],
+                            "applied",
+                            f"Recovered verified submission from durable ledger. {reason}",
+                            metadata=self._apply_validation_metadata(scraper),
+                        )
+                        applied_count += 1
+                        outcomes.append({
+                            "job": job,
+                            "status": "applied",
+                            "reason": "recovered verified ledger receipt",
+                        })
+                        console.print(
+                            "[green]Recovered verified submission from durable ledger; status updated.[/green]"
+                        )
+                        await self._push_status_to_cloud(job["job_id"], "applied")
+                        await self._push_apply_attempt_to_cloud(job["job_id"])
+                    else:
+                        if code in _AMBIGUOUS_SUBMISSION_STATUSES:
+                            self._mark_confirmation_ambiguous(job["job_id"], code)
+                        self._notify_reconciliation_required(job, code, reason)
+                        console.print(f"[yellow]Application not submitted ({code}) — status unchanged.[/yellow]")
+                        if reason:
+                            console.print(f"[dim]{reason}[/dim]")
+                        # Persist the specific block reason
+                        self.state.record_apply_attempt(
+                            job["job_id"],
+                            code,
+                            reason,
+                            metadata=self._apply_validation_metadata(scraper),
+                        )
+                        await self._push_apply_attempt_to_cloud(job["job_id"])
+                        skipped_count += 1
+                        outcomes.append({"job": job, "status": code, "reason": reason})
             except AuthFailedError as auth_exc:
                 console.print(f"[yellow]{src} apply: session expired — attempting reauth…[/yellow]")
                 if src in reauthed_this_run:
@@ -1271,15 +1423,39 @@ class Orchestrator:
                         else:
                             reason = getattr(scraper2, "last_apply_detail", "") or "not submitted"
                             code   = getattr(scraper2, "last_apply_status",  "") or "blocked"
-                            self.state.record_apply_attempt(
-                                job["job_id"],
-                                code,
-                                reason,
-                                metadata=self._apply_validation_metadata(scraper2),
-                            )
-                            await self._push_apply_attempt_to_cloud(job["job_id"])
-                            skipped_count += 1
-                            outcomes.append({"job": job, "status": code, "reason": reason})
+                            if code == "verified_submission_recovered":
+                                self._recover_verified_ledger_submission(job["job_id"])
+                                self.state.record_apply_attempt(
+                                    job["job_id"],
+                                    "applied",
+                                    "Recovered verified submission from durable ledger "
+                                    f"after reauth. {reason}",
+                                    metadata=self._apply_validation_metadata(scraper2),
+                                )
+                                applied_count += 1
+                                outcomes.append({
+                                    "job": job,
+                                    "status": "applied",
+                                    "reason": "recovered verified ledger receipt after reauth",
+                                })
+                                console.print(
+                                    "[green]Recovered verified submission after reauth; status updated.[/green]"
+                                )
+                                await self._push_status_to_cloud(job["job_id"], "applied")
+                                await self._push_apply_attempt_to_cloud(job["job_id"])
+                            else:
+                                if code in _AMBIGUOUS_SUBMISSION_STATUSES:
+                                    self._mark_confirmation_ambiguous(job["job_id"], code)
+                                self._notify_reconciliation_required(job, code, reason)
+                                self.state.record_apply_attempt(
+                                    job["job_id"],
+                                    code,
+                                    reason,
+                                    metadata=self._apply_validation_metadata(scraper2),
+                                )
+                                await self._push_apply_attempt_to_cloud(job["job_id"])
+                                skipped_count += 1
+                                outcomes.append({"job": job, "status": code, "reason": reason})
                     except Exception as retry_exc:
                         console.print(f"[red]{src} apply failed after reauth:[/red] {retry_exc}")
                         self.state.record_apply_attempt(job["job_id"], "reauth_retry_error", str(retry_exc)[:400])
@@ -1778,11 +1954,18 @@ class Orchestrator:
                 return
             pulled = 0
             for job in jobs:
-                # Insert if new, then always force status to "approved"
-                # (upsert_job skips existing rows, so set_status does the update)
-                job["status"] = "approved"
-                self.state.upsert_job(job)
-                self.state.set_status(job["job_id"], "approved")
+                # The dashboard can remain "approved" after a local submission
+                # when the status push crashes. Never downgrade that durable
+                # local applied state back into the eligible apply pool.
+                existing = self.state.get_job(job["job_id"])
+                target_status = (
+                    "applied"
+                    if existing and existing.get("status") == "applied"
+                    else "approved"
+                )
+                cloud_job = {**job, "status": target_status}
+                self.state.upsert_job(cloud_job)
+                self.state.set_status(job["job_id"], target_status)
                 pulled += 1
             console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")
         except Exception as e:
@@ -1838,29 +2021,54 @@ class Orchestrator:
             return response
         return None
 
-    async def _push_status_to_cloud(self, job_id: str, status: str) -> None:
-        """POST a status update back to the cloud dashboard (non-fatal)."""
+    async def _retry_pending_cloud_status_sync(self) -> None:
+        """Retry durable status promotions once per run until cloud confirms."""
+        for pending in self.state.list_pending_cloud_status_sync():
+            await self._push_status_to_cloud(
+                pending["job_id"], pending["status"]
+            )
+
+    async def _push_status_to_cloud(self, job_id: str, status: str) -> bool:
+        """POST a status update and clear its durable obligation only on 200."""
         dashboard_url = os.environ.get("DASHBOARD_URL", "")
         sync_secret = os.environ.get("SYNC_SECRET", "")
         if not dashboard_url:
-            return
+            # Missing configuration is not cloud confirmation. Keep the
+            # durable obligation so a later configured run can retry it.
+            return False
         try:
             r = await self._cloud_request(
                 "cloud_action",
                 "dashboard_action",
                 "post",
                 f"{dashboard_url}/api/action",
-                json={"job_id": job_id, "action": status},
+                json={
+                    "job_id": job_id,
+                    "action": status,
+                    "idempotency_key": _cloud_action_idempotency_key(
+                        job_id, status
+                    ),
+                },
                 headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
-                idempotent=False,
+                # The dashboard atomically stores this operation key with the
+                # status transition. Transport policy still performs one
+                # attempt per call because this remains state-changing, while
+                # durable cross-run retries are safely deduplicated server-side.
+                idempotent=True,
                 state_changing=True,
             )
-            if r is not None and r.status_code != 200:
+            if r is None:
+                return False
+            if r.status_code != 200:
                 console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
+                return False
+            self.state.clear_pending_cloud_status_sync(job_id, status)
+            return True
         except Exception as e:
             console.print(f"[dim]Cloud status push failed (non-fatal): {e}[/dim]")
             _log.warning("cloud_sync.push_status_failed error=%s", e)
             notify_error("Cloud sync failed: _push_status_to_cloud", str(e)[:200])
+            return False
 
     async def _push_apply_attempt_to_cloud(self, job_id: str) -> None:
         """Sync the latest local apply attempt fields to the dashboard.

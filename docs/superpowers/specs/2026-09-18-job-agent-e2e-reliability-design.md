@@ -48,8 +48,8 @@ Keep dashboard writes non-fatal, because discovery and the local SQLite journal 
 - distinguish missing configuration from transport failure and non-2xx response;
 - log and notify a safe structured failure record;
 - retry only operations named in an explicit retry-authorization allowlist, with a small bounded backoff and attempt limit;
-- preserve the exact existing payload and sync-secret header contract;
-- never retry `/api/action`, including after an ambiguous client timeout, because the server may have committed the state change.
+- preserve the sync-secret header contract and require a stable opaque idempotency key for replayable `/api/action` status updates;
+- never transport-retry `/api/action` within one call after an ambiguous client timeout; a later durable status-sync pass may replay only the same stable key, which the dashboard atomically deduplicates with the status mutation.
 
 The `/health` check remains unauthenticated and is only a diagnostic readiness probe; it is not a substitute for successful authenticated sync. Missing HTTP response never proves that a write was not processed. Retry authorization independently evaluates: operation allowlist, operation idempotency or server-side deduplication, submission state, configured attempt cap, and ACES-284's breaker decision. A `transport_retryable` diagnostic therefore never authorizes repeating a state-changing action.
 

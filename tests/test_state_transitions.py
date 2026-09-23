@@ -1,4 +1,6 @@
 """Unit tests for StateManager confirmation_status state transitions."""
+import json
+
 import pytest
 from pathlib import Path
 from src.state_manager import StateManager, InvalidStateTransitionError
@@ -96,6 +98,58 @@ def test_orchestrator_stamps_confirmation_status_on_apply_success(state_mgr):
     assert state_mgr.get_job("test_job_4")["confirmation_status"] == "submitted"
 
 
+def test_orchestrator_parks_unverified_submission_before_next_run(state_mgr):
+    """An ambiguous dispatch stays out of the scheduler until reconciliation."""
+    job = {
+        "job_id": "test_job_unverified",
+        "title": "Staff Engineer",
+        "company": "Acme Corp",
+        "source": "jobright",
+        "url": "https://boards.greenhouse.io/acme/jobs/1",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.config = {}
+    orch.state = state_mgr
+    orch._mark_confirmation_unverified(job["job_id"])
+
+    parked = state_mgr.get_job(job["job_id"])
+    assert parked["confirmation_status"] == "submission_unverified"
+    readiness, detail = orch._classify_apply_readiness(parked)
+    assert readiness == "needs-review"
+    assert "unverified" in detail.lower()
+
+
+@pytest.mark.parametrize("confirmation_status", ["submitted", "receipt_pending"])
+def test_orchestrator_parks_receipt_states_without_durable_recovery(
+    state_mgr, confirmation_status
+):
+    """Approved rows with receipt-state labels must not become apply-ready."""
+    job = {
+        "job_id": f"job_{confirmation_status}",
+        "title": "Staff Engineer",
+        "company": "Acme Corp",
+        "source": "jobright",
+        "url": "https://boards.greenhouse.io/acme/jobs/receipt-state",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    state_mgr.transition_confirmation(job["job_id"], "submitting")
+    state_mgr.transition_confirmation(job["job_id"], "submitted")
+    if confirmation_status == "receipt_pending":
+        state_mgr.transition_confirmation(job["job_id"], "receipt_pending")
+
+    parked = state_mgr.get_job(job["job_id"])
+    readiness, detail = Orchestrator.__new__(Orchestrator)._classify_apply_readiness(
+        parked
+    )
+
+    assert readiness == "needs-review"
+    assert "reconcile" in detail.lower()
+
+
 def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
     from src.sources.adapters.idempotency import SubmissionLedger, canonical_key, PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED
     ledger_path = tmp_path / "apply_ledger.json"
@@ -112,11 +166,12 @@ def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
     state_mgr.upsert_job(job)
     key = canonical_key(job)
 
-    # 1. Live in-progress -> 'submitting'
+    # 1. A live claim belongs to another active worker. It must block at the
+    # ledger boundary without becoming durable scheduler state.
     ledger.begin(key, "att_1")
     res1 = state_mgr.sync_confirmation_from_ledger("job_ledger_1", ledger=ledger)
-    assert res1 == "submitting"
-    assert state_mgr.get_job("job_ledger_1")["confirmation_status"] == "submitting"
+    assert res1 is None
+    assert state_mgr.get_job("job_ledger_1")["confirmation_status"] is None
 
     # 2. Complete verified -> 'submitted'
     ledger.complete(key, "att_1", verified=True)
@@ -141,6 +196,225 @@ def test_sync_confirmation_from_ledger_projections(state_mgr, tmp_path):
     res3 = state_mgr.sync_confirmation_from_ledger("job_ledger_2", ledger=ledger)
     assert res3 == "submission_unverified"
     assert state_mgr.get_job("job_ledger_2")["confirmation_status"] == "submission_unverified"
+
+
+def test_reconcile_live_claim_does_not_permanently_park_approved_job(
+    state_mgr, tmp_path
+):
+    """A released live claim must leave the approved row retryable."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    job = {
+        "job_id": "job-live-owner",
+        "title": "Principal Engineer",
+        "company": "Acme",
+        "url": "https://boards.greenhouse.io/acme/jobs/live-owner",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    ledger = SubmissionLedger(tmp_path / "live-ledger.json")
+    key = canonical_key(job)
+    ledger.claim(key, "live-attempt", job_id=job["job_id"])
+
+    count = state_mgr.reconcile_active_jobs_from_ledger(ledger=ledger)
+
+    assert count == 0
+    assert state_mgr.get_job(job["job_id"])["confirmation_status"] is None
+
+    ledger.clear(key, "live-attempt")
+    state_mgr.reconcile_active_jobs_from_ledger(ledger=ledger)
+    released = state_mgr.get_job(job["job_id"])
+    readiness, _reason = Orchestrator.__new__(Orchestrator)._classify_apply_readiness(
+        released
+    )
+    assert readiness == "ready"
+
+
+def test_sync_confirmation_uses_persisted_ats_url_key(state_mgr, tmp_path):
+    """Jobright discovery URLs must reconcile against the resolved ATS ledger key."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    ats_url = "https://boards.greenhouse.io/acme/jobs/42"
+    job = {
+        "job_id": "jobright-42",
+        "title": "Staff Engineer",
+        "company": "Acme",
+        "url": "https://jobright.ai/jobs/info/discovery-42",
+        "source": "jobright",
+        "status": "approved",
+        "extra_json": json.dumps({"ats_url": ats_url}),
+    }
+    state_mgr.upsert_job(job)
+    ledger = SubmissionLedger(tmp_path / "ats-ledger.json")
+    key = canonical_key({"url": ats_url})
+    ledger.claim(key, "attempt-42", job_id=job["job_id"])
+    ledger.complete(key, "attempt-42", verified=True)
+
+    recovered = state_mgr.sync_confirmation_from_ledger(job["job_id"], ledger=ledger)
+
+    assert recovered == "submitted"
+
+
+def test_reconcile_approved_job_by_ledger_job_id_before_ats_url_is_persisted(
+    state_mgr, tmp_path
+):
+    """A crash before DB metadata persists still recovers through the ledger job ID."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    ats_url = "https://boards.greenhouse.io/acme/jobs/99"
+    job = {
+        "job_id": "jobright-99",
+        "title": "Principal Engineer",
+        "company": "Acme",
+        "url": "https://jobright.ai/jobs/info/discovery-99",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    ledger = SubmissionLedger(tmp_path / "crash-ledger.json")
+    key = canonical_key({"url": ats_url})
+    ledger.claim(key, "attempt-99", job_id=job["job_id"])
+    ledger.complete(key, "attempt-99", verified=True)
+
+    count = state_mgr.reconcile_active_jobs_from_ledger(ledger=ledger)
+
+    assert count == 1
+    recovered = state_mgr.get_job(job["job_id"])
+    assert recovered["status"] == "applied"
+    assert recovered["confirmation_status"] == "submitted"
+    pending = json.loads(recovered["extra_json"] or "{}")
+    assert pending["cloud_status_sync_pending"]["status"] == "applied"
+
+
+def test_reconcile_does_not_assign_shared_url_receipt_to_another_job(
+    state_mgr, tmp_path
+):
+    """Canonical URL dedupe blocks a duplicate without claiming it was submitted."""
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    ats_url = "https://boards.greenhouse.io/acme/jobs/shared"
+    owner = {
+        "job_id": "job-owner",
+        "title": "Principal Engineer",
+        "company": "Acme",
+        "url": "https://jobright.ai/jobs/info/owner",
+        "source": "jobright",
+        "status": "approved",
+        "extra_json": json.dumps({"ats_url": ats_url}),
+    }
+    duplicate = {
+        **owner,
+        "job_id": "job-duplicate",
+        "url": "https://jobright.ai/jobs/info/duplicate",
+    }
+    state_mgr.upsert_job(owner)
+    state_mgr.upsert_job(duplicate)
+    ledger = SubmissionLedger(tmp_path / "shared-ledger.json")
+    key = canonical_key({"url": ats_url})
+    ledger.claim(key, "owner-attempt", job_id=owner["job_id"])
+    ledger.complete(key, "owner-attempt", verified=True)
+
+    state_mgr.reconcile_active_jobs_from_ledger(ledger=ledger)
+
+    assert state_mgr.get_job(owner["job_id"])["status"] == "applied"
+    untouched = state_mgr.get_job(duplicate["job_id"])
+    assert untouched["status"] == "approved"
+    assert untouched["confirmation_status"] is None
+
+
+def test_reconcile_propagates_unreadable_ledger_for_fail_closed_apply(
+    state_mgr, tmp_path
+):
+    from src.sources.adapters.idempotency import (
+        LedgerUnreadableError,
+        SubmissionLedger,
+    )
+
+    job = {
+        "job_id": "job-corrupt-ledger",
+        "title": "Principal Engineer",
+        "company": "Acme",
+        "url": "https://boards.greenhouse.io/acme/jobs/corrupt",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    ledger_path = tmp_path / "corrupt-ledger.json"
+    ledger_path.write_text("{not-json")
+
+    with pytest.raises(LedgerUnreadableError):
+        state_mgr.reconcile_active_jobs_from_ledger(
+            ledger=SubmissionLedger(ledger_path)
+        )
+
+
+def test_reconcile_propagates_ledger_constructor_failure(state_mgr, monkeypatch):
+    from src.sources.adapters.idempotency import LedgerUnreadableError
+
+    def _broken_ledger():
+        raise OSError("ledger path unavailable")
+
+    monkeypatch.setattr(
+        "src.sources.adapters.idempotency.SubmissionLedger",
+        _broken_ledger,
+    )
+
+    with pytest.raises(LedgerUnreadableError):
+        state_mgr.reconcile_active_jobs_from_ledger()
+
+
+def test_reconcile_does_not_promote_existing_submitted_state_without_receipt(
+    state_mgr, tmp_path
+):
+    from src.sources.adapters.idempotency import SubmissionLedger
+
+    job = {
+        "job_id": "job-state-only",
+        "title": "Principal Engineer",
+        "company": "Acme",
+        "url": "https://boards.greenhouse.io/acme/jobs/state-only",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    state_mgr.transition_confirmation(job["job_id"], "submitting")
+    state_mgr.transition_confirmation(job["job_id"], "submitted")
+
+    state_mgr.reconcile_active_jobs_from_ledger(
+        ledger=SubmissionLedger(tmp_path / "empty-ledger.json")
+    )
+
+    untouched = state_mgr.get_job(job["job_id"])
+    assert untouched["status"] == "approved"
+    assert untouched["confirmation_status"] == "submitted"
+
+
+def test_reconcile_promotes_owned_verified_receipt_pending_job(state_mgr, tmp_path):
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    job = {
+        "job_id": "job-receipt-pending",
+        "title": "Principal Engineer",
+        "company": "Acme",
+        "url": "https://boards.greenhouse.io/acme/jobs/receipt-pending",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    state_mgr.transition_confirmation(job["job_id"], "submitting")
+    state_mgr.transition_confirmation(job["job_id"], "submitted")
+    state_mgr.transition_confirmation(job["job_id"], "receipt_pending")
+    ledger = SubmissionLedger(tmp_path / "receipt-pending-ledger.json")
+    key = canonical_key(job)
+    ledger.claim(key, "attempt-1", job_id=job["job_id"])
+    ledger.complete(key, "attempt-1", verified=True)
+
+    state_mgr.reconcile_active_jobs_from_ledger(ledger=ledger)
+
+    recovered = state_mgr.get_job(job["job_id"])
+    assert recovered["status"] == "applied"
+    assert recovered["confirmation_status"] == "receipt_pending"
 
 
 def test_cold_start_ledger_recovery_from_crash(state_mgr, tmp_path):

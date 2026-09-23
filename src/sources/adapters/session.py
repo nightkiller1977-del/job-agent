@@ -32,7 +32,15 @@ from .registry import AtsAdapterRegistry
 from .generic import GenericAtsAdapter, detect_vendor
 from .attempt import AttemptPhase
 from .policy import AutoSubmitPolicy, SubmissionPolicy
-from .idempotency import SubmissionLedger, canonical_key, LedgerUnreadableError
+from .idempotency import (
+    LedgerUnreadableError,
+    PHASE_IN_PROGRESS,
+    PHASE_UNVERIFIED,
+    PHASE_VERIFIED,
+    SubmissionLedger,
+    canonical_key,
+    ledger_key_reference,
+)
 from .profile_lock import ProfileLock, ProfileLockError
 from .auth_routing import directive_for
 from . import forensics
@@ -207,6 +215,7 @@ class ExternalApplySession(BaseScraper):
         external_url = job.get("url") or job.get("external_url") or ""
         attempt_id = uuid.uuid4().hex
         key = canonical_key(job)
+        key_reference = ledger_key_reference(key)
         vendor = detect_vendor(external_url)
         job_id = str(job.get("job_id") or "")
         started = time.time()
@@ -219,13 +228,46 @@ class ExternalApplySession(BaseScraper):
                 duration_ms=int((time.time() - started) * 1000), **extra,
             )
 
+        def _reconciliation_block(outcome: str, detail: str) -> AtsApplyResult:
+            result = AtsApplyResult.blocked(
+                outcome,
+                detail,
+                attempt_id=attempt_id,
+            )
+            self._maybe_notify(
+                "reconciliation_required",
+                outcome,
+                f"{vendor}: reconciliation required",
+                result.detail,
+                key=f"reconcile:{job_id or key_reference}:{outcome}",
+            )
+            return result
+
         _event("attempt_started", AttemptPhase.STARTED, auto_submit=auto_submit)
 
         # --- 0.2 pre-flight duplicate/interrupted checks (before launching Chrome) ---
+        if auto_submit and not key:
+            _event(
+                "ledger_key_missing_blocked",
+                AttemptPhase.UNKNOWN,
+                outcome="submission_ledger_key_missing",
+            )
+            return AtsApplyResult.blocked(
+                "submission_ledger_key_missing",
+                "could not derive a durable submission key — refusing to open a "
+                "submit-capable browser",
+                attempt_id=attempt_id,
+            )
         try:
+            if auto_submit:
+                # A readable JSON file is insufficient: prove the lock/storage
+                # boundary is available before reaching the employer portal.
+                # The atomic claim still runs immediately before dispatch.
+                self.ledger.validate()
             already_applied = key and self.ledger.already_applied(key)
             in_progress = key and self.ledger.in_progress(key)
             needs_reconciliation = key and self.ledger.needs_reconciliation(key)
+            verified_record = self.ledger.record(key) if already_applied else None
         except LedgerUnreadableError as exc:
             # History we can't read must never be treated as "no prior submission" —
             # that would let a duplicate-application check silently pass through.
@@ -236,11 +278,21 @@ class ExternalApplySession(BaseScraper):
                 attempt_id=attempt_id,
             )
         if already_applied:
-            _event("duplicate_prevented", AttemptPhase.UNKNOWN, outcome="duplicate_application_prevented")
-            return AtsApplyResult.blocked(
-                "duplicate_application_prevented",
-                f"already applied to {key} — not resubmitting", attempt_id=attempt_id,
+            owned_recovery = bool(
+                job_id
+                and verified_record
+                and str(verified_record.get("job_id") or "") == job_id
             )
+            outcome = (
+                "verified_submission_recovered"
+                if owned_recovery
+                else "duplicate_application_prevented"
+            )
+            _event("duplicate_prevented", AttemptPhase.UNKNOWN, outcome=outcome)
+            detail = f"already applied to {key_reference} — not resubmitting"
+            if outcome == "duplicate_application_prevented":
+                return _reconciliation_block(outcome, detail)
+            return AtsApplyResult.blocked(outcome, detail, attempt_id=attempt_id)
         if in_progress:
             stale = self.ledger.is_stale_in_progress(key)
             _event("submit_in_progress_blocked", AttemptPhase.UNKNOWN,
@@ -248,10 +300,10 @@ class ExternalApplySession(BaseScraper):
             self._maybe_notify("submit_in_progress_blocked", "submit_in_progress",
                                f"{vendor}: apply needs attention",
                                "A prior submit is unresolved — review before retrying.",
-                               key=f"{key or attempt_id}:submit_in_progress")
+                               key=f"{key_reference}:submit_in_progress")
             return AtsApplyResult.blocked(
                 "submit_in_progress",
-                f"a prior submit for {key} is unresolved "
+                f"a prior submit for {key_reference} is unresolved "
                 f"({'stale/crashed' if stale else 'in flight'}) — not resubmitting blindly",
                 attempt_id=attempt_id,
             )
@@ -260,10 +312,9 @@ class ExternalApplySession(BaseScraper):
             # blindly risks a duplicate. Hold until reconciled (human/receipt re-check).
             _event("submit_unverified_blocked", AttemptPhase.UNKNOWN,
                    outcome="submit_unverified_unresolved")
-            return AtsApplyResult.blocked(
+            return _reconciliation_block(
                 "submit_unverified_unresolved",
-                f"a prior submit for {key} was unconfirmed — reconcile before resubmitting",
-                attempt_id=attempt_id,
+                f"a prior submit for {key_reference} was unconfirmed — reconcile before resubmitting",
             )
 
         policy: SubmissionPolicy = self._policy_override or AutoSubmitPolicy(allow=auto_submit)
@@ -277,7 +328,7 @@ class ExternalApplySession(BaseScraper):
             self._maybe_notify("profile_locked", "profile_locked",
                                f"{vendor}: apply blocked",
                                "Another Chrome holds the profile — close it and retry.",
-                               key=f"{key or attempt_id}:profile_locked")
+                               key=f"{key_reference}:profile_locked")
             return AtsApplyResult.blocked(
                 "profile_locked", str(e), attempt_id=attempt_id,
             )
@@ -342,9 +393,53 @@ class ExternalApplySession(BaseScraper):
                 run_log=self.run_log,
             )
 
-            # A submit may happen -> write the in-progress marker BEFORE it (crash-safe).
+            # A review-only call cannot dispatch: adapters and the policy both
+            # withhold submission when auto_submit is false.  Do not strand an
+            # in-progress marker if a dry-run adapter raises.  Submit-capable
+            # calls still claim atomically before the adapter can dispatch.
             if key and auto_submit:
-                self.ledger.begin(key, attempt_id)
+                try:
+                    existing = self.ledger.claim(key, attempt_id, job_id=job_id)
+                except LedgerUnreadableError as exc:
+                    return AtsApplyResult.blocked(
+                        "ledger_unreadable",
+                        f"submission ledger could not be claimed ({exc}) — refusing to submit",
+                        attempt_id=attempt_id,
+                    )
+                if existing is not None:
+                    phase = existing.get("phase")
+                    if phase == PHASE_VERIFIED:
+                        owned_recovery = bool(
+                            job_id
+                            and str(existing.get("job_id") or "") == job_id
+                        )
+                        outcome = (
+                            "verified_submission_recovered"
+                            if owned_recovery
+                            else "duplicate_application_prevented"
+                        )
+                        detail = f"already applied to {key_reference} — not resubmitting"
+                        if outcome == "duplicate_application_prevented":
+                            return _reconciliation_block(outcome, detail)
+                        return AtsApplyResult.blocked(
+                            outcome, detail, attempt_id=attempt_id
+                        )
+                    if phase == PHASE_IN_PROGRESS:
+                        return AtsApplyResult.blocked(
+                            "submit_in_progress",
+                            f"a prior submit for {key_reference} is unresolved — not resubmitting blindly",
+                            attempt_id=attempt_id,
+                        )
+                    if phase == PHASE_UNVERIFIED:
+                        return _reconciliation_block(
+                            "submit_unverified_unresolved",
+                            f"a prior submit for {key_reference} was unconfirmed — reconcile before resubmitting",
+                        )
+                    return AtsApplyResult.blocked(
+                        "ledger_unreadable",
+                        f"submission ledger has an unknown phase for {key_reference} — refusing to submit",
+                        attempt_id=attempt_id,
+                    )
                 marked = True
 
             adapter = await self.registry.pick(ctx)
@@ -403,12 +498,12 @@ class ExternalApplySession(BaseScraper):
                 elif res.status == "submission_unverified":
                     self.ledger.complete(key, attempt_id, verified=False)
                 else:
-                    self.ledger.clear(key)
+                    self.ledger.clear(key, attempt_id)
             _event("attempt_finished", _phase_for(res), outcome=res.status, verified=res.verified)
             self._emit_forensic_classification(attempt_id, job_id)
             self._maybe_notify("attempt_finished", res.status,
                                f"{vendor}: {res.status}", res.detail,
-                               key=f"{key or attempt_id}:{res.status}")
+                               key=f"{key_reference}:{res.status}")
             if not res.submitted and not res.verified:
                 # Coordinator incident reporting is strictly best-effort — it must
                 # never change the apply result or break the flow.
@@ -513,4 +608,3 @@ class ExternalApplySession(BaseScraper):
                 **(res.analytics or {}),
             )
         return res
-

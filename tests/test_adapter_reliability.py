@@ -3,6 +3,9 @@ containment, and profile lifecycle. All exercised with fakes; no browser needed.
 """
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -11,7 +14,12 @@ from src.sources.adapters.base import AtsAdapter
 from src.sources.adapters.registry import AtsAdapterRegistry
 from src.sources.adapters.session import ExternalApplySession
 from src.sources.adapters.policy import AutoSubmitPolicy, DenyAllPolicy
-from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+from src.sources.adapters.idempotency import (
+    LedgerOwnershipError,
+    SubmissionLedger,
+    canonical_key,
+    ledger_key_reference,
+)
 from src.sources.adapters.profile_lock import ProfileLock, ProfileLockError
 from src.sources.adapters.receipt import verify_receipt
 
@@ -174,6 +182,82 @@ def test_ledger_unverified_is_not_applied(tmp_path):
     assert led.needs_reconciliation(key) is True   # must block a blind resubmit
 
 
+def test_ledger_claim_is_atomic_across_concurrent_owners(tmp_path):
+    """Exactly one process-equivalent owner can claim a clear submission key."""
+    path = tmp_path / "l.json"
+    ledgers = [SubmissionLedger(path), SubmissionLedger(path)]
+    gate = Barrier(2)
+
+    def _claim(index):
+        gate.wait()
+        return ledgers[index].claim(
+            "greenhouse|https://example.test/job/1",
+            f"att-{index}",
+            job_id="job-1",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(_claim, range(2)))
+
+    assert sum(existing is None for existing in results) == 1
+    blocked = next(existing for existing in results if existing is not None)
+    winner = ledgers[0].record("greenhouse|https://example.test/job/1")
+    assert blocked == winner
+    assert winner["phase"] == "submit_in_progress"
+
+
+def test_stale_attempt_cannot_overwrite_newer_completion(tmp_path):
+    """Completion is conditional on the current atomic-claim owner."""
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(JOB)
+    ledger.claim(key, "old-attempt", job_id="job-1")
+    ledger.clear(key, "old-attempt")
+    ledger.claim(key, "new-attempt", job_id="job-1")
+    ledger.complete(key, "new-attempt", verified=True)
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.complete(key, "old-attempt", verified=False)
+
+    record = ledger.record(key)
+    assert record["attempt_id"] == "new-attempt"
+    assert record["phase"] == "receipt_verified"
+
+
+def test_stale_clear_cannot_delete_newer_or_verified_record(tmp_path):
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(JOB)
+    ledger.claim(key, "old-attempt", job_id="job-1")
+    ledger.clear(key, "old-attempt")
+    ledger.claim(key, "new-attempt", job_id="job-1")
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.clear(key, "old-attempt")
+
+    assert ledger.record(key)["attempt_id"] == "new-attempt"
+    ledger.complete(key, "new-attempt", verified=True)
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.clear(key, "new-attempt")
+
+    assert ledger.already_applied(key) is True
+
+
+def test_complete_requires_live_claim_and_cannot_downgrade_verified(tmp_path):
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(JOB)
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.complete(key, "attempt-1", verified=False)
+
+    ledger.claim(key, "attempt-1", job_id="job-1")
+    ledger.complete(key, "attempt-1", verified=True)
+
+    with pytest.raises(LedgerOwnershipError):
+        ledger.complete(key, "attempt-1", verified=False)
+
+    assert ledger.already_applied(key) is True
+
+
 def test_ledger_stale_in_progress(tmp_path):
     led = SubmissionLedger(tmp_path / "l.json")
     key = canonical_key(JOB)
@@ -242,13 +326,56 @@ async def test_session_honors_authorized_verified_submit(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_session_prevents_duplicate_without_launching(tmp_path, monkeypatch):
     led = SubmissionLedger(tmp_path / "l.json")
-    led.complete(canonical_key(JOB), "prev", verified=True)
+    key = canonical_key(JOB)
+    led.claim(key, "prev", job_id="another-local-row")
+    led.complete(key, "prev", verified=True)
     adapter = _RecordingAdapter(AtsApplyResult.ok())
     sess, page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=led)
     res = await sess.apply(JOB, auto_submit=True)
     assert res.status == "duplicate_application_prevented"
     assert page.goto_called is False                  # never even launched
     assert sess._closed is False
+
+
+@pytest.mark.asyncio
+async def test_session_recovers_only_verified_record_owned_by_same_job(tmp_path, monkeypatch):
+    led = SubmissionLedger(tmp_path / "l.json")
+    owned_job = {**JOB, "job_id": "job-1"}
+    key = canonical_key(owned_job)
+    led.claim(key, "prev", job_id=owned_job["job_id"])
+    led.complete(key, "prev", verified=True)
+    adapter = _RecordingAdapter(AtsApplyResult.ok())
+    sess, page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=led)
+
+    res = await sess.apply(owned_job, auto_submit=True)
+
+    assert res.status == "verified_submission_recovered"
+    assert page.goto_called is False
+
+
+@pytest.mark.asyncio
+async def test_session_rechecks_atomic_claim_before_adapter(tmp_path, monkeypatch):
+    """A race after preflight must still stop before any adapter can submit."""
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    adapter = _RecordingAdapter(AtsApplyResult.ok(), raises=True)
+    sess, page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=ledger)
+
+    monkeypatch.setattr(ledger, "already_applied", lambda _key: False)
+    monkeypatch.setattr(ledger, "in_progress", lambda _key: False)
+    monkeypatch.setattr(ledger, "needs_reconciliation", lambda _key: False)
+    monkeypatch.setattr(
+        ledger,
+        "claim",
+        lambda _key, _attempt_id, job_id="": {
+            "phase": "submit_in_progress",
+            "attempt_id": "concurrent-owner",
+        },
+    )
+
+    res = await sess.apply(JOB, auto_submit=True)
+
+    assert page.goto_called is True
+    assert res.status == "submit_in_progress"
 
 
 @pytest.mark.asyncio
@@ -264,11 +391,111 @@ async def test_session_blocks_unresolved_in_progress(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_session_blocks_unverified_until_reconciled(tmp_path, monkeypatch):
     led = SubmissionLedger(tmp_path / "l.json")
+    led.claim(canonical_key(JOB), "prev")
     led.complete(canonical_key(JOB), "prev", verified=False)   # a prior unconfirmed submit
     sess, page, _ = _make_session(tmp_path, _RecordingAdapter(AtsApplyResult.ok()), monkeypatch, ledger=led)
     res = await sess.apply(JOB, auto_submit=True)
     assert res.status == "submit_unverified_unresolved"
     assert page.goto_called is False                            # never resubmits blindly
+
+
+@pytest.mark.parametrize(
+    ("verified", "expected_status"),
+    [
+        (True, "duplicate_application_prevented"),
+        (False, "submit_unverified_unresolved"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_session_notifies_for_preflight_reconciliation(
+    tmp_path, monkeypatch, verified, expected_status
+):
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(JOB)
+    ledger.claim(key, "previous-attempt", job_id="another-job")
+    ledger.complete(key, "previous-attempt", verified=verified)
+    sess, page, _ = _make_session(
+        tmp_path,
+        _RecordingAdapter(AtsApplyResult.ok(), raises=True),
+        monkeypatch,
+        ledger=ledger,
+    )
+    sess.dispatcher = MagicMock()
+
+    result = await sess.apply(JOB, auto_submit=True)
+
+    assert result.status == expected_status
+    assert page.goto_called is False
+    sess.dispatcher.dispatch_event.assert_called_once_with(
+        "reconciliation_required",
+        expected_status,
+        "greenhouse: reconciliation required",
+        result.detail,
+        key=f"reconcile:{ledger_key_reference(key)}:{expected_status}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_redacts_sensitive_ledger_key_from_external_details(
+    tmp_path, monkeypatch
+):
+    job = {
+        "url": (
+            "https://applicant:super-secret@boards.greenhouse.io/acme/jobs/1"
+            "?gh_jid=private-token"
+        )
+    }
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    key = canonical_key(job)
+    ledger.claim(key, "previous-attempt", job_id="another-job")
+    ledger.complete(key, "previous-attempt", verified=True)
+    sess, page, _ = _make_session(
+        tmp_path,
+        _RecordingAdapter(AtsApplyResult.ok(), raises=True),
+        monkeypatch,
+        ledger=ledger,
+    )
+    sess.dispatcher = MagicMock()
+
+    result = await sess.apply(job, auto_submit=True)
+
+    exposed = f"{result.detail} {sess.dispatcher.dispatch_event.call_args}"
+    assert result.status == "duplicate_application_prevented"
+    assert page.goto_called is False
+    assert key not in exposed
+    assert "applicant" not in exposed
+    assert "super-secret" not in exposed
+    assert "private-token" not in exposed
+
+
+@pytest.mark.asyncio
+async def test_session_rejects_missing_durable_key_before_browser(tmp_path, monkeypatch):
+    adapter = _RecordingAdapter(AtsApplyResult.ok(), raises=True)
+    sess, page, _ = _make_session(tmp_path, adapter, monkeypatch)
+
+    res = await sess.apply({"job_id": "job-without-url"}, auto_submit=True)
+
+    assert res.status == "submission_ledger_key_missing"
+    assert page.goto_called is False
+
+
+@pytest.mark.asyncio
+async def test_session_validates_ledger_lock_before_browser(tmp_path, monkeypatch):
+    ledger = SubmissionLedger(tmp_path / "l.json")
+    adapter = _RecordingAdapter(AtsApplyResult.ok(), raises=True)
+    sess, page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=ledger)
+
+    def _unavailable_lock():
+        from src.sources.adapters.idempotency import LedgerUnreadableError
+
+        raise LedgerUnreadableError("lock unavailable")
+
+    monkeypatch.setattr(ledger, "validate", _unavailable_lock)
+
+    res = await sess.apply(JOB, auto_submit=True)
+
+    assert res.status == "ledger_unreadable"
+    assert page.goto_called is False
 
 
 @pytest.mark.asyncio
@@ -283,6 +510,21 @@ async def test_session_clears_marker_on_non_submit_outcome(tmp_path, monkeypatch
     key = canonical_key(JOB)
     assert led.needs_reconciliation(key) is False
     assert led.in_progress(key) is False
+
+
+@pytest.mark.asyncio
+async def test_session_dry_run_exception_never_creates_submit_marker(
+    tmp_path, monkeypatch
+):
+    """A review-only adapter call cannot dispatch, so it must not claim."""
+    led = SubmissionLedger(tmp_path / "l.json")
+    adapter = _RecordingAdapter(AtsApplyResult.ok(), raises=True)
+    sess, _page, _ = _make_session(tmp_path, adapter, monkeypatch, ledger=led)
+
+    with pytest.raises(RuntimeError, match="boom during apply"):
+        await sess.apply(JOB, auto_submit=False)
+
+    assert led.record(canonical_key(JOB)) is None
 
 
 @pytest.mark.asyncio

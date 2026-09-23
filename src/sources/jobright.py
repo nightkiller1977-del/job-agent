@@ -19,6 +19,7 @@ from playwright.async_api import Error as PlaywrightError, TimeoutError as Playw
 from rich.console import Console
 
 from .adapters.receipt import capture_receipt_evidence, verify_receipt
+from .adapters.forensics import host_of
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_success
 from src.resume_helper import ResumeFieldFixer, resolve_resume_path, check_ats_readability, ATSReadabilityError, KeywordCoverageError, PDFTextLayerError, load_profile
@@ -33,6 +34,8 @@ JOBRIGHT_JOBS_URL = "https://jobright.ai/jobs"
 JOBRIGHT_MATCHED_URL = "https://jobright.ai/jobs/recommend"
 TAILORED_RESUMES_DIR = Path(__file__).parent.parent.parent / "state" / "tailored_resumes"
 TAILORED_RESUMES_DIR.mkdir(parents=True, exist_ok=True)
+MAX_RECEIPT_FRAMES = 12
+RECEIPT_FRAME_TIMEOUT_MS = 1500
 
 
 class JobrightScraper(BaseScraper):
@@ -41,6 +44,15 @@ class JobrightScraper(BaseScraper):
     # Class-level flag: once Orion tailoring fails in a session, skip it for
     # all subsequent jobs instead of waiting 2-4 minutes per job on timeouts.
     _orion_tailoring_available: bool = True
+
+    def __init__(self, config: dict):
+        super().__init__(config)
+        # The registry path owns its own ledger through ExternalApplySession.
+        # Keep the same durable boundary on the legacy/Jobright-native path so
+        # an ambiguous click cannot be retried by a later scheduled process.
+        from .adapters.idempotency import SubmissionLedger
+
+        self._submission_ledger = SubmissionLedger()
 
     @classmethod
     def reset_orion_availability(cls) -> None:
@@ -56,6 +68,31 @@ class JobrightScraper(BaseScraper):
         self.last_apply_status = status
         self.last_apply_detail = detail
         return False
+
+    def _validate_submission_ledger_for_apply(self) -> bool:
+        """Fail closed before any employer-facing browser is launched."""
+        from .adapters.idempotency import LedgerUnreadableError
+
+        submission_ledger = getattr(self, "_submission_ledger", None)
+        if submission_ledger is None:
+            return self._set_apply_outcome(
+                "submission_ledger_unavailable",
+                "Submission ledger is unavailable; refusing to launch the browser.",
+            )
+        try:
+            submission_ledger.validate()
+        except LedgerUnreadableError as exc:
+            return self._set_apply_outcome(
+                "ledger_unreadable",
+                f"Submission ledger could not be read ({exc}); refusing to launch the browser.",
+            )
+        except Exception as exc:
+            return self._set_apply_outcome(
+                "submission_ledger_unavailable",
+                f"Submission ledger could not be validated ({type(exc).__name__}); "
+                "refusing to launch the browser.",
+            )
+        return True
 
     def _validation_metrics_from_error(self, exc: Exception) -> dict:
         result = getattr(exc, "result", None)
@@ -315,6 +352,12 @@ class JobrightScraper(BaseScraper):
                 self._apply_analytics = _res.analytics
             return _res.submitted
 
+        # The registry path performs this check in ExternalApplySession.  The
+        # opt-out legacy path shares this pre-browser boundary with native
+        # Jobright applies.
+        if not self._validate_submission_ledger_for_apply():
+            return False
+
         self.auto_submit = auto_submit
         self.last_apply_status = "started"
         self.last_apply_detail = ""
@@ -361,7 +404,10 @@ class JobrightScraper(BaseScraper):
                         continue
             else:
                 await self._delay(3, 5)
-            console.print(f"[magenta]Jobright ATS:[/magenta] Company portal loaded: {page.url}")
+            console.print(
+                "[magenta]Jobright ATS:[/magenta] Company portal loaded: "
+                f"{host_of(page.url) or 'employer portal'}"
+            )
 
             # Skip _click_ats_apply_button for Teamtailor — we're already on /applications/new
             if _is_teamtailor:
@@ -462,6 +508,7 @@ class JobrightScraper(BaseScraper):
                 console.print("[yellow]Jobright ATS:[/yellow] No local resume file found for upload fallback.")
 
             current_portal = page.url
+            current_portal_reference = host_of(current_portal) or "employer portal"
             _on_teamtailor = "teamtailor.com" in current_portal.lower()
             if "myworkdayjobs.com" not in current_portal:
                 if not entered_form and not await self._looks_like_application_form(page):
@@ -471,7 +518,7 @@ class JobrightScraper(BaseScraper):
                         f"{family}_form_not_reached" if family != "generic" else "form_not_reached",
                         (
                             f"Company portal did not expose an application form after opening "
-                            f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
+                            f"{current_portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                         ),
                     )
                 # Skip Jobright extension autofill for Teamtailor — extension not loaded,
@@ -495,11 +542,12 @@ class JobrightScraper(BaseScraper):
             if not _on_teamtailor and not await self._looks_like_application_form(page):
                 family = await self._detect_portal_family(page)
                 controls = await self._visible_controls_snapshot(page)
+                portal_reference = host_of(page.url) or "employer portal"
                 return self._set_apply_outcome(
                     f"{family}_form_not_detected" if family != "generic" else "form_not_detected",
                     (
                         f"ATS page loaded but no application/review form was detected at "
-                        f"{page.url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                        f"{portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                     ),
                 )
 
@@ -1634,6 +1682,9 @@ class JobrightScraper(BaseScraper):
                 auto_submit=auto_submit
             )
 
+        if not self._validate_submission_ledger_for_apply():
+            return False
+
         self.auto_submit = auto_submit
         self.last_apply_status = "started"
         self.last_apply_detail = ""
@@ -1743,7 +1794,10 @@ class JobrightScraper(BaseScraper):
                     base_url = company_page.url.split('?')[0].rstrip('/')
                     await company_page.goto(f"{base_url}/applications/new", wait_until="domcontentloaded", timeout=30000)
                     await self._delay(3, 5)
-                console.print(f"[green]Jobright:[/green] Extension opened ATS: {company_page.url[:80]}")
+                console.print(
+                    "[green]Jobright:[/green] Extension opened ATS: "
+                    f"{host_of(company_page.url) or 'employer portal'}"
+                )
             except Exception as _e:
                 console.print(f"[yellow]Jobright:[/yellow] Apply button didn't open new tab ({_e}); using direct navigation")
 
@@ -1769,7 +1823,10 @@ class JobrightScraper(BaseScraper):
             except Exception:
                 pass
 
-            console.print(f"[magenta]Jobright:[/magenta] Company portal loaded: {company_page.url}")
+            console.print(
+                "[magenta]Jobright:[/magenta] Company portal loaded: "
+                f"{host_of(company_page.url) or 'employer portal'}"
+            )
 
             # ── Step 7: Click Apply button FIRST ─────────────────────────────
             # Workday shows a job description page; clicking Apply opens the
@@ -1811,6 +1868,7 @@ class JobrightScraper(BaseScraper):
                 current_portal = company_page.url
             except Exception:
                 current_portal = ""
+            current_portal_reference = host_of(current_portal) or "employer portal"
 
             if 'myworkdayjobs.com' not in current_portal:
                 if not entered_form and not await self._looks_like_application_form(company_page):
@@ -1823,7 +1881,7 @@ class JobrightScraper(BaseScraper):
                         f"{family}_form_not_reached" if family != "generic" else "form_not_reached",
                         (
                             f"Company portal did not expose an application form after opening "
-                            f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
+                            f"{current_portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                         ),
                     )
                 # ── Claude ATS scoring + resume tailoring fallback (Jobright path) ──
@@ -1891,12 +1949,13 @@ class JobrightScraper(BaseScraper):
                     portal_url = company_page.url
                 except Exception:
                     portal_url = ""
+                portal_reference = host_of(portal_url) or "employer portal"
                 if "myworkdayjobs.com" in portal_url and "BUTTON Sign In" in controls_text:
                     console.print("[yellow]Jobright:[/yellow] Workday portal requires sign-in — marking as session-needed.")
                     self._workday_session_expired = True
                     return self._set_apply_outcome(
                         "workday_session_expired",
-                        f"Workday portal at {portal_url} requires sign-in. "
+                        f"Workday portal at {portal_reference} requires sign-in. "
                         "Run: python src/main.py prepare-sessions to authenticate this tenant.",
                     )
 
@@ -1904,7 +1963,7 @@ class JobrightScraper(BaseScraper):
                     f"{family}_form_not_detected" if family != "generic" else "form_not_detected",
                     (
                         f"ATS page loaded but no application/review form was detected at "
-                        f"{portal_url}. Visible controls: {controls_text}"
+                        f"{portal_reference}. Visible controls: {controls_text}"
                     ),
                 )
             submitted = await self._confirm_and_submit(company_page, job, auto_submit=auto_submit)
@@ -2018,7 +2077,9 @@ class JobrightScraper(BaseScraper):
                 await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
             await self._delay(4, 6)
             family = await self._detect_portal_family(company_page)
-            console.print(f"[cyan]Portal:[/cyan] {company_page.url}")
+            console.print(
+                f"[cyan]Portal:[/cyan] {host_of(company_page.url) or 'employer portal'}"
+            )
             console.print(f"[cyan]Detected:[/cyan] {family}")
 
             if family == "workday":
@@ -2191,6 +2252,11 @@ class JobrightScraper(BaseScraper):
                         if await asyncio.wait_for(
                             el.is_visible(), timeout=per_query_timeout_ms / 1000
                         ):
+                            # Keep the owning frame with the handle. Receipt
+                            # evidence after the click must be attributable to
+                            # this ATS context, not to any frame that happens to
+                            # appear elsewhere on the page.
+                            self._last_submit_frame = frame
                             return el
                     except Exception:
                         continue
@@ -2300,6 +2366,192 @@ class JobrightScraper(BaseScraper):
             if f not in ordered:
                 ordered.append(f)
         return ordered or [page]
+
+    @staticmethod
+    def _frame_origin(frame) -> str:
+        """Return a stable origin used to attribute a replacement ATS frame."""
+        from urllib.parse import urlsplit
+
+        try:
+            parsed = urlsplit(frame.url or "")
+        except Exception:
+            return ""
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        try:
+            port = parsed.port
+        except ValueError:
+            return ""
+        host = parsed.hostname.lower()
+        authority = f"{host}:{port}" if port is not None else host
+        return f"{parsed.scheme.lower()}://{authority}"
+
+    async def _capture_receipt_baselines(
+        self,
+        page,
+        *,
+        required_frame=None,
+        max_frames: int = MAX_RECEIPT_FRAMES,
+        per_frame_timeout_ms: int = RECEIPT_FRAME_TIMEOUT_MS,
+    ) -> list[tuple[object, object]]:
+        """Capture bounded pre-click evidence without trusting a wedged frame."""
+        if max_frames <= 0:
+            return []
+        frames = []
+        if required_frame is not None:
+            frames.append(required_frame)
+        for frame in self._candidate_frames(page):
+            if frame not in frames:
+                frames.append(frame)
+            if len(frames) >= max_frames:
+                break
+
+        baselines = []
+        for frame in frames:
+            try:
+                baseline = await asyncio.wait_for(
+                    capture_receipt_evidence(frame),
+                    timeout=per_frame_timeout_ms / 1000,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                continue
+            except Exception:
+                continue
+            baselines.append((frame, baseline))
+        return baselines
+
+    async def _verify_submit_receipt(
+        self,
+        page,
+        *,
+        submit_frame,
+        submit_origin: str,
+        receipt_baselines: list[tuple[object, object]],
+        retries: int = 5,
+        delay: float = 0.4,
+        max_frames: int = MAX_RECEIPT_FRAMES,
+        per_frame_timeout_ms: int = RECEIPT_FRAME_TIMEOUT_MS,
+    ) -> str:
+        """Poll only receipt contexts attributable to the clicked submit.
+
+        Playwright keeps a frame object when it navigates, but an embedded ATS
+        can replace its iframe entirely. A replacement is eligible only after
+        the submit-owning frame disappears and only when it has the same origin.
+        A surviving frame keeps its own pre-click baseline. A genuinely new
+        replacement inherits the submit frame's baseline, so neither a stale
+        sibling nor a remounted confirmation can become fresh merely because
+        the submit frame disappeared. Frames are re-enumerated on every poll to
+        catch delayed remounts.
+        """
+        submit_baseline = next(
+            (
+                baseline
+                for baseline_frame, baseline in receipt_baselines
+                if baseline_frame is submit_frame
+            ),
+            None,
+        )
+        if submit_baseline is None:
+            # Freshness cannot be proven without a pre-click snapshot.
+            return ""
+        if not submit_origin:
+            # about:blank, data:, and other opaque owners cannot be tied to an
+            # ATS origin. Neither a surviving opaque owner nor its future
+            # replacement may supply trusted receipt evidence.
+            return ""
+
+        submit_origin_baselines = [
+            baseline
+            for baseline_frame, baseline in receipt_baselines
+            if self._frame_origin(baseline_frame) == submit_origin
+        ] or [submit_baseline]
+
+        async def _verify_against_all_baselines(receipt_frame, baselines):
+            signal = ""
+            for baseline in baselines:
+                verified, current_signal = await verify_receipt(
+                    receipt_frame,
+                    retries=0,
+                    baseline=baseline,
+                )
+                if not verified:
+                    return False, ""
+                signal = signal or current_signal
+            return bool(signal), signal
+
+        for attempt in range(retries + 1):
+            current_frames = self._candidate_frames(page)
+            submit_frame_present = any(
+                current_frame is submit_frame for current_frame in current_frames
+            )
+
+            if (
+                submit_frame_present
+                and self._frame_origin(submit_frame) != submit_origin
+            ):
+                # The original owner is still attached but has left the ATS
+                # origin. Treat that as a poisoned context: a same-origin
+                # sibling must not be mistaken for a replacement receipt.
+                return ""
+
+            if submit_frame_present:
+                receipt_contexts = [(submit_frame, [submit_baseline])]
+            elif submit_origin:
+                receipt_contexts = []
+                for current_frame in current_frames:
+                    if len(receipt_contexts) >= max_frames:
+                        break
+                    if self._frame_origin(current_frame) != submit_origin:
+                        continue
+                    saved_baseline = next(
+                        (
+                            (True, baseline)
+                            for baseline_frame, baseline in receipt_baselines
+                            if baseline_frame is current_frame
+                        ),
+                        (False, None),
+                    )
+                    receipt_contexts.append(
+                        (
+                            current_frame,
+                            [saved_baseline[1]]
+                            if saved_baseline[0]
+                            else submit_origin_baselines,
+                        )
+                    )
+            else:
+                # An opaque/about:blank replacement cannot be safely tied to
+                # the clicked ATS frame, so fail closed.
+                receipt_contexts = []
+
+            receipt_checks = await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        _verify_against_all_baselines(
+                            receipt_frame,
+                            baselines,
+                        ),
+                        timeout=per_frame_timeout_ms / 1000,
+                    )
+                    for receipt_frame, baselines in receipt_contexts
+                ),
+                return_exceptions=True,
+            )
+            receipt_signal = next(
+                (
+                    signal
+                    for result in receipt_checks
+                    if not isinstance(result, BaseException)
+                    for verified, signal in [result]
+                    if verified
+                ),
+                "",
+            )
+            if receipt_signal:
+                return receipt_signal
+            if attempt < retries:
+                await self._delay(delay, delay)
+        return ""
 
     async def _frame_controls_snapshot(self, frame, limit: int) -> list[dict]:
         """Visible-control snapshot for exactly one frame."""
@@ -3186,9 +3438,10 @@ class JobrightScraper(BaseScraper):
         if clicked:
             await self._delay(5, 8)
             if await self._looks_like_login_wall(page):
+                portal_reference = host_of(page.url) or "Microsoft careers"
                 self._set_apply_outcome(
                     "microsoft_login_required",
-                    f"Microsoft careers redirected to login at {page.url}.",
+                    f"Microsoft careers redirected to login at {portal_reference}.",
                 )
                 return False
             apply_still_visible = await self._has_visible_control_matching(page, ['^apply now$', '^apply$'])
@@ -3198,9 +3451,10 @@ class JobrightScraper(BaseScraper):
                 return True
 
         controls = await self._visible_controls_snapshot(page)
+        portal_reference = host_of(page.url) or "Microsoft careers"
         self._set_apply_outcome(
             "microsoft_apply_control_not_activated" if clicked else "microsoft_apply_not_reached",
-            f"Could not enter Microsoft application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
+            f"Could not enter Microsoft application flow at {portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}",
         )
         return False
 
@@ -3226,9 +3480,10 @@ class JobrightScraper(BaseScraper):
         if clicked:
             await self._delay(5, 8)
             if await self._looks_like_login_wall(page):
+                portal_reference = host_of(page.url) or "BrassRing"
                 self._set_apply_outcome(
                     "brassring_login_required",
-                    f"BrassRing redirected to login/profile page at {page.url}.",
+                    f"BrassRing redirected to login/profile page at {portal_reference}.",
                 )
                 return False
             if await self._looks_like_application_form(page):
@@ -3236,9 +3491,10 @@ class JobrightScraper(BaseScraper):
                 return True
 
         controls = await self._visible_controls_snapshot(page)
+        portal_reference = host_of(page.url) or "BrassRing"
         self._set_apply_outcome(
             "brassring_apply_not_reached",
-            f"Could not enter BrassRing application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
+            f"Could not enter BrassRing application flow at {portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}",
         )
         return False
 
@@ -3259,6 +3515,12 @@ class JobrightScraper(BaseScraper):
         # first manual login, so this block is only reached when the session
         # has expired.  We detect the redirect and abort gracefully — the user
         # will need to re-run once manually to refresh the session.
+        def _portal_reference() -> str:
+            try:
+                return host_of(page.url) or "Workday portal"
+            except Exception:
+                return "Workday portal"
+
         try:
             url = page.url.lower()
             on_login_page = any(w in url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso."])
@@ -3280,7 +3542,8 @@ class JobrightScraper(BaseScraper):
 
         if on_login_page:
             console.print(
-                f"[bold red]Jobright: Workday session expired[/bold red] — portal URL: {page.url}"
+                "[bold red]Jobright: Workday session expired[/bold red] — portal: "
+                f"{_portal_reference()}"
             )
             self._workday_session_expired = True
 
@@ -3335,7 +3598,7 @@ class JobrightScraper(BaseScraper):
                 notify_error(
                     "Workday session expired",
                     f"Run 'python src/main.py prepare-sessions' to refresh the Workday session.\n"
-                    f"Portal: {page.url}",
+                    f"Portal: {_portal_reference()}",
                 )
             return
 
@@ -3375,12 +3638,13 @@ class JobrightScraper(BaseScraper):
 
         if session_gate:
             console.print(
-                f"[bold red]Jobright: Workday session gate detected after chooser click[/bold red] — {page.url}"
+                "[bold red]Jobright: Workday session gate detected after chooser click[/bold red] — "
+                f"{_portal_reference()}"
             )
             self._workday_session_expired = True
             notify_error(
                 "Workday session expired",
-                f"Run 'python src/main.py prepare-sessions' to refresh the Workday session.\nPortal: {page.url}",
+                f"Run 'python src/main.py prepare-sessions' to refresh the Workday session.\nPortal: {_portal_reference()}",
             )
             return
 
@@ -3905,12 +4169,14 @@ class JobrightScraper(BaseScraper):
         except Exception:
             pass
 
+        self._last_submit_frame = None
         submit_btn = await self._find_submit_control(page, submit_selectors)
 
         try:
             portal_url = page.url
         except Exception:
             portal_url = "(unknown)"
+        portal_reference = host_of(portal_url) or "employer portal"
         family = await self._detect_portal_family(page)
 
         # ── Guard: refuse to submit if no form fields appear to be filled ────
@@ -3970,10 +4236,10 @@ class JobrightScraper(BaseScraper):
                     "[yellow]Jobright: Submit button found but form appears empty — "
                     "autofill did not run or this is a listing page, not the application form.[/yellow]"
                 )
-                console.print(f"[dim]Portal: {portal_url}[/dim]")
+                console.print(f"[dim]Portal: {portal_reference}[/dim]")
                 return self._set_apply_outcome(
                     "form_empty_not_submitted",
-                    f"Submit button was found at {portal_url} but all form fields were empty. "
+                    f"Submit button was found at {portal_reference} but all form fields were empty. "
                     "Jobright autofill did not populate the form — ensure the extension is active "
                     "and the Jobright session is logged in, then re-run.",
                 )
@@ -3983,7 +4249,7 @@ class JobrightScraper(BaseScraper):
                 "[yellow]Jobright: Submit button not found and this run is non-interactive — "
                 "skipping instead of prompting.[/yellow]"
             )
-            console.print(f"[dim]Portal: {portal_url}[/dim]")
+            console.print(f"[dim]Portal: {portal_reference}[/dim]")
             controls = await self._visible_controls_snapshot(page)
             tailored_hint = getattr(self, "_last_tailored_resume_path", "") or ""
             if tailored_hint:
@@ -3992,7 +4258,7 @@ class JobrightScraper(BaseScraper):
                 f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
                 (
                     f"Reached portal but could not find a final Submit/Apply button at "
-                    f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                    f"{portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                     + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
                 ),
             )
@@ -4002,7 +4268,7 @@ class JobrightScraper(BaseScraper):
 
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
         console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
-        console.print(f"  Portal: {portal_url}")
+        console.print(f"  Portal: {portal_reference}")
         if submit_btn:
             console.print(f"  [green]Submit button found ✓[/green]")
         else:
@@ -4027,66 +4293,166 @@ class JobrightScraper(BaseScraper):
             # A click is an ambiguous external side effect. Snapshot every frame
             # immediately before dispatch so only fresh ATS acceptance evidence
             # can move this job to the submitted state.
-            receipt_baselines = []
-            for receipt_frame in self._candidate_frames(page):
+            submit_frame = self._last_submit_frame
+            if submit_frame is None:
                 try:
-                    baseline = await capture_receipt_evidence(receipt_frame)
+                    submit_frame = await submit_btn.owner_frame()
                 except Exception:
-                    continue
-                receipt_baselines.append((receipt_frame, baseline))
+                    try:
+                        submit_frame = page.main_frame
+                    except Exception:
+                        submit_frame = page
+            submit_origin = self._frame_origin(submit_frame)
+            submission_ledger = getattr(self, "_submission_ledger", None)
+            ledger_key = ""
+            ledger_attempt_id = ""
+            if submission_ledger is not None:
+                from uuid import uuid4
+
+                from .adapters.idempotency import canonical_key, ledger_key_reference
+
+                ledger_job = dict(job)
+                ledger_url = (
+                    getattr(self, "last_apply_ats_url", "")
+                    or self._safe_frame_url(submit_frame)
+                    or portal_url
+                )
+                ledger_job["url"] = ledger_url
+                ledger_key = canonical_key(ledger_job)
+                ledger_key_ref = ledger_key_reference(ledger_key)
+                ledger_attempt_id = uuid4().hex
+                if not ledger_key:
+                    return self._set_apply_outcome(
+                        "submission_ledger_key_missing",
+                        "Could not derive a durable submission key; refusing to click submit.",
+                    )
+            receipt_baselines = await self._capture_receipt_baselines(
+                page,
+                required_frame=submit_frame,
+            )
+
+            if submission_ledger is not None:
+                try:
+                    from .adapters.idempotency import (
+                        LedgerUnreadableError,
+                        PHASE_IN_PROGRESS,
+                        PHASE_UNVERIFIED,
+                        PHASE_VERIFIED,
+                    )
+
+                    # Atomic crash-safe boundary: only one worker can claim this
+                    # key before the employer-facing side effect below.
+                    existing = submission_ledger.claim(
+                        ledger_key,
+                        ledger_attempt_id,
+                        job_id=str(job.get("job_id") or ""),
+                    )
+                except LedgerUnreadableError as exc:
+                    return self._set_apply_outcome(
+                        "ledger_unreadable",
+                        f"Submission ledger could not be read ({exc}); refusing to submit.",
+                    )
+                except Exception as exc:
+                    return self._set_apply_outcome(
+                        "submission_ledger_unavailable",
+                        f"Could not persist the pre-submit marker ({type(exc).__name__}); refusing to submit.",
+                    )
+                if existing is not None:
+                    phase = existing.get("phase")
+                    if phase == PHASE_VERIFIED:
+                        owned_recovery = bool(
+                            job.get("job_id")
+                            and str(existing.get("job_id") or "")
+                            == str(job.get("job_id"))
+                        )
+                        return self._set_apply_outcome(
+                            (
+                                "verified_submission_recovered"
+                                if owned_recovery
+                                else "duplicate_application_prevented"
+                            ),
+                            f"A verified submission already exists for {ledger_key_ref}; not resubmitting.",
+                        )
+                    if phase == PHASE_IN_PROGRESS:
+                        return self._set_apply_outcome(
+                            "submit_in_progress",
+                            f"A prior submit for {ledger_key_ref} is unresolved; not resubmitting.",
+                        )
+                    if phase == PHASE_UNVERIFIED:
+                        return self._set_apply_outcome(
+                            "submit_unverified_unresolved",
+                            f"A prior submit for {ledger_key_ref} was unconfirmed; reconcile before resubmitting.",
+                        )
+                    return self._set_apply_outcome(
+                        "submission_ledger_unavailable",
+                        f"Submission ledger has an unknown phase for {ledger_key_ref}; refusing to submit.",
+                    )
 
             # Use JS click to bypass Workday overlay divs that intercept pointer events.
             # Evaluate on the handle itself, not on `page`: the control may live in a
             # child frame, and a handle cannot be adopted into another frame's context
             # (ACES-428). ElementHandle.evaluate always runs in its own frame.
+            dispatch_error = None
             try:
                 await submit_btn.evaluate("btn => btn.click()")
-            except Exception:
-                # Fallback: dispatch a MouseEvent directly, same frame-local rule.
-                try:
-                    await submit_btn.evaluate(
-                        "btn => btn.dispatchEvent("
-                        "new MouseEvent('click', {bubbles: true, cancelable: true}))"
-                    )
-                except Exception as exc:
-                    # Neither click path landed — do not fall through to the
-                    # "submitted" bookkeeping below on an unproven click.
-                    return self._set_apply_outcome(
-                        "submit_click_failed",
-                        f"Found a submit control at {portal_url} but could not click it: "
-                        f"{type(exc).__name__}.",
-                    )
+            except Exception as exc:
+                # evaluate() can reject after btn.click() already dispatched
+                # (for example, when navigation destroys the execution context).
+                # Never issue a blind fallback click: reconcile the one uncertain
+                # dispatch against fresh receipt evidence instead.
+                dispatch_error = exc
             await self._delay(3, 5)
 
-            receipt_checks = await asyncio.gather(
-                *(
-                    verify_receipt(
-                        receipt_frame,
-                        retries=5,
-                        delay=0.4,
-                        baseline=baseline,
-                    )
-                    for receipt_frame, baseline in receipt_baselines
-                ),
-                return_exceptions=True,
-            )
-            receipt_signal = next(
-                (
-                    signal
-                    for result in receipt_checks
-                    if not isinstance(result, BaseException)
-                    for verified, signal in [result]
-                    if verified
-                ),
-                "",
+            receipt_signal = await self._verify_submit_receipt(
+                page,
+                submit_frame=submit_frame,
+                submit_origin=submit_origin,
+                receipt_baselines=receipt_baselines,
             )
             if not receipt_signal:
+                ledger_detail = ""
+                if submission_ledger is not None:
+                    try:
+                        submission_ledger.complete(
+                            ledger_key, ledger_attempt_id, verified=False
+                        )
+                    except Exception as exc:
+                        # begin() already persisted submit_in_progress, which is
+                        # still a fail-closed duplicate guard if completion fails.
+                        ledger_detail = (
+                            f" Ledger completion raised {type(exc).__name__}; "
+                            "the in-progress marker remains for reconciliation."
+                        )
+                dispatch_detail = (
+                    f"submit dispatch raised {type(dispatch_error).__name__}; its "
+                    "outcome is uncertain, and no fresh "
+                    if dispatch_error is not None
+                    else "a final submit control was clicked, but no fresh "
+                )
                 return self._set_apply_outcome(
                     "submission_unverified",
-                    f"Clicked a final submit control at {portal_url}, but no fresh "
-                    "ATS acceptance receipt appeared. Reconcile the employer portal "
-                    "before retrying to avoid a duplicate application.",
+                    f"At {portal_reference}, {dispatch_detail}ATS acceptance receipt "
+                    "appeared. Reconcile the employer portal "
+                    f"before retrying to avoid a duplicate application.{ledger_detail}",
                 )
+
+            if submission_ledger is not None:
+                try:
+                    submission_ledger.complete(
+                        ledger_key, ledger_attempt_id, verified=True
+                    )
+                except Exception as exc:
+                    # Receipt evidence is not a recoverable success until the
+                    # verified phase is durable.  Keep the job parked behind the
+                    # pre-submit marker instead of letting the orchestrator mark
+                    # it applied with no crash-recovery proof.
+                    return self._set_apply_outcome(
+                        "submission_unverified",
+                        f"A fresh ATS receipt appeared at {portal_reference}, but the "
+                        f"submission ledger could not durably record it "
+                        f"({type(exc).__name__}). Reconcile the employer portal "
+                        "before retrying.",
+                    )
 
             # ── Record analytics for orchestrator to persist via extra_json ──
             self._apply_analytics = {
@@ -4116,17 +4482,135 @@ class JobrightScraper(BaseScraper):
                     f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
                     (
                         f"Auto-submit requested, but no submit button was found at "
-                        f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                        f"{portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                         + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
                     ),
                 )
+            submission_ledger = getattr(self, "_submission_ledger", None)
+            if submission_ledger is None:
+                return self._set_apply_outcome(
+                    "submission_ledger_unavailable",
+                    "Cannot guard a manual submission without a durable ledger; refusing to report success.",
+                )
+
+            from uuid import uuid4
+
+            from .adapters.idempotency import (
+                LedgerUnreadableError,
+                PHASE_IN_PROGRESS,
+                PHASE_UNVERIFIED,
+                PHASE_VERIFIED,
+                canonical_key,
+                ledger_key_reference,
+            )
+
+            ledger_job = dict(job)
+            ledger_job["url"] = (
+                getattr(self, "last_apply_ats_url", "") or portal_url
+            )
+            ledger_key = canonical_key(ledger_job)
+            ledger_key_ref = ledger_key_reference(ledger_key)
+            if not ledger_key:
+                return self._set_apply_outcome(
+                    "submission_ledger_key_missing",
+                    "Could not derive a durable submission key; refusing to request a manual submit.",
+                )
+            ledger_attempt_id = uuid4().hex
+            try:
+                existing = submission_ledger.claim(
+                    ledger_key,
+                    ledger_attempt_id,
+                    job_id=str(job.get("job_id") or ""),
+                )
+            except LedgerUnreadableError as exc:
+                return self._set_apply_outcome(
+                    "ledger_unreadable",
+                    f"Submission ledger could not be read ({exc}); refusing a manual submit.",
+                )
+            except Exception as exc:
+                return self._set_apply_outcome(
+                    "submission_ledger_unavailable",
+                    f"Could not persist the pre-submit marker ({type(exc).__name__}); "
+                    "refusing a manual submit.",
+                )
+            if existing is not None:
+                phase = existing.get("phase")
+                if phase == PHASE_VERIFIED:
+                    owned_recovery = bool(
+                        job.get("job_id")
+                        and str(existing.get("job_id") or "")
+                        == str(job.get("job_id"))
+                    )
+                    return self._set_apply_outcome(
+                        (
+                            "verified_submission_recovered"
+                            if owned_recovery
+                            else "duplicate_application_prevented"
+                        ),
+                        f"A verified submission already exists for {ledger_key_ref}; not resubmitting.",
+                    )
+                if phase == PHASE_IN_PROGRESS:
+                    return self._set_apply_outcome(
+                        "submit_in_progress",
+                        f"A prior submit for {ledger_key_ref} is unresolved; not resubmitting.",
+                    )
+                if phase == PHASE_UNVERIFIED:
+                    return self._set_apply_outcome(
+                        "submit_unverified_unresolved",
+                        f"A prior submit for {ledger_key_ref} was unconfirmed; reconcile before resubmitting.",
+                    )
+                return self._set_apply_outcome(
+                    "submission_ledger_unavailable",
+                    f"Submission ledger has an unknown phase for {ledger_key_ref}; refusing to submit.",
+                )
+
             console.print("[yellow]Click Submit in the browser window, then confirm below.[/yellow]")
             try:
                 input("  Press Enter after submitting (or to skip) > ")
-                answer = input("  Did you successfully submit? [y/N] > ").strip().lower()
-                return answer == "y"
+                dispatched = input("  Did you click Submit? [y/n] > ").strip().lower()
+                answer = (
+                    input("  Did you successfully submit? [y/N] > ").strip().lower()
+                    if dispatched == "y"
+                    else ""
+                )
             except (EOFError, KeyboardInterrupt):
-                return False
+                # Without an explicit no-click answer, preserve the claim: the
+                # external side effect may already have happened.
+                dispatched = "unknown"
+                answer = ""
+
+            if dispatched not in {"n", "no"}:
+                ledger_detail = ""
+                try:
+                    submission_ledger.complete(
+                        ledger_key, ledger_attempt_id, verified=False
+                    )
+                except Exception as exc:
+                    ledger_detail = (
+                        f" Ledger completion raised {type(exc).__name__}; the "
+                        "in-progress marker remains for reconciliation."
+                    )
+                return self._set_apply_outcome(
+                    "submission_unverified",
+                    "A manual submit click may have been dispatched"
+                    + (" and portal success was reported" if answer == "y" else "")
+                    + ", but no fresh receipt was verified. Reconcile the employer "
+                    "portal before retrying."
+                    f"{ledger_detail}",
+                )
+
+            try:
+                submission_ledger.clear(ledger_key, ledger_attempt_id)
+            except Exception as exc:
+                return self._set_apply_outcome(
+                    "submission_ledger_unavailable",
+                    f"Manual submission was cancelled, but its ledger marker could "
+                    f"not be cleared ({type(exc).__name__}); reconcile before retrying.",
+                )
+            return self._set_apply_outcome(
+                "submission_cancelled",
+                "Manual submission was not confirmed.",
+            )
 
 
 def _infer_remote_type(remote_raw: str, location: str) -> str:

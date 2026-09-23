@@ -253,18 +253,76 @@ class StateManager:
             "skipped": "reviewed_at",
             "bookmarked": "reviewed_at",
         }.get(status)
-        if ts_field:
-            with self._connect() as conn:
+        with self._connect() as conn:
+            extra_json = None
+            if status == "applied":
+                row = conn.execute(
+                    "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if row is not None:
+                    extra = parse_extra_json(row["extra_json"])
+                    # Queue this in the same transaction as the local status
+                    # promotion. A crash or ambiguous network failure can then
+                    # be retried safely until the cloud confirms the idempotent
+                    # target state.
+                    extra["cloud_status_sync_pending"] = {
+                        "status": status,
+                        "queued_at": now,
+                    }
+                    extra_json = json.dumps(extra)
+            if ts_field and extra_json is not None:
+                conn.execute(
+                    f"UPDATE jobs SET status = ?, {ts_field} = ?, extra_json = ? "
+                    "WHERE job_id = ?",
+                    (status, now, extra_json, job_id),
+                )
+            elif ts_field:
                 conn.execute(
                     f"UPDATE jobs SET status = ?, {ts_field} = ? WHERE job_id = ?",
                     (status, now, job_id),
                 )
-        else:
-            with self._connect() as conn:
+            else:
                 conn.execute(
                     "UPDATE jobs SET status = ? WHERE job_id = ?",
                     (status, job_id),
                 )
+
+    def list_pending_cloud_status_sync(self) -> list[dict]:
+        """Return durable local status promotions not yet confirmed by cloud."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, extra_json FROM jobs "
+                "WHERE extra_json LIKE '%cloud_status_sync_pending%'"
+            ).fetchall()
+        pending: list[dict] = []
+        for row in rows:
+            marker = parse_extra_json(row["extra_json"]).get(
+                "cloud_status_sync_pending"
+            )
+            status = marker.get("status") if isinstance(marker, dict) else ""
+            if status:
+                pending.append({"job_id": row["job_id"], "status": str(status)})
+        return pending
+
+    def clear_pending_cloud_status_sync(self, job_id: str, status: str) -> bool:
+        """Clear only the cloud-sync obligation matching a confirmed status."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            extra = parse_extra_json(row["extra_json"])
+            marker = extra.get("cloud_status_sync_pending")
+            marker_status = marker.get("status") if isinstance(marker, dict) else ""
+            if marker_status != status:
+                return False
+            extra.pop("cloud_status_sync_pending", None)
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra) if extra else None, job_id),
+            )
+        return True
 
     def transition_confirmation(self, job_id: str, to_status: str) -> None:
         """Transitions confirmation_status following the formal state transition table."""
@@ -350,12 +408,19 @@ class StateManager:
             )
             return target_status
 
-    def sync_confirmation_from_ledger(self, job_id: str, ledger: Any = None) -> Optional[str]:
+    def sync_confirmation_from_ledger(
+        self,
+        job_id: str,
+        ledger: Any = None,
+        *,
+        raise_on_error: bool = False,
+    ) -> Optional[str]:
         """Projects SubmissionLedger attempt state onto the job's confirmation_status lifecycle.
 
         Handles:
           - receipt_verified -> 'submitted'
-          - submit_in_progress (live) -> 'submitting'
+          - submit_in_progress (live) -> no durable projection; the ledger
+            itself blocks competing workers until the owner resolves it
           - submit_in_progress (stale) -> 'reconciliation_required'
           - submission_unverified -> 'submission_unverified'
         """
@@ -372,11 +437,46 @@ class StateManager:
 
         try:
             from .sources.adapters.idempotency import canonical_key, PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED
-            key = canonical_key(job)
-            if not key:
-                return job.get("confirmation_status")
 
-            record = ledger.record(key) if hasattr(ledger, "record") else ledger.get(key)
+            extra = parse_extra_json(job.get("extra_json"))
+            candidate_urls = [
+                job.get("ats_url"),
+                extra.get("ats_url"),
+                job.get("external_url"),
+                job.get("url"),
+            ]
+            keys = []
+            for url in candidate_urls:
+                key = canonical_key({"url": url}) if url else ""
+                if key and key not in keys:
+                    keys.append(key)
+
+            record = None
+            matched_key = ""
+            for key in keys:
+                candidate = ledger.record(key) if hasattr(ledger, "record") else ledger.get(key)
+                if candidate:
+                    # An approved row may share a canonical ATS URL with a
+                    # different local discovery row. That record still blocks
+                    # duplicate dispatch, but it is not evidence that *this*
+                    # row was submitted and must not promote it to applied.
+                    candidate_job_id = str(candidate.get("job_id") or "")
+                    if candidate_job_id != str(job_id) and (
+                        candidate_job_id or job.get("status") == "approved"
+                    ):
+                        continue
+                    matched_key = key
+                    record = candidate
+                    break
+
+            # Crash recovery cannot depend solely on extra_json.ats_url: the
+            # process may die after employer submission but before persisting
+            # that resolved portal URL. The atomic claim therefore carries the
+            # local job ID as a secondary durable lookup key.
+            if not record and hasattr(ledger, "record_for_job"):
+                job_record = ledger.record_for_job(str(job_id))
+                if job_record:
+                    matched_key, record = job_record
             if not record:
                 return job.get("confirmation_status")
 
@@ -388,10 +488,13 @@ class StateManager:
             elif phase == PHASE_UNVERIFIED:
                 target_status = "submission_unverified"
             elif phase == PHASE_IN_PROGRESS:
-                if hasattr(ledger, "is_stale_in_progress") and ledger.is_stale_in_progress(key):
+                if hasattr(ledger, "is_stale_in_progress") and ledger.is_stale_in_progress(matched_key):
                     target_status = "reconciliation_required"
                 else:
-                    target_status = "submitting"
+                    # A live claim is temporary ownership, not durable evidence
+                    # that this job submitted. Persisting it can strand the row
+                    # after the owner releases a pre-submit claim.
+                    return job.get("confirmation_status")
 
             curr_conf = job.get("confirmation_status")
             # Never downgrade terminal verified state
@@ -403,27 +506,69 @@ class StateManager:
 
         except Exception as exc:
             _log.warning("Error syncing confirmation from ledger for %s: %s", job_id, exc)
+            if raise_on_error:
+                raise
 
         return job.get("confirmation_status")
 
-    def reconcile_active_jobs_from_ledger(self) -> int:
-        """Scans unconfirmed active applied jobs, projecting SubmissionLedger phase onto confirmation_status."""
-        try:
-            from .sources.adapters.idempotency import SubmissionLedger
-            ledger = SubmissionLedger()
-        except Exception:
-            return 0
+    def reconcile_active_jobs_from_ledger(self, ledger: Any = None) -> int:
+        """Project durable submit state onto unconfirmed approved/applied jobs.
+
+        A verified receipt promotes an approved row to applied before the apply
+        pool is built, preventing a restarted worker from reopening a browser
+        for an application that the employer already received.
+        """
+        if ledger is None:
+            try:
+                from .sources.adapters.idempotency import (
+                    LedgerUnreadableError,
+                    SubmissionLedger,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "submission ledger could not be imported for reconciliation"
+                ) from exc
+            try:
+                ledger = SubmissionLedger()
+            except LedgerUnreadableError:
+                raise
+            except Exception as exc:
+                raise LedgerUnreadableError(
+                    f"submission ledger could not be initialized: {exc}"
+                ) from exc
 
         reconciled_count = 0
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT job_id FROM jobs WHERE status = 'applied' AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')"
+                "SELECT job_id, status FROM jobs WHERE status IN ('approved', 'applied') AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')"
             ).fetchall()
 
         for r in rows:
             jid = r["job_id"]
-            new_status = self.sync_confirmation_from_ledger(jid, ledger=ledger)
+            new_status = self.sync_confirmation_from_ledger(
+                jid,
+                ledger=ledger,
+                raise_on_error=True,
+            )
             if new_status:
+                if r["status"] == "approved" and new_status in {
+                    "submitted",
+                    "receipt_pending",
+                }:
+                    # ``sync_confirmation_from_ledger`` preserves an existing
+                    # higher-ranked DB status even when no ledger record was
+                    # found. Promotion requires separate proof that this pass
+                    # found a receipt-verified record owned by this exact job.
+                    owned_record = (
+                        ledger.record_for_job(str(jid))
+                        if hasattr(ledger, "record_for_job")
+                        else None
+                    )
+                    if (
+                        owned_record
+                        and owned_record[1].get("phase") == "receipt_verified"
+                    ):
+                        self.set_status(jid, "applied")
                 reconciled_count += 1
 
         return reconciled_count

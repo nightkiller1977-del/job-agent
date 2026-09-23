@@ -37,6 +37,7 @@ class NoticeClass(str, Enum):
 _HUMAN_OUTCOMES = {
     "review_ready", "needs_answer", "needs_session", "needs_session_prep",
     "needs_hydration", "submission_unverified", "submit_in_progress",
+    "submit_unverified_unresolved", "duplicate_application_prevented",
     "login_required",   # generic adapter's pre-fill login wall needs a human
     # terminal 'Needs Human / Structural' outcomes: the application was NOT submitted
     "submit_not_found", "form_not_reached",
@@ -143,7 +144,7 @@ def _default_channels() -> list[Channel]:
 
     def _warn(n: dict) -> None:
         from src.notifier import notify_warning
-        notify_warning(n["title"], n["message"])
+        notify_warning(n["title"], n["message"], dedupe_key=n.get("key"))
 
     def _error(n: dict) -> None:
         from src.notifier import notify_error

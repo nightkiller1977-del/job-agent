@@ -5,22 +5,26 @@ a duplicate application. Keyed by a canonical (vendor, normalized-URL) key so th
 same posting reached via two different tracking URLs is still recognised as one.
 
 Lifecycle per attempt:
-    begin(key, attempt_id)  -> writes a "submit_in_progress" marker BEFORE the click
+    claim(key, attempt_id)  -> atomically writes "submit_in_progress" iff clear
     complete(key, attempt_id, verified) -> "receipt_verified" | "submission_unverified"
 
 Reads before launching a browser:
     already_applied(key)  -> a prior attempt reached receipt_verified  -> skip, do not resubmit
     in_progress(key)      -> a prior attempt died mid-submit           -> do not blindly resubmit
 
-Backed by a small JSON file under state/ so it is self-contained and does not touch
-the concurrently-edited state_manager.py. Full jobs.db integration is a later step.
+Backed by a small JSON file under state/. Read-modify-write transitions use an OS
+file lock so independent scheduler processes cannot both claim the same posting.
 """
 from __future__ import annotations
 
 import json
+import fcntl
+import hashlib
+import math
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .generic import detect_vendor
@@ -44,6 +48,10 @@ class LedgerUnreadableError(Exception):
     can't be read must never be treated as empty history, or a prior
     unresolved/verified submission could be silently forgotten."""
 
+
+class LedgerOwnershipError(RuntimeError):
+    """A stale attempt tried to mutate a key now owned by another attempt."""
+
 # An in-progress marker older than this (seconds) is treated as a crashed attempt,
 # not a live one — it still blocks a *blind* resubmit but is reported as stale.
 STALE_AFTER_S = 6 * 60 * 60
@@ -55,6 +63,22 @@ def canonical_key(job: dict) -> str:
     norm = normalize_external_url(url)
     vendor = detect_vendor(norm or url)
     return f"{vendor}|{norm}" if norm else ""
+
+
+def ledger_key_reference(key: str) -> str:
+    """Return an opaque, stable reference safe for external diagnostics.
+
+    Canonical keys deliberately include a normalized posting URL for exact
+    deduplication. That URL can contain userinfo or job-ID query values, so the
+    raw key must remain confined to the local ledger and never enter operator
+    notifications, apply-attempt details, or cloud state.
+    """
+    if not key:
+        return "submission|ref:unknown"
+    vendor, separator, _url = key.partition("|")
+    safe_vendor = vendor if separator and vendor.isalnum() else "submission"
+    digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{safe_vendor}|ref:{digest}"
 
 
 class SubmissionLedger:
@@ -71,9 +95,34 @@ class SubmissionLedger:
         except OSError as e:
             raise LedgerUnreadableError(f"ledger at {self.path} could not be read: {e}") from e
         try:
-            return json.loads(raw)
+            data = json.loads(raw)
         except Exception as e:
             raise LedgerUnreadableError(f"ledger at {self.path} is corrupt: {e}") from e
+        if not isinstance(data, dict):
+            raise LedgerUnreadableError(
+                f"ledger at {self.path} must contain a JSON object"
+            )
+        known_phases = {PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED}
+        for key, record in data.items():
+            attempt_id = record.get("attempt_id") if isinstance(record, dict) else None
+            timestamp = record.get("ts") if isinstance(record, dict) else None
+            valid_timestamp = (
+                isinstance(timestamp, (int, float))
+                and not isinstance(timestamp, bool)
+                and math.isfinite(timestamp)
+            )
+            if (
+                not isinstance(record, dict)
+                or record.get("phase") not in known_phases
+                or not isinstance(attempt_id, str)
+                or not attempt_id.strip()
+                or not valid_timestamp
+            ):
+                raise LedgerUnreadableError(
+                    f"ledger at {self.path} has an invalid record for "
+                    f"{ledger_key_reference(str(key))}"
+                )
+        return data
 
     def _save(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,11 +139,57 @@ class SubmissionLedger:
                 pass
             raise
 
+    @contextmanager
+    def _exclusive_lock(self):
+        """Serialize read-modify-write transitions across worker processes."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f"{self.path.name}.lock")
+        try:
+            with open(lock_path, "a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            raise LedgerUnreadableError(
+                f"ledger lock at {lock_path} could not be acquired: {exc}"
+            ) from exc
+
     # ---- queries -------------------------------------------------------------
     def record(self, key: str) -> dict | None:
         if not key:
             return None
         return self._load().get(key)
+
+    def validate(self) -> None:
+        """Verify durable history is readable and its lock is available.
+
+        A missing first-run file is valid empty history.  Existing corrupt or
+        inaccessible state must fail before an employer-facing browser starts.
+        """
+        with self._exclusive_lock():
+            self._load()
+
+    def record_for_job(self, job_id: str) -> tuple[str, dict] | None:
+        """Return the newest durable record associated with *job_id*.
+
+        The ATS key can differ from the discovery URL stored on the job row.
+        Keeping the local job identifier on the pre-submit claim lets startup
+        recovery find the receipt even if the process crashed before it could
+        persist the resolved ATS URL back to SQLite.
+        """
+        if not job_id:
+            return None
+        matches = [
+            (key, record)
+            for key, record in self._load().items()
+            if isinstance(record, dict) and str(record.get("job_id") or "") == job_id
+        ]
+        if not matches:
+            return None
+        key, record = max(matches, key=lambda item: float(item[1].get("ts", 0)))
+        return key, dict(record)
 
     def already_applied(self, key: str) -> bool:
         rec = self.record(key)
@@ -110,14 +205,33 @@ class SubmissionLedger:
         rec = self.record(key)
         return bool(rec and rec.get("phase") == PHASE_UNVERIFIED)
 
-    def clear(self, key: str) -> None:
+    def clear(self, key: str, attempt_id: str) -> None:
         """Drop a marker entirely — used when an attempt ended WITHOUT a submit
         click (e.g. a login wall or blocker), so the in-progress marker must not
-        linger as unverified and block future attempts."""
+        linger as unverified and block future attempts.
+
+        Clearing is a compare-and-delete transition: only the attempt that owns
+        the current in-progress claim may release it. A delayed worker must not
+        erase a newer claim or terminal receipt evidence.
+        """
         if not key:
             return
-        data = self._load()
-        if key in data:
+        with self._exclusive_lock():
+            data = self._load()
+            existing = data.get(key)
+            if existing is None:
+                return
+            existing_attempt_id = str(existing.get("attempt_id") or "")
+            if (
+                existing.get("phase") != PHASE_IN_PROGRESS
+                or existing_attempt_id != str(attempt_id)
+            ):
+                raise LedgerOwnershipError(
+                    f"submission key {ledger_key_reference(key)} cannot be cleared "
+                    f"by {attempt_id}; "
+                    f"current owner is {existing_attempt_id or '(unknown)'} "
+                    f"in phase {existing.get('phase') or '(unknown)'}"
+                )
             del data[key]
             self._save(data)
 
@@ -128,20 +242,74 @@ class SubmissionLedger:
         return (time.time() - float(rec.get("ts", 0))) > STALE_AFTER_S
 
     # ---- transitions ---------------------------------------------------------
-    def begin(self, key: str, attempt_id: str) -> None:
+    def claim(self, key: str, attempt_id: str, *, job_id: str = "") -> dict | None:
+        """Atomically claim *key* for one submit attempt.
+
+        Returns ``None`` when this caller wrote the in-progress marker. If any
+        prior marker already exists, returns that record without modifying it.
+        The compare-and-set and write share one OS file lock, so concurrent
+        processes cannot both pass the duplicate gate.
+        """
         if not key:
-            return
-        data = self._load()
-        data[key] = {"phase": PHASE_IN_PROGRESS, "attempt_id": attempt_id, "ts": time.time()}
-        self._save(data)
+            return None
+        with self._exclusive_lock():
+            data = self._load()
+            existing = data.get(key)
+            if existing is not None:
+                return dict(existing)
+            record = {
+                "phase": PHASE_IN_PROGRESS,
+                "attempt_id": attempt_id,
+                "ts": time.time(),
+            }
+            if job_id:
+                record["job_id"] = job_id
+            data[key] = record
+            self._save(data)
+        return None
+
+    def begin(self, key: str, attempt_id: str) -> None:
+        """Backward-compatible claiming helper used by tests and migrations."""
+        existing = self.claim(key, attempt_id)
+        if existing is not None:
+            raise LedgerOwnershipError(
+                f"submission key {ledger_key_reference(key)} is already owned by "
+                f"{existing.get('attempt_id') or '(unknown)'}"
+            )
 
     def complete(self, key: str, attempt_id: str, verified: bool) -> None:
         if not key:
             return
-        data = self._load()
-        data[key] = {
-            "phase": PHASE_VERIFIED if verified else PHASE_UNVERIFIED,
-            "attempt_id": attempt_id,
-            "ts": time.time(),
-        }
-        self._save(data)
+        with self._exclusive_lock():
+            data = self._load()
+            existing = data.get(key) if isinstance(data.get(key), dict) else None
+            if not existing:
+                raise LedgerOwnershipError(
+                    f"submission key {ledger_key_reference(key)} has no live claim "
+                    f"for attempt {attempt_id}"
+                )
+            existing_attempt_id = str(existing.get("attempt_id") or "")
+            if existing_attempt_id != str(attempt_id):
+                raise LedgerOwnershipError(
+                    f"submission key {ledger_key_reference(key)} belongs to attempt "
+                    f"{existing_attempt_id or '(unknown)'}, not {attempt_id}"
+                )
+            existing_phase = existing.get("phase")
+            if existing_phase == PHASE_VERIFIED and verified:
+                return
+            if existing_phase != PHASE_IN_PROGRESS:
+                raise LedgerOwnershipError(
+                    f"submission key {ledger_key_reference(key)} is already terminal "
+                    "in phase "
+                    f"{existing_phase or '(unknown)'}; attempt {attempt_id} "
+                    "cannot rewrite it"
+                )
+            record = {
+                "phase": PHASE_VERIFIED if verified else PHASE_UNVERIFIED,
+                "attempt_id": attempt_id,
+                "ts": time.time(),
+            }
+            if existing.get("job_id"):
+                record["job_id"] = existing["job_id"]
+            data[key] = record
+            self._save(data)

@@ -125,10 +125,11 @@ def test_classification_is_local_only_by_default(monkeypatch):
     """Key names must not egress unless the operator opts in."""
     seen = {}
     fake = _FakeModelClient(keyword="mail")
+    original_complete = fake.complete
 
     async def _complete(messages, system="", **kw):
         seen.update(kw)
-        return await fake.complete(messages, system=system, **kw)
+        return await original_complete(messages, system=system, **kw)
 
     fake.complete = _complete
     monkeypatch.delenv("ALLOW_REMOTE_METADATA_CLASSIFICATION", raising=False)
@@ -140,10 +141,11 @@ def test_classification_is_local_only_by_default(monkeypatch):
 def test_classification_allows_egress_when_opted_in(monkeypatch):
     seen = {}
     fake = _FakeModelClient(keyword="mail")
+    original_complete = fake.complete
 
     async def _complete(messages, system="", **kw):
         seen.update(kw)
-        return await fake.complete(messages, system=system, **kw)
+        return await original_complete(messages, system=system, **kw)
 
     fake.complete = _complete
     monkeypatch.setenv("ALLOW_REMOTE_METADATA_CLASSIFICATION", "1")
