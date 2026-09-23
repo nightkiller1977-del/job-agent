@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from enum import Enum
+from typing import NamedTuple
 
 # Mirror of reauth.HUMAN_SOURCES + per-source credential env pairs. Kept here (a
 # pure, import-light module) so the preflight guard is testable without pulling
@@ -211,3 +212,208 @@ def should_attempt(
         suffix = f" [adaptive; static={static}]" if cap < static else ""
         return False, f"{cls.value} retry cap reached ({attempt_count}/{cap}){suffix}: {last_status}"
     return True, ""
+
+
+# ─── Circuit re-arm ────────────────────────────────────────────────────────
+# should_attempt() above is a one-way door: apply_attempt_count only ever
+# increments (state_manager.record_apply_attempt), so once a job reaches its
+# cap the circuit stays open forever. That is correct while nothing changes —
+# but two things do change, and neither is visible to the attempt counter:
+#
+#   1. Our code. NEEDS_HUMAN literally means "retrying without a code fix
+#      won't help". When the fix ships, every job capped on that blocker is
+#      still locked out, so the fix cannot be measured. ACES-428 (iframe
+#      submit detection) landed against 7 jobs already capped at the
+#      NEEDS_HUMAN ceiling of 1 — none of them could exercise it.
+#   2. The environment. A gateway 502 or a bad-network night burns the cap on
+#      jobs that would succeed on a healthy run.
+#
+# So the circuit re-arms on exactly those two signals, and on nothing else.
+# PERMANENT and SUCCESS never re-arm: a closed posting, a bad URL and an
+# already-submitted application do not become winnable because we edited code.
+
+# Modules that implement the apply/submit path. A change to any of them can
+# plausibly turn a previous blocker into a submission; changes to scoring,
+# discovery, notifications or docs cannot, and must not re-arm anything.
+_APPLY_PATH_GLOBS = ("sources/**/*.py",)
+_APPLY_PATH_FILES = ("orchestrator.py", "resume_tailor.py")
+
+# Environment flags that re-route the apply path without changing a byte of it.
+# Flipping one is as material as an edit — ACES-284 calls out USE_ADAPTER_REGISTRY
+# specifically, since the registry route carries the fixes that make retries
+# succeed — so they are part of the build identity.
+_APPLY_PATH_ENV_FLAGS = ("USE_ADAPTER_REGISTRY",)
+
+# Classes whose blocker a code change can plausibly resolve.
+_CODE_REARM_CLASSES = frozenset({
+    BlockerClass.TRANSIENT,
+    BlockerClass.AUTH_REQUIRED,
+    BlockerClass.NEEDS_HUMAN,
+    BlockerClass.UNKNOWN,
+})
+
+# Classes the cooldown can re-arm. Deliberately the same set as the code-change
+# path, NEEDS_HUMAN included. Waiting does not itself teach the agent to find a
+# submit button, so on its own this would be a weak signal — but the measured
+# failure mode (ACES-284) was 48 approved jobs aging out to `expired` having
+# never been retried after one breaker trip. A small, bounded number of retries
+# across the posting's life is cheap insurance against a blocker that was really
+# a bad night, a half-loaded page, or a fix that shipped outside the
+# fingerprinted path. _MAX_COOLDOWN_REARMS is what keeps it from becoming the
+# unbounded retry loop this module was built to stop.
+_COOLDOWN_REARM_CLASSES = _CODE_REARM_CLASSES
+
+_DEFAULT_COOLDOWN_HOURS = 24
+
+# Cooldown re-arm is bounded; code-change re-arm is not. A code change is its own
+# evidence that something material happened, and each one grants exactly one
+# retry (the next attempt stamps the new fingerprint). The clock carries no such
+# evidence — left unbounded it would hand every doomed job a free attempt every
+# day forever, which is precisely the 245-wasted-retry behaviour this module
+# exists to stop. After this many cooldown re-arms without a different outcome,
+# the blocker is not environmental and the circuit stays open.
+_MAX_COOLDOWN_REARMS = 3
+
+class Rearm(NamedTuple):
+    """Why a circuit re-armed. *kind* drives policy (only COOLDOWN is budgeted);
+    *reason* is the operator-facing explanation. Kept separate so no caller has
+    to parse the message to decide what happened."""
+
+    kind: str
+    reason: str
+
+    COOLDOWN = "cooldown"
+    CODE_CHANGE = "code_change"
+
+    def __str__(self) -> str:  # pragma: no cover - display only
+        return self.reason
+
+
+_fingerprint_cache: str | None = None
+
+
+def _cooldown_hours() -> int:
+    """Hours before an environmental blocker is retryable. 0 disables cooldown
+    re-arm entirely (code-change re-arm is unaffected)."""
+    raw = os.environ.get("APPLY_CIRCUIT_COOLDOWN_HOURS", "")
+    try:
+        return max(0, int(raw)) if raw.strip() else _DEFAULT_COOLDOWN_HOURS
+    except ValueError:
+        return _DEFAULT_COOLDOWN_HOURS
+
+
+def apply_path_fingerprint() -> str:
+    """Short digest of the apply-path source. Changes exactly when code that
+    could alter an apply outcome changes.
+
+    Computed once per process: the files cannot change under a running apply
+    loop, and every job in the run must be judged against the same build.
+    Unreadable/missing files degrade to an empty digest rather than raising —
+    a fingerprint we cannot compute must not break the apply run; it only
+    costs us the code-change re-arm for that run.
+    """
+    global _fingerprint_cache
+    if _fingerprint_cache is not None:
+        return _fingerprint_cache
+
+    import hashlib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent
+    paths: set[Path] = set()
+    try:
+        for pattern in _APPLY_PATH_GLOBS:
+            paths.update(p for p in root.glob(pattern) if p.is_file())
+        for name in _APPLY_PATH_FILES:
+            p = root / name
+            if p.is_file():
+                paths.add(p)
+    except OSError:
+        _fingerprint_cache = ""
+        return _fingerprint_cache
+
+    digest = hashlib.sha256()
+    for flag in _APPLY_PATH_ENV_FLAGS:
+        digest.update(f"{flag}={os.environ.get(flag, '')}".encode())
+    try:
+        for path in sorted(paths):
+            if "__pycache__" in path.parts:
+                continue
+            digest.update(str(path.relative_to(root)).encode())
+            digest.update(path.read_bytes())
+    except OSError:
+        _fingerprint_cache = ""
+        return _fingerprint_cache
+
+    _fingerprint_cache = digest.hexdigest()[:16]
+    return _fingerprint_cache
+
+
+def reset_fingerprint_cache() -> None:
+    """Drop the memoized fingerprint. The apply-path files cannot change under a
+    running apply loop, but the env flags folded into the digest can — and tests
+    need to vary both."""
+    global _fingerprint_cache
+    _fingerprint_cache = None
+
+
+def rearm_reason(
+    extra: dict,
+    *,
+    current_fingerprint: str | None = None,
+    now: "datetime | None" = None,
+) -> Rearm | None:
+    """Why this job's open circuit should re-arm now, or None to leave it open.
+
+    *extra* is the job's parsed extra_json. Pure and side-effect free — the
+    caller decides what to do with the verdict, so the policy stays testable
+    without a database.
+    """
+    from datetime import datetime as _dt
+
+    last_status = extra.get("apply_last_status")
+    if not last_status:
+        return None  # never attempted — no circuit to re-arm
+    if not int(extra.get("apply_attempt_count", 0) or 0):
+        return None  # budget already available
+
+    cls = classify(last_status)
+    if cls is BlockerClass.SUCCESS or cls is BlockerClass.PERMANENT:
+        return None
+
+    # 1. Code-change re-arm.
+    if cls in _CODE_REARM_CLASSES:
+        current = current_fingerprint if current_fingerprint is not None else apply_path_fingerprint()
+        recorded = extra.get("apply_code_fingerprint")
+        # An absent fingerprint means the attempt predates this field. Treat it
+        # as unknown rather than as a change: re-arming every legacy row on the
+        # first run after deploy would stampede the whole backlog through a
+        # code path we have no evidence about. The cooldown below still applies,
+        # and `rearm-breakers` exists for a deliberate one-off sweep.
+        if current and recorded and recorded != current:
+            return Rearm(
+                Rearm.CODE_CHANGE,
+                f"apply-path code changed since last attempt ({recorded} → {current})",
+            )
+
+    # 2. Cooldown re-arm.
+    if cls in _COOLDOWN_REARM_CLASSES:
+        hours = _cooldown_hours()
+        last_at = extra.get("apply_last_attempt")
+        spent = int(extra.get("apply_cooldown_rearm_count", 0) or 0)
+        if spent >= _MAX_COOLDOWN_REARMS:
+            return None  # repeatedly retried across days — not an environmental blip
+        if hours and last_at:
+            try:
+                elapsed = (now or _dt.utcnow()) - _dt.fromisoformat(str(last_at))
+            except (TypeError, ValueError):
+                return None
+            if elapsed.total_seconds() >= hours * 3600:
+                aged = int(elapsed.total_seconds() // 3600)
+                return Rearm(
+                    Rearm.COOLDOWN,
+                    f"{cls.value} blocker idle {aged}h "
+                    f"(cooldown {hours}h, {spent + 1}/{_MAX_COOLDOWN_REARMS})",
+                )
+
+    return None
