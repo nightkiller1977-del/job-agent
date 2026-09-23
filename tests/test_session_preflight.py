@@ -69,3 +69,30 @@ def test_new_statuses_are_classified():
     assert classify("credentials_missing") is BlockerClass.PERMANENT
     # historic rows from before USAJobsScraper.apply() raised AuthFailedError
     assert classify("usajobs_login_required") is BlockerClass.AUTH_REQUIRED
+
+
+def test_source_absent_from_reauth_creds_is_never_viable(monkeypatch):
+    """A source with no _REAUTH_CREDS entry at all — like builtin — must not be
+    confused with one whose (zero) required creds are trivially satisfied.
+
+    Before this fix, _REAUTH_CREDS.get(source, ()) returned "()" for both
+    cases, so the missing-creds comprehension was empty either way and this
+    reported viable by accident. In production that meant a
+    builtin_login_required job (AUTH_REQUIRED, ACES-437) triggered a P3
+    preflight reauth for "builtin", ReauthManager.handle("builtin") returned
+    False (builtin is in neither AUTOMATED_SOURCES nor HUMAN_SOURCES), and the
+    orchestrator recorded reauth_failed — discarding the accurate diagnosis and
+    burning the AUTH_REQUIRED retry budget on a reauth that could never
+    succeed (Copilot + Codex review findings on PR #151).
+    """
+    assert "builtin" not in __import__("src.blocker_classifier", fromlist=["_REAUTH_CREDS"])._REAUTH_CREDS
+    assert preflight_reauth_viable("builtin") == (False, "credentials_missing")
+
+
+def test_unrelated_env_vars_cannot_make_an_unsupported_source_viable(monkeypatch):
+    """Setting env vars that happen to share a name with another source's
+    credentials must not accidentally satisfy an unsupported source's (empty)
+    requirement list."""
+    monkeypatch.setenv("JOBRIGHT_EMAIL", "user@example.com")
+    monkeypatch.setenv("JOBRIGHT_PASSWORD", "secret")
+    assert preflight_reauth_viable("builtin")[0] is False

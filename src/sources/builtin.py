@@ -313,7 +313,27 @@ class BuiltInScraper(BaseScraper):
     async def _resolve_ats_url(self, job: dict) -> str:
         """Re-fetch the job-detail page fresh (howToApply may have changed
         since scrape time). Falls back to the ats_url stashed in extra_json at
-        scrape time if the re-fetch fails or is blocked."""
+        scrape time if the re-fetch fails or is blocked.
+
+        Marketing-page canonicalization (ACES-436) now happens once, centrally,
+        in JobrightScraper.apply_external_ats_job — every external-apply caller
+        funnels through it, including this one via _apply_via_ats. Doing it
+        again here would be the same duplicated-copy failure mode as the two
+        review findings this class of bug came from (ACES-436/437): a second
+        place asserting the same thing that can silently drift from the first.
+        It was also incomplete here — this function's own early returns
+        (network failure, Cloudflare block) skipped it entirely, so exactly
+        the hosts most likely to need canonicalizing (BuiltIn slow or
+        rate-limiting) were the ones that never got it (review finding).
+
+        A fresh, successful re-fetch is preferred over the stashed value only
+        when it is not itself BuiltIn's own login-wall redirect — see
+        _is_builtin_login_wall. That wall is confirmed to appear on every
+        anonymous re-fetch (ACES-437), so preferring it unconditionally would
+        let a routine successful refresh discard a genuinely usable stashed
+        URL from an earlier attempt (review finding) — the wall is not new
+        information, it is the same non-answer every time.
+        """
         url = job.get("url", "")
         stashed = self._stashed_ats_url(job)
 
@@ -334,17 +354,9 @@ class BuiltInScraper(BaseScraper):
 
         job_blob = post_init.get("job") if isinstance(post_init.get("job"), dict) else post_init
         fresh_url = self._apply_url_from_blob(job_blob, base_url=str(resp.url))
-        resolved = fresh_url or stashed
-        # BuiltIn's howToApply is often the employer's careers/marketing page,
-        # which carries no application form — the cause of builtin_no_ats_url /
-        # form_not_reached (ACES-436). Rewrite to the vendor's own application
-        # URL when it is derivable; canonical_ats_url returns '' otherwise, so
-        # an underivable URL is left exactly as resolved.
-        try:
-            from src.url_utils import canonical_ats_url
-            return canonical_ats_url(resolved) or resolved
-        except Exception:
-            return resolved
+        if fresh_url and self._is_builtin_login_wall(fresh_url) and stashed and not self._is_builtin_login_wall(stashed):
+            return stashed
+        return fresh_url or stashed
 
     @staticmethod
     def _apply_url_from_blob(job_blob: dict, *, base_url: str) -> str:
@@ -384,15 +396,24 @@ class BuiltInScraper(BaseScraper):
         when checked, every one ``isEasyApply=False``. Landing back on BuiltIn
         is an authentication outcome, not a missing URL, and must be reported
         as such so the job is not retried as though the posting were broken.
+
+        Checks the host as an exact/subdomain boundary, not a netloc substring
+        (``notbuiltin.com`` must not match), and checks the actual query VALUES,
+        not merely that the parameter names are present — an explicit
+        ``applyRequired=false`` is not the wall this exists to detect (review
+        findings; both confirmed reachable before this fix).
         """
         try:
             parsed = urllib.parse.urlparse(url or "")
         except Exception:
             return False
-        if "builtin.com" not in parsed.netloc.lower():
+        host = (parsed.hostname or "").lower()
+        if host != "builtin.com" and not host.endswith(".builtin.com"):
             return False
-        qs = {k.lower() for k, _ in urllib.parse.parse_qsl(parsed.query)}
-        return "applyrequired" in qs or "handler" in qs
+        qs = {k.lower(): v for k, v in urllib.parse.parse_qsl(parsed.query)}
+        if qs.get("applyrequired", "").strip().lower() == "true":
+            return True
+        return qs.get("handler", "").strip().lower() == "applyredirect"
 
     @staticmethod
     def _stashed_ats_url(job: dict) -> str:
