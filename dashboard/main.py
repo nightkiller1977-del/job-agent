@@ -271,6 +271,7 @@ class ActionRequest(BaseModel):
     action: str
     idempotency_key: Optional[str] = None
     expected_status: Optional[str] = None
+    expected_revision: Optional[int] = None
 
 
 class ExternalJobRequest(BaseModel):
@@ -462,6 +463,7 @@ async def sync_jobs(request: Request, x_sync_secret: Optional[str] = Header(defa
                     "$set": payload,
                     "$setOnInsert": {
                         "status": raw.get("status", "discovered"),
+                        "status_revision": 0,
                         "discovered_at": _parse_dt(raw.get("discovered_at"), now),
                     },
                 },
@@ -484,6 +486,7 @@ async def job_action(body: ActionRequest):
     jobs = get_db().jobs
     idempotency_key = body.idempotency_key
     expected_status = body.expected_status
+    expected_revision = body.expected_revision
     if expected_status is not None:
         allowed_status_chars = set(
             "abcdefghijklmnopqrstuvwxyz"
@@ -510,17 +513,31 @@ async def job_action(body: ActionRequest):
             or any(char not in allowed for char in idempotency_key)
         ):
             raise HTTPException(status_code=400, detail="invalid idempotency_key")
+        if expected_status is None or expected_revision is None:
+            raise HTTPException(
+                status_code=400,
+                detail="keyed actions require expected_status and expected_revision",
+            )
+        if isinstance(expected_revision, bool) or expected_revision < 0:
+            raise HTTPException(status_code=400, detail="invalid expected_revision")
         operation_key = f"{status}:{idempotency_key}"
         action_filter = {
             "job_id": body.job_id,
             "_action_idempotency_keys": {"$ne": operation_key},
+            "status": expected_status,
         }
-        if expected_status is not None:
-            action_filter["status"] = expected_status
+        if expected_revision == 0:
+            action_filter["$or"] = [
+                {"status_revision": 0},
+                {"status_revision": {"$exists": False}},
+            ]
+        else:
+            action_filter["status_revision"] = expected_revision
         result = jobs.find_one_and_update(
             action_filter,
             {
                 "$set": {"status": status, "updated_at": _utcnow()},
+                "$inc": {"status_revision": 1},
                 "$push": {
                     "_action_idempotency_keys": {
                         "$each": [operation_key],
@@ -533,37 +550,66 @@ async def job_action(body: ActionRequest):
         if not result:
             current = jobs.find_one(
                 {"job_id": body.job_id},
-                {"status": 1, "_action_idempotency_keys": 1},
+                {"status": 1, "status_revision": 1, "_action_idempotency_keys": 1},
             )
             if not current:
                 raise HTTPException(status_code=404, detail="Job not found")
             operation_recorded = operation_key in current.get(
                 "_action_idempotency_keys", []
             )
+            current_revision = current.get("status_revision", 0)
+            if (
+                isinstance(current_revision, bool)
+                or not isinstance(current_revision, int)
+                or current_revision < 0
+            ):
+                current_revision = 0
             if operation_recorded and current.get("status") != status:
                 raise HTTPException(
                     status_code=409,
-                    detail="Current status no longer matches action",
+                    detail={
+                        "message": "Current status or revision no longer matches expected state",
+                        "current_status": current.get("status"),
+                        "current_revision": current_revision,
+                    },
                 )
             if operation_recorded:
                 return {
                     "ok": True,
                     "job_id": body.job_id,
                     "status": status,
+                    "status_revision": current_revision,
                     "deduplicated": True,
                 }
             if current.get("status") == status:
-                # The target state itself is sufficient confirmation, but the
-                # key still has to be recorded atomically. Otherwise a delayed
-                # duplicate could become eligible again after a later status
-                # cycle returns the row to expected_status.
+                # A target-state no-op is safe only at the exact expected
+                # revision. Advancing the revision here fences any older
+                # in-flight request from an away/back (ABA) status cycle.
+                if current_revision != expected_revision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": "Current status or revision no longer matches expected state",
+                            "current_status": current.get("status"),
+                            "current_revision": current_revision,
+                        },
+                    )
+                record_filter = {
+                    "job_id": body.job_id,
+                    "status": status,
+                    "_action_idempotency_keys": {"$ne": operation_key},
+                }
+                if expected_revision == 0:
+                    record_filter["$or"] = [
+                        {"status_revision": 0},
+                        {"status_revision": {"$exists": False}},
+                    ]
+                else:
+                    record_filter["status_revision"] = expected_revision
                 recorded = jobs.update_one(
+                    record_filter,
                     {
-                        "job_id": body.job_id,
-                        "status": status,
-                        "_action_idempotency_keys": {"$ne": operation_key},
-                    },
-                    {
+                        "$inc": {"status_revision": 1},
                         "$push": {
                             "_action_idempotency_keys": {
                                 "$each": [operation_key],
@@ -577,11 +623,12 @@ async def job_action(body: ActionRequest):
                         "ok": True,
                         "job_id": body.job_id,
                         "status": status,
+                        "status_revision": expected_revision + 1,
                         "deduplicated": True,
                     }
                 current = jobs.find_one(
                     {"job_id": body.job_id},
-                    {"status": 1, "_action_idempotency_keys": 1},
+                    {"status": 1, "status_revision": 1, "_action_idempotency_keys": 1},
                 )
                 if not current:
                     raise HTTPException(status_code=404, detail="Job not found")
@@ -593,12 +640,24 @@ async def job_action(body: ActionRequest):
                         "ok": True,
                         "job_id": body.job_id,
                         "status": status,
+                        "status_revision": current.get("status_revision", 0),
                         "deduplicated": True,
                     }
                 if current.get("status") != status:
+                    refreshed_revision = current.get("status_revision", 0)
+                    if (
+                        isinstance(refreshed_revision, bool)
+                        or not isinstance(refreshed_revision, int)
+                        or refreshed_revision < 0
+                    ):
+                        refreshed_revision = 0
                     raise HTTPException(
                         status_code=409,
-                        detail="Current status no longer matches action",
+                        detail={
+                            "message": "Current status or revision no longer matches expected state",
+                            "current_status": current.get("status"),
+                            "current_revision": refreshed_revision,
+                        },
                     )
                 raise HTTPException(
                     status_code=409,
@@ -610,7 +669,20 @@ async def job_action(body: ActionRequest):
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail="Current status no longer matches expected status",
+                    detail={
+                        "message": "Current status or revision no longer matches expected state",
+                        "current_status": current.get("status"),
+                        "current_revision": current_revision,
+                    },
+                )
+            if current_revision != expected_revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Current status or revision no longer matches expected state",
+                        "current_status": current.get("status"),
+                        "current_revision": current_revision,
+                    },
                 )
             raise HTTPException(
                 status_code=409,
@@ -620,6 +692,9 @@ async def job_action(body: ActionRequest):
             "ok": True,
             "job_id": body.job_id,
             "status": status,
+            "status_revision": result.get(
+                "status_revision", expected_revision + 1
+            ),
             "deduplicated": False,
         }
 
@@ -628,7 +703,10 @@ async def job_action(body: ActionRequest):
         action_filter["status"] = expected_status
     result = jobs.find_one_and_update(
         action_filter,
-        {"$set": {"status": status, "updated_at": _utcnow()}},
+        {
+            "$set": {"status": status, "updated_at": _utcnow()},
+            "$inc": {"status_revision": 1},
+        },
         return_document=ReturnDocument.AFTER,
     )
     if not result:
@@ -636,12 +714,22 @@ async def job_action(body: ActionRequest):
         if not current:
             raise HTTPException(status_code=404, detail="Job not found")
         if current.get("status") == status:
-            return {"ok": True, "job_id": body.job_id, "status": status}
+            return {
+                "ok": True,
+                "job_id": body.job_id,
+                "status": status,
+                "status_revision": current.get("status_revision", 0),
+            }
         raise HTTPException(
             status_code=409,
             detail="Current status no longer matches expected status",
         )
-    return {"ok": True, "job_id": body.job_id, "status": status}
+    return {
+        "ok": True,
+        "job_id": body.job_id,
+        "status": status,
+        "status_revision": result.get("status_revision", 0),
+    }
 
 
 @app.post("/api/jobs/external")
@@ -662,7 +750,7 @@ async def add_external_job(body: ExternalJobRequest):
     # 80 %}`: a genuinely absent key renders as Jinja2 Undefined, which
     # passes `is not none` but raises UndefinedError on `>=`, crashing the
     # whole page render for every visitor until this job is hydrated/scored.
-    db.jobs.insert_one({"job_id": job_id, "source": source, "title": "Importing...", "company": "Pending local agent sync", "url": url, "status": "discovered", "flags": "needs_hydration", "score": None, "discovered_at": now, "updated_at": now})
+    db.jobs.insert_one({"job_id": job_id, "source": source, "title": "Importing...", "company": "Pending local agent sync", "url": url, "status": "discovered", "status_revision": 0, "flags": "needs_hydration", "score": None, "discovered_at": now, "updated_at": now})
     return {"ok": True, "job_id": job_id, "url": url}
 
 

@@ -1996,6 +1996,7 @@ class Orchestrator:
                     job["job_id"],
                     target_status,
                     expected_cloud_status=str(job.get("status") or "approved"),
+                    expected_cloud_revision=job.get("status_revision", 0),
                 )
                 pulled += 1
             console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")
@@ -2119,13 +2120,13 @@ class Orchestrator:
                 # requests, so fail closed before touching the network.
                 return False
 
-            generation = str(
-                marker.get("generation")
-                or marker.get("queued_at")
-                or hashlib.sha256(
-                    json.dumps(marker, sort_keys=True).encode("utf-8")
-                ).hexdigest()
-            )
+            generation_value = marker.get("generation")
+            if not isinstance(generation_value, str) or not generation_value.strip():
+                # Legacy markers did not persist a unique transition
+                # generation. Synthesizing one at send time would make a stale
+                # marker eligible again, so legacy repair must fail closed.
+                return False
+            generation = generation_value.strip()
 
             payload = {
                 "job_id": job_id,
@@ -2137,14 +2138,16 @@ class Orchestrator:
                 ),
             }
             expected_status = marker.get("expected_status")
-            if not expected_status and status == "applied":
-                # Legacy markers predate the expected-status field. Applied
-                # promotions originate from the approved queue; using that
-                # baseline fails closed if the cloud has moved elsewhere.
-                expected_status = "approved"
-            if not expected_status:
+            expected_revision = marker.get("expected_revision")
+            if (
+                not expected_status
+                or isinstance(expected_revision, bool)
+                or not isinstance(expected_revision, int)
+                or expected_revision < 0
+            ):
                 return False
             payload["expected_status"] = str(expected_status)
+            payload["expected_revision"] = expected_revision
 
             r = await self._cloud_request(
                 "cloud_action",
@@ -2162,22 +2165,56 @@ class Orchestrator:
             )
             if r is None:
                 return False
+            if r.status_code == 409:
+                try:
+                    conflict_detail = r.json().get("detail", {})
+                    conflict_status = conflict_detail.get("current_status")
+                    conflict_revision = conflict_detail.get("current_revision")
+                except (AttributeError, TypeError, ValueError):
+                    conflict_status = None
+                    conflict_revision = None
+                if (
+                    isinstance(conflict_status, str)
+                    and conflict_status
+                    and isinstance(conflict_revision, int)
+                    and not isinstance(conflict_revision, bool)
+                    and conflict_revision >= 0
+                ):
+                    self.state.rebase_pending_cloud_status_sync(
+                        job_id,
+                        status,
+                        expected_marker=marker,
+                        cloud_status=conflict_status,
+                        cloud_revision=conflict_revision,
+                    )
+                console.print("[dim]Cloud status push returned 409[/dim]")
+                return False
             if r.status_code != 200:
                 console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
                 return False
             try:
-                response_status = r.json().get("status")
+                response_body = r.json()
+                response_status = response_body.get("status")
+                response_revision = response_body.get("status_revision")
             except (AttributeError, TypeError, ValueError):
                 response_status = None
-            if response_status != status:
+                response_revision = None
+            if (
+                response_status != status
+                or isinstance(response_revision, bool)
+                or not isinstance(response_revision, int)
+                or response_revision < 0
+            ):
                 console.print(
-                    "[dim]Cloud status push did not confirm the requested status[/dim]"
+                    "[dim]Cloud status push did not confirm the requested "
+                    "status revision[/dim]"
                 )
                 return False
             return self.state.clear_pending_cloud_status_sync(
                 job_id,
                 status,
                 expected_marker=marker,
+                confirmed_revision=response_revision,
             )
         except Exception as e:
             console.print(f"[dim]Cloud status push failed (non-fatal): {e}[/dim]")
