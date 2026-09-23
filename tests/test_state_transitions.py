@@ -354,6 +354,33 @@ def test_reconcile_does_not_promote_existing_submitted_state_without_receipt(
     assert untouched["confirmation_status"] == "submitted"
 
 
+def test_reconcile_promotes_owned_verified_receipt_pending_job(state_mgr, tmp_path):
+    from src.sources.adapters.idempotency import SubmissionLedger, canonical_key
+
+    job = {
+        "job_id": "job-receipt-pending",
+        "title": "Principal Engineer",
+        "company": "Acme",
+        "url": "https://boards.greenhouse.io/acme/jobs/receipt-pending",
+        "source": "jobright",
+        "status": "approved",
+    }
+    state_mgr.upsert_job(job)
+    state_mgr.transition_confirmation(job["job_id"], "submitting")
+    state_mgr.transition_confirmation(job["job_id"], "submitted")
+    state_mgr.transition_confirmation(job["job_id"], "receipt_pending")
+    ledger = SubmissionLedger(tmp_path / "receipt-pending-ledger.json")
+    key = canonical_key(job)
+    ledger.claim(key, "attempt-1", job_id=job["job_id"])
+    ledger.complete(key, "attempt-1", verified=True)
+
+    state_mgr.reconcile_active_jobs_from_ledger(ledger=ledger)
+
+    recovered = state_mgr.get_job(job["job_id"])
+    assert recovered["status"] == "applied"
+    assert recovered["confirmation_status"] == "receipt_pending"
+
+
 def test_cold_start_ledger_recovery_from_crash(state_mgr, tmp_path):
     """After a process crash/restart, a job with confirmation_status=None successfully
     recovers directly to 'submitted' or 'reconciliation_required' from durable ledger state."""

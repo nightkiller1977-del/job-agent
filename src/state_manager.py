@@ -489,7 +489,10 @@ class StateManager:
                 raise_on_error=True,
             )
             if new_status:
-                if r["status"] == "approved" and new_status == "submitted":
+                if r["status"] == "approved" and new_status in {
+                    "submitted",
+                    "receipt_pending",
+                }:
                     # ``sync_confirmation_from_ledger`` preserves an existing
                     # higher-ranked DB status even when no ledger record was
                     # found. Promotion requires separate proof that this pass

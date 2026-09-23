@@ -22,6 +22,21 @@ def test_corrupt_json_raises_instead_of_empty(tmp_path):
         ledger.record("vendor|https://example.com/job/1")
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "[]",
+        '{"vendor|https://example.com/job/1":{"phase":"unknown"}}',
+    ],
+)
+def test_structurally_invalid_ledger_raises(tmp_path, payload):
+    path = tmp_path / "apply_ledger.json"
+    path.write_text(payload)
+
+    with pytest.raises(LedgerUnreadableError):
+        SubmissionLedger(path=path).validate()
+
+
 @pytest.mark.asyncio
 async def test_corrupt_ledger_blocks_session_pre_flight(tmp_path):
     """The session's duplicate/in-progress gate must fail closed and return a
@@ -68,6 +83,39 @@ async def test_corrupt_ledger_blocks_legacy_flow_before_browser(
     submitted = await scraper.apply_external_ats_job(
         {"job_id": "job-1", "title": "Engineer", "company": "Acme"},
         "https://boards.greenhouse.io/acme/jobs/1",
+        auto_submit=True,
+    )
+
+    assert submitted is False
+    assert scraper.last_apply_status == "ledger_unreadable"
+    assert browser_starts == 0
+
+
+@pytest.mark.asyncio
+async def test_corrupt_ledger_blocks_native_jobright_before_browser(tmp_path):
+    """Native jobright.ai applies share the same pre-browser ledger gate."""
+    from src.sources.jobright import JobrightScraper
+
+    path = tmp_path / "apply_ledger.json"
+    path.write_text("{not valid json")
+    scraper = JobrightScraper.__new__(JobrightScraper)
+    scraper.config = {}
+    scraper._submission_ledger = SubmissionLedger(path=path)
+    browser_starts = 0
+
+    async def _start_browser(**_kwargs):
+        nonlocal browser_starts
+        browser_starts += 1
+        raise AssertionError("browser must not start with an unreadable ledger")
+
+    scraper._start_browser = _start_browser
+    submitted = await scraper.apply(
+        {
+            "job_id": "job-native",
+            "title": "Engineer",
+            "company": "Acme",
+            "url": "https://jobright.ai/jobs/info/native",
+        },
         auto_submit=True,
     )
 

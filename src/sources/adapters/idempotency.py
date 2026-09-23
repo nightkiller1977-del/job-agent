@@ -77,9 +77,20 @@ class SubmissionLedger:
         except OSError as e:
             raise LedgerUnreadableError(f"ledger at {self.path} could not be read: {e}") from e
         try:
-            return json.loads(raw)
+            data = json.loads(raw)
         except Exception as e:
             raise LedgerUnreadableError(f"ledger at {self.path} is corrupt: {e}") from e
+        if not isinstance(data, dict):
+            raise LedgerUnreadableError(
+                f"ledger at {self.path} must contain a JSON object"
+            )
+        known_phases = {PHASE_IN_PROGRESS, PHASE_VERIFIED, PHASE_UNVERIFIED}
+        for key, record in data.items():
+            if not isinstance(record, dict) or record.get("phase") not in known_phases:
+                raise LedgerUnreadableError(
+                    f"ledger at {self.path} has an invalid record for {key!r}"
+                )
+        return data
 
     def _save(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

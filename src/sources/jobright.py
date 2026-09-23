@@ -66,6 +66,31 @@ class JobrightScraper(BaseScraper):
         self.last_apply_detail = detail
         return False
 
+    def _validate_submission_ledger_for_apply(self) -> bool:
+        """Fail closed before any employer-facing browser is launched."""
+        from .adapters.idempotency import LedgerUnreadableError
+
+        submission_ledger = getattr(self, "_submission_ledger", None)
+        if submission_ledger is None:
+            return self._set_apply_outcome(
+                "submission_ledger_unavailable",
+                "Submission ledger is unavailable; refusing to launch the browser.",
+            )
+        try:
+            submission_ledger.validate()
+        except LedgerUnreadableError as exc:
+            return self._set_apply_outcome(
+                "ledger_unreadable",
+                f"Submission ledger could not be read ({exc}); refusing to launch the browser.",
+            )
+        except Exception as exc:
+            return self._set_apply_outcome(
+                "submission_ledger_unavailable",
+                f"Submission ledger could not be validated ({type(exc).__name__}); "
+                "refusing to launch the browser.",
+            )
+        return True
+
     def _validation_metrics_from_error(self, exc: Exception) -> dict:
         result = getattr(exc, "result", None)
         if not result:
@@ -325,24 +350,10 @@ class JobrightScraper(BaseScraper):
             return _res.submitted
 
         # The registry path performs this check in ExternalApplySession.  The
-        # opt-out legacy path must do the same before opening an employer-facing
-        # browser; treating unreadable durable history as empty could duplicate
-        # a prior or unresolved application.
-        from .adapters.idempotency import LedgerUnreadableError
-
-        try:
-            self._submission_ledger.validate()
-        except LedgerUnreadableError as exc:
-            return self._set_apply_outcome(
-                "ledger_unreadable",
-                f"Submission ledger could not be read ({exc}); refusing to launch the browser.",
-            )
-        except Exception as exc:
-            return self._set_apply_outcome(
-                "submission_ledger_unavailable",
-                f"Submission ledger could not be validated ({type(exc).__name__}); "
-                "refusing to launch the browser.",
-            )
+        # opt-out legacy path shares this pre-browser boundary with native
+        # Jobright applies.
+        if not self._validate_submission_ledger_for_apply():
+            return False
 
         self.auto_submit = auto_submit
         self.last_apply_status = "started"
@@ -1662,6 +1673,9 @@ class JobrightScraper(BaseScraper):
                 resume_path=tailored_path,
                 auto_submit=auto_submit
             )
+
+        if not self._validate_submission_ledger_for_apply():
+            return False
 
         self.auto_submit = auto_submit
         self.last_apply_status = "started"
