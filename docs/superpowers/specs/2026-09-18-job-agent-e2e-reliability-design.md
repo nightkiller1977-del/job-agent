@@ -1,7 +1,9 @@
 # Job Agent E2E Reliability Design
 
 **Work item:** ACES-387
+
 **Parent:** ACES-18 — Job Agent Roadmap
+
 **Status:** Approved for design; implementation plan pending review
 
 ## Goal

@@ -35,9 +35,18 @@ Jira is the planning and source-of-truth layer for AI Commander implementation w
 - Never point Playwright/scrapers at the user's main Chrome profile. Each scraper must use its isolated profile under `state/sessions/<name>_profile/`; do not add `--profile-directory=Default` or bypass profile-lock cleanup semantics to use the main profile.
 - Never commit `settings-v3.json`, `.env`, `state/jobs.db`, `state/profile.json`, `state/sessions/`, or `state/tailored_resumes/`.
 - Never push directly to `main`; use a feature branch and PR. Never use `--no-verify` to skip pre-commit/pre-push hooks.
-- Verify file/line and behavior claims from subagents, tools, OpenHands, Codex, or external reports against actual source/tests before acting on or quoting them.
+- Verify file/line and behavior claims from subagents, tools, OpenHands, GitHub Copilot Code Review, the AI Commander Code Review Agent, or external reports against actual source/tests before acting on or quoting them.
 - Employer-facing submissions and messages are external side effects. Do not claim a submission succeeded without durable evidence. Reconcile an ambiguous outcome before retrying to avoid duplicate applications.
 
 ## Skills
 
 OpenHands skills live under `.agents/skills/`. Claude Code skills live under `.claude/skills/`. Skills supplement these rules and do not override them.
+
+## Pull request review policy
+
+- **Use GitHub Copilot Code Review and the AI Commander Code Review Agent for AI-assisted pull-request review.**
+- When an external AI review is needed, request **GitHub Copilot** through GitHub's normal reviewer mechanism.
+- Also inspect the **AI Commander Code Review Agent** result when it is available; treat its findings as hypotheses to verify against the current head, source, tests, and deterministic evidence.
+- Do **not** request, invoke, enable, or depend on Codex/OpenAI/ChatGPT pull-request review, including `@codex review`.
+- Historical Codex or other reviewer comments may remain as evidence, but do not trigger new Codex review rounds.
+- Copilot and AI Commander review do not replace deterministic merge evidence: required CI, tests, lint, security checks, and repository-specific validation still must pass.
