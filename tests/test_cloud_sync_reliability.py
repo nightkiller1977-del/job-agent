@@ -68,7 +68,53 @@ async def test_pull_approved_preserves_local_applied_state(tmp_path, monkeypatch
 
     await orchestrator._pull_approved_from_cloud()
 
-    assert orchestrator.state.get_job("job-applied")["status"] == "applied"
+    preserved = orchestrator.state.get_job("job-applied")
+    assert preserved["status"] == "applied"
+    from src.state_manager import parse_extra_json
+    assert parse_extra_json(preserved["extra_json"])["cloud_status_sync_pending"]["status"] == "applied"
+
+
+@pytest.mark.asyncio
+async def test_pending_applied_sync_retries_until_cloud_confirms(tmp_path, monkeypatch):
+    """A failed status push remains durable and a later run clears it on 200."""
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-recovered",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/recovered",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator.state.set_status(job["job_id"], "applied")
+    failed = MagicMock(status_code=503)
+    confirmed = MagicMock(status_code=200)
+    orchestrator._cloud_request = AsyncMock(side_effect=[failed, confirmed])
+
+    first_result = await orchestrator._push_status_to_cloud(job["job_id"], "applied")
+
+    assert first_result is False
+    pending = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )
+    assert pending["cloud_status_sync_pending"]["status"] == "applied"
+
+    await orchestrator._retry_pending_cloud_status_sync()
+
+    assert orchestrator._cloud_request.await_count == 2
+    cleared = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )
+    assert "cloud_status_sync_pending" not in cleared
 
 
 @pytest.mark.asyncio

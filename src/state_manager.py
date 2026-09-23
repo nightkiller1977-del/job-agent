@@ -253,18 +253,76 @@ class StateManager:
             "skipped": "reviewed_at",
             "bookmarked": "reviewed_at",
         }.get(status)
-        if ts_field:
-            with self._connect() as conn:
+        with self._connect() as conn:
+            extra_json = None
+            if status == "applied":
+                row = conn.execute(
+                    "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if row is not None:
+                    extra = parse_extra_json(row["extra_json"])
+                    # Queue this in the same transaction as the local status
+                    # promotion. A crash or ambiguous network failure can then
+                    # be retried safely until the cloud confirms the idempotent
+                    # target state.
+                    extra["cloud_status_sync_pending"] = {
+                        "status": status,
+                        "queued_at": now,
+                    }
+                    extra_json = json.dumps(extra)
+            if ts_field and extra_json is not None:
+                conn.execute(
+                    f"UPDATE jobs SET status = ?, {ts_field} = ?, extra_json = ? "
+                    "WHERE job_id = ?",
+                    (status, now, extra_json, job_id),
+                )
+            elif ts_field:
                 conn.execute(
                     f"UPDATE jobs SET status = ?, {ts_field} = ? WHERE job_id = ?",
                     (status, now, job_id),
                 )
-        else:
-            with self._connect() as conn:
+            else:
                 conn.execute(
                     "UPDATE jobs SET status = ? WHERE job_id = ?",
                     (status, job_id),
                 )
+
+    def list_pending_cloud_status_sync(self) -> list[dict]:
+        """Return durable local status promotions not yet confirmed by cloud."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, extra_json FROM jobs "
+                "WHERE extra_json LIKE '%cloud_status_sync_pending%'"
+            ).fetchall()
+        pending: list[dict] = []
+        for row in rows:
+            marker = parse_extra_json(row["extra_json"]).get(
+                "cloud_status_sync_pending"
+            )
+            status = marker.get("status") if isinstance(marker, dict) else ""
+            if status:
+                pending.append({"job_id": row["job_id"], "status": str(status)})
+        return pending
+
+    def clear_pending_cloud_status_sync(self, job_id: str, status: str) -> bool:
+        """Clear only the cloud-sync obligation matching a confirmed status."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            extra = parse_extra_json(row["extra_json"])
+            marker = extra.get("cloud_status_sync_pending")
+            marker_status = marker.get("status") if isinstance(marker, dict) else ""
+            if marker_status != status:
+                return False
+            extra.pop("cloud_status_sync_pending", None)
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra) if extra else None, job_id),
+            )
+        return True
 
     def transition_confirmation(self, job_id: str, to_status: str) -> None:
         """Transitions confirmation_status following the formal state transition table."""

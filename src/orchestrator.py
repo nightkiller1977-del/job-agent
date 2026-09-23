@@ -938,6 +938,7 @@ class Orchestrator:
 
         # Pull cloud-approved jobs into local SQLite first
         await self._pull_approved_from_cloud()
+        await self._retry_pending_cloud_status_sync()
 
         # Recover durable employer receipts before building the apply pool. A
         # worker can crash after submit succeeds but before the resolved ATS URL
@@ -1894,12 +1895,20 @@ class Orchestrator:
             return response
         return None
 
-    async def _push_status_to_cloud(self, job_id: str, status: str) -> None:
-        """POST a status update back to the cloud dashboard (non-fatal)."""
+    async def _retry_pending_cloud_status_sync(self) -> None:
+        """Retry durable status promotions once per run until cloud confirms."""
+        for pending in self.state.list_pending_cloud_status_sync():
+            await self._push_status_to_cloud(
+                pending["job_id"], pending["status"]
+            )
+
+    async def _push_status_to_cloud(self, job_id: str, status: str) -> bool:
+        """POST a status update and clear its durable obligation only on 200."""
         dashboard_url = os.environ.get("DASHBOARD_URL", "")
         sync_secret = os.environ.get("SYNC_SECRET", "")
         if not dashboard_url:
-            return
+            self.state.clear_pending_cloud_status_sync(job_id, status)
+            return True
         try:
             r = await self._cloud_request(
                 "cloud_action",
@@ -1911,12 +1920,18 @@ class Orchestrator:
                 idempotent=False,
                 state_changing=True,
             )
-            if r is not None and r.status_code != 200:
+            if r is None:
+                return False
+            if r.status_code != 200:
                 console.print(f"[dim]Cloud status push returned {r.status_code}[/dim]")
+                return False
+            self.state.clear_pending_cloud_status_sync(job_id, status)
+            return True
         except Exception as e:
             console.print(f"[dim]Cloud status push failed (non-fatal): {e}[/dim]")
             _log.warning("cloud_sync.push_status_failed error=%s", e)
             notify_error("Cloud sync failed: _push_status_to_cloud", str(e)[:200])
+            return False
 
     async def _push_apply_attempt_to_cloud(self, job_id: str) -> None:
         """Sync the latest local apply attempt fields to the dashboard.

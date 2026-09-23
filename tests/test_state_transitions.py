@@ -283,6 +283,8 @@ def test_reconcile_approved_job_by_ledger_job_id_before_ats_url_is_persisted(
     recovered = state_mgr.get_job(job["job_id"])
     assert recovered["status"] == "applied"
     assert recovered["confirmation_status"] == "submitted"
+    pending = json.loads(recovered["extra_json"] or "{}")
+    assert pending["cloud_status_sync_pending"]["status"] == "applied"
 
 
 def test_reconcile_does_not_assign_shared_url_receipt_to_another_job(
