@@ -2195,9 +2195,15 @@ class JobrightScraper(BaseScraper):
                         continue
             if deadline is None or asyncio.get_running_loop().time() >= deadline:
                 return None
-            await asyncio.sleep(poll_interval_ms / 1000)
+            # Never sleep past the deadline: 100ms remaining with a 500ms poll
+            # interval would otherwise overshoot the advertised total timeout
+            # (Copilot review, PR #149).
+            remaining = deadline - asyncio.get_running_loop().time()
+            await asyncio.sleep(max(0.0, min(poll_interval_ms / 1000, remaining)))
 
-    async def _visible_controls_snapshot(self, page, limit: int = 40) -> list[dict]:
+    async def _visible_controls_snapshot(
+        self, page, limit: int = 40, *, frame_timeout_ms: int = 2000
+    ) -> list[dict]:
         """Return visible buttons/links/inputs to make ATS failures diagnosable.
 
         Sweeps the main frame *and* every child frame. Many ATS vendors embed the
@@ -2215,15 +2221,40 @@ class JobrightScraper(BaseScraper):
         # host page's marketing nav alone exceeded limit=40 on a live CoreWeave
         # job page, so the embedded Greenhouse form's controls never appeared in
         # the failure detail — the one thing the diagnostic exists to show.
-        per_frame = max(5, limit // max(1, len(frames)))
+        # Must fit *within* limit, not merely soften the ordering: a floor of 5
+        # over 9 frames allocates 45 against a limit of 40, and the early break
+        # below then drops the last frame — losing the embedded form exactly
+        # when it is enumerated last, which is the case this budgeting exists
+        # to fix (Copilot review, PR #149). Give every frame a slot whenever
+        # len(frames) <= limit.
+        per_frame = max(1, limit // max(1, len(frames)))
         controls: list[dict] = []
         for frame in frames:
             if len(controls) >= limit:
                 break
             try:
-                found = await self._frame_controls_snapshot(
-                    frame, min(per_frame, limit - len(controls))
+                # Per-frame timeout is mandatory here, not defensive polish.
+                # Budgeting per frame means every frame is now visited, where
+                # the old fill-to-limit loop usually broke after the main frame
+                # and never touched the rest. On the live CoreWeave page that
+                # exposed an unresponsive third-party frame (reCAPTCHA /
+                # googleapis proxy) which hung frame.evaluate indefinitely —
+                # and this runs on the FAILURE path, so an apply that had
+                # already gone wrong would hang forever building its diagnostic.
+                found = await asyncio.wait_for(
+                    self._frame_controls_snapshot(
+                        frame, min(per_frame, limit - len(controls))
+                    ),
+                    timeout=frame_timeout_ms / 1000,
                 )
+            except (TimeoutError, asyncio.TimeoutError):
+                controls.append({
+                    "tag": "FRAME",
+                    "role": "",
+                    "text": "(unresponsive frame: timed out)",
+                    "href": self._safe_frame_url(frame),
+                })
+                continue
             except Exception as exc:
                 controls.append({
                     "tag": "FRAME",

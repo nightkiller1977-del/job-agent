@@ -280,3 +280,80 @@ async def test_iframe_controls_survive_a_chatty_host_page():
         "embedded form controls were crowded out by host-page navigation"
     )
     assert len(controls) <= 40
+
+
+class HangingEvaluateFrame(FakeFrame):
+    """Frame whose evaluate never returns — models the live reCAPTCHA frame.
+
+    Per-frame budgeting made this reachable: the old fill-to-limit loop usually
+    broke after the main frame and never evaluated the rest.
+    """
+
+    def __init__(self, url, delay=30.0):
+        super().__init__(url)
+        self._delay = delay
+
+    async def evaluate(self, _js, *args):
+        await asyncio.sleep(self._delay)
+        return []
+
+
+@pytest.mark.asyncio
+async def test_snapshot_cannot_hang_on_an_unresponsive_frame():
+    """This runs on the FAILURE path — hanging here stalls the whole apply run."""
+    page = FakePage([
+        FakeFrame("https://host", evaluate_result=[{"tag": "A", "text": "home"}]),
+        HangingEvaluateFrame("https://www.recaptcha.net/recaptcha/enterprise/anchor"),
+        FakeFrame("https://job-boards.greenhouse.io/embed/job_app",
+                  evaluate_result=[{"tag": "BUTTON", "text": "Submit Application"}]),
+    ])
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    controls = await _scraper()._visible_controls_snapshot(page, frame_timeout_ms=200)
+    elapsed = loop.time() - start
+
+    assert elapsed < 5.0, f"snapshot hung for {elapsed:.1f}s"
+    texts = [c.get("text") for c in controls]
+    # the wedged frame is reported, not silently dropped...
+    assert any("unresponsive frame" in (t or "") for t in texts), texts
+    # ...and it must not prevent the real form's controls being collected
+    assert "Submit Application" in texts, texts
+
+
+# ─── Copilot review findings on PR #149 ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_last_frame_is_not_crowded_out_by_earlier_frames():
+    """9 chatty frames + limit 40: a floor of 5 allocated 45 and dropped frame 9.
+
+    The embedded form is frequently enumerated last, so losing the final frame
+    loses exactly what the budgeting exists to preserve.
+    """
+    chatty = [{"tag": "A", "text": f"nav{i}"} for i in range(30)]
+    frames = [FakeFrame(f"https://noise{i}", evaluate_result=chatty) for i in range(8)]
+    frames.append(FakeFrame("https://job-boards.greenhouse.io/embed/job_app",
+                            evaluate_result=[{"tag": "BUTTON", "text": "Submit Application"}]))
+
+    controls = await _scraper()._visible_controls_snapshot(FakePage(frames), limit=40)
+    texts = [c.get("text") for c in controls]
+
+    assert "Submit Application" in texts, "the LAST frame must still get a slot"
+    assert len(controls) <= 40
+
+
+@pytest.mark.asyncio
+async def test_poll_sleep_never_overshoots_the_deadline():
+    """100ms remaining with a 500ms poll interval must not overshoot."""
+    page = FakePage([FakeFrame("https://host", {})])
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    found = await _scraper()._find_submit_control(
+        page, ["#nope"],
+        total_timeout_ms=100, poll_interval_ms=500, per_query_timeout_ms=50,
+    )
+    elapsed = loop.time() - start
+
+    assert found is None
+    assert elapsed < 0.45, f"overshot a 100ms budget by sleeping a full poll: {elapsed:.2f}s"
