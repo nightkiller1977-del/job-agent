@@ -4267,10 +4267,18 @@ class JobrightScraper(BaseScraper):
                     submission_ledger.complete(
                         ledger_key, ledger_attempt_id, verified=True
                     )
-                except Exception:
-                    # The durable begin marker still prevents a blind retry; the
-                    # fresh receipt remains authoritative for this return value.
-                    pass
+                except Exception as exc:
+                    # Receipt evidence is not a recoverable success until the
+                    # verified phase is durable.  Keep the job parked behind the
+                    # pre-submit marker instead of letting the orchestrator mark
+                    # it applied with no crash-recovery proof.
+                    return self._set_apply_outcome(
+                        "submission_unverified",
+                        f"A fresh ATS receipt appeared at {portal_url}, but the "
+                        f"submission ledger could not durably record it "
+                        f"({type(exc).__name__}). Reconcile the employer portal "
+                        "before retrying.",
+                    )
 
             # ── Record analytics for orchestrator to persist via extra_json ──
             self._apply_analytics = {

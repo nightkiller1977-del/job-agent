@@ -381,6 +381,51 @@ async def test_fresh_receipt_inside_submit_iframe_allows_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fresh_receipt_with_failed_ledger_completion_is_unverified(monkeypatch):
+    """Receipt evidence is not success until it is durably recorded."""
+
+    class FailingCompletionLedger:
+        def claim(self, _key, _attempt_id, *, job_id=""):
+            return None
+
+        def complete(self, _key, _attempt_id, *, verified):
+            assert verified is True
+            raise OSError("disk unavailable")
+
+    submit_button = FakeElement("Submit Application")
+    frame = FakeFrame(
+        "https://boards.greenhouse.io/acme/jobs/1",
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    scraper = _scraper()
+    scraper._submission_ledger = FailingCompletionLedger()
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    async def _capture_baseline(receipt_frame):
+        return receipt_frame
+
+    async def _fresh_receipt(_frame, **_kwargs):
+        return True, "t:application received"
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _fresh_receipt)
+
+    submitted = await scraper._confirm_and_submit(
+        FakePage([frame], url=frame.url),
+        {"job_id": "job-1", "title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    assert submit_button.evaluate_calls == 1
+    assert submitted is False
+    assert scraper.last_apply_status == "submission_unverified"
+    assert "durably record" in scraper.last_apply_detail
+    assert not getattr(scraper, "_apply_analytics", {}).get("submitted", False)
+
+
+@pytest.mark.asyncio
 async def test_replaced_submit_iframe_is_reenumerated_for_fresh_receipt(monkeypatch):
     """A newly attached confirmation frame must replace the detached pre-click frame."""
     main = FakeFrame("https://host.example/jobs/1", evaluate_result=False)
