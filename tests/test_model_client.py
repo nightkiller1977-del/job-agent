@@ -1,10 +1,55 @@
 import asyncio
 import json
+import socket
 import time
 
 import pytest
 
 from src.model_client import ModelClient
+
+
+def test_provider_history_preserves_order_bound_and_taxonomy():
+    client = ModelClient()
+    client._record_provider_failure("openrouter", socket.gaierror(-3, "dns"))
+    for _ in range(client.MAX_PROVIDER_ATTEMPTS + 1):
+        history = client._record_provider_failure("ollama", TimeoutError(""))
+
+    assert len(history) == client.MAX_PROVIDER_ATTEMPTS
+    assert history[0] == {"provider": "ollama", "kind": "timeout", "exception_type": "TimeoutError"}
+    assert history[-1]["kind"] == "timeout"
+
+
+def test_provider_failure_taxonomy_is_distinguishable():
+    from src.model_client import BudgetExceededError
+    client = ModelClient()
+    assert client._provider_failure_kind(socket.gaierror(-3, "dns")) == "dns"
+    assert client._provider_failure_kind(TimeoutError("")) == "timeout"
+    assert client._provider_failure_kind(ValueError("bad json")) == "malformed_output"
+    assert client._provider_failure_kind(BudgetExceededError("budget")) == "quota"
+
+
+@pytest.mark.asyncio
+async def test_empty_provider_responses_are_recorded_in_cascade_history(monkeypatch):
+    from src.model_client import ModelCascadeError, reset_provider_status
+
+    reset_provider_status()
+    client = ModelClient(anthropic_api_key="test-anthropic-key")
+    monkeypatch.setattr(client, "_pick_ollama_model", lambda task_type: asyncio.sleep(0, result="local-model"))
+    monkeypatch.setattr(client, "_call_ollama", lambda *args, **kwargs: asyncio.sleep(0, result="  "))
+    monkeypatch.setenv("AICC_OPENROUTER_API_KEY", "test-gateway-key")
+    monkeypatch.setenv("OPENROUTER_GATEWAY_URL", "https://gateway.example")
+    monkeypatch.setattr(client, "_call_openrouter_gateway", lambda *args, **kwargs: asyncio.sleep(0, result=""))
+    monkeypatch.setattr(client, "_call_claude", lambda *args, **kwargs: asyncio.sleep(0, result="\n"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ModelCascadeError):
+        await client.complete([{"role": "user", "content": "test"}])
+
+    assert client.provider_attempt_history == [
+        {"provider": "ollama", "kind": "malformed_output", "exception_type": "ValueError"},
+        {"provider": "openrouter", "kind": "malformed_output", "exception_type": "ValueError"},
+        {"provider": "anthropic", "kind": "malformed_output", "exception_type": "ValueError"},
+    ]
 
 
 @pytest.mark.asyncio

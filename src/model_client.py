@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import platform
+import socket
 import subprocess
 import threading
 import urllib.error
@@ -424,6 +425,7 @@ class ModelClient:
     """
 
     _semaphores: dict[str, asyncio.Semaphore] = {}
+    MAX_PROVIDER_ATTEMPTS = 12
 
     @classmethod
     def reset_semaphores(cls) -> None:
@@ -453,6 +455,46 @@ class ModelClient:
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self._api_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self._anthropic_model = anthropic_model or DEFAULT_ANTHROPIC_MODEL
+        self.provider_attempt_history: list[dict[str, str]] = []
+
+    @staticmethod
+    def _provider_failure_kind(exc: BaseException) -> str:
+        """Classify deterministic provider failures without preserving payload text."""
+        status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(exc, BudgetExceededError):
+            return "quota"
+        if status in (401, 403):
+            return "authentication"
+        if status in (402,):
+            return "quota"
+        if status in (429,):
+            return "rate_limit"
+        if status in (502, 503, 504):
+            return "unavailable"
+        if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+            return "timeout"
+        if isinstance(exc, socket.gaierror):
+            return "dns"
+        name = type(exc).__name__.lower()
+        text = str(exc).lower()
+        if "ssl" in name or "ssl" in text:
+            return "tls"
+        if isinstance(exc, (ConnectionError, httpx.ConnectError)):
+            return "connect"
+        if isinstance(exc, (ValueError, json.JSONDecodeError)):
+            return "malformed_output"
+        return "unknown"
+
+    def _record_provider_failure(self, provider: str, exc: BaseException) -> list[dict[str, str]]:
+        """Append a bounded, ordered and non-secret provider failure record."""
+        self.provider_attempt_history.append({
+            "provider": provider,
+            "kind": self._provider_failure_kind(exc),
+            "exception_type": type(exc).__name__,
+        })
+        if len(self.provider_attempt_history) > self.MAX_PROVIDER_ATTEMPTS:
+            self.provider_attempt_history = self.provider_attempt_history[-self.MAX_PROVIDER_ATTEMPTS:]
+        return list(self.provider_attempt_history)
 
     # ------------------------------------------------------------------
     # Public API
@@ -497,8 +539,11 @@ class ModelClient:
                 if text and text.strip():
                     _log.info("ModelClient: Ollama model=%s task=%s", ollama_model, task_type)
                     return text
+                self._record_provider_failure("ollama", ValueError("empty provider response"))
+                last_error = "ollama_empty_response"
                 _log.warning("ModelClient: Ollama returned empty — escalating to OpenRouter Gateway")
             except Exception as exc:
+                self._record_provider_failure("ollama", exc)
                 last_error = str(exc)
                 _log.warning("ModelClient: Ollama failed (%s) — escalating to OpenRouter Gateway", exc)
         else:
@@ -521,8 +566,11 @@ class ModelClient:
                 if text and text.strip():
                     _log.info("ModelClient: OpenRouter Gateway model=%s task=%s", model_name, task_type)
                     return text
+                self._record_provider_failure("openrouter", ValueError("empty provider response"))
+                last_error = "openrouter_empty_response"
                 _log.warning("ModelClient: OpenRouter returned empty — escalating to Direct Claude")
             except BudgetExceededError as exc:
+                self._record_provider_failure("openrouter", exc)
                 # Do NOT bypass budget denial to spend direct cloud money without explicit authorization
                 allow_bypass = os.environ.get("ALLOW_DIRECT_CLOUD_FALLBACK_ON_BUDGET_DENIAL", "").lower() in ("true", "1")
                 if not allow_bypass:
@@ -530,6 +578,7 @@ class ModelClient:
                     raise
                 _log.warning("ModelClient: Gateway budget exceeded but explicit bypass authorized — escalating to Direct Claude")
             except Exception as exc:
+                self._record_provider_failure("openrouter", exc)
                 last_error = str(exc)
                 _log.warning("ModelClient: OpenRouter Gateway failed (%s) — escalating to Direct Claude", exc)
         else:
@@ -560,8 +609,11 @@ class ModelClient:
                 if text and text.strip():
                     _log.info("ModelClient: Claude model=%s task=%s", self._anthropic_model, task_type)
                     return text
+                self._record_provider_failure("anthropic", ValueError("empty provider response"))
+                last_error = "anthropic_empty_response"
                 _log.warning("ModelClient: Claude returned empty — escalating to OpenAI")
             except Exception as exc:
+                self._record_provider_failure("anthropic", exc)
                 last_error = str(exc)
                 if getattr(exc, "status_code", None) == 401:
                     _mark_provider_unavailable("anthropic", f"ANTHROPIC_API_KEY rejected with 401: {exc}")
@@ -577,9 +629,14 @@ class ModelClient:
             try:
                 with _model_span("openai", OPENAI_MODEL):
                     text = await self._call_openai(messages, system, max_tokens, temperature=temperature)
-                _log.info("ModelClient: OpenAI model=%s task=%s", OPENAI_MODEL, task_type)
-                return text
+                if text and text.strip():
+                    _log.info("ModelClient: OpenAI model=%s task=%s", OPENAI_MODEL, task_type)
+                    return text
+                self._record_provider_failure("openai", ValueError("empty provider response"))
+                last_error = "openai_empty_response"
+                _log.warning("ModelClient: OpenAI returned empty")
             except Exception as exc:
+                self._record_provider_failure("openai", exc)
                 last_error = str(exc)
                 if getattr(exc, "status_code", None) == 401:
                     _mark_provider_unavailable("openai", f"OPENAI_API_KEY rejected with 401: {exc}")
