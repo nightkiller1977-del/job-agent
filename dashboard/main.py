@@ -204,6 +204,7 @@ def _public_doc(doc: dict | None) -> dict:
         return {}
     out = dict(doc)
     out.pop("_id", None)
+    out.pop("_action_idempotency_keys", None)
     return out
 
 
@@ -267,6 +268,7 @@ def on_startup():
 class ActionRequest(BaseModel):
     job_id: str
     action: str
+    idempotency_key: Optional[str] = None
 
 
 class ExternalJobRequest(BaseModel):
@@ -477,8 +479,61 @@ async def job_action(body: ActionRequest):
     if body.action not in valid:
         raise HTTPException(status_code=400, detail=f"action must be one of {valid}")
     status = "skipped" if body.action == "archive" else body.action
-    result = get_db().jobs.find_one_and_update(
-        {"job_id": body.job_id}, {"$set": {"status": status, "updated_at": _utcnow()}},
+    jobs = get_db().jobs
+    idempotency_key = body.idempotency_key
+    if idempotency_key is not None:
+        allowed = set(
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "0123456789-_.:"
+        )
+        if (
+            not idempotency_key
+            or idempotency_key != idempotency_key.strip()
+            or len(idempotency_key) > 128
+            or any(char not in allowed for char in idempotency_key)
+        ):
+            raise HTTPException(status_code=400, detail="invalid idempotency_key")
+        operation_key = f"{status}:{idempotency_key}"
+        result = jobs.find_one_and_update(
+            {
+                "job_id": body.job_id,
+                "_action_idempotency_keys": {"$ne": operation_key},
+            },
+            {
+                "$set": {"status": status, "updated_at": _utcnow()},
+                "$addToSet": {"_action_idempotency_keys": operation_key},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if not result:
+            current = jobs.find_one(
+                {"job_id": body.job_id},
+                {"status": 1, "_action_idempotency_keys": 1},
+            )
+            if not current:
+                raise HTTPException(status_code=404, detail="Job not found")
+            if operation_key not in current.get("_action_idempotency_keys", []):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Action could not be atomically deduplicated",
+                )
+            return {
+                "ok": True,
+                "job_id": body.job_id,
+                "status": current.get("status", status),
+                "deduplicated": True,
+            }
+        return {
+            "ok": True,
+            "job_id": body.job_id,
+            "status": status,
+            "deduplicated": False,
+        }
+
+    result = jobs.find_one_and_update(
+        {"job_id": body.job_id},
+        {"$set": {"status": status, "updated_at": _utcnow()}},
         return_document=ReturnDocument.AFTER,
     )
     if not result:

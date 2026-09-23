@@ -4,6 +4,7 @@ Orchestrator — coordinates scraping, scoring, review, and application flow.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -59,6 +60,12 @@ from .sources.adapters.runtime import get_run_log as _get_run_log
 
 console = Console()
 _log = logging.getLogger(__name__)
+
+
+def _cloud_action_idempotency_key(job_id: str, status: str) -> str:
+    """Stable replay key for one logical dashboard status transition."""
+    material = f"job-agent:cloud-action:v1:{job_id}:{status}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def meets_min_apply_score(score, min_apply_score: int) -> bool:
@@ -2035,9 +2042,19 @@ class Orchestrator:
                 "dashboard_action",
                 "post",
                 f"{dashboard_url}/api/action",
-                json={"job_id": job_id, "action": status},
+                json={
+                    "job_id": job_id,
+                    "action": status,
+                    "idempotency_key": _cloud_action_idempotency_key(
+                        job_id, status
+                    ),
+                },
                 headers={"X-Sync-Secret": sync_secret} if sync_secret else {},
-                idempotent=False,
+                # The dashboard atomically stores this operation key with the
+                # status transition. Transport policy still performs one
+                # attempt per call because this remains state-changing, while
+                # durable cross-run retries are safely deduplicated server-side.
+                idempotent=True,
                 state_changing=True,
             )
             if r is None:

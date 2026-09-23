@@ -19,6 +19,7 @@ from playwright.async_api import Error as PlaywrightError, TimeoutError as Playw
 from rich.console import Console
 
 from .adapters.receipt import capture_receipt_evidence, verify_receipt
+from .adapters.forensics import host_of
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_success
 from src.resume_helper import ResumeFieldFixer, resolve_resume_path, check_ats_readability, ATSReadabilityError, KeywordCoverageError, PDFTextLayerError, load_profile
@@ -33,6 +34,8 @@ JOBRIGHT_JOBS_URL = "https://jobright.ai/jobs"
 JOBRIGHT_MATCHED_URL = "https://jobright.ai/jobs/recommend"
 TAILORED_RESUMES_DIR = Path(__file__).parent.parent.parent / "state" / "tailored_resumes"
 TAILORED_RESUMES_DIR.mkdir(parents=True, exist_ok=True)
+MAX_RECEIPT_FRAMES = 12
+RECEIPT_FRAME_TIMEOUT_MS = 1500
 
 
 class JobrightScraper(BaseScraper):
@@ -401,7 +404,10 @@ class JobrightScraper(BaseScraper):
                         continue
             else:
                 await self._delay(3, 5)
-            console.print(f"[magenta]Jobright ATS:[/magenta] Company portal loaded: {page.url}")
+            console.print(
+                "[magenta]Jobright ATS:[/magenta] Company portal loaded: "
+                f"{host_of(page.url) or 'employer portal'}"
+            )
 
             # Skip _click_ats_apply_button for Teamtailor — we're already on /applications/new
             if _is_teamtailor:
@@ -502,6 +508,7 @@ class JobrightScraper(BaseScraper):
                 console.print("[yellow]Jobright ATS:[/yellow] No local resume file found for upload fallback.")
 
             current_portal = page.url
+            current_portal_reference = host_of(current_portal) or "employer portal"
             _on_teamtailor = "teamtailor.com" in current_portal.lower()
             if "myworkdayjobs.com" not in current_portal:
                 if not entered_form and not await self._looks_like_application_form(page):
@@ -511,7 +518,7 @@ class JobrightScraper(BaseScraper):
                         f"{family}_form_not_reached" if family != "generic" else "form_not_reached",
                         (
                             f"Company portal did not expose an application form after opening "
-                            f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
+                            f"{current_portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                         ),
                     )
                 # Skip Jobright extension autofill for Teamtailor — extension not loaded,
@@ -535,11 +542,12 @@ class JobrightScraper(BaseScraper):
             if not _on_teamtailor and not await self._looks_like_application_form(page):
                 family = await self._detect_portal_family(page)
                 controls = await self._visible_controls_snapshot(page)
+                portal_reference = host_of(page.url) or "employer portal"
                 return self._set_apply_outcome(
                     f"{family}_form_not_detected" if family != "generic" else "form_not_detected",
                     (
                         f"ATS page loaded but no application/review form was detected at "
-                        f"{page.url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                        f"{portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                     ),
                 )
 
@@ -1786,7 +1794,10 @@ class JobrightScraper(BaseScraper):
                     base_url = company_page.url.split('?')[0].rstrip('/')
                     await company_page.goto(f"{base_url}/applications/new", wait_until="domcontentloaded", timeout=30000)
                     await self._delay(3, 5)
-                console.print(f"[green]Jobright:[/green] Extension opened ATS: {company_page.url[:80]}")
+                console.print(
+                    "[green]Jobright:[/green] Extension opened ATS: "
+                    f"{host_of(company_page.url) or 'employer portal'}"
+                )
             except Exception as _e:
                 console.print(f"[yellow]Jobright:[/yellow] Apply button didn't open new tab ({_e}); using direct navigation")
 
@@ -1812,7 +1823,10 @@ class JobrightScraper(BaseScraper):
             except Exception:
                 pass
 
-            console.print(f"[magenta]Jobright:[/magenta] Company portal loaded: {company_page.url}")
+            console.print(
+                "[magenta]Jobright:[/magenta] Company portal loaded: "
+                f"{host_of(company_page.url) or 'employer portal'}"
+            )
 
             # ── Step 7: Click Apply button FIRST ─────────────────────────────
             # Workday shows a job description page; clicking Apply opens the
@@ -1854,6 +1868,7 @@ class JobrightScraper(BaseScraper):
                 current_portal = company_page.url
             except Exception:
                 current_portal = ""
+            current_portal_reference = host_of(current_portal) or "employer portal"
 
             if 'myworkdayjobs.com' not in current_portal:
                 if not entered_form and not await self._looks_like_application_form(company_page):
@@ -1866,7 +1881,7 @@ class JobrightScraper(BaseScraper):
                         f"{family}_form_not_reached" if family != "generic" else "form_not_reached",
                         (
                             f"Company portal did not expose an application form after opening "
-                            f"{current_portal}. Visible controls: {self._format_controls_snapshot(controls)}"
+                            f"{current_portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                         ),
                     )
                 # ── Claude ATS scoring + resume tailoring fallback (Jobright path) ──
@@ -1934,12 +1949,13 @@ class JobrightScraper(BaseScraper):
                     portal_url = company_page.url
                 except Exception:
                     portal_url = ""
+                portal_reference = host_of(portal_url) or "employer portal"
                 if "myworkdayjobs.com" in portal_url and "BUTTON Sign In" in controls_text:
                     console.print("[yellow]Jobright:[/yellow] Workday portal requires sign-in — marking as session-needed.")
                     self._workday_session_expired = True
                     return self._set_apply_outcome(
                         "workday_session_expired",
-                        f"Workday portal at {portal_url} requires sign-in. "
+                        f"Workday portal at {portal_reference} requires sign-in. "
                         "Run: python src/main.py prepare-sessions to authenticate this tenant.",
                     )
 
@@ -1947,7 +1963,7 @@ class JobrightScraper(BaseScraper):
                     f"{family}_form_not_detected" if family != "generic" else "form_not_detected",
                     (
                         f"ATS page loaded but no application/review form was detected at "
-                        f"{portal_url}. Visible controls: {controls_text}"
+                        f"{portal_reference}. Visible controls: {controls_text}"
                     ),
                 )
             submitted = await self._confirm_and_submit(company_page, job, auto_submit=auto_submit)
@@ -2061,7 +2077,9 @@ class JobrightScraper(BaseScraper):
                 await company_page.goto(ext_url, wait_until="domcontentloaded", timeout=45000)
             await self._delay(4, 6)
             family = await self._detect_portal_family(company_page)
-            console.print(f"[cyan]Portal:[/cyan] {company_page.url}")
+            console.print(
+                f"[cyan]Portal:[/cyan] {host_of(company_page.url) or 'employer portal'}"
+            )
             console.print(f"[cyan]Detected:[/cyan] {family}")
 
             if family == "workday":
@@ -2358,9 +2376,49 @@ class JobrightScraper(BaseScraper):
             parsed = urlsplit(frame.url or "")
         except Exception:
             return ""
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             return ""
-        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+        try:
+            port = parsed.port
+        except ValueError:
+            return ""
+        host = parsed.hostname.lower()
+        authority = f"{host}:{port}" if port is not None else host
+        return f"{parsed.scheme.lower()}://{authority}"
+
+    async def _capture_receipt_baselines(
+        self,
+        page,
+        *,
+        required_frame=None,
+        max_frames: int = MAX_RECEIPT_FRAMES,
+        per_frame_timeout_ms: int = RECEIPT_FRAME_TIMEOUT_MS,
+    ) -> list[tuple[object, object]]:
+        """Capture bounded pre-click evidence without trusting a wedged frame."""
+        if max_frames <= 0:
+            return []
+        frames = []
+        if required_frame is not None:
+            frames.append(required_frame)
+        for frame in self._candidate_frames(page):
+            if frame not in frames:
+                frames.append(frame)
+            if len(frames) >= max_frames:
+                break
+
+        baselines = []
+        for frame in frames:
+            try:
+                baseline = await asyncio.wait_for(
+                    capture_receipt_evidence(frame),
+                    timeout=per_frame_timeout_ms / 1000,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                continue
+            except Exception:
+                continue
+            baselines.append((frame, baseline))
+        return baselines
 
     async def _verify_submit_receipt(
         self,
@@ -2371,6 +2429,8 @@ class JobrightScraper(BaseScraper):
         receipt_baselines: list[tuple[object, object]],
         retries: int = 5,
         delay: float = 0.4,
+        max_frames: int = MAX_RECEIPT_FRAMES,
+        per_frame_timeout_ms: int = RECEIPT_FRAME_TIMEOUT_MS,
     ) -> str:
         """Poll only receipt contexts attributable to the clicked submit.
 
@@ -2439,6 +2499,8 @@ class JobrightScraper(BaseScraper):
             elif submit_origin:
                 receipt_contexts = []
                 for current_frame in current_frames:
+                    if len(receipt_contexts) >= max_frames:
+                        break
                     if self._frame_origin(current_frame) != submit_origin:
                         continue
                     saved_baseline = next(
@@ -2464,9 +2526,12 @@ class JobrightScraper(BaseScraper):
 
             receipt_checks = await asyncio.gather(
                 *(
-                    _verify_against_all_baselines(
-                        receipt_frame,
-                        baselines,
+                    asyncio.wait_for(
+                        _verify_against_all_baselines(
+                            receipt_frame,
+                            baselines,
+                        ),
+                        timeout=per_frame_timeout_ms / 1000,
                     )
                     for receipt_frame, baselines in receipt_contexts
                 ),
@@ -3373,9 +3438,10 @@ class JobrightScraper(BaseScraper):
         if clicked:
             await self._delay(5, 8)
             if await self._looks_like_login_wall(page):
+                portal_reference = host_of(page.url) or "Microsoft careers"
                 self._set_apply_outcome(
                     "microsoft_login_required",
-                    f"Microsoft careers redirected to login at {page.url}.",
+                    f"Microsoft careers redirected to login at {portal_reference}.",
                 )
                 return False
             apply_still_visible = await self._has_visible_control_matching(page, ['^apply now$', '^apply$'])
@@ -3385,9 +3451,10 @@ class JobrightScraper(BaseScraper):
                 return True
 
         controls = await self._visible_controls_snapshot(page)
+        portal_reference = host_of(page.url) or "Microsoft careers"
         self._set_apply_outcome(
             "microsoft_apply_control_not_activated" if clicked else "microsoft_apply_not_reached",
-            f"Could not enter Microsoft application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
+            f"Could not enter Microsoft application flow at {portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}",
         )
         return False
 
@@ -3413,9 +3480,10 @@ class JobrightScraper(BaseScraper):
         if clicked:
             await self._delay(5, 8)
             if await self._looks_like_login_wall(page):
+                portal_reference = host_of(page.url) or "BrassRing"
                 self._set_apply_outcome(
                     "brassring_login_required",
-                    f"BrassRing redirected to login/profile page at {page.url}.",
+                    f"BrassRing redirected to login/profile page at {portal_reference}.",
                 )
                 return False
             if await self._looks_like_application_form(page):
@@ -3423,9 +3491,10 @@ class JobrightScraper(BaseScraper):
                 return True
 
         controls = await self._visible_controls_snapshot(page)
+        portal_reference = host_of(page.url) or "BrassRing"
         self._set_apply_outcome(
             "brassring_apply_not_reached",
-            f"Could not enter BrassRing application flow at {page.url}. Visible controls: {self._format_controls_snapshot(controls)}",
+            f"Could not enter BrassRing application flow at {portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}",
         )
         return False
 
@@ -3446,6 +3515,12 @@ class JobrightScraper(BaseScraper):
         # first manual login, so this block is only reached when the session
         # has expired.  We detect the redirect and abort gracefully — the user
         # will need to re-run once manually to refresh the session.
+        def _portal_reference() -> str:
+            try:
+                return host_of(page.url) or "Workday portal"
+            except Exception:
+                return "Workday portal"
+
         try:
             url = page.url.lower()
             on_login_page = any(w in url for w in ["/login", "/signin", "/sign-in", "/auth", "login.", "sso."])
@@ -3467,7 +3542,8 @@ class JobrightScraper(BaseScraper):
 
         if on_login_page:
             console.print(
-                f"[bold red]Jobright: Workday session expired[/bold red] — portal URL: {page.url}"
+                "[bold red]Jobright: Workday session expired[/bold red] — portal: "
+                f"{_portal_reference()}"
             )
             self._workday_session_expired = True
 
@@ -3522,7 +3598,7 @@ class JobrightScraper(BaseScraper):
                 notify_error(
                     "Workday session expired",
                     f"Run 'python src/main.py prepare-sessions' to refresh the Workday session.\n"
-                    f"Portal: {page.url}",
+                    f"Portal: {_portal_reference()}",
                 )
             return
 
@@ -3562,12 +3638,13 @@ class JobrightScraper(BaseScraper):
 
         if session_gate:
             console.print(
-                f"[bold red]Jobright: Workday session gate detected after chooser click[/bold red] — {page.url}"
+                "[bold red]Jobright: Workday session gate detected after chooser click[/bold red] — "
+                f"{_portal_reference()}"
             )
             self._workday_session_expired = True
             notify_error(
                 "Workday session expired",
-                f"Run 'python src/main.py prepare-sessions' to refresh the Workday session.\nPortal: {page.url}",
+                f"Run 'python src/main.py prepare-sessions' to refresh the Workday session.\nPortal: {_portal_reference()}",
             )
             return
 
@@ -4099,6 +4176,7 @@ class JobrightScraper(BaseScraper):
             portal_url = page.url
         except Exception:
             portal_url = "(unknown)"
+        portal_reference = host_of(portal_url) or "employer portal"
         family = await self._detect_portal_family(page)
 
         # ── Guard: refuse to submit if no form fields appear to be filled ────
@@ -4158,10 +4236,10 @@ class JobrightScraper(BaseScraper):
                     "[yellow]Jobright: Submit button found but form appears empty — "
                     "autofill did not run or this is a listing page, not the application form.[/yellow]"
                 )
-                console.print(f"[dim]Portal: {portal_url}[/dim]")
+                console.print(f"[dim]Portal: {portal_reference}[/dim]")
                 return self._set_apply_outcome(
                     "form_empty_not_submitted",
-                    f"Submit button was found at {portal_url} but all form fields were empty. "
+                    f"Submit button was found at {portal_reference} but all form fields were empty. "
                     "Jobright autofill did not populate the form — ensure the extension is active "
                     "and the Jobright session is logged in, then re-run.",
                 )
@@ -4171,7 +4249,7 @@ class JobrightScraper(BaseScraper):
                 "[yellow]Jobright: Submit button not found and this run is non-interactive — "
                 "skipping instead of prompting.[/yellow]"
             )
-            console.print(f"[dim]Portal: {portal_url}[/dim]")
+            console.print(f"[dim]Portal: {portal_reference}[/dim]")
             controls = await self._visible_controls_snapshot(page)
             tailored_hint = getattr(self, "_last_tailored_resume_path", "") or ""
             if tailored_hint:
@@ -4180,7 +4258,7 @@ class JobrightScraper(BaseScraper):
                 f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
                 (
                     f"Reached portal but could not find a final Submit/Apply button at "
-                    f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                    f"{portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                     + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
                 ),
             )
@@ -4190,7 +4268,7 @@ class JobrightScraper(BaseScraper):
 
         console.print(f"\n[bold yellow]─── READY TO SUBMIT ───[/bold yellow]")
         console.print(f"  Job   : {job.get('title')} @ {job.get('company')}")
-        console.print(f"  Portal: {portal_url}")
+        console.print(f"  Portal: {portal_reference}")
         if submit_btn:
             console.print(f"  [green]Submit button found ✓[/green]")
         else:
@@ -4248,13 +4326,10 @@ class JobrightScraper(BaseScraper):
                         "submission_ledger_key_missing",
                         "Could not derive a durable submission key; refusing to click submit.",
                     )
-            receipt_baselines = []
-            for receipt_frame in self._candidate_frames(page):
-                try:
-                    baseline = await capture_receipt_evidence(receipt_frame)
-                except Exception:
-                    continue
-                receipt_baselines.append((receipt_frame, baseline))
+            receipt_baselines = await self._capture_receipt_baselines(
+                page,
+                required_frame=submit_frame,
+            )
 
             if submission_ledger is not None:
                 try:
@@ -4356,7 +4431,7 @@ class JobrightScraper(BaseScraper):
                 )
                 return self._set_apply_outcome(
                     "submission_unverified",
-                    f"At {portal_url}, {dispatch_detail}ATS acceptance receipt "
+                    f"At {portal_reference}, {dispatch_detail}ATS acceptance receipt "
                     "appeared. Reconcile the employer portal "
                     f"before retrying to avoid a duplicate application.{ledger_detail}",
                 )
@@ -4373,7 +4448,7 @@ class JobrightScraper(BaseScraper):
                     # it applied with no crash-recovery proof.
                     return self._set_apply_outcome(
                         "submission_unverified",
-                        f"A fresh ATS receipt appeared at {portal_url}, but the "
+                        f"A fresh ATS receipt appeared at {portal_reference}, but the "
                         f"submission ledger could not durably record it "
                         f"({type(exc).__name__}). Reconcile the employer portal "
                         "before retrying.",
@@ -4407,7 +4482,7 @@ class JobrightScraper(BaseScraper):
                     f"{family}_submit_not_found" if family != "generic" else "submit_not_found",
                     (
                         f"Auto-submit requested, but no submit button was found at "
-                        f"{portal_url}. Visible controls: {self._format_controls_snapshot(controls)}"
+                        f"{portal_reference}. Visible controls: {self._format_controls_snapshot(controls)}"
                         + (f"\nTailored resume ready: {tailored_hint}" if tailored_hint else "")
                     ),
                 )

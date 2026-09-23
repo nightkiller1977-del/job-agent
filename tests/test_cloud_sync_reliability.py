@@ -111,6 +111,10 @@ async def test_pending_applied_sync_retries_until_cloud_confirms(tmp_path, monke
     await orchestrator._retry_pending_cloud_status_sync()
 
     assert orchestrator._cloud_request.await_count == 2
+    first_payload = orchestrator._cloud_request.await_args_list[0].kwargs["json"]
+    retry_payload = orchestrator._cloud_request.await_args_list[1].kwargs["json"]
+    assert first_payload["idempotency_key"]
+    assert retry_payload["idempotency_key"] == first_payload["idempotency_key"]
     cleared = parse_extra_json(
         orchestrator.state.get_job(job["job_id"])["extra_json"]
     )

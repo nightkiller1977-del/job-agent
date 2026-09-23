@@ -14,7 +14,7 @@
 
 - ACES-387 is under ACES-18; ACES-284 owns breaker decay/re-arm policy.
 - Preserve isolated browser profiles and never access the main Chrome profile.
-- Never retry employer submissions, unresolved `submission_unverified`, or ambiguous `/api/action` outcomes.
+- Never retry employer submissions or unresolved `submission_unverified`. Never transport-retry an ambiguous `/api/action` call; only a durable status obligation carrying the same server-deduplicated idempotency key may be replayed by a later run.
 - Never log secrets, credentials, URLs, query strings, headers, response bodies, personal data, or raw prompts.
 - Preserve dashboard payloads/headers, database schema, result tokens, and ledger ownership.
 - No live submissions, CAPTCHA/2FA bypasses, production resets, or destructive operations.
@@ -74,7 +74,7 @@ async def test_server_committed_client_timeout_action_runs_once(orchestrator, cl
 
 - [ ] **Step 2: Verify RED.** Run `.venv/bin/python3 -m pytest tests/test_cloud_sync_reliability.py -q`; expect policy/event failure.
 
-- [ ] **Step 3: Implement the operation map.** Route GET `/api/jobs/approved` as `cloud_pull_approved` / `dashboard_read`; POST `/api/sync` as `cloud_sync_jobs` / `dashboard_sync`; POST `/api/action` as `cloud_action` / `dashboard_action`. Preserve current payload/header shapes. Verify server-side `/api/sync` deduplication before authorizing any POST retry; if absent, set it non-retryable and create a linked ACES-18 dashboard-contract child ticket. `/api/action` stays exactly once regardless of missing response.
+- [ ] **Step 3: Implement the operation map.** Route GET `/api/jobs/approved` as `cloud_pull_approved` / `dashboard_read`; POST `/api/sync` as `cloud_sync_jobs` / `dashboard_sync`; POST `/api/action` as `cloud_action` / `dashboard_action`. Preserve current headers. Verify server-side `/api/sync` deduplication before authorizing any POST retry; if absent, set it non-retryable and create a linked ACES-18 dashboard-contract child ticket. `/api/action` remains one transport attempt per call; durable status replay requires a stable key atomically recorded by the dashboard.
 
 - [ ] **Step 4: Verify GREEN and commit.** Run `.venv/bin/python3 -m pytest tests/test_cloud_sync_reliability.py tests/test_credentials.py tests/test_dashboard_sync_regressions.py -q`; expect PASS. Then add modified source/tests and commit `fix: harden cloud sync diagnostics and retry safety`.
 

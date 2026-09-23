@@ -545,9 +545,13 @@ async def test_fresh_receipt_with_failed_ledger_completion_is_unverified(monkeyp
             assert verified is True
             raise OSError("disk unavailable")
 
+    sensitive_url = (
+        "https://applicant:super-secret@boards.greenhouse.io/acme/jobs/1"
+        "?gh_jid=private-token"
+    )
     submit_button = FakeElement("Submit Application")
     frame = FakeFrame(
-        "https://boards.greenhouse.io/acme/jobs/1",
+        sensitive_url,
         {"#submit_app": submit_button},
         evaluate_result=True,
     )
@@ -575,6 +579,10 @@ async def test_fresh_receipt_with_failed_ledger_completion_is_unverified(monkeyp
     assert submitted is False
     assert scraper.last_apply_status == "submission_unverified"
     assert "durably record" in scraper.last_apply_detail
+    assert "boards.greenhouse.io" in scraper.last_apply_detail
+    assert "applicant" not in scraper.last_apply_detail
+    assert "super-secret" not in scraper.last_apply_detail
+    assert "private-token" not in scraper.last_apply_detail
     assert not getattr(scraper, "_apply_analytics", {}).get("submitted", False)
 
 
@@ -621,6 +629,115 @@ async def test_replaced_submit_iframe_is_reenumerated_for_fresh_receipt(monkeypa
 
     assert submitted is True
     assert scraper._apply_analytics["receiptSignal"] == "t:application received"
+
+
+@pytest.mark.asyncio
+async def test_receipt_poll_caps_same_origin_replacement_frames(monkeypatch):
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        evaluate_result=True,
+    )
+    replacements = [
+        FakeFrame(
+            f"https://boards.greenhouse.io/embed/replacement-{index}",
+            evaluate_result=True,
+        )
+        for index in range(20)
+    ]
+    checked = []
+
+    async def _no_receipt(frame, **_kwargs):
+        checked.append(frame)
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "verify_receipt", _no_receipt)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+
+    signal = await scraper._verify_submit_receipt(
+        FakePage(replacements),
+        submit_frame=application,
+        submit_origin="https://boards.greenhouse.io",
+        receipt_baselines=[(application, application)],
+        retries=0,
+        max_frames=4,
+    )
+
+    assert signal == ""
+    assert checked == replacements[:4]
+
+
+@pytest.mark.asyncio
+async def test_receipt_baseline_capture_is_bounded_and_timeout_safe(monkeypatch):
+    frames = [
+        FakeFrame(f"https://boards.greenhouse.io/embed/{index}")
+        for index in range(20)
+    ]
+    checked = []
+
+    async def _capture(frame):
+        checked.append(frame)
+        if frame is frames[0]:
+            await asyncio.sleep(30)
+        return frame
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture)
+    scraper = _scraper()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    baselines = await scraper._capture_receipt_baselines(
+        FakePage(frames),
+        max_frames=4,
+        per_frame_timeout_ms=50,
+    )
+
+    assert checked == frames[:4]
+    assert baselines == [(frame, frame) for frame in frames[1:4]]
+    assert loop.time() - started < 1.0
+
+
+@pytest.mark.asyncio
+async def test_receipt_poll_times_out_one_frame_without_hiding_healthy_sibling(
+    monkeypatch,
+):
+    application = FakeFrame(
+        "https://boards.greenhouse.io/embed/application",
+        evaluate_result=True,
+    )
+    hanging = FakeFrame(
+        "https://boards.greenhouse.io/embed/hanging",
+        evaluate_result=True,
+    )
+    healthy = FakeFrame(
+        "https://boards.greenhouse.io/embed/confirmation",
+        evaluate_result=True,
+    )
+
+    async def _receipt(frame, **_kwargs):
+        if frame is hanging:
+            await asyncio.sleep(30)
+        if frame is healthy:
+            return True, "t:application received"
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "verify_receipt", _receipt)
+    scraper = _scraper()
+    scraper._delay = _no_delay
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    signal = await scraper._verify_submit_receipt(
+        FakePage([hanging, healthy]),
+        submit_frame=application,
+        submit_origin="https://boards.greenhouse.io",
+        receipt_baselines=[(application, application)],
+        retries=0,
+        per_frame_timeout_ms=50,
+    )
+
+    assert signal == "t:application received"
+    assert loop.time() - started < 1.0
 
 
 @pytest.mark.asyncio
@@ -1146,6 +1263,51 @@ async def test_legacy_ledger_outcome_redacts_sensitive_canonical_key(
     assert scraper.last_apply_status == "duplicate_application_prevented"
     assert submit_button.evaluate_calls == 0
     assert key not in detail
+    assert "applicant" not in detail
+    assert "super-secret" not in detail
+    assert "private-token" not in detail
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_submit_detail_redacts_sensitive_portal_url(
+    monkeypatch, tmp_path
+):
+    from src.sources.adapters.idempotency import SubmissionLedger
+
+    sensitive_url = (
+        "https://applicant:super-secret@boards.greenhouse.io/acme/jobs/2"
+        "?gh_jid=private-token"
+    )
+
+    async def _capture_baseline(frame):
+        return frame
+
+    async def _no_receipt(_frame, **_kwargs):
+        return False, ""
+
+    monkeypatch.setattr(jobright_module, "capture_receipt_evidence", _capture_baseline)
+    monkeypatch.setattr(jobright_module, "verify_receipt", _no_receipt)
+    submit_button = FakeElement("Submit Application")
+    frame = FakeFrame(
+        sensitive_url,
+        {"#submit_app": submit_button},
+        evaluate_result=True,
+    )
+    scraper = _scraper()
+    scraper._submission_ledger = SubmissionLedger(tmp_path / "ledger.json")
+    scraper._delay = _no_delay
+    scraper._run_pre_submission_validation = _no_delay
+
+    submitted = await scraper._confirm_and_submit(
+        FakePage([frame], url=sensitive_url),
+        {"job_id": "job-2", "title": "Engineer", "company": "Acme"},
+        auto_submit=True,
+    )
+
+    detail = scraper.last_apply_detail
+    assert submitted is False
+    assert scraper.last_apply_status == "submission_unverified"
+    assert "boards.greenhouse.io" in detail
     assert "applicant" not in detail
     assert "super-secret" not in detail
     assert "private-token" not in detail

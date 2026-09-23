@@ -85,6 +85,65 @@ class TestSyncPreservesDiscoveredAt(unittest.TestCase):
         self.assertIsNotNone(update["$setOnInsert"]["discovered_at"])
 
 
+class TestActionIdempotency(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+
+    @patch("dashboard.main.get_db")
+    def test_action_atomically_records_idempotency_key(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = {
+            "job_id": "job-1",
+            "status": "applied",
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["deduplicated"])
+        filt, update = mock_db.jobs.find_one_and_update.call_args.args
+        operation_key = "applied:stable-key-1"
+        self.assertEqual(filt["_action_idempotency_keys"], {"$ne": operation_key})
+        self.assertEqual(
+            update["$addToSet"]["_action_idempotency_keys"],
+            operation_key,
+        )
+
+    @patch("dashboard.main.get_db")
+    def test_action_replay_returns_success_without_reapplying(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "applied",
+            "_action_idempotency_keys": ["applied:stable-key-1"],
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["deduplicated"])
+        mock_db.jobs.find_one.assert_called_once()
+
+
 class TestExternalJobScorePlaceholder(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
