@@ -354,17 +354,27 @@ async def login_submit(request: Request):
     return _issue_session(next_path, request)
 
 
-def _issue_session(next_path: str, request: Request) -> RedirectResponse:
+def _issue_session(next_path: str, request: Request, samesite: str = "strict") -> RedirectResponse:
     """Shared by both login paths: mint the same signed ja_session cookie the
     sync-secret flow has always issued, so nothing downstream needs to know
-    which credential the browser actually presented."""
+    which credential the browser actually presented.
+
+    samesite defaults to "strict" (the sync-secret POST /login is same-site
+    start to finish, so Strict is the tightest correct setting). The Google
+    callback overrides this to "lax": that request itself arrives via a
+    cross-site top-level navigation (redirected from accounts.google.com),
+    and browsers treat the immediate 303 this function issues as still part
+    of that same cross-site navigation chain — a Strict cookie set here would
+    be silently dropped on that one hop, bouncing the browser back to /login
+    even though sign-in succeeded.
+    """
     response = RedirectResponse(next_path, status_code=303)
     response.set_cookie(
         _SESSION_COOKIE,
         _make_session_token(),
         max_age=_SESSION_MAX_AGE,
         httponly=True,
-        samesite="strict",
+        samesite=samesite,
         secure=_is_secure_request(request),
         path="/",
     )
@@ -438,7 +448,7 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
     if not profile.get("verified_email") or not email or not hmac.compare_digest(email, ALLOWED_GOOGLE_EMAIL):
         return _login_page("This Google account is not authorized for this dashboard.", next_path=next_path)
 
-    response = _issue_session(next_path, request)
+    response = _issue_session(next_path, request, samesite="lax")
     response.delete_cookie(_OAUTH_STATE_COOKIE, path="/auth/google")
     return response
 

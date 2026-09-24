@@ -220,6 +220,30 @@ class TestGoogleCallback(unittest.TestCase):
         self.assertEqual(resp.headers["location"], "/dashboard-home")
         self.assertIn("ja_session", resp.cookies)
 
+    def test_issued_session_cookie_is_samesite_lax_not_strict(self):
+        # Regression: the callback request arrives via a cross-site top-level
+        # navigation (redirected from accounts.google.com). A browser treats
+        # the 303 this handler issues as still part of that same navigation,
+        # so a SameSite=Strict cookie set here is silently dropped on that one
+        # hop — the sync-secret /login path is same-site throughout and can
+        # stay Strict, but this one specifically must be Lax or sign-in
+        # succeeds server-side and then immediately bounces back to /login.
+        state = self._start()
+        patches = _configured()
+        for p in patches:
+            p.start()
+        try:
+            with patch.object(dm.httpx, "AsyncClient", _FakeAsyncClient()):
+                resp = self.client.get(
+                    f"/auth/google/callback?code=abc&state={state}", follow_redirects=False
+                )
+        finally:
+            for p in patches:
+                p.stop()
+        cookie_header = resp.headers["set-cookie"].lower()
+        self.assertIn("samesite=lax", cookie_header)
+        self.assertNotIn("samesite=strict", cookie_header)
+
     def test_wrong_google_account_is_rejected(self):
         state = self._start()
         patches = _configured()
