@@ -556,6 +556,58 @@ class StateManager:
             )
         return True
 
+    def discard_superseded_cloud_status_sync(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        expected_marker: dict,
+        cloud_revision: int,
+    ) -> bool:
+        """Discard an exact operation already committed then superseded.
+
+        This intentionally does not rebase a replacement marker. A 409 with
+        this provenance proves the old operation completed and a newer cloud
+        action now owns the status; making the old transition eligible again
+        would overwrite that newer action.
+        """
+        expected_revision = expected_marker.get("expected_revision")
+        if (
+            isinstance(cloud_revision, bool)
+            or not isinstance(cloud_revision, int)
+            or cloud_revision < 0
+            or isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+            or cloud_revision <= expected_revision
+        ):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            extra = parse_extra_json(row["extra_json"])
+            marker = extra.get("cloud_status_sync_pending")
+            marker_status = marker.get("status") if isinstance(marker, dict) else ""
+            if marker_status != status or marker != expected_marker:
+                return False
+            stored_revision = extra.get("cloud_status_revision", 0)
+            if (
+                isinstance(stored_revision, bool)
+                or not isinstance(stored_revision, int)
+                or stored_revision < 0
+            ):
+                stored_revision = 0
+            extra["cloud_status_revision"] = max(stored_revision, cloud_revision)
+            extra.pop("cloud_status_sync_pending", None)
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra) if extra else None, job_id),
+            )
+        return True
+
     def transition_confirmation(self, job_id: str, to_status: str) -> None:
         """Transitions confirmation_status following the formal state transition table."""
         job = self.get_job(job_id)

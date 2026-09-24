@@ -255,6 +255,8 @@ async def test_revision_conflict_rebases_exact_pending_generation(
             "detail": {
                 "current_status": "applied",
                 "current_revision": 1,
+                "conflict_kind": "compare_and_set_failed",
+                "operation_recorded": False,
             }
         },
     )
@@ -286,6 +288,158 @@ async def test_revision_conflict_rebases_exact_pending_generation(
     assert "cloud_status_sync_pending" not in parse_extra_json(
         orchestrator.state.get_job(job["job_id"])["extra_json"]
     )
+
+
+@pytest.mark.asyncio
+async def test_recorded_superseded_action_clears_exact_obligation_without_retry(
+    tmp_path, monkeypatch
+):
+    """A lost successful response must not overwrite a newer cloud action."""
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-superseded-operation",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/superseded-operation",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator.state.set_status(job["job_id"], "applied")
+    superseded = MagicMock(
+        status_code=409,
+        json=lambda: {
+            "detail": {
+                "current_status": "skipped",
+                "current_revision": 2,
+                "conflict_kind": "operation_superseded",
+                "operation_recorded": True,
+            }
+        },
+    )
+    orchestrator._cloud_request = AsyncMock(return_value=superseded)
+
+    result = await orchestrator._push_status_to_cloud(job["job_id"], "applied")
+    await orchestrator._retry_pending_cloud_status_sync()
+
+    assert result is True
+    orchestrator._cloud_request.assert_awaited_once()
+    current = orchestrator.state.get_job(job["job_id"])
+    extra = parse_extra_json(current["extra_json"])
+    assert current["status"] == "applied"
+    assert extra["cloud_status_revision"] == 2
+    assert "cloud_status_sync_pending" not in extra
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_conflict_does_not_rebase_pending_generation(
+    tmp_path, monkeypatch
+):
+    """Older dashboards without conflict provenance must fail closed."""
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-ambiguous-conflict",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/ambiguous-conflict",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator.state.set_status(job["job_id"], "applied")
+    initial_marker = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+    orchestrator._cloud_request = AsyncMock(
+        return_value=MagicMock(
+            status_code=409,
+            json=lambda: {
+                "detail": {
+                    "current_status": "skipped",
+                    "current_revision": 2,
+                }
+            },
+        )
+    )
+
+    result = await orchestrator._push_status_to_cloud(job["job_id"], "applied")
+
+    assert result is False
+    current_marker = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+    assert current_marker == initial_marker
+
+
+@pytest.mark.asyncio
+async def test_superseded_response_cannot_clear_replacement_generation(
+    tmp_path, monkeypatch
+):
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-superseded-generation-race",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/superseded-generation-race",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator.state.set_status(job["job_id"], "applied")
+    old_marker = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+
+    async def _replace_generation(*_args, **_kwargs):
+        orchestrator.state.set_status(job["job_id"], "skipped")
+        orchestrator.state.set_status(job["job_id"], "applied")
+        return MagicMock(
+            status_code=409,
+            json=lambda: {
+                "detail": {
+                    "current_status": "skipped",
+                    "current_revision": 2,
+                    "conflict_kind": "operation_superseded",
+                    "operation_recorded": True,
+                }
+            },
+        )
+
+    orchestrator._cloud_request = AsyncMock(side_effect=_replace_generation)
+
+    result = await orchestrator._push_status_to_cloud(job["job_id"], "applied")
+
+    assert result is False
+    current_marker = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+    assert current_marker["generation"] != old_marker["generation"]
+    assert current_marker["status"] == "applied"
+    assert current_marker["expected_status"] == "skipped"
 
 
 def test_later_local_status_clears_pending_applied_sync(tmp_path):

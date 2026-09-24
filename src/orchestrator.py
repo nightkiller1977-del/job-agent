@@ -2170,9 +2170,15 @@ class Orchestrator:
                     conflict_detail = r.json().get("detail", {})
                     conflict_status = conflict_detail.get("current_status")
                     conflict_revision = conflict_detail.get("current_revision")
+                    conflict_kind = conflict_detail.get("conflict_kind")
+                    operation_recorded = conflict_detail.get(
+                        "operation_recorded"
+                    )
                 except (AttributeError, TypeError, ValueError):
                     conflict_status = None
                     conflict_revision = None
+                    conflict_kind = None
+                    operation_recorded = None
                 if (
                     isinstance(conflict_status, str)
                     and conflict_status
@@ -2180,13 +2186,28 @@ class Orchestrator:
                     and not isinstance(conflict_revision, bool)
                     and conflict_revision >= 0
                 ):
-                    self.state.rebase_pending_cloud_status_sync(
-                        job_id,
-                        status,
-                        expected_marker=marker,
-                        cloud_status=conflict_status,
-                        cloud_revision=conflict_revision,
-                    )
+                    if (
+                        conflict_kind == "operation_superseded"
+                        and operation_recorded is True
+                        and conflict_status != status
+                    ):
+                        return self.state.discard_superseded_cloud_status_sync(
+                            job_id,
+                            status,
+                            expected_marker=marker,
+                            cloud_revision=conflict_revision,
+                        )
+                    if (
+                        conflict_kind == "compare_and_set_failed"
+                        and operation_recorded is False
+                    ):
+                        self.state.rebase_pending_cloud_status_sync(
+                            job_id,
+                            status,
+                            expected_marker=marker,
+                            cloud_status=conflict_status,
+                            cloud_revision=conflict_revision,
+                        )
                 console.print("[dim]Cloud status push returned 409[/dim]")
                 return False
             if r.status_code != 200:

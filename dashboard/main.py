@@ -571,6 +571,8 @@ async def job_action(body: ActionRequest):
                         "message": "Current status or revision no longer matches expected state",
                         "current_status": current.get("status"),
                         "current_revision": current_revision,
+                        "conflict_kind": "operation_superseded",
+                        "operation_recorded": True,
                     },
                 )
             if operation_recorded:
@@ -592,6 +594,8 @@ async def job_action(body: ActionRequest):
                             "message": "Current status or revision no longer matches expected state",
                             "current_status": current.get("status"),
                             "current_revision": current_revision,
+                            "conflict_kind": "compare_and_set_failed",
+                            "operation_recorded": False,
                         },
                     )
                 record_filter = {
@@ -632,10 +636,10 @@ async def job_action(body: ActionRequest):
                 )
                 if not current:
                     raise HTTPException(status_code=404, detail="Job not found")
-                if (
-                    operation_key in current.get("_action_idempotency_keys", [])
-                    and current.get("status") == status
-                ):
+                operation_recorded = operation_key in current.get(
+                    "_action_idempotency_keys", []
+                )
+                if operation_recorded and current.get("status") == status:
                     return {
                         "ok": True,
                         "job_id": body.job_id,
@@ -657,6 +661,12 @@ async def job_action(body: ActionRequest):
                             "message": "Current status or revision no longer matches expected state",
                             "current_status": current.get("status"),
                             "current_revision": refreshed_revision,
+                            "conflict_kind": (
+                                "operation_superseded"
+                                if operation_recorded
+                                else "compare_and_set_failed"
+                            ),
+                            "operation_recorded": operation_recorded,
                         },
                     )
                 raise HTTPException(
@@ -673,6 +683,8 @@ async def job_action(body: ActionRequest):
                         "message": "Current status or revision no longer matches expected state",
                         "current_status": current.get("status"),
                         "current_revision": current_revision,
+                        "conflict_kind": "compare_and_set_failed",
+                        "operation_recorded": False,
                     },
                 )
             if current_revision != expected_revision:
@@ -682,6 +694,8 @@ async def job_action(body: ActionRequest):
                         "message": "Current status or revision no longer matches expected state",
                         "current_status": current.get("status"),
                         "current_revision": current_revision,
+                        "conflict_kind": "compare_and_set_failed",
+                        "operation_recorded": False,
                     },
                 )
             raise HTTPException(

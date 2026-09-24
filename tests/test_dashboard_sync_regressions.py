@@ -186,6 +186,11 @@ class TestActionIdempotency(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["detail"]["current_status"], "approved")
         self.assertEqual(response.json()["detail"]["current_revision"], 6)
+        self.assertEqual(
+            response.json()["detail"]["conflict_kind"],
+            "operation_superseded",
+        )
+        self.assertTrue(response.json()["detail"]["operation_recorded"])
 
     @patch("dashboard.main.get_db")
     def test_first_keyed_action_uses_expected_status_compare_and_set(self, mock_get_db):
@@ -218,6 +223,11 @@ class TestActionIdempotency(unittest.TestCase):
         )
         self.assertEqual(response.json()["detail"]["current_status"], "skipped")
         self.assertEqual(response.json()["detail"]["current_revision"], 6)
+        self.assertEqual(
+            response.json()["detail"]["conflict_kind"],
+            "compare_and_set_failed",
+        )
+        self.assertFalse(response.json()["detail"]["operation_recorded"])
         filt = mock_db.jobs.find_one_and_update.call_args.args[0]
         self.assertEqual(filt["status"], "approved")
         self.assertEqual(filt["status_revision"], 4)
@@ -263,6 +273,50 @@ class TestActionIdempotency(unittest.TestCase):
             update["$push"]["_action_idempotency_keys"]["$slice"],
             0,
         )
+
+    @patch("dashboard.main.get_db")
+    def test_target_noop_losing_record_race_reports_superseded_operation(
+        self, mock_get_db
+    ):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.side_effect = [
+            {
+                "job_id": "job-1",
+                "status": "applied",
+                "status_revision": 4,
+                "_action_idempotency_keys": [],
+            },
+            {
+                "job_id": "job-1",
+                "status": "skipped",
+                "status_revision": 6,
+                "_action_idempotency_keys": ["applied:stable-key-1"],
+            },
+        ]
+        mock_db.jobs.update_one.return_value.matched_count = 0
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+                "expected_status": "approved",
+                "expected_revision": 4,
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"]["conflict_kind"],
+            "operation_superseded",
+        )
+        self.assertTrue(response.json()["detail"]["operation_recorded"])
+        self.assertEqual(response.json()["detail"]["current_status"], "skipped")
+        self.assertEqual(response.json()["detail"]["current_revision"], 6)
 
     @patch("dashboard.main.get_db")
     def test_already_targeted_action_rejects_stale_revision(self, mock_get_db):
