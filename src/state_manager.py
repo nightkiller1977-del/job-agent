@@ -9,6 +9,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Any
+from uuid import uuid4
 
 from src.scorer import SCORING_FAILED_FLAG
 
@@ -238,12 +239,26 @@ class StateManager:
             )
             return True
 
-    def set_status(self, job_id: str, status: str) -> None:
+    def set_status(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        expected_cloud_status: Optional[str] = None,
+        expected_cloud_revision: Optional[int] = None,
+        queue_cloud_sync: bool = False,
+    ) -> None:
         _log.info("job.status job_id=%s status=%s", job_id, status)
         if status == "expired":
             # Route through mark_expired so the row is retained (with reason
             # metadata) instead of silently vanishing from the dashboard.
-            self.mark_expired(job_id, reason="status set to expired")
+            self.mark_expired(
+                job_id,
+                reason="status set to expired",
+                expected_cloud_status=expected_cloud_status,
+                expected_cloud_revision=expected_cloud_revision,
+                queue_cloud_sync=queue_cloud_sync,
+            )
             return
 
         now = datetime.utcnow().isoformat()
@@ -255,22 +270,116 @@ class StateManager:
         }.get(status)
         with self._connect() as conn:
             extra_json = None
-            if status == "applied":
-                row = conn.execute(
-                    "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
-                ).fetchone()
-                if row is not None:
-                    extra = parse_extra_json(row["extra_json"])
-                    # Queue this in the same transaction as the local status
-                    # promotion. A crash or ambiguous network failure can then
-                    # be retried safely until the cloud confirms the idempotent
-                    # target state.
-                    extra["cloud_status_sync_pending"] = {
-                        "status": status,
-                        "queued_at": now,
-                    }
-                    extra_json = json.dumps(extra)
-            if ts_field and extra_json is not None:
+            extra_json_changed = False
+            row = conn.execute(
+                "SELECT status, extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is not None:
+                extra = parse_extra_json(row["extra_json"])
+                if expected_cloud_revision is not None:
+                    incoming_revision = max(0, int(expected_cloud_revision))
+                    stored_revision = extra.get("cloud_status_revision", 0)
+                    if (
+                        isinstance(stored_revision, bool)
+                        or not isinstance(stored_revision, int)
+                        or stored_revision < 0
+                    ):
+                        stored_revision = 0
+                    extra["cloud_status_revision"] = max(
+                        stored_revision, incoming_revision
+                    )
+                    extra_json_changed = True
+                if status == "applied" or queue_cloud_sync:
+                    existing_marker = extra.get("cloud_status_sync_pending")
+                    same_pending_transition = (
+                        row["status"] == status
+                        and isinstance(existing_marker, dict)
+                        and existing_marker.get("status") == status
+                    )
+                    if same_pending_transition and expected_cloud_revision is not None:
+                        existing_expected_revision = existing_marker.get(
+                            "expected_revision", 0
+                        )
+                        if (
+                            isinstance(existing_expected_revision, bool)
+                            or not isinstance(existing_expected_revision, int)
+                            or existing_expected_revision < 0
+                        ):
+                            existing_expected_revision = 0
+                        if incoming_revision >= existing_expected_revision:
+                            refreshed_marker = dict(existing_marker)
+                            generation = refreshed_marker.get("generation")
+                            if (
+                                not isinstance(generation, str)
+                                or not generation.strip()
+                            ):
+                                # Only an authoritative dashboard status and
+                                # revision can safely re-arm a generation-less
+                                # pre-upgrade obligation. The fresh token then
+                                # fences all future sends and clears normally.
+                                refreshed_marker["generation"] = uuid4().hex
+                            refreshed_marker["expected_status"] = str(
+                                expected_cloud_status
+                                or refreshed_marker.get("expected_status")
+                                or row["status"]
+                            )
+                            refreshed_marker["expected_revision"] = (
+                                incoming_revision
+                            )
+                            extra["cloud_status_sync_pending"] = refreshed_marker
+                            extra_json_changed = True
+                    elif not same_pending_transition:
+                        # Queue this in the same transaction as the local status
+                        # promotion. The generation uniquely identifies this
+                        # transition so an older in-flight retry cannot clear a
+                        # newer obligation after the status changes away/back.
+                        marker_expected_status = (
+                            existing_marker.get("expected_status")
+                            if isinstance(existing_marker, dict)
+                            else None
+                        )
+                        marker_expected_revision = (
+                            existing_marker.get("expected_revision")
+                            if isinstance(existing_marker, dict)
+                            else None
+                        )
+                        if not marker_expected_status:
+                            marker_expected_status = (
+                                expected_cloud_status or str(row["status"])
+                            )
+                        if (
+                            isinstance(marker_expected_revision, bool)
+                            or not isinstance(marker_expected_revision, int)
+                            or marker_expected_revision < 0
+                        ):
+                            marker_expected_revision = extra.get(
+                                "cloud_status_revision", 0
+                            )
+                        if (
+                            isinstance(marker_expected_revision, bool)
+                            or not isinstance(marker_expected_revision, int)
+                            or marker_expected_revision < 0
+                        ):
+                            marker_expected_revision = 0
+                        extra["cloud_status_sync_pending"] = {
+                            "status": status,
+                            "expected_status": str(marker_expected_status),
+                            "expected_revision": marker_expected_revision,
+                            "queued_at": now,
+                            "generation": uuid4().hex,
+                        }
+                        extra_json = json.dumps(extra)
+                        extra_json_changed = True
+                elif "cloud_status_sync_pending" in extra:
+                    # A newer local status supersedes the older cloud repair.
+                    # Remove both the marker and its ability to overwrite the
+                    # newer state during a later retry pass.
+                    extra.pop("cloud_status_sync_pending", None)
+                    extra_json = json.dumps(extra) if extra else None
+                    extra_json_changed = True
+            if extra_json_changed:
+                extra_json = json.dumps(extra) if extra else None
+            if ts_field and extra_json_changed:
                 conn.execute(
                     f"UPDATE jobs SET status = ?, {ts_field} = ?, extra_json = ? "
                     "WHERE job_id = ?",
@@ -280,6 +389,11 @@ class StateManager:
                 conn.execute(
                     f"UPDATE jobs SET status = ?, {ts_field} = ? WHERE job_id = ?",
                     (status, now, job_id),
+                )
+            elif extra_json_changed:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, extra_json = ? WHERE job_id = ?",
+                    (status, extra_json, job_id),
                 )
             else:
                 conn.execute(
@@ -301,11 +415,30 @@ class StateManager:
             )
             status = marker.get("status") if isinstance(marker, dict) else ""
             if status:
-                pending.append({"job_id": row["job_id"], "status": str(status)})
+                pending.append(
+                    {
+                        "job_id": row["job_id"],
+                        "status": str(status),
+                        "marker": dict(marker),
+                    }
+                )
         return pending
 
-    def clear_pending_cloud_status_sync(self, job_id: str, status: str) -> bool:
-        """Clear only the cloud-sync obligation matching a confirmed status."""
+    def clear_pending_cloud_status_sync(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        expected_marker: dict,
+        confirmed_revision: Optional[int] = None,
+    ) -> bool:
+        """Record a cloud confirmation and clear only its exact generation.
+
+        If a newer local transition replaced the confirmed marker while the
+        request was in flight, rebase that newer marker onto the confirmed
+        cloud status/revision. This preserves transition ordering without
+        letting the older response clear the newer durable obligation.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
@@ -315,8 +448,159 @@ class StateManager:
             extra = parse_extra_json(row["extra_json"])
             marker = extra.get("cloud_status_sync_pending")
             marker_status = marker.get("status") if isinstance(marker, dict) else ""
-            if marker_status != status:
+            if confirmed_revision is None:
+                if marker_status != status or marker != expected_marker:
+                    return False
+                extra.pop("cloud_status_sync_pending", None)
+                conn.execute(
+                    "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                    (json.dumps(extra) if extra else None, job_id),
+                )
+                return True
+            if (
+                isinstance(confirmed_revision, bool)
+                or not isinstance(confirmed_revision, int)
+                or confirmed_revision < 0
+            ):
                 return False
+            stored_revision = extra.get("cloud_status_revision", 0)
+            if (
+                isinstance(stored_revision, bool)
+                or not isinstance(stored_revision, int)
+                or stored_revision < 0
+            ):
+                stored_revision = 0
+            extra["cloud_status_revision"] = max(stored_revision, confirmed_revision)
+            if (
+                marker_status == status
+                and marker == expected_marker
+                and confirmed_revision >= stored_revision
+            ):
+                extra.pop("cloud_status_sync_pending", None)
+                cleared = True
+            else:
+                cleared = False
+                if isinstance(marker, dict) and marker.get("generation"):
+                    marker_expected_revision = marker.get("expected_revision", 0)
+                    if (
+                        isinstance(marker_expected_revision, bool)
+                        or not isinstance(marker_expected_revision, int)
+                        or marker_expected_revision < 0
+                    ):
+                        marker_expected_revision = 0
+                    if confirmed_revision >= max(
+                        stored_revision, marker_expected_revision
+                    ):
+                        marker = dict(marker)
+                        marker["expected_status"] = status
+                        marker["expected_revision"] = confirmed_revision
+                        extra["cloud_status_sync_pending"] = marker
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra) if extra else None, job_id),
+            )
+        return cleared
+
+    def rebase_pending_cloud_status_sync(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        expected_marker: dict,
+        cloud_status: str,
+        cloud_revision: int,
+    ) -> bool:
+        """Rebase one exact pending generation after an authoritative 409.
+
+        The dashboard increments its revision for every accepted action, so
+        persisting the observed status/revision creates a new compare-and-set
+        baseline without weakening the server-side stale-write fence.
+        """
+        if (
+            not cloud_status
+            or isinstance(cloud_revision, bool)
+            or not isinstance(cloud_revision, int)
+            or cloud_revision < 0
+        ):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            extra = parse_extra_json(row["extra_json"])
+            marker = extra.get("cloud_status_sync_pending")
+            marker_status = marker.get("status") if isinstance(marker, dict) else ""
+            if marker_status != status or marker != expected_marker:
+                return False
+            marker = dict(marker)
+            marker["expected_status"] = cloud_status
+            marker["expected_revision"] = cloud_revision
+            marker["queued_at"] = datetime.utcnow().isoformat()
+            marker["generation"] = uuid4().hex
+            extra["cloud_status_sync_pending"] = marker
+            stored_revision = extra.get("cloud_status_revision", 0)
+            if (
+                isinstance(stored_revision, bool)
+                or not isinstance(stored_revision, int)
+                or stored_revision < 0
+            ):
+                stored_revision = 0
+            if cloud_revision < stored_revision:
+                return False
+            extra["cloud_status_revision"] = max(stored_revision, cloud_revision)
+            conn.execute(
+                "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
+                (json.dumps(extra), job_id),
+            )
+        return True
+
+    def discard_superseded_cloud_status_sync(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        expected_marker: dict,
+        cloud_revision: int,
+    ) -> bool:
+        """Discard an exact operation already committed then superseded.
+
+        This intentionally does not rebase a replacement marker. A 409 with
+        this provenance proves the old operation completed and a newer cloud
+        action now owns the status; making the old transition eligible again
+        would overwrite that newer action.
+        """
+        expected_revision = expected_marker.get("expected_revision")
+        if (
+            isinstance(cloud_revision, bool)
+            or not isinstance(cloud_revision, int)
+            or cloud_revision < 0
+            or isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+            or cloud_revision <= expected_revision
+        ):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT extra_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            extra = parse_extra_json(row["extra_json"])
+            marker = extra.get("cloud_status_sync_pending")
+            marker_status = marker.get("status") if isinstance(marker, dict) else ""
+            if marker_status != status or marker != expected_marker:
+                return False
+            stored_revision = extra.get("cloud_status_revision", 0)
+            if (
+                isinstance(stored_revision, bool)
+                or not isinstance(stored_revision, int)
+                or stored_revision < 0
+            ):
+                stored_revision = 0
+            extra["cloud_status_revision"] = max(stored_revision, cloud_revision)
             extra.pop("cloud_status_sync_pending", None)
             conn.execute(
                 "UPDATE jobs SET extra_json = ? WHERE job_id = ?",
@@ -573,7 +857,16 @@ class StateManager:
 
         return reconciled_count
 
-    def mark_expired(self, job_id: str, reason: str, signal: str = "manual") -> bool:
+    def mark_expired(
+        self,
+        job_id: str,
+        reason: str,
+        signal: str = "manual",
+        *,
+        expected_cloud_status: Optional[str] = None,
+        expected_cloud_revision: Optional[int] = None,
+        queue_cloud_sync: bool = False,
+    ) -> bool:
         """Mark a job as expired: dead posting, removed from the applyable pool.
 
         The row is KEPT in the jobs table with status='expired' (rather than
@@ -601,6 +894,89 @@ class StateManager:
             extra = parse_extra_json(row["extra_json"])
             if prior_status != "expired":
                 extra["expired_prior_status"] = prior_status
+            existing_marker = extra.pop("cloud_status_sync_pending", None)
+            if expected_cloud_revision is not None:
+                incoming_revision = max(0, int(expected_cloud_revision))
+                stored_revision = extra.get("cloud_status_revision", 0)
+                if (
+                    isinstance(stored_revision, bool)
+                    or not isinstance(stored_revision, int)
+                    or stored_revision < 0
+                ):
+                    stored_revision = 0
+                extra["cloud_status_revision"] = max(
+                    stored_revision, incoming_revision
+                )
+            if queue_cloud_sync:
+                same_pending_transition = (
+                    prior_status == "expired"
+                    and isinstance(existing_marker, dict)
+                    and existing_marker.get("status") == "expired"
+                )
+                if same_pending_transition:
+                    refreshed_marker = dict(existing_marker)
+                    generation = refreshed_marker.get("generation")
+                    if not isinstance(generation, str) or not generation.strip():
+                        refreshed_marker["generation"] = uuid4().hex
+                    queued_at = refreshed_marker.get("queued_at")
+                    if not isinstance(queued_at, str) or not queued_at.strip():
+                        refreshed_marker["queued_at"] = now
+                    if expected_cloud_revision is not None:
+                        marker_revision = refreshed_marker.get(
+                            "expected_revision", 0
+                        )
+                        if (
+                            isinstance(marker_revision, bool)
+                            or not isinstance(marker_revision, int)
+                            or marker_revision < 0
+                        ):
+                            marker_revision = 0
+                        if incoming_revision >= marker_revision:
+                            refreshed_marker["expected_status"] = str(
+                                expected_cloud_status
+                                or refreshed_marker.get("expected_status")
+                                or prior_status
+                            )
+                            refreshed_marker["expected_revision"] = (
+                                incoming_revision
+                            )
+                    extra["cloud_status_sync_pending"] = refreshed_marker
+                else:
+                    marker_expected_status = (
+                        existing_marker.get("expected_status")
+                        if isinstance(existing_marker, dict)
+                        else None
+                    )
+                    marker_expected_revision = (
+                        existing_marker.get("expected_revision")
+                        if isinstance(existing_marker, dict)
+                        else None
+                    )
+                    if not marker_expected_status:
+                        marker_expected_status = expected_cloud_status or str(
+                            prior_status
+                        )
+                    if (
+                        isinstance(marker_expected_revision, bool)
+                        or not isinstance(marker_expected_revision, int)
+                        or marker_expected_revision < 0
+                    ):
+                        marker_expected_revision = extra.get(
+                            "cloud_status_revision", 0
+                        )
+                    if (
+                        isinstance(marker_expected_revision, bool)
+                        or not isinstance(marker_expected_revision, int)
+                        or marker_expected_revision < 0
+                    ):
+                        marker_expected_revision = 0
+                    extra["cloud_status_sync_pending"] = {
+                        "status": "expired",
+                        "expected_status": str(marker_expected_status),
+                        "expected_revision": marker_expected_revision,
+                        "queued_at": now,
+                        "generation": uuid4().hex,
+                    }
             extra["expired_at"] = now
             extra["expired_reason"] = (reason or "")[:300]
             extra["expired_signal"] = signal
@@ -634,6 +1010,9 @@ class StateManager:
             if not row:
                 return None
             job = dict(row)
+            extra = parse_extra_json(job.get("extra_json"))
+            extra.pop("cloud_status_sync_pending", None)
+            job["extra_json"] = json.dumps(extra) if extra else None
             conn.execute(
                 """
                 INSERT OR REPLACE INTO archived_jobs

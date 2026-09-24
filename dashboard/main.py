@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 
 load_dotenv()
@@ -68,6 +68,7 @@ _SYNC_SECRET_HEADER = "x-sync-secret"
 # so a cross-site request cannot ride it, Secure whenever the request is https.
 _SESSION_COOKIE = "ja_session"
 _SESSION_MAX_AGE = 12 * 60 * 60
+_ACTION_IDEMPOTENCY_KEY_LIMIT = 64
 # Browser navigations without a session are redirected here. Kept as a constant so
 # the middleware and the route cannot drift apart.
 _LOGIN_REDIRECT = "/login"
@@ -241,6 +242,40 @@ def _public_doc(doc: dict | None) -> dict:
     return out
 
 
+def _action_conflict_detail(
+    current: dict,
+    current_revision: int,
+    *,
+    operation_recorded: bool,
+) -> dict:
+    """Describe whether a missing keyed CAS is safe to rebase.
+
+    At the retention limit, key absence is no longer proof that an operation
+    never committed: an older key may have been evicted. Report that state as
+    ambiguous so durable clients fail closed instead of replaying stale work.
+    """
+    raw_keys = current.get("_action_idempotency_keys", [])
+    action_keys = raw_keys if isinstance(raw_keys, list) else []
+    history_saturated = len(action_keys) >= _ACTION_IDEMPOTENCY_KEY_LIMIT
+    if operation_recorded:
+        conflict_kind = "operation_superseded"
+        recorded_value = True
+    elif history_saturated:
+        conflict_kind = "operation_history_ambiguous"
+        recorded_value = None
+    else:
+        conflict_kind = "compare_and_set_failed"
+        recorded_value = False
+    return {
+        "message": "Current status or revision no longer matches expected state",
+        "current_status": current.get("status"),
+        "current_revision": current_revision,
+        "conflict_kind": conflict_kind,
+        "operation_recorded": recorded_value,
+        "history_saturated": history_saturated,
+    }
+
+
 def get_db():
     global _client
     if not MONGODB_URI:
@@ -302,6 +337,8 @@ class ActionRequest(BaseModel):
     job_id: str
     action: str
     idempotency_key: Optional[str] = None
+    expected_status: Optional[str] = None
+    expected_revision: Optional[StrictInt] = None
 
 
 class ExternalJobRequest(BaseModel):
@@ -582,6 +619,7 @@ async def sync_jobs(request: Request, x_sync_secret: Optional[str] = Header(defa
                     "$set": payload,
                     "$setOnInsert": {
                         "status": raw.get("status", "discovered"),
+                        "status_revision": 0,
                         "discovered_at": _parse_dt(raw.get("discovered_at"), now),
                     },
                 },
@@ -603,6 +641,21 @@ async def job_action(body: ActionRequest):
     status = "skipped" if body.action == "archive" else body.action
     jobs = get_db().jobs
     idempotency_key = body.idempotency_key
+    expected_status = body.expected_status
+    expected_revision = body.expected_revision
+    if expected_status is not None:
+        allowed_status_chars = set(
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "0123456789-_"
+        )
+        if (
+            not expected_status
+            or expected_status != expected_status.strip()
+            or len(expected_status) > 64
+            or any(char not in allowed_status_chars for char in expected_status)
+        ):
+            raise HTTPException(status_code=400, detail="invalid expected_status")
     if idempotency_key is not None:
         allowed = set(
             "abcdefghijklmnopqrstuvwxyz"
@@ -616,51 +669,253 @@ async def job_action(body: ActionRequest):
             or any(char not in allowed for char in idempotency_key)
         ):
             raise HTTPException(status_code=400, detail="invalid idempotency_key")
+        if expected_status is None or expected_revision is None:
+            raise HTTPException(
+                status_code=400,
+                detail="keyed actions require expected_status and expected_revision",
+            )
+        if isinstance(expected_revision, bool) or expected_revision < 0:
+            raise HTTPException(status_code=400, detail="invalid expected_revision")
         operation_key = f"{status}:{idempotency_key}"
+        action_filter = {
+            "job_id": body.job_id,
+            "_action_idempotency_keys": {"$ne": operation_key},
+            "status": expected_status,
+        }
+        if expected_revision == 0:
+            action_filter["$or"] = [
+                {"status_revision": 0},
+                {"status_revision": {"$exists": False}},
+            ]
+        else:
+            action_filter["status_revision"] = expected_revision
         result = jobs.find_one_and_update(
-            {
-                "job_id": body.job_id,
-                "_action_idempotency_keys": {"$ne": operation_key},
-            },
+            action_filter,
             {
                 "$set": {"status": status, "updated_at": _utcnow()},
-                "$addToSet": {"_action_idempotency_keys": operation_key},
+                "$inc": {"status_revision": 1},
+                "$push": {
+                    "_action_idempotency_keys": {
+                        "$each": [operation_key],
+                        "$slice": -_ACTION_IDEMPOTENCY_KEY_LIMIT,
+                    }
+                },
             },
             return_document=ReturnDocument.AFTER,
         )
         if not result:
             current = jobs.find_one(
                 {"job_id": body.job_id},
-                {"status": 1, "_action_idempotency_keys": 1},
+                {"status": 1, "status_revision": 1, "_action_idempotency_keys": 1},
             )
             if not current:
                 raise HTTPException(status_code=404, detail="Job not found")
-            if operation_key not in current.get("_action_idempotency_keys", []):
+            raw_operation_keys = current.get("_action_idempotency_keys", [])
+            operation_keys = (
+                raw_operation_keys
+                if isinstance(raw_operation_keys, list)
+                else []
+            )
+            operation_recorded = operation_key in operation_keys
+            current_revision = current.get("status_revision", 0)
+            if (
+                isinstance(current_revision, bool)
+                or not isinstance(current_revision, int)
+                or current_revision < 0
+            ):
+                current_revision = 0
+            if operation_recorded and current.get("status") != status:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_action_conflict_detail(
+                        current,
+                        current_revision,
+                        operation_recorded=True,
+                    ),
+                )
+            if operation_recorded:
+                return {
+                    "ok": True,
+                    "job_id": body.job_id,
+                    "status": status,
+                    "status_revision": current_revision,
+                    "deduplicated": True,
+                }
+            if current.get("status") == status:
+                # A target-state no-op is safe only at the exact expected
+                # revision. Advancing the revision here fences any older
+                # in-flight request from an away/back (ABA) status cycle.
+                if current_revision != expected_revision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=_action_conflict_detail(
+                            current,
+                            current_revision,
+                            operation_recorded=False,
+                        ),
+                    )
+                record_filter = {
+                    "job_id": body.job_id,
+                    "status": status,
+                    "_action_idempotency_keys": {"$ne": operation_key},
+                }
+                if expected_revision == 0:
+                    record_filter["$or"] = [
+                        {"status_revision": 0},
+                        {"status_revision": {"$exists": False}},
+                    ]
+                else:
+                    record_filter["status_revision"] = expected_revision
+                recorded = jobs.update_one(
+                    record_filter,
+                    {
+                        "$inc": {"status_revision": 1},
+                        "$push": {
+                            "_action_idempotency_keys": {
+                                "$each": [operation_key],
+                                "$slice": -_ACTION_IDEMPOTENCY_KEY_LIMIT,
+                            }
+                        }
+                    },
+                )
+                if recorded.matched_count:
+                    return {
+                        "ok": True,
+                        "job_id": body.job_id,
+                        "status": status,
+                        "status_revision": expected_revision + 1,
+                        "deduplicated": True,
+                    }
+                current = jobs.find_one(
+                    {"job_id": body.job_id},
+                    {"status": 1, "status_revision": 1, "_action_idempotency_keys": 1},
+                )
+                if not current:
+                    raise HTTPException(status_code=404, detail="Job not found")
+                raw_operation_keys = current.get("_action_idempotency_keys", [])
+                operation_keys = (
+                    raw_operation_keys
+                    if isinstance(raw_operation_keys, list)
+                    else []
+                )
+                operation_recorded = operation_key in operation_keys
+                if operation_recorded and current.get("status") == status:
+                    return {
+                        "ok": True,
+                        "job_id": body.job_id,
+                        "status": status,
+                        "status_revision": current.get("status_revision", 0),
+                        "deduplicated": True,
+                    }
+                if current.get("status") != status:
+                    refreshed_revision = current.get("status_revision", 0)
+                    if (
+                        isinstance(refreshed_revision, bool)
+                        or not isinstance(refreshed_revision, int)
+                        or refreshed_revision < 0
+                    ):
+                        refreshed_revision = 0
+                    raise HTTPException(
+                        status_code=409,
+                        detail=_action_conflict_detail(
+                            current,
+                            refreshed_revision,
+                            operation_recorded=operation_recorded,
+                        ),
+                    )
                 raise HTTPException(
                     status_code=409,
                     detail="Action could not be atomically deduplicated",
                 )
-            return {
-                "ok": True,
-                "job_id": body.job_id,
-                "status": current.get("status", status),
-                "deduplicated": True,
-            }
+            if (
+                expected_status is not None
+                and current.get("status") != expected_status
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=_action_conflict_detail(
+                        current,
+                        current_revision,
+                        operation_recorded=False,
+                    ),
+                )
+            if current_revision != expected_revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_action_conflict_detail(
+                        current,
+                        current_revision,
+                        operation_recorded=False,
+                    ),
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="Action could not be atomically deduplicated",
+            )
         return {
             "ok": True,
             "job_id": body.job_id,
             "status": status,
+            "status_revision": result.get(
+                "status_revision", expected_revision + 1
+            ),
             "deduplicated": False,
         }
 
+    action_filter = {"job_id": body.job_id}
+    if expected_status is not None:
+        action_filter["status"] = expected_status
     result = jobs.find_one_and_update(
-        {"job_id": body.job_id},
-        {"$set": {"status": status, "updated_at": _utcnow()}},
+        action_filter,
+        {
+            "$set": {"status": status, "updated_at": _utcnow()},
+            "$inc": {"status_revision": 1},
+        },
         return_document=ReturnDocument.AFTER,
     )
     if not result:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return {"ok": True, "job_id": body.job_id, "status": status}
+        current = jobs.find_one(
+            {"job_id": body.job_id}, {"status": 1, "status_revision": 1}
+        )
+        if not current:
+            raise HTTPException(status_code=404, detail="Job not found")
+        current_revision = current.get("status_revision", 0)
+        if (
+            isinstance(current_revision, bool)
+            or not isinstance(current_revision, int)
+            or current_revision < 0
+        ):
+            current_revision = 0
+        if expected_status is not None:
+            # Supplying an expected status makes this a compare-and-set. Once
+            # that atomic update misses, observing the requested target in a
+            # second read cannot turn the stale precondition into success: an
+            # away/back transition may have occurred between those operations.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Current status no longer matches expected status",
+                    "current_status": current.get("status"),
+                    "current_revision": current_revision,
+                },
+            )
+        if current.get("status") == status:
+            return {
+                "ok": True,
+                "job_id": body.job_id,
+                "status": status,
+                "status_revision": current_revision,
+            }
+        raise HTTPException(
+            status_code=409,
+            detail="Current status no longer matches expected status",
+        )
+    return {
+        "ok": True,
+        "job_id": body.job_id,
+        "status": status,
+        "status_revision": result.get("status_revision", 0),
+    }
 
 
 @app.post("/api/jobs/external")
@@ -681,7 +936,7 @@ async def add_external_job(body: ExternalJobRequest):
     # 80 %}`: a genuinely absent key renders as Jinja2 Undefined, which
     # passes `is not none` but raises UndefinedError on `>=`, crashing the
     # whole page render for every visitor until this job is hydrated/scored.
-    db.jobs.insert_one({"job_id": job_id, "source": source, "title": "Importing...", "company": "Pending local agent sync", "url": url, "status": "discovered", "flags": "needs_hydration", "score": None, "discovered_at": now, "updated_at": now})
+    db.jobs.insert_one({"job_id": job_id, "source": source, "title": "Importing...", "company": "Pending local agent sync", "url": url, "status": "discovered", "status_revision": 0, "flags": "needs_hydration", "score": None, "discovered_at": now, "updated_at": now})
     return {"ok": True, "job_id": job_id, "url": url}
 
 

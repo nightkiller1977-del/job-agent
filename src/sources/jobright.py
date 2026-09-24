@@ -18,7 +18,11 @@ from typing import Optional
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 from rich.console import Console
 
-from .adapters.receipt import capture_receipt_evidence, verify_receipt
+from .adapters.receipt import (
+    ReceiptEvidence,
+    capture_receipt_evidence,
+    verify_receipt,
+)
 from .adapters.forensics import host_of
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_success
@@ -36,6 +40,21 @@ TAILORED_RESUMES_DIR = Path(__file__).parent.parent.parent / "state" / "tailored
 TAILORED_RESUMES_DIR.mkdir(parents=True, exist_ok=True)
 MAX_RECEIPT_FRAMES = 12
 RECEIPT_FRAME_TIMEOUT_MS = 1500
+
+
+class _ReceiptBaselines(list):
+    """Pre-click evidence plus frames/origins whose snapshot was incomplete."""
+
+    def __init__(
+        self,
+        entries=(),
+        *,
+        incomplete_origins=(),
+        incomplete_frames=(),
+    ):
+        super().__init__(entries)
+        self.incomplete_origins = frozenset(incomplete_origins)
+        self.incomplete_frames = tuple(incomplete_frames)
 
 
 class JobrightScraper(BaseScraper):
@@ -2425,30 +2444,54 @@ class JobrightScraper(BaseScraper):
         per_frame_timeout_ms: int = RECEIPT_FRAME_TIMEOUT_MS,
     ) -> list[tuple[object, object]]:
         """Capture bounded pre-click evidence without trusting a wedged frame."""
-        if max_frames <= 0:
-            return []
-        frames = []
-        if required_frame is not None:
-            frames.append(required_frame)
-        for frame in self._candidate_frames(page):
-            if frame not in frames:
-                frames.append(frame)
-            if len(frames) >= max_frames:
-                break
+        candidates = self._candidate_frames(page)
+        ordered_frames = []
+        for frame in ([required_frame] if required_frame is not None else []) + candidates:
+            if not any(existing is frame for existing in ordered_frames):
+                ordered_frames.append(frame)
+
+        selected_frames = ordered_frames[: max(0, max_frames)]
+        incomplete_frames = list(ordered_frames[len(selected_frames):])
+        incomplete_origins = {
+            origin
+            for frame in incomplete_frames
+            if (origin := self._frame_origin(frame))
+        }
+
+        def _mark_incomplete(frame) -> None:
+            if not any(existing is frame for existing in incomplete_frames):
+                incomplete_frames.append(frame)
+            origin = self._frame_origin(frame)
+            if origin:
+                incomplete_origins.add(origin)
 
         baselines = []
-        for frame in frames:
+        for frame in selected_frames:
             try:
                 baseline = await asyncio.wait_for(
                     capture_receipt_evidence(frame),
                     timeout=per_frame_timeout_ms / 1000,
                 )
             except (TimeoutError, asyncio.TimeoutError):
+                _mark_incomplete(frame)
                 continue
             except Exception:
+                _mark_incomplete(frame)
+                continue
+            if isinstance(baseline, ReceiptEvidence) and (
+                not baseline.dom_available or baseline.match_count is None
+            ):
+                # capture_receipt_evidence deliberately absorbs evaluator
+                # failures. Preserve that uncertainty here instead of turning
+                # its incomplete snapshot into a trusted pre-click baseline.
+                _mark_incomplete(frame)
                 continue
             baselines.append((frame, baseline))
-        return baselines
+        return _ReceiptBaselines(
+            baselines,
+            incomplete_origins=incomplete_origins,
+            incomplete_frames=incomplete_frames,
+        )
 
     async def _verify_submit_receipt(
         self,
@@ -2495,6 +2538,16 @@ class JobrightScraper(BaseScraper):
             for baseline_frame, baseline in receipt_baselines
             if self._frame_origin(baseline_frame) == submit_origin
         ] or [submit_baseline]
+        incomplete_baseline_origins = getattr(
+            receipt_baselines,
+            "incomplete_origins",
+            frozenset(),
+        )
+        incomplete_baseline_frames = getattr(
+            receipt_baselines,
+            "incomplete_frames",
+            (),
+        )
 
         async def _verify_against_all_baselines(receipt_frame, baselines):
             signal = ""
@@ -2541,6 +2594,21 @@ class JobrightScraper(BaseScraper):
                         ),
                         (False, None),
                     )
+                    if (
+                        not saved_baseline[0]
+                        and (
+                            submit_origin in incomplete_baseline_origins
+                            or any(
+                                incomplete_frame is current_frame
+                                for incomplete_frame in incomplete_baseline_frames
+                            )
+                        )
+                    ):
+                        # A capped or timed-out pre-click frame is not a new
+                        # replacement merely because an opaque/about:blank URL
+                        # later becomes the submit origin. Its pre-existing
+                        # receipt signal cannot prove freshness.
+                        continue
                     receipt_contexts.append(
                         (
                             current_frame,

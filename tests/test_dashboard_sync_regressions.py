@@ -90,11 +90,34 @@ class TestActionIdempotency(unittest.TestCase):
         self.client = TestClient(app)
 
     @patch("dashboard.main.get_db")
+    def test_action_rejects_boolean_expected_revision_before_db_access(
+        self, mock_get_db
+    ):
+        for revision in (False, True):
+            with self.subTest(revision=revision):
+                response = self.client.post(
+                    "/api/action",
+                    json={
+                        "job_id": "job-1",
+                        "action": "applied",
+                        "idempotency_key": f"boolean-revision-{revision}",
+                        "expected_status": "approved",
+                        "expected_revision": revision,
+                    },
+                    headers=_AUTH,
+                )
+
+                self.assertEqual(response.status_code, 422)
+
+        mock_get_db.assert_not_called()
+
+    @patch("dashboard.main.get_db")
     def test_action_atomically_records_idempotency_key(self, mock_get_db):
         mock_db = MagicMock()
         mock_db.jobs.find_one_and_update.return_value = {
             "job_id": "job-1",
             "status": "applied",
+            "status_revision": 5,
         }
         mock_get_db.return_value = mock_db
 
@@ -104,18 +127,29 @@ class TestActionIdempotency(unittest.TestCase):
                 "job_id": "job-1",
                 "action": "applied",
                 "idempotency_key": "stable-key-1",
+                "expected_status": "approved",
+                "expected_revision": 4,
             },
             headers=_AUTH,
         )
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["deduplicated"])
+        self.assertEqual(response.json()["status_revision"], 5)
         filt, update = mock_db.jobs.find_one_and_update.call_args.args
         operation_key = "applied:stable-key-1"
         self.assertEqual(filt["_action_idempotency_keys"], {"$ne": operation_key})
+        self.assertEqual(filt["status"], "approved")
+        self.assertEqual(filt["status_revision"], 4)
+        self.assertEqual(update["$inc"]["status_revision"], 1)
+        self.assertNotIn("$addToSet", update)
         self.assertEqual(
-            update["$addToSet"]["_action_idempotency_keys"],
-            operation_key,
+            update["$push"]["_action_idempotency_keys"]["$each"],
+            [operation_key],
+        )
+        self.assertLess(
+            update["$push"]["_action_idempotency_keys"]["$slice"],
+            0,
         )
 
     @patch("dashboard.main.get_db")
@@ -125,6 +159,7 @@ class TestActionIdempotency(unittest.TestCase):
         mock_db.jobs.find_one.return_value = {
             "job_id": "job-1",
             "status": "applied",
+            "status_revision": 5,
             "_action_idempotency_keys": ["applied:stable-key-1"],
         }
         mock_get_db.return_value = mock_db
@@ -135,13 +170,265 @@ class TestActionIdempotency(unittest.TestCase):
                 "job_id": "job-1",
                 "action": "applied",
                 "idempotency_key": "stable-key-1",
+                "expected_status": "approved",
+                "expected_revision": 4,
             },
             headers=_AUTH,
         )
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["deduplicated"])
+        self.assertEqual(response.json()["status_revision"], 5)
         mock_db.jobs.find_one.assert_called_once()
+
+    @patch("dashboard.main.get_db")
+    def test_action_replay_conflicts_when_current_status_changed(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "approved",
+            "status_revision": 6,
+            "_action_idempotency_keys": ["applied:stable-key-1"],
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+                "expected_status": "approved",
+                "expected_revision": 4,
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["current_status"], "approved")
+        self.assertEqual(response.json()["detail"]["current_revision"], 6)
+        self.assertEqual(
+            response.json()["detail"]["conflict_kind"],
+            "operation_superseded",
+        )
+        self.assertTrue(response.json()["detail"]["operation_recorded"])
+
+    @patch("dashboard.main.get_db")
+    def test_first_keyed_action_uses_expected_status_compare_and_set(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "skipped",
+            "status_revision": 6,
+            "_action_idempotency_keys": [],
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+                "expected_status": "approved",
+                "expected_revision": 4,
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"]["message"],
+            "Current status or revision no longer matches expected state",
+        )
+        self.assertEqual(response.json()["detail"]["current_status"], "skipped")
+        self.assertEqual(response.json()["detail"]["current_revision"], 6)
+        self.assertEqual(
+            response.json()["detail"]["conflict_kind"],
+            "compare_and_set_failed",
+        )
+        self.assertFalse(response.json()["detail"]["operation_recorded"])
+        filt = mock_db.jobs.find_one_and_update.call_args.args[0]
+        self.assertEqual(filt["status"], "approved")
+        self.assertEqual(filt["status_revision"], 4)
+
+    @patch("dashboard.main.get_db")
+    def test_saturated_key_history_makes_absence_ambiguous(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "skipped",
+            "status_revision": 70,
+            "_action_idempotency_keys": [
+                f"skipped:retained-{index}" for index in range(64)
+            ],
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "evicted-generation",
+                "expected_status": "approved",
+                "expected_revision": 4,
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"]["conflict_kind"],
+            "operation_history_ambiguous",
+        )
+        self.assertIsNone(response.json()["detail"]["operation_recorded"])
+        self.assertTrue(response.json()["detail"]["history_saturated"])
+
+    @patch("dashboard.main.get_db")
+    def test_already_targeted_action_still_records_operation_key(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "applied",
+            "status_revision": 4,
+            "_action_idempotency_keys": [],
+        }
+        mock_db.jobs.update_one.return_value.matched_count = 1
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+                "expected_status": "approved",
+                "expected_revision": 4,
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["deduplicated"])
+        self.assertEqual(response.json()["status_revision"], 5)
+        filt, update = mock_db.jobs.update_one.call_args.args
+        self.assertEqual(filt["status"], "applied")
+        self.assertEqual(filt["status_revision"], 4)
+        self.assertEqual(update["$inc"]["status_revision"], 1)
+        self.assertNotIn("$addToSet", update)
+        self.assertEqual(
+            update["$push"]["_action_idempotency_keys"]["$each"],
+            ["applied:stable-key-1"],
+        )
+        self.assertLess(
+            update["$push"]["_action_idempotency_keys"]["$slice"],
+            0,
+        )
+
+    @patch("dashboard.main.get_db")
+    def test_target_noop_losing_record_race_reports_superseded_operation(
+        self, mock_get_db
+    ):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.side_effect = [
+            {
+                "job_id": "job-1",
+                "status": "applied",
+                "status_revision": 4,
+                "_action_idempotency_keys": [],
+            },
+            {
+                "job_id": "job-1",
+                "status": "skipped",
+                "status_revision": 6,
+                "_action_idempotency_keys": ["applied:stable-key-1"],
+            },
+        ]
+        mock_db.jobs.update_one.return_value.matched_count = 0
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "stable-key-1",
+                "expected_status": "approved",
+                "expected_revision": 4,
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"]["conflict_kind"],
+            "operation_superseded",
+        )
+        self.assertTrue(response.json()["detail"]["operation_recorded"])
+        self.assertEqual(response.json()["detail"]["current_status"], "skipped")
+        self.assertEqual(response.json()["detail"]["current_revision"], 6)
+
+    @patch("dashboard.main.get_db")
+    def test_already_targeted_action_rejects_stale_revision(self, mock_get_db):
+        """An away/back cycle must not acknowledge an older generation."""
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "applied",
+            "status_revision": 7,
+            "_action_idempotency_keys": [],
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "newer-generation",
+                "expected_status": "skipped",
+                "expected_revision": 6,
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["current_status"], "applied")
+        self.assertEqual(response.json()["detail"]["current_revision"], 7)
+        mock_db.jobs.update_one.assert_not_called()
+
+    @patch("dashboard.main.get_db")
+    def test_unkeyed_compare_and_set_miss_conflicts_at_target(self, mock_get_db):
+        """A stale expected status must not become a successful target no-op."""
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "applied",
+            "status_revision": 8,
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "expected_status": "approved",
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["current_status"], "applied")
+        self.assertEqual(response.json()["detail"]["current_revision"], 8)
 
 
 class TestExternalJobScorePlaceholder(unittest.TestCase):
