@@ -5,6 +5,7 @@ The OpenRouter tier defaults previously pointed at retired Anthropic models
 retired Feb 2026), so tier 2 of the cascade failed with model-not-found on
 every request.
 """
+import importlib
 import json
 
 import httpx
@@ -12,6 +13,17 @@ import pytest
 
 from src import model_client
 from src.model_client import ModelClient, OPENROUTER_TASK_MODELS
+
+# The four overrides OPENROUTER_TASK_MODELS reads at import time — cleared in
+# test_reasoning_and_general_defaults_do_not_route_to_claude so the test
+# exercises the literal hardcoded defaults, not whatever the ambient
+# developer/CI environment happens to have exported.
+_OVERRIDE_ENV_VARS = (
+    "JOB_AGENT_OPENROUTER_REASONING_MODEL",
+    "JOB_AGENT_OPENROUTER_GENERAL_MODEL",
+    "JOB_AGENT_OPENROUTER_CODING_MODEL",
+    "JOB_AGENT_OPENROUTER_MONITORING_MODEL",
+)
 
 RETIRED_MODEL_FRAGMENTS = (
     "claude-3.5-sonnet",
@@ -37,6 +49,39 @@ def test_anthropic_defaults_do_not_use_retired_models():
     for name in (model_client.DEFAULT_ANTHROPIC_MODEL,):
         for fragment in RETIRED_MODEL_FRAGMENTS:
             assert fragment not in name
+
+
+def test_reasoning_and_general_defaults_do_not_route_to_claude(monkeypatch):
+    """ACES-441: with Direct Claude (tier 3) unconfigured on most hosts,
+    "reasoning"/"general" defaulting to an anthropic/* model was the only
+    place a Claude call actually happened — just gateway-routed instead of
+    direct. Pins the policy that OpenRouter's own defaults must not silently
+    prefer Claude, independent of whether the model is still a live/retired
+    one (test_openrouter_defaults_do_not_use_retired_models covers that).
+
+    Reloads the module with the four JOB_AGENT_OPENROUTER_* overrides
+    explicitly cleared first (Copilot review on PR #158): OPENROUTER_TASK_MODELS
+    is built once at import time from os.environ, so asserting against the
+    already-imported dict would fail for a developer/CI environment that has
+    deliberately set e.g. JOB_AGENT_OPENROUTER_REASONING_MODEL=anthropic/... —
+    a supported override this PR explicitly preserves, not a regression. This
+    test is about the literal hardcoded default, not whatever's effectively
+    active in the environment it happens to run in.
+    """
+    for var in _OVERRIDE_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    importlib.reload(model_client)
+    try:
+        for task in ("reasoning", "general"):
+            model = model_client.OPENROUTER_TASK_MODELS[task]
+            assert "claude" not in model.lower() and "anthropic" not in model.lower(), (
+                f"OPENROUTER_TASK_MODELS[{task!r}] = {model!r} still routes to Claude"
+            )
+    finally:
+        # monkeypatch restores the env vars on teardown, but this test's own
+        # reload must not leave OTHER tests importing a module object built
+        # from the artificially-cleared environment.
+        importlib.reload(model_client)
 
 
 @pytest.mark.asyncio

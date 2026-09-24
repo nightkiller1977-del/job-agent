@@ -62,10 +62,16 @@ OPENROUTER_TIMEOUT = int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "30"))
 # defaults ("anthropic/claude-3.5-sonnet" / "anthropic/claude-3.5-haiku") were
 # retired by Anthropic (Oct 2025 / Feb 2026), so every gateway call failed with
 # a model-not-found error and the cascade silently burned a tier on each request.
+#
+# "reasoning"/"general" deliberately do not default to a Claude model (ACES-441):
+# with Direct Claude (tier 3) unconfigured on most hosts, these two were the
+# only place a Claude call actually happened, just routed through the gateway
+# instead of a direct Anthropic key. Reuses "monitoring"'s already-proven
+# non-Claude choice rather than introducing a third model.
 OPENROUTER_TASK_MODELS: dict[str, str] = {
     "coding": os.environ.get("JOB_AGENT_OPENROUTER_CODING_MODEL", "qwen/qwen-2.5-coder-32b-instruct"),
-    "reasoning": os.environ.get("JOB_AGENT_OPENROUTER_REASONING_MODEL", "anthropic/claude-sonnet-4.5"),
-    "general": os.environ.get("JOB_AGENT_OPENROUTER_GENERAL_MODEL", "anthropic/claude-haiku-4.5"),
+    "reasoning": os.environ.get("JOB_AGENT_OPENROUTER_REASONING_MODEL", "meta-llama/llama-3.3-70b-instruct"),
+    "general": os.environ.get("JOB_AGENT_OPENROUTER_GENERAL_MODEL", "meta-llama/llama-3.3-70b-instruct"),
     "monitoring": os.environ.get("JOB_AGENT_OPENROUTER_MONITORING_MODEL", "meta-llama/llama-3.3-70b-instruct"),
 }
 
