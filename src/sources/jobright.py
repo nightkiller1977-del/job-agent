@@ -1760,11 +1760,11 @@ class JobrightScraper(BaseScraper):
                 ext_url = await self._extract_external_url(page)
 
             if not ext_url:
-                console.print("[red]Jobright:[/red] Could not find company ATS URL — skipping.")
-                return self._set_apply_outcome(
-                    "missing_ats_url",
-                    "Could not extract the company ATS URL from the Jobright posting.",
+                status, detail = self._classify_missing_ats_url(
+                    getattr(self, "_last_url_extraction_diagnostic", None) or {}
                 )
+                console.print(f"[red]Jobright:[/red] {detail}")
+                return self._set_apply_outcome(status, detail)
 
             # Validate the URL has a real hostname
             try:
@@ -2876,22 +2876,86 @@ class JobrightScraper(BaseScraper):
 
         return captured_url
 
+    @staticmethod
+    def _classify_missing_ats_url(diagnostic: dict) -> tuple[str, str]:
+        """Decide the apply-outcome status to report when no ATS URL could be
+        extracted, using the __NEXT_DATA__ diagnostic captured by
+        _extract_external_url (ACES-440).
+
+        Distinguishes two conditions that were previously both silently folded
+        into the generic 'missing_ats_url' — hiding a fixable credentials/session
+        gap and a code-owned schema drift behind the same undifferentiated status:
+
+        * auth-gated: __NEXT_DATA__ parsed and its own `pageProps.logined` flag
+          says the request was unauthenticated. This is a session problem, not a
+          missing posting — jobright already has reauth support (_REAUTH_CREDS),
+          so this routes to the existing reauth path instead of burning retries
+          on a URL that cannot appear without a session.
+        * schema drift: __NEXT_DATA__ parsed but none of the known job/jobDetail/
+          jobInfo keys were present even though we are (or may be) logged in —
+          the provider's page shape changed and the extractor's field names are
+          stale, exactly the failure mode this ticket exists to fix. A retry
+          cannot succeed until a human updates the extractor.
+
+        Falls back to the original 'missing_ats_url' whenever __NEXT_DATA__
+        itself didn't parse (e.g. a different page state entirely — a
+        Cloudflare-style block or an unrelated layout) or the known fields WERE
+        present, since in that case not finding a URL is genuinely unremarkable
+        (some jobs have no external application at all).
+        """
+        if not diagnostic.get("next_data_parsed"):
+            return "missing_ats_url", "Could not extract the company ATS URL from the Jobright posting."
+        if diagnostic.get("logined") is False:
+            return "jobright_auth_required", (
+                "Jobright's job-detail payload indicates the session is not "
+                "authenticated (pageProps.logined=false); the external application "
+                "URL is not exposed to an anonymous viewer. Re-run prepare-sessions "
+                "to refresh the Jobright login."
+            )
+        if not diagnostic.get("known_field_found"):
+            return "jobright_schema_drift", (
+                "Jobright's __NEXT_DATA__ payload parsed successfully but pageProps "
+                "did not contain job/jobDetail/jobInfo — the provider's page schema "
+                "has likely changed and _extract_external_url's field names need "
+                "updating."
+            )
+        return "missing_ats_url", "Could not extract the company ATS URL from the Jobright posting."
+
     async def _extract_external_url(self, page) -> str:
         """
         Extract the company ATS application URL directly from the Jobright DOM.
         Tries Next.js page data first, then scans anchor tags for known ATS hostnames.
+
+        Also stashes a __NEXT_DATA__ diagnostic on self._last_url_extraction_diagnostic
+        (next_data_parsed / logined / known_field_found) so a caller that gets an
+        empty result back can tell an auth-gated payload and a schema-drifted one
+        apart from an ordinary missing URL (see _classify_missing_ats_url, ACES-440).
+        Only meaningful when this function's own return is empty — a hit via
+        strategy 2/3 or the autofill-button fallback means a URL was found and the
+        diagnostic (which only covers strategy 1) is not consulted.
         """
-        url = await self._safe_evaluate(page, """
+        result = await self._safe_evaluate(page, """
         () => {
+            const diag = {url: '', next_data_parsed: false, logined: null, known_field_found: false};
             // 1. Try Next.js __NEXT_DATA__ (most reliable)
-            try {
-                const nd = JSON.parse(document.getElementById('__NEXT_DATA__')?.textContent || '{}');
-                const pageProps = nd?.props?.pageProps || {};
-                const job = pageProps.job || pageProps.jobDetail || pageProps.jobInfo || {};
-                const url = job.externalApplyLink || job.applyUrl || job.apply_url
-                          || job.externalUrl || job.applicationUrl;
-                if (url && !url.includes('jobright.ai')) return url;
-            } catch(e) {}
+            const ndEl = document.getElementById('__NEXT_DATA__');
+            if (ndEl) {
+                try {
+                    const nd = JSON.parse(ndEl.textContent || '{}');
+                    // The element itself existed and its content parsed — distinct
+                    // from "no element at all", which the '?? \"{}\"' style default
+                    // would otherwise make indistinguishable (both then read as an
+                    // empty object). Only a real, parsed __NEXT_DATA__ counts here.
+                    diag.next_data_parsed = true;
+                    const pageProps = nd?.props?.pageProps || {};
+                    if (typeof pageProps.logined === 'boolean') diag.logined = pageProps.logined;
+                    const job = pageProps.job || pageProps.jobDetail || pageProps.jobInfo;
+                    diag.known_field_found = !!job;
+                    const url = (job || {}).externalApplyLink || (job || {}).applyUrl || (job || {}).apply_url
+                              || (job || {}).externalUrl || (job || {}).applicationUrl;
+                    if (url && !url.includes('jobright.ai')) { diag.url = url; return diag; }
+                } catch(e) {}
+            }
 
             // 2. Scan all <a> tags for known ATS hostnames
             const ATS = [
@@ -2906,17 +2970,21 @@ class JobrightScraper(BaseScraper):
             for (const a of document.querySelectorAll('a[href]')) {
                 const h = a.href || '';
                 if (h.includes('jobright.ai')) continue;
-                if (ATS.some(p => h.includes(p))) return h;
+                if (ATS.some(p => h.includes(p))) { diag.url = h; return diag; }
             }
 
             // 3. "Original Job Post" button/link
             const orig = Array.from(document.querySelectorAll('a, button'))
                 .find(el => /original job post/i.test(el.textContent));
-            if (orig?.href) return orig.href;
+            if (orig?.href) { diag.url = orig.href; return diag; }
 
-            return '';
+            return diag;
         }
-        """, default="")
+        """, default={})
+        if not isinstance(result, dict):
+            result = {}
+        self._last_url_extraction_diagnostic = result
+        url = result.get("url") or ""
         if url:
             return url
         return await self._reveal_external_url_with_autofill(page)
