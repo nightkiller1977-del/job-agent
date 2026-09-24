@@ -123,6 +123,91 @@ def test_confirmation_transition_advances_with_submission_evidence(state_mgr):
     assert "needs_manual_confirmation" not in outcome
 
 
+def test_fetch_candidate_jobs_includes_approved_submission_unverified(state_mgr):
+    """ACES-445: a job whose submit was clicked but couldn't be receipt-verified
+    stays at status='approved' / confirmation_status='submission_unverified'
+    (StateManager never promotes it to 'applied' without a verified ledger
+    phase). The inbox scan is its only remaining path to reconciliation, so it
+    must be a scan candidate even though its status isn't 'applied'."""
+    state_mgr.upsert_job({
+        "job_id": "unverified_job_1",
+        "title": "Engineering Manager",
+        "company": "Valon",
+        "source": "ashby",
+        "status": "approved",
+    })
+    state_mgr.transition_confirmation("unverified_job_1", "submitting")
+    state_mgr.transition_confirmation("unverified_job_1", "submission_unverified")
+
+    tracker = EmailConfirmationTracker(state_manager=state_mgr)
+    candidates = {j["job_id"] for j in tracker._fetch_candidate_jobs()}
+
+    assert "unverified_job_1" in candidates
+
+
+def test_fetch_candidate_jobs_excludes_approved_without_unverified_receipt(state_mgr):
+    """An 'approved' row that was never submitted (no submission_unverified
+    ledger evidence) must not be pulled into the scan — only the specific
+    receipt-reconciliation-candidate case from ACES-445 is in scope."""
+    state_mgr.upsert_job({
+        "job_id": "not_yet_applied_1",
+        "title": "Staff Engineer",
+        "company": "Acme",
+        "source": "greenhouse",
+        "status": "approved",
+    })
+
+    tracker = EmailConfirmationTracker(state_manager=state_mgr)
+    candidates = {j["job_id"] for j in tracker._fetch_candidate_jobs()}
+
+    assert "not_yet_applied_1" not in candidates
+
+
+def test_fetch_candidate_jobs_excludes_confirmed_by_employer(state_mgr):
+    """A row already confirmed by the employer is terminal and must not be
+    rescanned."""
+    state_mgr.upsert_job({
+        "job_id": "already_confirmed_1",
+        "title": "Director",
+        "company": "Globex",
+        "source": "lever",
+        "status": "applied",
+    })
+    state_mgr.transition_confirmation("already_confirmed_1", "submitting")
+    state_mgr.transition_confirmation("already_confirmed_1", "submitted")
+    state_mgr.transition_confirmation("already_confirmed_1", "confirmed_by_employer")
+
+    tracker = EmailConfirmationTracker(state_manager=state_mgr)
+    candidates = {j["job_id"] for j in tracker._fetch_candidate_jobs()}
+
+    assert "already_confirmed_1" not in candidates
+
+
+def test_unverified_email_match_flags_for_manual_review_not_auto_confirm(state_mgr):
+    """A matched confirmation email against a submission_unverified row is
+    ambiguous, not proof — it must be routed to the manual review queue, the
+    same as any other row lacking submitted/receipt_pending evidence. It must
+    never silently promote to confirmed_by_employer, since that would fabricate
+    certainty ACES-445's whole scenario doesn't have."""
+    state_mgr.upsert_job({
+        "job_id": "unverified_job_2",
+        "title": "Engineering Manager",
+        "company": "Valon",
+        "source": "ashby",
+        "status": "approved",
+    })
+    state_mgr.transition_confirmation("unverified_job_2", "submitting")
+    state_mgr.transition_confirmation("unverified_job_2", "submission_unverified")
+
+    tracker = EmailConfirmationTracker(state_manager=state_mgr)
+    fetched = state_mgr.get_job("unverified_job_2")
+    outcome = {"confirmed": True}
+    tracker._apply_confirmation_transition(fetched, 0.9, outcome)
+
+    assert state_mgr.get_job("unverified_job_2")["confirmation_status"] == "submission_unverified"
+    assert outcome["needs_manual_confirmation"] is True
+
+
 def test_requisition_id_verification_and_mismatch():
     tracker = EmailConfirmationTracker()
     job_with_req = {
