@@ -908,41 +908,75 @@ class StateManager:
                     stored_revision, incoming_revision
                 )
             if queue_cloud_sync:
-                marker_expected_status = (
-                    existing_marker.get("expected_status")
-                    if isinstance(existing_marker, dict)
-                    else None
+                same_pending_transition = (
+                    prior_status == "expired"
+                    and isinstance(existing_marker, dict)
+                    and existing_marker.get("status") == "expired"
                 )
-                marker_expected_revision = (
-                    existing_marker.get("expected_revision")
-                    if isinstance(existing_marker, dict)
-                    else None
-                )
-                if not marker_expected_status:
-                    marker_expected_status = expected_cloud_status or str(
-                        prior_status
+                if same_pending_transition:
+                    refreshed_marker = dict(existing_marker)
+                    generation = refreshed_marker.get("generation")
+                    if not isinstance(generation, str) or not generation.strip():
+                        refreshed_marker["generation"] = uuid4().hex
+                    queued_at = refreshed_marker.get("queued_at")
+                    if not isinstance(queued_at, str) or not queued_at.strip():
+                        refreshed_marker["queued_at"] = now
+                    if expected_cloud_revision is not None:
+                        marker_revision = refreshed_marker.get(
+                            "expected_revision", 0
+                        )
+                        if (
+                            isinstance(marker_revision, bool)
+                            or not isinstance(marker_revision, int)
+                            or marker_revision < 0
+                        ):
+                            marker_revision = 0
+                        if incoming_revision >= marker_revision:
+                            refreshed_marker["expected_status"] = str(
+                                expected_cloud_status
+                                or refreshed_marker.get("expected_status")
+                                or prior_status
+                            )
+                            refreshed_marker["expected_revision"] = (
+                                incoming_revision
+                            )
+                    extra["cloud_status_sync_pending"] = refreshed_marker
+                else:
+                    marker_expected_status = (
+                        existing_marker.get("expected_status")
+                        if isinstance(existing_marker, dict)
+                        else None
                     )
-                if (
-                    isinstance(marker_expected_revision, bool)
-                    or not isinstance(marker_expected_revision, int)
-                    or marker_expected_revision < 0
-                ):
-                    marker_expected_revision = extra.get(
-                        "cloud_status_revision", 0
+                    marker_expected_revision = (
+                        existing_marker.get("expected_revision")
+                        if isinstance(existing_marker, dict)
+                        else None
                     )
-                if (
-                    isinstance(marker_expected_revision, bool)
-                    or not isinstance(marker_expected_revision, int)
-                    or marker_expected_revision < 0
-                ):
-                    marker_expected_revision = 0
-                extra["cloud_status_sync_pending"] = {
-                    "status": "expired",
-                    "expected_status": str(marker_expected_status),
-                    "expected_revision": marker_expected_revision,
-                    "queued_at": now,
-                    "generation": uuid4().hex,
-                }
+                    if not marker_expected_status:
+                        marker_expected_status = expected_cloud_status or str(
+                            prior_status
+                        )
+                    if (
+                        isinstance(marker_expected_revision, bool)
+                        or not isinstance(marker_expected_revision, int)
+                        or marker_expected_revision < 0
+                    ):
+                        marker_expected_revision = extra.get(
+                            "cloud_status_revision", 0
+                        )
+                    if (
+                        isinstance(marker_expected_revision, bool)
+                        or not isinstance(marker_expected_revision, int)
+                        or marker_expected_revision < 0
+                    ):
+                        marker_expected_revision = 0
+                    extra["cloud_status_sync_pending"] = {
+                        "status": "expired",
+                        "expected_status": str(marker_expected_status),
+                        "expected_revision": marker_expected_revision,
+                        "queued_at": now,
+                        "generation": uuid4().hex,
+                    }
             extra["expired_at"] = now
             extra["expired_reason"] = (reason or "")[:300]
             extra["expired_signal"] = signal

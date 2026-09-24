@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 
 load_dotenv()
@@ -305,7 +305,7 @@ class ActionRequest(BaseModel):
     action: str
     idempotency_key: Optional[str] = None
     expected_status: Optional[str] = None
-    expected_revision: Optional[int] = None
+    expected_revision: Optional[StrictInt] = None
 
 
 class ExternalJobRequest(BaseModel):

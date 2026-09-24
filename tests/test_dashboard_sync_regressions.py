@@ -90,6 +90,28 @@ class TestActionIdempotency(unittest.TestCase):
         self.client = TestClient(app)
 
     @patch("dashboard.main.get_db")
+    def test_action_rejects_boolean_expected_revision_before_db_access(
+        self, mock_get_db
+    ):
+        for revision in (False, True):
+            with self.subTest(revision=revision):
+                response = self.client.post(
+                    "/api/action",
+                    json={
+                        "job_id": "job-1",
+                        "action": "applied",
+                        "idempotency_key": f"boolean-revision-{revision}",
+                        "expected_status": "approved",
+                        "expected_revision": revision,
+                    },
+                    headers=_AUTH,
+                )
+
+                self.assertEqual(response.status_code, 422)
+
+        mock_get_db.assert_not_called()
+
+    @patch("dashboard.main.get_db")
     def test_action_atomically_records_idempotency_key(self, mock_get_db):
         mock_db = MagicMock()
         mock_db.jobs.find_one_and_update.return_value = {

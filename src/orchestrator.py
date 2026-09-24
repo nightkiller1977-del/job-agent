@@ -1983,10 +1983,27 @@ class Orchestrator:
             for job in jobs:
                 # The dashboard can remain "approved" after a local submission
                 # when the status push crashes. Never downgrade that durable
-                # local applied state back into the eligible apply pool.
+                # local transition back into the eligible apply pool. This is
+                # not limited to applied: skipped and expired transitions also
+                # remain locally authoritative while their exact-generation
+                # cloud retry marker is pending.
                 existing = self.state.get_job(job["job_id"])
+                existing_marker = (
+                    parse_extra_json(existing.get("extra_json")).get(
+                        "cloud_status_sync_pending"
+                    )
+                    if existing
+                    else None
+                )
+                pending_local_transition = (
+                    existing
+                    and isinstance(existing_marker, dict)
+                    and existing_marker.get("status") == existing.get("status")
+                )
                 target_status = (
-                    "applied"
+                    str(existing.get("status"))
+                    if pending_local_transition
+                    else "applied"
                     if existing and existing.get("status") == "applied"
                     else "approved"
                 )
@@ -1997,6 +2014,7 @@ class Orchestrator:
                     target_status,
                     expected_cloud_status=str(job.get("status") or "approved"),
                     expected_cloud_revision=job.get("status_revision", 0),
+                    queue_cloud_sync=bool(pending_local_transition),
                 )
                 pulled += 1
             console.print(f"[cyan]☁ Pulled {pulled} approved job(s) from cloud dashboard.[/cyan]")

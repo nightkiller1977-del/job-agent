@@ -81,6 +81,56 @@ async def test_pull_approved_preserves_local_applied_state(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("local_status", ["skipped", "expired"])
+async def test_pull_approved_preserves_pending_local_transition(
+    tmp_path, monkeypatch, local_status
+):
+    """A stale cloud approval must not erase a durable local status retry."""
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    local_job = {
+        "job_id": f"job-pending-{local_status}",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/pending",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(local_job)
+    orchestrator.state.set_status(
+        local_job["job_id"], local_status, queue_cloud_sync=True
+    )
+    before = orchestrator.state.get_job(local_job["job_id"])
+    before_marker = parse_extra_json(before["extra_json"])[
+        "cloud_status_sync_pending"
+    ]
+    cloud_job = {**local_job, "status": "approved", "status_revision": 4}
+    orchestrator._cloud_request = AsyncMock(
+        return_value=MagicMock(status_code=200, json=lambda: [cloud_job])
+    )
+
+    await orchestrator._pull_approved_from_cloud()
+
+    preserved = orchestrator.state.get_job(local_job["job_id"])
+    marker = parse_extra_json(preserved["extra_json"])[
+        "cloud_status_sync_pending"
+    ]
+    assert preserved["status"] == local_status
+    assert marker["status"] == local_status
+    assert marker["generation"] == before_marker["generation"]
+    assert marker["queued_at"] == before_marker["queued_at"]
+    assert marker["expected_status"] == "approved"
+    assert marker["expected_revision"] == 4
+
+
+@pytest.mark.asyncio
 async def test_pending_applied_sync_retries_until_cloud_confirms(tmp_path, monkeypatch):
     """A failed status push remains durable and a later run clears it on 200."""
     from src.orchestrator import Orchestrator
