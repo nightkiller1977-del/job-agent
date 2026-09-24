@@ -176,6 +176,50 @@ async def test_status_push_keeps_obligation_when_200_reports_wrong_status(
 
 
 @pytest.mark.asyncio
+async def test_status_push_keeps_obligation_when_revision_did_not_advance(
+    tmp_path, monkeypatch
+):
+    """A target-status response at the baseline revision proves no action."""
+    from src.orchestrator import Orchestrator
+    from src.state_manager import parse_extra_json
+
+    monkeypatch.setenv("DASHBOARD_URL", "https://dashboard.example")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"state_db_path": str(tmp_path / "jobs.db")})
+    )
+    orchestrator = Orchestrator(config_path=str(config_path))
+    job = {
+        "job_id": "job-stale-revision-confirmation",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/stale-revision-confirmation",
+        "status": "approved",
+    }
+    orchestrator.state.upsert_job(job)
+    orchestrator.state.set_status(job["job_id"], "applied")
+    orchestrator._cloud_request = AsyncMock(
+        return_value=MagicMock(
+            status_code=200,
+            json=lambda: {
+                "status": "applied",
+                "status_revision": 0,
+                "deduplicated": True,
+            },
+        )
+    )
+
+    result = await orchestrator._push_status_to_cloud(job["job_id"], "applied")
+
+    assert result is False
+    marker = parse_extra_json(
+        orchestrator.state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+    assert marker["expected_revision"] == 0
+
+
+@pytest.mark.asyncio
 async def test_revision_conflict_rebases_exact_pending_generation(
     tmp_path, monkeypatch
 ):
@@ -481,6 +525,45 @@ def test_requested_skipped_sync_gets_generation_and_expected_status(tmp_path):
     assert marker["status"] == "skipped"
     assert marker["expected_status"] == "approved"
     assert marker["expected_revision"] == 0
+    assert marker["generation"]
+
+
+def test_authoritative_refresh_assigns_generation_to_legacy_marker(tmp_path):
+    from src.state_manager import StateManager, parse_extra_json
+
+    state = StateManager(db_path=tmp_path / "jobs.db")
+    job = {
+        "job_id": "job-legacy-authoritative-refresh",
+        "source": "jobright",
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com/jobs/legacy-authoritative-refresh",
+        "status": "applied",
+        "extra_json": json.dumps(
+            {
+                "cloud_status_sync_pending": {
+                    "status": "applied",
+                    "expected_status": "approved",
+                    "expected_revision": 0,
+                    "queued_at": "2026-09-23T00:00:00",
+                }
+            }
+        ),
+    }
+    state.upsert_job(job)
+
+    state.set_status(
+        job["job_id"],
+        "applied",
+        expected_cloud_status="approved",
+        expected_cloud_revision=4,
+    )
+
+    marker = parse_extra_json(
+        state.get_job(job["job_id"])["extra_json"]
+    )["cloud_status_sync_pending"]
+    assert marker["expected_status"] == "approved"
+    assert marker["expected_revision"] == 4
     assert marker["generation"]
 
 

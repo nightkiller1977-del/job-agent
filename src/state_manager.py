@@ -308,6 +308,16 @@ class StateManager:
                             existing_expected_revision = 0
                         if incoming_revision >= existing_expected_revision:
                             refreshed_marker = dict(existing_marker)
+                            generation = refreshed_marker.get("generation")
+                            if (
+                                not isinstance(generation, str)
+                                or not generation.strip()
+                            ):
+                                # Only an authoritative dashboard status and
+                                # revision can safely re-arm a generation-less
+                                # pre-upgrade obligation. The fresh token then
+                                # fences all future sends and clears normally.
+                                refreshed_marker["generation"] = uuid4().hex
                             refreshed_marker["expected_status"] = str(
                                 expected_cloud_status
                                 or refreshed_marker.get("expected_status")

@@ -294,6 +294,32 @@ class TestActionIdempotency(unittest.TestCase):
         self.assertEqual(response.json()["detail"]["current_revision"], 7)
         mock_db.jobs.update_one.assert_not_called()
 
+    @patch("dashboard.main.get_db")
+    def test_unkeyed_compare_and_set_miss_conflicts_at_target(self, mock_get_db):
+        """A stale expected status must not become a successful target no-op."""
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "applied",
+            "status_revision": 8,
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "expected_status": "approved",
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["current_status"], "applied")
+        self.assertEqual(response.json()["detail"]["current_revision"], 8)
+
 
 class TestExternalJobScorePlaceholder(unittest.TestCase):
     def setUp(self):

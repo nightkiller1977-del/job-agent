@@ -710,15 +710,37 @@ async def job_action(body: ActionRequest):
         return_document=ReturnDocument.AFTER,
     )
     if not result:
-        current = jobs.find_one({"job_id": body.job_id}, {"status": 1})
+        current = jobs.find_one(
+            {"job_id": body.job_id}, {"status": 1, "status_revision": 1}
+        )
         if not current:
             raise HTTPException(status_code=404, detail="Job not found")
+        current_revision = current.get("status_revision", 0)
+        if (
+            isinstance(current_revision, bool)
+            or not isinstance(current_revision, int)
+            or current_revision < 0
+        ):
+            current_revision = 0
+        if expected_status is not None:
+            # Supplying an expected status makes this a compare-and-set. Once
+            # that atomic update misses, observing the requested target in a
+            # second read cannot turn the stale precondition into success: an
+            # away/back transition may have occurred between those operations.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Current status no longer matches expected status",
+                    "current_status": current.get("status"),
+                    "current_revision": current_revision,
+                },
+            )
         if current.get("status") == status:
             return {
                 "ok": True,
                 "job_id": body.job_id,
                 "status": status,
-                "status_revision": current.get("status_revision", 0),
+                "status_revision": current_revision,
             }
         raise HTTPException(
             status_code=409,

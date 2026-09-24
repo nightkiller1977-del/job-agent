@@ -2203,7 +2203,7 @@ class Orchestrator:
                 response_status != status
                 or isinstance(response_revision, bool)
                 or not isinstance(response_revision, int)
-                or response_revision < 0
+                or response_revision <= expected_revision
             ):
                 console.print(
                     "[dim]Cloud status push did not confirm the requested "
