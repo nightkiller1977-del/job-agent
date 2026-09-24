@@ -386,6 +386,13 @@ def test_apply_preflight_runs_for_credless_queued_jobs(monkeypatch):
 
 def test_apply_preflight_skipped_for_empty_queue(monkeypatch):
     """An empty queue means nothing to apply — and nothing to validate."""
+    # This test's whole premise is the local-only branch (main.py: no
+    # DASHBOARD_URL -> has_queued_jobs comes from the mocked _apply_queue_scope
+    # below). With DASHBOARD_URL set, main() takes the cloud-approval branch
+    # instead and hardcodes has_queued_jobs=True, ignoring the mock — so this
+    # must not depend on the var being absent from the ambient environment
+    # (e.g. a real .env leaked in earlier by another test's Orchestrator()).
+    monkeypatch.delenv("DASHBOARD_URL", raising=False)
     monkeypatch.setattr(main_mod, "load_env", lambda: None)
     monkeypatch.setattr(main_mod, "check_api_key", lambda: True)
     monkeypatch.setattr(main_mod, "preflight_env_check", lambda sources: True)
