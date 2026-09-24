@@ -19,10 +19,14 @@ Contract (mirrors the email-agent/Node and Go implementations):
   over failed sends.
 * Default policy: remote export auto-enables in production and is off in
   dev/test unless ``OBSERVABILITY_REMOTE=1``. ``OBSERVABILITY_REMOTE=0`` opts
-  out even in production. Production is detected via the ``RENDER`` env var,
-  which Render sets on every service it runs (this repo's ``render.yaml``
-  defines no explicit mode variable). Local Loki logging (``LOKI_URL``) is
-  independent of this policy and unchanged.
+  out even in production. Production is detected via a present, truthy
+  ``RENDER`` env var, which Render used to set on every service it ran (this
+  repo's ``render.yaml`` defines no explicit mode variable). Post-Render-
+  migration (ACES-461) ``RENDER`` is no longer set on the live deployment, so
+  an *absent* ``RENDER`` also now defaults to production — the safer failure
+  mode for an ops-visibility feature, mirroring the Go services' "unset
+  environment defaults to production" convention. Local Loki logging
+  (``LOKI_URL``) is independent of this policy and unchanged.
 """
 from __future__ import annotations
 
@@ -95,9 +99,14 @@ def _valid_push_url(url: str) -> bool:
 
 
 def is_production(env: os._Environ | dict | None = None) -> bool:
-    """Render sets ``RENDER`` on every service (documented in loki_config)."""
+    """A present ``RENDER`` still counts as an explicit signal. A completely
+    absent ``RENDER`` (the Azure reality; see module docstring) now also
+    defaults to production rather than dev/test.
+    """
     env = os.environ if env is None else env
-    return bool(env.get("RENDER"))
+    if "RENDER" in env:
+        return bool(env.get("RENDER"))
+    return True
 
 
 def _disabled(reason: str, *, warn: bool = True) -> LokiConfig:

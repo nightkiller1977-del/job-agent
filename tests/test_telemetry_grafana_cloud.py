@@ -46,9 +46,21 @@ def test_invalid_shared_auth_fails_closed(monkeypatch):
     assert resolve_loki_url() == "http://localhost:3100/loki/api/v1/push"
 
 
-def test_dev_test_remote_off_by_default(monkeypatch):
+def test_missing_render_signal_defaults_to_production(monkeypatch):
+    # ACES-461: post-Render-migration, a completely absent RENDER (the Azure
+    # reality) must still auto-enable a valid pair, not silently disable it.
     monkeypatch.delenv("OBSERVABILITY_REMOTE", raising=False)
     monkeypatch.delenv("RENDER", raising=False)
+    monkeypatch.setenv("LOKI_URL_REMOTE", REMOTE_URL)
+    monkeypatch.setenv("LOKI_REMOTE_AUTH", AUTH)
+    monkeypatch.delenv("LOKI_URL", raising=False)
+    assert resolve_loki_auth() == ("123456", "secret-token")
+    assert resolve_loki_url() == REMOTE_URL
+
+
+def test_render_present_but_falsy_stays_non_production_default_off(monkeypatch):
+    monkeypatch.delenv("OBSERVABILITY_REMOTE", raising=False)
+    monkeypatch.setenv("RENDER", "")
     monkeypatch.setenv("LOKI_URL_REMOTE", REMOTE_URL)
     monkeypatch.setenv("LOKI_REMOTE_AUTH", AUTH)
     monkeypatch.delenv("LOKI_URL", raising=False)

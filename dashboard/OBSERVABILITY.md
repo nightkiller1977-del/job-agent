@@ -24,10 +24,13 @@ with non-empty user/password. A partial or malformed pair disables export with
 a single warning (values are never logged) and never starts the export worker.
 The legacy split-auth names `LOKI_USER`/`LOKI_API_KEY` are retired.
 
-Default policy (ACES-293): remote export auto-enables in production — detected
-via the `RENDER` env var, which Render sets on every service — and is off in
-dev/test unless `OBSERVABILITY_REMOTE=1`. `OBSERVABILITY_REMOTE=0` opts out
-even in production. Local logging is independent and unchanged.
+Default policy (ACES-293, updated ACES-461): remote export auto-enables in
+production — detected via a present, truthy `RENDER` env var (Render used to
+set this on every service), or the *absence* of `RENDER` entirely, which is
+the reality on Azure Container Apps post-migration — and is off in dev/test
+only when `RENDER` is explicitly present but falsy, unless
+`OBSERVABILITY_REMOTE=1`. `OBSERVABILITY_REMOTE=0` opts out even in
+production. Local logging is independent and unchanged.
 
 The Dashboard exporter has one worker and a queue of 64 events. Overflow is
 best-effort loss, not additional threads or blocked application requests. HTTP

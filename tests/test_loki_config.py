@@ -73,9 +73,29 @@ class PairResolutionTests(unittest.TestCase):
         self.assertNotIn("SECRETVALUE", "\n".join(captured.output))
 
 
+class IsProductionTests(unittest.TestCase):
+    """ACES-461: an absent RENDER now also defaults to production."""
+
+    def test_missing_signal_defaults_to_production(self):
+        self.assertTrue(loki_config.is_production({}))
+
+    def test_render_present_and_truthy_is_still_production(self):
+        self.assertTrue(loki_config.is_production({"RENDER": "true"}))
+
+    def test_render_present_but_falsy_is_still_non_production(self):
+        self.assertFalse(loki_config.is_production({"RENDER": ""}))
+
+
 class PolicyTests(unittest.TestCase):
-    def test_dev_test_off_by_default(self):
+    def test_missing_signal_defaults_to_production(self):
+        # ACES-461: post-Render-migration, no signal at all (the Azure
+        # reality) must still auto-enable a valid pair, not silently disable it.
         with patch.dict(os.environ, {"LOKI_URL_REMOTE": URL, "LOKI_REMOTE_AUTH": AUTH}, clear=True):
+            config = loki_config.resolve_loki_config()
+        self.assertTrue(config.enabled)
+
+    def test_render_present_but_falsy_stays_non_production_default_off(self):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": URL, "LOKI_REMOTE_AUTH": AUTH, "RENDER": ""}, clear=True):
             config = loki_config.resolve_loki_config()
         self.assertFalse(config.enabled)
         self.assertEqual(config.reason, "non_production_default_off")
