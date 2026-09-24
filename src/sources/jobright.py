@@ -18,7 +18,11 @@ from typing import Optional
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 from rich.console import Console
 
-from .adapters.receipt import capture_receipt_evidence, verify_receipt
+from .adapters.receipt import (
+    ReceiptEvidence,
+    capture_receipt_evidence,
+    verify_receipt,
+)
 from .adapters.forensics import host_of
 from .base import BaseScraper, AuthFailedError, JobExpiredError
 from src.notifier import notify_error, notify_success
@@ -2424,6 +2428,13 @@ class JobrightScraper(BaseScraper):
             if (origin := self._frame_origin(frame))
         }
 
+        def _mark_incomplete(frame) -> None:
+            if not any(existing is frame for existing in incomplete_frames):
+                incomplete_frames.append(frame)
+            origin = self._frame_origin(frame)
+            if origin:
+                incomplete_origins.add(origin)
+
         baselines = []
         for frame in selected_frames:
             try:
@@ -2432,18 +2443,18 @@ class JobrightScraper(BaseScraper):
                     timeout=per_frame_timeout_ms / 1000,
                 )
             except (TimeoutError, asyncio.TimeoutError):
-                if not any(existing is frame for existing in incomplete_frames):
-                    incomplete_frames.append(frame)
-                origin = self._frame_origin(frame)
-                if origin:
-                    incomplete_origins.add(origin)
+                _mark_incomplete(frame)
                 continue
             except Exception:
-                if not any(existing is frame for existing in incomplete_frames):
-                    incomplete_frames.append(frame)
-                origin = self._frame_origin(frame)
-                if origin:
-                    incomplete_origins.add(origin)
+                _mark_incomplete(frame)
+                continue
+            if isinstance(baseline, ReceiptEvidence) and (
+                not baseline.dom_available or baseline.match_count is None
+            ):
+                # capture_receipt_evidence deliberately absorbs evaluator
+                # failures. Preserve that uncertainty here instead of turning
+                # its incomplete snapshot into a trusted pre-click baseline.
+                _mark_incomplete(frame)
                 continue
             baselines.append((frame, baseline))
         return _ReceiptBaselines(

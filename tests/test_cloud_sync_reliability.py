@@ -339,11 +339,25 @@ async def test_recorded_superseded_action_clears_exact_obligation_without_retry(
     assert "cloud_status_sync_pending" not in extra
 
 
+@pytest.mark.parametrize(
+    "conflict_detail",
+    [
+        {"current_status": "skipped", "current_revision": 2},
+        {
+            "current_status": "skipped",
+            "current_revision": 2,
+            "conflict_kind": "operation_history_ambiguous",
+            "operation_recorded": None,
+            "history_saturated": True,
+        },
+    ],
+    ids=["legacy-untyped", "saturated-history"],
+)
 @pytest.mark.asyncio
 async def test_ambiguous_conflict_does_not_rebase_pending_generation(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, conflict_detail
 ):
-    """Older dashboards without conflict provenance must fail closed."""
+    """Unproven operation absence must fail closed."""
     from src.orchestrator import Orchestrator
     from src.state_manager import parse_extra_json
 
@@ -369,12 +383,7 @@ async def test_ambiguous_conflict_does_not_rebase_pending_generation(
     orchestrator._cloud_request = AsyncMock(
         return_value=MagicMock(
             status_code=409,
-            json=lambda: {
-                "detail": {
-                    "current_status": "skipped",
-                    "current_revision": 2,
-                }
-            },
+            json=lambda: {"detail": conflict_detail},
         )
     )
 

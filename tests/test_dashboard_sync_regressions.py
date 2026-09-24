@@ -233,6 +233,40 @@ class TestActionIdempotency(unittest.TestCase):
         self.assertEqual(filt["status_revision"], 4)
 
     @patch("dashboard.main.get_db")
+    def test_saturated_key_history_makes_absence_ambiguous(self, mock_get_db):
+        mock_db = MagicMock()
+        mock_db.jobs.find_one_and_update.return_value = None
+        mock_db.jobs.find_one.return_value = {
+            "job_id": "job-1",
+            "status": "skipped",
+            "status_revision": 70,
+            "_action_idempotency_keys": [
+                f"skipped:retained-{index}" for index in range(64)
+            ],
+        }
+        mock_get_db.return_value = mock_db
+
+        response = self.client.post(
+            "/api/action",
+            json={
+                "job_id": "job-1",
+                "action": "applied",
+                "idempotency_key": "evicted-generation",
+                "expected_status": "approved",
+                "expected_revision": 4,
+            },
+            headers=_AUTH,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"]["conflict_kind"],
+            "operation_history_ambiguous",
+        )
+        self.assertIsNone(response.json()["detail"]["operation_recorded"])
+        self.assertTrue(response.json()["detail"]["history_saturated"])
+
+    @patch("dashboard.main.get_db")
     def test_already_targeted_action_still_records_operation_key(self, mock_get_db):
         mock_db = MagicMock()
         mock_db.jobs.find_one_and_update.return_value = None

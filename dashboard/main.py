@@ -209,6 +209,40 @@ def _public_doc(doc: dict | None) -> dict:
     return out
 
 
+def _action_conflict_detail(
+    current: dict,
+    current_revision: int,
+    *,
+    operation_recorded: bool,
+) -> dict:
+    """Describe whether a missing keyed CAS is safe to rebase.
+
+    At the retention limit, key absence is no longer proof that an operation
+    never committed: an older key may have been evicted. Report that state as
+    ambiguous so durable clients fail closed instead of replaying stale work.
+    """
+    raw_keys = current.get("_action_idempotency_keys", [])
+    action_keys = raw_keys if isinstance(raw_keys, list) else []
+    history_saturated = len(action_keys) >= _ACTION_IDEMPOTENCY_KEY_LIMIT
+    if operation_recorded:
+        conflict_kind = "operation_superseded"
+        recorded_value = True
+    elif history_saturated:
+        conflict_kind = "operation_history_ambiguous"
+        recorded_value = None
+    else:
+        conflict_kind = "compare_and_set_failed"
+        recorded_value = False
+    return {
+        "message": "Current status or revision no longer matches expected state",
+        "current_status": current.get("status"),
+        "current_revision": current_revision,
+        "conflict_kind": conflict_kind,
+        "operation_recorded": recorded_value,
+        "history_saturated": history_saturated,
+    }
+
+
 def get_db():
     global _client
     if not MONGODB_URI:
@@ -554,9 +588,13 @@ async def job_action(body: ActionRequest):
             )
             if not current:
                 raise HTTPException(status_code=404, detail="Job not found")
-            operation_recorded = operation_key in current.get(
-                "_action_idempotency_keys", []
+            raw_operation_keys = current.get("_action_idempotency_keys", [])
+            operation_keys = (
+                raw_operation_keys
+                if isinstance(raw_operation_keys, list)
+                else []
             )
+            operation_recorded = operation_key in operation_keys
             current_revision = current.get("status_revision", 0)
             if (
                 isinstance(current_revision, bool)
@@ -567,13 +605,11 @@ async def job_action(body: ActionRequest):
             if operation_recorded and current.get("status") != status:
                 raise HTTPException(
                     status_code=409,
-                    detail={
-                        "message": "Current status or revision no longer matches expected state",
-                        "current_status": current.get("status"),
-                        "current_revision": current_revision,
-                        "conflict_kind": "operation_superseded",
-                        "operation_recorded": True,
-                    },
+                    detail=_action_conflict_detail(
+                        current,
+                        current_revision,
+                        operation_recorded=True,
+                    ),
                 )
             if operation_recorded:
                 return {
@@ -590,13 +626,11 @@ async def job_action(body: ActionRequest):
                 if current_revision != expected_revision:
                     raise HTTPException(
                         status_code=409,
-                        detail={
-                            "message": "Current status or revision no longer matches expected state",
-                            "current_status": current.get("status"),
-                            "current_revision": current_revision,
-                            "conflict_kind": "compare_and_set_failed",
-                            "operation_recorded": False,
-                        },
+                        detail=_action_conflict_detail(
+                            current,
+                            current_revision,
+                            operation_recorded=False,
+                        ),
                     )
                 record_filter = {
                     "job_id": body.job_id,
@@ -636,9 +670,13 @@ async def job_action(body: ActionRequest):
                 )
                 if not current:
                     raise HTTPException(status_code=404, detail="Job not found")
-                operation_recorded = operation_key in current.get(
-                    "_action_idempotency_keys", []
+                raw_operation_keys = current.get("_action_idempotency_keys", [])
+                operation_keys = (
+                    raw_operation_keys
+                    if isinstance(raw_operation_keys, list)
+                    else []
                 )
+                operation_recorded = operation_key in operation_keys
                 if operation_recorded and current.get("status") == status:
                     return {
                         "ok": True,
@@ -657,17 +695,11 @@ async def job_action(body: ActionRequest):
                         refreshed_revision = 0
                     raise HTTPException(
                         status_code=409,
-                        detail={
-                            "message": "Current status or revision no longer matches expected state",
-                            "current_status": current.get("status"),
-                            "current_revision": refreshed_revision,
-                            "conflict_kind": (
-                                "operation_superseded"
-                                if operation_recorded
-                                else "compare_and_set_failed"
-                            ),
-                            "operation_recorded": operation_recorded,
-                        },
+                        detail=_action_conflict_detail(
+                            current,
+                            refreshed_revision,
+                            operation_recorded=operation_recorded,
+                        ),
                     )
                 raise HTTPException(
                     status_code=409,
@@ -679,24 +711,20 @@ async def job_action(body: ActionRequest):
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail={
-                        "message": "Current status or revision no longer matches expected state",
-                        "current_status": current.get("status"),
-                        "current_revision": current_revision,
-                        "conflict_kind": "compare_and_set_failed",
-                        "operation_recorded": False,
-                    },
+                    detail=_action_conflict_detail(
+                        current,
+                        current_revision,
+                        operation_recorded=False,
+                    ),
                 )
             if current_revision != expected_revision:
                 raise HTTPException(
                     status_code=409,
-                    detail={
-                        "message": "Current status or revision no longer matches expected state",
-                        "current_status": current.get("status"),
-                        "current_revision": current_revision,
-                        "conflict_kind": "compare_and_set_failed",
-                        "operation_recorded": False,
-                    },
+                    detail=_action_conflict_detail(
+                        current,
+                        current_revision,
+                        operation_recorded=False,
+                    ),
                 )
             raise HTTPException(
                 status_code=409,
