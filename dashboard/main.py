@@ -17,6 +17,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -40,14 +41,23 @@ MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
 JOB_AGENT_DB = os.environ.get("JOB_AGENT_DB", "job_agent").strip() or "job_agent"
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "")
 CREDENTIAL_ENCRYPTION_KEY = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
+# Optional alternative to typing the sync secret: "Sign in with Google", restricted
+# to a single allow-listed account. All three must be set (fail-closed, same
+# philosophy as SYNC_SECRET) or the login page falls back to the secret form only.
+# ALLOWED_GOOGLE_EMAIL is deliberately env-only — this repo is public, so no email
+# address may ever land in source.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+ALLOWED_GOOGLE_EMAIL = os.environ.get("ALLOWED_GOOGLE_EMAIL", "").strip().lower()
 _client: MongoClient | None = None
 
 # Paths reachable without the shared secret: the app's own liveness probe, which
-# carries no data and no side effects, plus the login page that exchanges the
-# shared secret for a session cookie. /metrics is deliberately NOT here — it
-# exposes the Prometheus process/runtime registry, and no public scraper depends
-# on it, so it authenticates like any other machine route.
-_UNAUTHENTICATED_PATHS = frozenset({"/health", "/login"})
+# carries no data and no side effects, plus the login page (and the Google OAuth
+# start/callback pair it can redirect through) that exchanges the shared secret,
+# or a verified Google identity, for a session cookie. /metrics is deliberately
+# NOT here — it exposes the Prometheus process/runtime registry, and no public
+# scraper depends on it, so it authenticates like any other machine route.
+_UNAUTHENTICATED_PATHS = frozenset({"/health", "/login", "/auth/google/start", "/auth/google/callback"})
 # Static assets are needed to render the login page and the authenticated shell;
 # they contain no application data.
 _UNAUTHENTICATED_PREFIXES = ("/static/",)
@@ -61,6 +71,14 @@ _SESSION_MAX_AGE = 12 * 60 * 60
 # Browser navigations without a session are redirected here. Kept as a constant so
 # the middleware and the route cannot drift apart.
 _LOGIN_REDIRECT = "/login"
+# Short-lived cookie carrying the OAuth CSRF state (and the post-login redirect
+# target) between /auth/google/start and /auth/google/callback. Scoped to the
+# /auth/google path so it never rides along to any other route.
+_OAUTH_STATE_COOKIE = "ja_oauth_state"
+_OAUTH_STATE_MAX_AGE = 10 * 60
+_GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
 def _session_signature(token: str) -> str:
@@ -114,6 +132,14 @@ def _safe_next(target: str | None) -> str:
     return "/"
 
 
+def _google_callback_url(request: Request) -> str:
+    # Must exactly match an authorized redirect URI on the Google OAuth client.
+    # Built from the incoming request rather than a BASE_URL env var so it keeps
+    # working if the container app's hostname ever changes.
+    scheme = "https" if _is_secure_request(request) else request.url.scheme
+    return f"{scheme}://{request.url.netloc}/auth/google/callback"
+
+
 class SharedSecretMiddleware(BaseHTTPMiddleware):
     """Fail-closed authentication gate for every non-probe route.
 
@@ -163,6 +189,12 @@ app.add_middleware(SharedSecretMiddleware)
 def _login_page(error: str = "", next_path: str = "/") -> HTMLResponse:
     banner = f'<p class="err">{html.escape(error)}</p>' if error else ""
     status = 401 if error else 200
+    google_block = ""
+    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and ALLOWED_GOOGLE_EMAIL:
+        google_href = f"/auth/google/start?next={urllib.parse.quote(next_path, safe='')}"
+        google_block = f"""
+    <a href="{html.escape(google_href)}" style="display:block;text-align:center;margin-bottom:16px;padding:9px;border-radius:6px;background:#fff;color:#1F2937;font-weight:600;text-decoration:none">Sign in with Google</a>
+    <div style="text-align:center;color:#64748B;font-size:12px;margin-bottom:16px">or use the sync secret</div>"""
     return HTMLResponse(
         f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -171,6 +203,7 @@ def _login_page(error: str = "", next_path: str = "/") -> HTMLResponse:
 <body style="font-family:system-ui,sans-serif;background:#0F172A;color:#E2E8F0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
   <form method="post" action="/login" style="background:#1E293B;padding:28px;border-radius:12px;min-width:300px">
     <h1 style="font-size:16px;margin:0 0 16px">Job Agent</h1>
+    {google_block}
     {banner}
     <input type="hidden" name="next" value="{html.escape(next_path)}">
     <label style="display:block;font-size:12px;margin-bottom:6px" for="secret">Sync secret</label>
@@ -318,6 +351,13 @@ async def login_submit(request: Request):
     next_path = _safe_next(fields.get("next", [""])[0])
     if not hmac.compare_digest(supplied, SYNC_SECRET):
         return _login_page("Invalid sync secret.", next_path=next_path)
+    return _issue_session(next_path, request)
+
+
+def _issue_session(next_path: str, request: Request) -> RedirectResponse:
+    """Shared by both login paths: mint the same signed ja_session cookie the
+    sync-secret flow has always issued, so nothing downstream needs to know
+    which credential the browser actually presented."""
     response = RedirectResponse(next_path, status_code=303)
     response.set_cookie(
         _SESSION_COOKIE,
@@ -328,6 +368,78 @@ async def login_submit(request: Request):
         secure=_is_secure_request(request),
         path="/",
     )
+    return response
+
+
+@app.get("/auth/google/start")
+async def google_start(request: Request, next: str = "/"):
+    next_path = _safe_next(next)
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and ALLOWED_GOOGLE_EMAIL):
+        return _login_page("Google sign-in is not configured.", next_path=next_path)
+    state = secrets.token_urlsafe(24)
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": _google_callback_url(request),
+        "response_type": "code",
+        "scope": "openid email",
+        "state": state,
+        "prompt": "select_account",
+    }
+    response = RedirectResponse(f"{_GOOGLE_AUTH_URL}?{urllib.parse.urlencode(params)}", status_code=303)
+    # State and the post-login redirect travel together in one short-lived,
+    # HttpOnly cookie scoped to /auth/google — there is no server-side session
+    # store to stash them in before the browser is authenticated.
+    response.set_cookie(
+        _OAUTH_STATE_COOKIE,
+        f"{state}.{next_path}",
+        max_age=_OAUTH_STATE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=_is_secure_request(request),
+        path="/auth/google",
+    )
+    return response
+
+
+@app.get("/auth/google/callback")
+async def google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    stored_state, _, stored_next = request.cookies.get(_OAUTH_STATE_COOKIE, "").partition(".")
+    next_path = _safe_next(stored_next)
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and ALLOWED_GOOGLE_EMAIL):
+        return _login_page("Google sign-in is not configured.", next_path=next_path)
+    if error or not code or not state or not stored_state or not hmac.compare_digest(state, stored_state):
+        return _login_page("Google sign-in failed.", next_path=next_path)
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            token_resp = await client.post(
+                _GOOGLE_TOKEN_URL,
+                data={
+                    "code": code,
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": _google_callback_url(request),
+                    "grant_type": "authorization_code",
+                },
+            )
+            token_resp.raise_for_status()
+            access_token = token_resp.json().get("access_token", "")
+            if not access_token:
+                raise ValueError("Google token response carried no access_token")
+            info_resp = await client.get(
+                _GOOGLE_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}
+            )
+            info_resp.raise_for_status()
+            profile = info_resp.json()
+    except Exception:
+        return _login_page("Google sign-in failed.", next_path=next_path)
+
+    email = (profile.get("email") or "").strip().lower()
+    if not profile.get("verified_email") or not email or not hmac.compare_digest(email, ALLOWED_GOOGLE_EMAIL):
+        return _login_page("This Google account is not authorized for this dashboard.", next_path=next_path)
+
+    response = _issue_session(next_path, request)
+    response.delete_cookie(_OAUTH_STATE_COOKIE, path="/auth/google")
     return response
 
 
