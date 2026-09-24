@@ -2,7 +2,7 @@
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 import pytest
-from src.email_confirmation_tracker import EmailConfirmationTracker
+from src.email_confirmation_tracker import EmailConfirmationTracker, _CONFIRMATION_REVIEW_QUEUE_FILE
 from src.state_manager import StateManager
 
 
@@ -75,7 +75,7 @@ def state_mgr(tmp_path):
     return StateManager(db_path=tmp_path / "test_jobs.db")
 
 
-def test_confirmation_transition_requires_submission_evidence(state_mgr):
+def test_confirmation_transition_requires_submission_evidence(state_mgr, tmp_path):
     """A high-scoring email match must never fabricate submitting/submitted history
     for a row with no ledger-backed evidence (e.g. a legacy row, or one the
     orchestrator never got to stamp) — it should flag for manual review instead."""
@@ -90,7 +90,9 @@ def test_confirmation_transition_requires_submission_evidence(state_mgr):
     fetched = state_mgr.get_job("legacy_job_1")
     assert fetched.get("confirmation_status") is None
 
-    tracker = EmailConfirmationTracker(state_manager=state_mgr)
+    tracker = EmailConfirmationTracker(
+        state_manager=state_mgr, review_queue_file=tmp_path / "confirmation_review_queue.json"
+    )
     outcome = {"confirmed": True}
     tracker._apply_confirmation_transition(fetched, 0.9, outcome)
 
@@ -183,7 +185,7 @@ def test_fetch_candidate_jobs_excludes_confirmed_by_employer(state_mgr):
     assert "already_confirmed_1" not in candidates
 
 
-def test_unverified_email_match_flags_for_manual_review_not_auto_confirm(state_mgr):
+def test_unverified_email_match_flags_for_manual_review_not_auto_confirm(state_mgr, tmp_path):
     """A matched confirmation email against a submission_unverified row is
     ambiguous, not proof — it must be routed to the manual review queue, the
     same as any other row lacking submitted/receipt_pending evidence. It must
@@ -199,13 +201,55 @@ def test_unverified_email_match_flags_for_manual_review_not_auto_confirm(state_m
     state_mgr.transition_confirmation("unverified_job_2", "submitting")
     state_mgr.transition_confirmation("unverified_job_2", "submission_unverified")
 
-    tracker = EmailConfirmationTracker(state_manager=state_mgr)
+    tracker = EmailConfirmationTracker(
+        state_manager=state_mgr, review_queue_file=tmp_path / "confirmation_review_queue.json"
+    )
     fetched = state_mgr.get_job("unverified_job_2")
     outcome = {"confirmed": True}
     tracker._apply_confirmation_transition(fetched, 0.9, outcome)
 
     assert state_mgr.get_job("unverified_job_2")["confirmation_status"] == "submission_unverified"
     assert outcome["needs_manual_confirmation"] is True
+
+
+def test_review_queue_write_is_isolated_to_the_injected_path(state_mgr, tmp_path):
+    """ACES-448: a flagged review case must land only in the path passed to the
+    constructor, and the real project state/confirmation_review_queue.json must
+    stay untouched by tests. A test that forgets to inject a path is exactly the
+    bug this ticket fixes — assert the isolation directly rather than trusting
+    every call site to remember."""
+    queue_path = tmp_path / "confirmation_review_queue.json"
+    real_snapshot = (
+        _CONFIRMATION_REVIEW_QUEUE_FILE.read_bytes() if _CONFIRMATION_REVIEW_QUEUE_FILE.exists() else None
+    )
+
+    job = {
+        "job_id": "isolation_check_1",
+        "title": "Whatever",
+        "company": "Whoever",
+        "source": "linkedin",
+        "status": "applied",
+    }
+    state_mgr.upsert_job(job)
+    fetched = state_mgr.get_job("isolation_check_1")
+
+    tracker = EmailConfirmationTracker(state_manager=state_mgr, review_queue_file=queue_path)
+    tracker._apply_confirmation_transition(fetched, 0.9, {"confirmed": True})
+
+    assert queue_path.exists(), "the injected path must receive the write"
+    assert "isolation_check_1" in queue_path.read_text()
+
+    real_after = (
+        _CONFIRMATION_REVIEW_QUEUE_FILE.read_bytes() if _CONFIRMATION_REVIEW_QUEUE_FILE.exists() else None
+    )
+    assert real_after == real_snapshot, "the real project state file must be untouched"
+
+
+def test_review_queue_defaults_to_the_real_project_path_when_not_overridden():
+    """Confirms the constructor wiring without exercising a write: the module's
+    real path is only the default, and an explicit override always wins."""
+    tracker = EmailConfirmationTracker()
+    assert tracker.review_queue_file == _CONFIRMATION_REVIEW_QUEUE_FILE
 
 
 def test_requisition_id_verification_and_mismatch():

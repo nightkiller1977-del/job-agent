@@ -78,9 +78,11 @@ def _decode_header(hdr: str) -> str:
 
 
 class EmailConfirmationTracker:
-    def __init__(self, state_manager=None, processed_file: Optional[Path] = None, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, state_manager=None, processed_file: Optional[Path] = None,
+                 config: Optional[Dict[str, Any]] = None, review_queue_file: Optional[Path] = None):
         self.state_manager = state_manager
         self.processed_file = processed_file or _PROCESSED_EMAILS_FILE
+        self.review_queue_file = review_queue_file or _CONFIRMATION_REVIEW_QUEUE_FILE
         self._processed_ids = self._load_processed_ids()
         self.config = config or self._load_default_config()
         self.vendor_domains = self.config.get("ats_vendor_domains", DEFAULT_ATS_VENDOR_DOMAINS)
@@ -115,13 +117,16 @@ class EmailConfirmationTracker:
             logger.warning("Could not save processed email IDs: %s", exc)
 
     def _save_to_review_queue(self, job: dict, score: float, outcome: dict) -> None:
-        """Persists flagged/ambiguous confirmation cases into state/confirmation_review_queue.json."""
+        """Persists flagged/ambiguous confirmation cases into self.review_queue_file
+        (state/confirmation_review_queue.json in real usage; tests must inject their
+        own path via the constructor rather than let this fall through to the real
+        file — see ACES-448)."""
         try:
-            _CONFIRMATION_REVIEW_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.review_queue_file.parent.mkdir(parents=True, exist_ok=True)
             queue: dict = {}
-            if _CONFIRMATION_REVIEW_QUEUE_FILE.exists():
+            if self.review_queue_file.exists():
                 try:
-                    with open(_CONFIRMATION_REVIEW_QUEUE_FILE) as f:
+                    with open(self.review_queue_file) as f:
                         queue = json.load(f)
                 except Exception:
                     queue = {}
@@ -136,7 +141,7 @@ class EmailConfirmationTracker:
                 "flagged_at": datetime.utcnow().isoformat(),
             }
 
-            with open(_CONFIRMATION_REVIEW_QUEUE_FILE, "w") as f:
+            with open(self.review_queue_file, "w") as f:
                 json.dump(queue, f, indent=2)
         except Exception as exc:
             logger.warning("Could not persist confirmation review item: %s", exc)
