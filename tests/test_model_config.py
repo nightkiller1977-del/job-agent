@@ -39,6 +39,20 @@ def test_anthropic_defaults_do_not_use_retired_models():
             assert fragment not in name
 
 
+def test_reasoning_and_general_defaults_do_not_route_to_claude():
+    """ACES-441: with Direct Claude (tier 3) unconfigured on most hosts,
+    "reasoning"/"general" defaulting to an anthropic/* model was the only
+    place a Claude call actually happened — just gateway-routed instead of
+    direct. Pins the policy that OpenRouter's own defaults must not silently
+    prefer Claude, independent of whether the model is still a live/retired
+    one (test_openrouter_defaults_do_not_use_retired_models covers that)."""
+    for task in ("reasoning", "general"):
+        model = OPENROUTER_TASK_MODELS[task]
+        assert "claude" not in model.lower() and "anthropic" not in model.lower(), (
+            f"OPENROUTER_TASK_MODELS[{task!r}] = {model!r} still routes to Claude"
+        )
+
+
 @pytest.mark.asyncio
 async def test_gateway_model_not_found_raises_clear_error(monkeypatch):
     """A 404/400 naming the model must surface a config-pointing error (and
