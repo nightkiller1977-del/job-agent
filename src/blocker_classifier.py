@@ -63,6 +63,10 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     "session_expired": BlockerClass.AUTH_REQUIRED,
     "usajobs_login_required": BlockerClass.AUTH_REQUIRED,  # historic rows; apply now raises AuthFailedError instead
     "needs_session_prep": BlockerClass.AUTH_REQUIRED,  # P3: human source, run prepare-sessions
+    # BuiltIn holds the employer URL behind sign-in; previously mis-reported as
+    # builtin_no_ats_url (UNKNOWN), which retried a URL that cannot change
+    # without a session and hid the credentials gap (ACES-437).
+    "builtin_login_required": BlockerClass.AUTH_REQUIRED,
     # config — user must fix .env / creds; never auto-retry
     "credentials_missing": BlockerClass.PERMANENT,
     # needs human — retrying without a code/profile fix won't help
@@ -175,8 +179,23 @@ def preflight_reauth_viable(source: str) -> tuple[bool, str]:
       here, which meant a scheduled run could never recover a USAJobs session on its
       own. ReauthManager now runs the automated login first and never blocks a
       non-interactive run waiting for a person, so they follow the same rule.
+    - A source with NO entry in _REAUTH_CREDS at all is a different case from one
+      whose listed creds are all present: ``_REAUTH_CREDS.get(source, ())`` was
+      "()" for both an unsupported source and one needing zero creds, so the
+      missing-creds comprehension was empty either way and this returned viable
+      by accident. That is reachable in production, not hypothetical: a
+      BuiltIn-classified AUTH_REQUIRED status (ACES-437, e.g. builtin_login_required)
+      was reported viable, ReauthManager.handle("builtin") then returned False
+      because "builtin" is in neither AUTOMATED_SOURCES nor HUMAN_SOURCES, and the
+      orchestrator recorded reauth_failed — silently discarding the accurate
+      diagnosis and burning the AUTH_REQUIRED retry budget on a reauth that could
+      never succeed (review finding). A source absent from _REAUTH_CREDS has no
+      automated recovery route at all and is never viable, regardless of what
+      env vars happen to be set.
     """
-    missing = [c for c in _REAUTH_CREDS.get(source, ()) if not os.environ.get(c)]
+    if source not in _REAUTH_CREDS:
+        return False, "credentials_missing"
+    missing = [c for c in _REAUTH_CREDS[source] if not os.environ.get(c)]
     if missing:
         return False, "credentials_missing"
     return True, ""
