@@ -273,6 +273,32 @@ class EmailConfirmationTracker:
             )
             self._save_to_review_queue(job, score, outcome)
 
+    def _fetch_candidate_jobs(self) -> List[Dict[str, Any]]:
+        """Rows an inbox scan should try to match a confirmation email against.
+
+        Two groups:
+          - status='applied' and not yet confirmed_by_employer — the common case.
+          - status='approved' with confirmation_status='submission_unverified' — a
+            submit was clicked but the in-browser receipt check couldn't verify it
+            (ACES-445). These rows are excluded from `applied` on purpose (see
+            StateManager.reconcile_active_jobs_from_ledger) and are blocked from
+            resubmission by the ledger's needs_reconciliation guard, so an inbox
+            scan is the only remaining way to discover the true outcome. A match
+            here still can't fabricate `confirmed_by_employer` for them —
+            `_apply_confirmation_transition` only advances rows that already carry
+            submitted/receipt_pending evidence; anything else (including this
+            group) is routed to the manual confirmation_review_queue instead.
+        """
+        with self.state_manager._connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM jobs WHERE "
+                    "(status = 'applied' AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')) "
+                    "OR (status = 'approved' AND confirmation_status = 'submission_unverified')"
+                ).fetchall()
+            ]
+
     def scan_inbox_and_confirm(
         self,
         days: int = 7,
@@ -304,17 +330,10 @@ class EmailConfirmationTracker:
         except Exception:
             pass
 
-        # Fetch applied jobs from state
-        with self.state_manager._connect() as conn:
-            applied_jobs = [
-                dict(row)
-                for row in conn.execute(
-                    "SELECT * FROM jobs WHERE status = 'applied' AND (confirmation_status IS NULL OR confirmation_status != 'confirmed_by_employer')"
-                ).fetchall()
-            ]
+        applied_jobs = self._fetch_candidate_jobs()
 
         if not applied_jobs:
-            console.print("[dim]No unconfirmed applied jobs pending verification.[/dim]")
+            console.print("[dim]No jobs pending confirmation.[/dim]")
             return []
 
         results = []
