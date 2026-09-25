@@ -86,9 +86,11 @@ pattern fixed in email-agent and is never allowed.
   user and password; anything else (wrong scheme, bad base64, control
   characters) disables export up front — it never starts an export worker.
 - Default policy: remote export auto-enables **in production** (detected via
-  the `RENDER` env var, which Render sets on every service) and is **off in
-  dev/test** unless `OBSERVABILITY_REMOTE=1`. `OBSERVABILITY_REMOTE=0` opts out
-  even in production. Local Loki logging (`LOKI_URL`, default localhost) is
+  the `RENDER` env var, which Render used to set on every service, or
+  `CONTAINER_APP_NAME`, which Azure Container Apps injects into every
+  revision automatically — ACES-461) and is **off in dev/test** unless
+  `OBSERVABILITY_REMOTE=1`. `OBSERVABILITY_REMOTE=0` opts out even in
+  production. Local Loki logging (`LOKI_URL`, default localhost) is
   independent and unaffected — local + cloud run in parallel.
 - **Retired:** the legacy split-auth names `LOKI_USER` / `LOKI_API_KEY` are no
   longer read by any code path and were removed from `CANONICAL_KEYS`. Delete

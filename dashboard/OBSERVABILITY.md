@@ -26,11 +26,15 @@ The legacy split-auth names `LOKI_USER`/`LOKI_API_KEY` are retired.
 
 Default policy (ACES-293, updated ACES-461): remote export auto-enables in
 production — detected via a present, truthy `RENDER` env var (Render used to
-set this on every service), or the *absence* of `RENDER` entirely, which is
-the reality on Azure Container Apps post-migration — and is off in dev/test
-only when `RENDER` is explicitly present but falsy, unless
-`OBSERVABILITY_REMOTE=1`. `OBSERVABILITY_REMOTE=0` opts out even in
-production. Local logging is independent and unchanged.
+set this on every service), or `CONTAINER_APP_NAME`, which Azure Container
+Apps injects into every revision automatically (see
+[Azure's built-in environment variables](https://learn.microsoft.com/azure/container-apps/environment-variables#built-in-environment-variables)),
+giving a real positive signal on the live post-Render-migration deployment —
+and is off in dev/test unless `OBSERVABILITY_REMOTE=1`. An ordinary local/dev
+run has neither signal and stays off by default, even if a valid
+`LOKI_URL_REMOTE`/`LOKI_REMOTE_AUTH` pair is present from central-store
+credential fill. `OBSERVABILITY_REMOTE=0` opts out even in production. Local
+logging is independent and unchanged.
 
 The Dashboard exporter has one worker and a queue of 64 events. Overflow is
 best-effort loss, not additional threads or blocked application requests. HTTP

@@ -74,10 +74,12 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(emitter.stats["dropped"], 1)
 
 class IsProductionTests(unittest.TestCase):
-    """ACES-461: an absent RENDER now also defaults to production."""
+    """ACES-461: CONTAINER_APP_NAME (Azure's auto-injected signal) is now
+    also explicit production; nothing recognized — including an ordinary
+    local/dev run — stays non-production."""
 
-    def test_missing_signal_defaults_to_production(self):
-        self.assertTrue(module.loki_config.is_production({}))
+    def test_missing_all_signals_stays_non_production(self):
+        self.assertFalse(module.loki_config.is_production({}))
 
     def test_render_present_and_truthy_is_still_production(self):
         self.assertTrue(module.loki_config.is_production({"RENDER": "true"}))
@@ -85,15 +87,25 @@ class IsProductionTests(unittest.TestCase):
     def test_render_present_but_falsy_is_still_non_production(self):
         self.assertFalse(module.loki_config.is_production({"RENDER": ""}))
 
+    def test_container_app_name_present_is_production(self):
+        self.assertTrue(module.loki_config.is_production({"CONTAINER_APP_NAME": "job-agent-dashboard"}))
+
 
 class PolicyTests(unittest.TestCase):
     URL = "https://logs.example.grafana.net/loki/api/v1/push"
     AUTH = "Basic dGVzdDp0ZXN0"
 
-    def test_missing_signal_defaults_to_production(self):
-        # ACES-461: post-Render-migration, no signal at all (the Azure
-        # reality) must still auto-enable a valid pair, not silently disable it.
+    def test_missing_all_signals_stays_non_production_default_off(self):
         env = {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH}
+        with patch.dict(os.environ, env, clear=True):
+            config = module.resolve_loki_config()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.reason, "non_production_default_off")
+
+    def test_container_app_name_auto_on(self):
+        # ACES-461: the real Azure Container Apps signal must auto-enable a
+        # valid pair without requiring a manual OBSERVABILITY_REMOTE=1.
+        env = {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH, "CONTAINER_APP_NAME": "job-agent-dashboard"}
         with patch.dict(os.environ, env, clear=True):
             config = module.resolve_loki_config()
         self.assertTrue(config.enabled)

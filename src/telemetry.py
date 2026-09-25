@@ -6,8 +6,9 @@ and latencies appear in Grafana automatically. Local Loki (LOKI_URL, default
 localhost) remains the default and is independent of remote export; Grafana
 Cloud is selected only through the shared atomic contract resolved by
 src/loki_config.resolve_loki_config(): LOKI_URL_REMOTE + LOKI_REMOTE_AUTH,
-auto-on in production (RENDER present+truthy, or absent entirely — ACES-461),
-off in dev/test unless OBSERVABILITY_REMOTE=1.
+auto-on in production (RENDER truthy, or CONTAINER_APP_NAME — Azure Container
+Apps' auto-injected signal, ACES-461), off in dev/test unless
+OBSERVABILITY_REMOTE=1.
 The legacy LOKI_USER/LOKI_API_KEY split-key fallback is retired (ACES-293).
 """
 from __future__ import annotations

@@ -46,26 +46,31 @@ def test_invalid_shared_auth_fails_closed(monkeypatch):
     assert resolve_loki_url() == "http://localhost:3100/loki/api/v1/push"
 
 
-def test_missing_render_signal_defaults_to_production(monkeypatch):
-    # ACES-461: post-Render-migration, a completely absent RENDER (the Azure
-    # reality) must still auto-enable a valid pair, not silently disable it.
+def test_dev_test_remote_off_by_default(monkeypatch):
+    # A missing RENDER also occurs on an ordinary local/dev run — must NOT
+    # become production just because RENDER happens to be unset (ACES-461).
     monkeypatch.delenv("OBSERVABILITY_REMOTE", raising=False)
     monkeypatch.delenv("RENDER", raising=False)
-    monkeypatch.setenv("LOKI_URL_REMOTE", REMOTE_URL)
-    monkeypatch.setenv("LOKI_REMOTE_AUTH", AUTH)
-    monkeypatch.delenv("LOKI_URL", raising=False)
-    assert resolve_loki_auth() == ("123456", "secret-token")
-    assert resolve_loki_url() == REMOTE_URL
-
-
-def test_render_present_but_falsy_stays_non_production_default_off(monkeypatch):
-    monkeypatch.delenv("OBSERVABILITY_REMOTE", raising=False)
-    monkeypatch.setenv("RENDER", "")
+    monkeypatch.delenv("CONTAINER_APP_NAME", raising=False)
     monkeypatch.setenv("LOKI_URL_REMOTE", REMOTE_URL)
     monkeypatch.setenv("LOKI_REMOTE_AUTH", AUTH)
     monkeypatch.delenv("LOKI_URL", raising=False)
     assert resolve_loki_auth() is None
     assert resolve_loki_url() == "http://localhost:3100/loki/api/v1/push"
+
+
+def test_container_app_name_signal_defaults_to_production(monkeypatch):
+    # ACES-461: Azure Container Apps injects CONTAINER_APP_NAME into every
+    # revision automatically — the real replacement for the retired RENDER
+    # signal, without requiring a manual OBSERVABILITY_REMOTE=1.
+    monkeypatch.delenv("OBSERVABILITY_REMOTE", raising=False)
+    monkeypatch.delenv("RENDER", raising=False)
+    monkeypatch.setenv("CONTAINER_APP_NAME", "job-agent-dashboard")
+    monkeypatch.setenv("LOKI_URL_REMOTE", REMOTE_URL)
+    monkeypatch.setenv("LOKI_REMOTE_AUTH", AUTH)
+    monkeypatch.delenv("LOKI_URL", raising=False)
+    assert resolve_loki_auth() == ("123456", "secret-token")
+    assert resolve_loki_url() == REMOTE_URL
 
 
 def test_production_auto_on_and_opt_out(monkeypatch):
