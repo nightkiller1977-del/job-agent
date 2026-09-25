@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .state_manager import StateManager, parse_extra_json
+from . import brain_memory_client
 from .scorer import JobScorer, SCORING_FAILED_ACTION, SCORING_FAILED_FLAG
 from .review_queue import run_review_queue, show_summary_table
 from .sources.jobright import JobrightScraper
@@ -1213,6 +1214,25 @@ class Orchestrator:
                 _cls = classify(_last).value
                 console.print(f"[dim]⛔ Circuit breaker: skipping — {_skip_reason}[/dim]")
                 self.state.flag_circuit_break(job["job_id"], _cls, _skip_reason)
+                # Brain Memory challenge record (ACES-457) — fire-and-forget,
+                # never raises. A recurring circuit-breaker trip is exactly
+                # the "recurring friction" ChallengeContextSchema exists for
+                # (ACES-284's own circuit-breaker history is the concrete
+                # example the ticket cites). record_id is keyed on
+                # (job_id, blocker class), not a fresh id per trip, so a
+                # repeated trip re-ingests as an update to the SAME record
+                # rather than a growing pile of near-duplicates.
+                try:
+                    brain_memory_client.emit_challenge(
+                        record_id=f"job-agent-challenge-{job['job_id']}-{_cls}",
+                        title=f"Circuit breaker: {_cls}",
+                        status="active",
+                        impact="medium",
+                        recurrence_count=int(_attempts or 0),
+                        evidence_refs=[f"job:{job['job_id']}", f"reason:{_skip_reason}"[:200]],
+                    )
+                except Exception:
+                    pass
                 skipped_count += 1
                 outcomes.append({"job": job, "status": "circuit_open", "reason": _skip_reason})
                 continue

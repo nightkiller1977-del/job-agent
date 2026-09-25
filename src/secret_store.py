@@ -92,6 +92,10 @@ CANONICAL_KEYS: tuple[str, ...] = (
     # FailureEvidence, the bearer token for it, and which registered repository
     # the resulting repair operation targets.
     "COORDINATOR_URL", "AICC_JOB_AGENT_SERVICE_TOKEN", "JOB_AGENT_REPOSITORY_SLUG",
+    # Brain Memory outcome/goal/challenge ingestion (ACES-457): a
+    # job-agent-scoped credential, distinct from Desktop's and Coordinator's
+    # own — least-privilege, per-consumer, per system-brain-integration.md.
+    "BRAIN_MEMORY_URL", "BRAIN_MEMORY_KEY_ID", "BRAIN_MEMORY_SECRET",
     "NOTIFY_PHONE",
     "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER",
     "APPROVAL_SEND_EMAIL", "APPROVAL_SEND_PASSWORD", "APPROVAL_NOTIFY_EMAIL",
@@ -129,6 +133,11 @@ STORE_AUTHORITATIVE_KEYS: tuple[str, ...] = (
 # (loki_config.resolve_loki_config() then disables remote export and warns).
 ATOMIC_PAIRS: tuple[tuple[str, ...], ...] = (
     ("LOKI_URL_REMOTE", "LOKI_REMOTE_AUTH"),
+    # Brain Memory credential (ACES-457): a URL paired with the wrong keyId/
+    # secret would sign requests for one identity against a different
+    # instance/tenant — same "never mix authorities" reasoning as the Loki
+    # pair, extended to three members instead of two.
+    ("BRAIN_MEMORY_URL", "BRAIN_MEMORY_KEY_ID", "BRAIN_MEMORY_SECRET"),
 )
 
 
