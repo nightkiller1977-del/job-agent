@@ -134,3 +134,99 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ACES-453: deploy the dashboard/ subtree's image to Azure Container Apps
+  # after CI passes on main. Supersedes deploy-render.yml (Render is
+  # decommissioned as of the 2026-09-24 Azure migration). Built from the repo
+  # ROOT using Dockerfile.dashboard, not dashboard/Dockerfile — dashboard/
+  # observability.py resolves the shared src/loki_config.py as a sibling
+  # directory, so the image needs dashboard/ and src/ copied together (see
+  # Dockerfile.dashboard's own header comment). OIDC federated auth (no
+  # stored client secret) via a service principal scoped to rg-aicc-fleet
+  # only — see AZURE_CLIENT_ID/TENANT_ID/SUBSCRIPTION_ID repo secrets. Runs
+  # only on a push to main (this workflow also triggers on fix/**/feat/**/
+  # feature/** pushes and PRs — the ref check below excludes all of those),
+  # and only after test + receipt-truthfulness + lint + secrets succeed.
+  deploy:
+    name: Deploy dashboard to Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: [test, receipt-truthfulness, lint, secrets]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: deploy-job-agent-dashboard
+      cancel-in-progress: false
+    env:
+      RESOURCE_GROUP: rg-aicc-fleet
+      APP_NAME: job-agent-dashboard
+      ACR_NAME: aiccfleetacr
+      IMAGE_NAME: job-agent-dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Azure Container Apps CLI extension
+        run: az extension add --name containerapp --upgrade -y
+
+      - name: Build image (az acr build)
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          echo "IMAGE_TAG=sha-${SHORT_SHA}" >> "$GITHUB_ENV"
+          echo "REVISION_SUFFIX=gh${SHORT_SHA}" >> "$GITHUB_ENV"
+          az acr build \
+            --registry "$ACR_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "${IMAGE_NAME}:sha-${SHORT_SHA}" \
+            --file Dockerfile.dashboard \
+            .
+
+      - name: Update Container App revision
+        run: |
+          set -euo pipefail
+          az containerapp update \
+            --name "$APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}" \
+            --revision-suffix "$REVISION_SUFFIX"
+
+      - name: Wait for new revision to report healthy
+        run: |
+          set -euo pipefail
+          REVISION_NAME="${APP_NAME}--${REVISION_SUFFIX}"
+          echo "Waiting on revision: $REVISION_NAME"
+          for i in $(seq 1 30); do
+            RUNNING_STATE=$(az containerapp revision show \
+              --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
+              --revision "$REVISION_NAME" \
+              --query "properties.runningState" -o tsv 2>/dev/null || echo "Pending")
+            HEALTH_STATE=$(az containerapp revision show \
+              --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
+              --revision "$REVISION_NAME" \
+              --query "properties.healthState" -o tsv 2>/dev/null || echo "Pending")
+            echo "Attempt $i/30: running=$RUNNING_STATE health=$HEALTH_STATE"
+            case "$RUNNING_STATE" in
+              Running|RunningAtMaxScale|RunningAtMinScale)
+                if [ "$HEALTH_STATE" = "Healthy" ]; then
+                  echo "Revision is healthy."
+                  exit 0
+                fi
+                ;;
+            esac
+            if [ "$RUNNING_STATE" = "Failed" ] || [ "$RUNNING_STATE" = "Degraded" ] || [ "$HEALTH_STATE" = "Unhealthy" ]; then
+              echo "Revision reported unhealthy/failed. Recent logs:"
+              az containerapp logs show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --revision "$REVISION_NAME" --tail 100 || true
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for revision to report healthy."
+          exit 1

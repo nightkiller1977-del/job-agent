@@ -1,0 +1,19 @@
+# Dashboard image for Azure Container Apps. Built from the repo ROOT (not
+# dashboard/) because dashboard/observability.py resolves the shared
+# src/loki_config.py relative to its own parent directory
+# (Path(__file__).resolve().parents[1] / "src" / "loki_config.py") -- it
+# needs dashboard/ and src/ to stay siblings, the same layout Render's
+# rootDir: dashboard config produces via sys.path, not a dashboard-only copy.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY dashboard/requirements.txt dashboard/requirements.txt
+RUN pip install --no-cache-dir -r dashboard/requirements.txt
+
+COPY dashboard/ dashboard/
+COPY src/ src/
+
+EXPOSE 8000
+
+CMD ["uvicorn", "dashboard.observed:app", "--host", "0.0.0.0", "--port", "8000"]
