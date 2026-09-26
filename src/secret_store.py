@@ -54,9 +54,14 @@ def _default_commander_dir() -> Path:
     return Path(xdg) / "ai-command-center"
 
 
+def commander_user_data_dir() -> Path:
+    """Return AI Commander's platform-specific user-data directory (not secret storage)."""
+    return _default_commander_dir()
+
+
 def _commander_dir() -> Path:
     override = os.environ.get("AICC_SECRETS_DIR")
-    return Path(override).expanduser() if override else _default_commander_dir()
+    return Path(override).expanduser() if override else commander_user_data_dir()
 
 
 # Every secret this repo may need. Used as the default set for fill_missing() and
