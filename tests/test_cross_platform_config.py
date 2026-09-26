@@ -138,7 +138,7 @@ def test_linux_inactive_but_installed_timer(monkeypatch):
     def fake_run(cmd, **kwargs):
         verb = cmd[2]
         out = "enabled" if verb == "is-enabled" else "inactive"
-        return subprocess.CompletedProcess(cmd, 0, stdout=out + "\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0 if verb == "is-enabled" else 3, stdout=out + "\n", stderr="")
 
     monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
     rows = dict(main_mod._scheduler_unit_statuses())
@@ -200,11 +200,34 @@ def test_masked_timer_is_not_reported_as_not_installed(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         out = "masked" if cmd[2] == "is-enabled" else "inactive"
-        return subprocess.CompletedProcess(cmd, 1, stdout=out + "\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 1 if verb == "is-enabled" else 3, stdout=out + "\n", stderr="")
 
     monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
     rows = dict(main_mod._scheduler_unit_statuses())
     assert all("MASKED" in v for v in rows.values()), rows
+
+
+def test_systemctl_user_manager_failure_reports_unknown(monkeypatch):
+    monkeypatch.setattr("sys.platform", "linux")
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Failed to connect to bus: No medium found")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+    rows = dict(main_mod._scheduler_unit_statuses())
+    assert all("UNKNOWN" in value for value in rows.values()), rows
+
+
+def test_misleading_systemctl_stdout_with_failure_code_reports_unknown(monkeypatch):
+    monkeypatch.setattr("sys.platform", "linux")
+
+    def fake_run(cmd, **kwargs):
+        out = "enabled" if cmd[2] == "is-enabled" else "active"
+        return subprocess.CompletedProcess(cmd, 4, stdout=out + "\\n", stderr="query failed")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+    rows = dict(main_mod._scheduler_unit_statuses())
+    assert all("UNKNOWN" in value for value in rows.values()), rows
 
 
 def test_missing_unit_is_reported_not_installed(monkeypatch):
