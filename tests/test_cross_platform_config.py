@@ -59,12 +59,21 @@ def test_settings_found_on_every_platform(monkeypatch, tmp_path, platform, subpa
     )
 
 
-def test_settings_respects_aicc_secrets_dir_override(monkeypatch, tmp_path):
-    """Both this module and secret_store must agree on the overridden location."""
-    store = tmp_path / "custom-store"
-    store.mkdir()
-    (store / "settings-v3.json").write_text(json.dumps(_settings_payload()))
-    monkeypatch.setenv("AICC_SECRETS_DIR", str(store))
+def test_settings_lookup_is_independent_of_aicc_secrets_dir_override(monkeypatch, tmp_path):
+    """Secrets may live elsewhere; settings stay under platform user-data."""
+    home = tmp_path / "home"
+    settings_dir = home / ".config" / "ai-command-center"
+    settings_dir.mkdir(parents=True)
+    (settings_dir / "settings-v3.json").write_text(json.dumps(_settings_payload()))
+    secret_store = tmp_path / "custom-secrets"
+    secret_store.mkdir()
+    (secret_store / "settings-v3.json").write_text(json.dumps({"jobAgent": {"browserRecovery": {"maxSteps": 7}}}))
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("AICC_SECRETS_DIR", str(secret_store))
+    import src.secret_store as ss
+    monkeypatch.setattr(ss.Path, "home", staticmethod(lambda: home))
 
     merged = ConfigLoader()._merge_ai_commander_settings({"jobAgent": {}})
     assert merged["jobAgent"]["browser_recovery"]["max_steps"] == 99
