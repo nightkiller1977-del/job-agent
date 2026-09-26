@@ -211,8 +211,8 @@ class ConfigLoader:
         (ACES-430).
         """
         try:
-            from .secret_store import _commander_dir
-            settings_path = _commander_dir() / "settings-v3.json"
+            from .secret_store import commander_user_data_dir
+            settings_path = commander_user_data_dir() / "settings-v3.json"
             if not settings_path.exists():
                 return base
 
