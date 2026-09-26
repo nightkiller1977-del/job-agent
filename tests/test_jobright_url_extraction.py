@@ -258,6 +258,16 @@ def test_dead_schema_but_logged_in_flags_schema_drift_not_auth():
     assert status == "jobright_schema_drift"
 
 
+def test_falsey_known_job_field_is_not_misreported_as_schema_drift():
+    """A present-but-empty known field is an ordinary record shape, not a missing schema key."""
+    props = dict(DEAD_PAGE_PROPS, logined=True, job=None)
+    r = _run_extraction_case(base_url=BASE_URL, initial_html=_next_data_html(props))
+    assert r["url"] == ""
+    assert r["diagnostic"]["known_field_found"] is True
+    status, _ = JobrightScraper._classify_missing_ats_url(r["diagnostic"])
+    assert status == "missing_ats_url"
+
+
 def test_working_schema_still_extracts_the_url_normally():
     """Regression guard: when pageProps.job carries a real URL, strategy 1
     must still work exactly as before — this fix only adds diagnostics to
