@@ -195,14 +195,24 @@ class ConfigLoader:
     def _merge_ai_commander_settings(self, base: dict) -> dict:
         """
         Merge from AI Commander's centralized settings if available.
-        Looks for settings at ~/Library/Application Support/ai-command-center/settings-v3.json
+
+        The settings file lives in AI Commander's userData directory, which is
+        per-platform (Electron ``app.getPath('userData')``):
+          macOS   → ~/Library/Application Support/ai-command-center
+          Windows → %APPDATA%/ai-command-center
+          Linux   → $XDG_CONFIG_HOME (or ~/.config) / ai-command-center
+
+        Resolved through ``secret_store._commander_dir`` so this module and the
+        secret resolver can never disagree about where AI Commander state lives
+        on the same host, and so the ``AICC_SECRETS_DIR`` override applies here
+        too. Previously this path was hardcoded to the macOS layout, so on Linux
+        and Windows the file was never found and this entire settings layer was
+        silently skipped — the agent ran on defaults while appearing healthy
+        (ACES-430).
         """
         try:
-            home = Path.home()
-            settings_path = (
-                home / "Library" / "Application Support" /
-                "ai-command-center" / "settings-v3.json"
-            )
+            from .secret_store import commander_user_data_dir
+            settings_path = commander_user_data_dir() / "settings-v3.json"
             if not settings_path.exists():
                 return base
 
