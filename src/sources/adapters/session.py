@@ -27,6 +27,7 @@ from rich.console import Console
 
 from ..base import BaseScraper
 from ...events import RunLog, read_run
+from ... import brain_memory_client
 from .context import AtsApplyContext, AtsApplyResult
 from .registry import AtsAdapterRegistry
 from .generic import GenericAtsAdapter, detect_vendor
@@ -500,6 +501,26 @@ class ExternalApplySession(BaseScraper):
                 else:
                     self.ledger.clear(key, attempt_id)
             _event("attempt_finished", _phase_for(res), outcome=res.status, verified=res.verified)
+            # Brain Memory outcome record (ACES-457) — fire-and-forget, never
+            # raises: technicalSuccess tracks whether a VERIFIED submission
+            # happened (res.verified), distinct from res.submitted, which
+            # unverified() deliberately leaves False for an ambiguous
+            # post-click state. evidence_refs carries only internal
+            # identifiers (job_id, attempt_id, vendor/ATS platform name) —
+            # never title, company, or resume content.
+            try:
+                brain_memory_client.emit_outcome(
+                    record_id=f"job-agent-outcome-{job_id or key_reference}-{attempt_id}",
+                    technical_success=bool(res.verified),
+                    evidence_refs=[
+                        f"job:{job_id}" if job_id else f"key:{key_reference}",
+                        f"attempt:{attempt_id}",
+                        f"vendor:{vendor}",
+                        f"status:{res.status}",
+                    ],
+                )
+            except Exception:
+                pass
             self._emit_forensic_classification(attempt_id, job_id)
             self._maybe_notify("attempt_finished", res.status,
                                f"{vendor}: {res.status}", res.detail,

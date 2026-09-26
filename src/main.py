@@ -799,6 +799,17 @@ async def main_async(args: argparse.Namespace) -> int:
 
     from src.orchestrator import Orchestrator
 
+    if args.command in ("discover", "apply"):
+        # Brain Memory outbox flush (ACES-457) — retries any outcome/goal/
+        # challenge record a prior run couldn't deliver, before this run
+        # queues new ones. Fire-and-forget: never raises, never blocks
+        # discover/apply on Brain Memory availability.
+        try:
+            from src import brain_memory_client
+            brain_memory_client.flush_pending()
+        except Exception:
+            pass
+
     # Config path relative to project root
     config_path = str(project_root / "config.json")
     orchestrator = Orchestrator(config_path=config_path)
