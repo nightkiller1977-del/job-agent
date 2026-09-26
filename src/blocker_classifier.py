@@ -90,10 +90,20 @@ _STATUS_TO_CLASS: dict[str, BlockerClass] = {
     # builtin_no_ats_url (UNKNOWN), which retried a URL that cannot change
     # without a session and hid the credentials gap (ACES-437).
     "builtin_login_required": BlockerClass.AUTH_REQUIRED,
+    # Jobright's __NEXT_DATA__ itself reports pageProps.logined=false; jobright
+    # already has reauth support (_REAUTH_CREDS below), so this routes there
+    # instead of retrying a URL that cannot appear without a session (ACES-440).
+    "jobright_auth_required": BlockerClass.AUTH_REQUIRED,
     # config — user must fix .env / creds; never auto-retry
     "credentials_missing": BlockerClass.PERMANENT,
     # needs human — retrying without a code/profile fix won't help
     "submit_not_found": BlockerClass.NEEDS_HUMAN,
+    # __NEXT_DATA__ parsed but none of the known job/jobDetail/jobInfo keys were
+    # present — the provider's page schema changed and the extractor's field
+    # names are stale. A retry cannot succeed until a human updates the
+    # extractor, so this is surfaced rather than silently folded into the
+    # generic missing_ats_url (ACES-440).
+    "jobright_schema_drift": BlockerClass.NEEDS_HUMAN,
     "submit_click_failed": BlockerClass.NEEDS_HUMAN,  # control located but click did not land
     "form_not_reached": BlockerClass.NEEDS_HUMAN,
     "linkedin_stuck_on_required_field": BlockerClass.NEEDS_HUMAN,
