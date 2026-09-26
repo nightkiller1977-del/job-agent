@@ -809,31 +809,46 @@ def _scheduler_unit_statuses() -> list[tuple[str, str]]:
     rows = []
     for unit in ("jobagent-discover.timer", "jobagent-apply.timer"):
         try:
-            enabled = subprocess.run(
+            enabled_result = subprocess.run(
                 ["systemctl", "--user", "is-enabled", unit],
                 capture_output=True, text=True, timeout=5, check=False,
-            ).stdout.strip()
-            active = subprocess.run(
+            )
+            active_result = subprocess.run(
                 ["systemctl", "--user", "is-active", unit],
                 capture_output=True, text=True, timeout=5, check=False,
-            ).stdout.strip()
+            )
         except Exception:
             # systemctl absent (container, minimal image) — say so rather than
             # implying the unit is simply not installed.
             rows.append((unit, "[dim]UNKNOWN (systemctl unavailable)[/dim]"))
             continue
-        if active == "active":
+
+        enabled = enabled_result.stdout.strip()
+        active = active_result.stdout.strip()
+        manager_error = any(
+            marker in f"{result.stderr or ''} {result.stdout or ''}".lower()
+            for result in (enabled_result, active_result)
+            for marker in ("failed to connect to bus", "cannot connect to", "connection refused")
+        )
+        if manager_error:
+            rows.append((unit, "[dim]UNKNOWN (systemd user manager unavailable)[/dim]"))
+        elif enabled == "not-found" and enabled_result.returncode != 0:
+            rows.append((unit, "[dim]NOT INSTALLED[/dim]"))
+        elif active == "active" and active_result.returncode == 0:
             rows.append((unit, "[green]ACTIVE / LOADED[/green]"))
-        elif enabled == "masked":
+        elif enabled == "masked" and enabled_result.returncode in (0, 1):
             # Masked units exist but are deliberately blocked — reporting them
             # as NOT INSTALLED would send an operator looking for the wrong fix.
             rows.append((unit, "[red]MASKED (will never run)[/red]"))
-        elif enabled in ("enabled", "static", "disabled", "indirect", "enabled-runtime"):
+        elif (
+            enabled in ("enabled", "static", "indirect", "enabled-runtime") and enabled_result.returncode == 0
+            or enabled == "disabled" and enabled_result.returncode == 1
+        ) and active in ("inactive", "failed") and active_result.returncode == 3:
             rows.append((unit, "[yellow]INSTALLED (NOT ACTIVE)[/yellow]"))
         else:
-            # Verified on this host: a missing unit yields is-enabled="not-found"
-            # (rc=4) and is-active="inactive" (rc=4), so it lands here correctly.
-            rows.append((unit, "[dim]NOT INSTALLED[/dim]"))
+            # Nonstandard output/exit-code combinations mean the manager did
+            # not establish a trustworthy installed or runtime state.
+            rows.append((unit, "[dim]UNKNOWN (systemctl query failed)[/dim]"))
     return rows
 
 
