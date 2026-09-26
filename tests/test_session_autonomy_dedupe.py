@@ -59,7 +59,8 @@ def test_deep_link_dedupe_survives_memory_reset(tmp_path, monkeypatch):
     monkeypatch.setattr(notifier, "STATUS_FILE", status_file)
     monkeypatch.setattr(notifier, "_send_telegram", lambda message: sent.append(message))
     monkeypatch.setattr(notifier, "_desktop_notify", lambda *args, **kwargs: None)
-    monkeypatch.setattr(sw, "_stage_prepare_sessions", lambda source: True)
+    monkeypatch.setattr(sw, "_stage_prepare_sessions",
+                        lambda source: sw.StagingResult(staged=True, supported=True))
     monkeypatch.setattr(sw, "_novnc_link", lambda: None)
     notifier._last_notification_times.clear()
 
@@ -76,7 +77,8 @@ def test_deep_link_staging_failure_does_not_send_or_consume_dedupe(tmp_path, mon
     monkeypatch.setattr(notifier, "STATUS_FILE", status_file)
     monkeypatch.setattr(notifier, "_send_telegram", lambda message: sent.append(message))
     monkeypatch.setattr(notifier, "_desktop_notify", lambda *args, **kwargs: None)
-    monkeypatch.setattr(sw, "_stage_prepare_sessions", lambda source: False)
+    monkeypatch.setattr(sw, "_stage_prepare_sessions",
+                        lambda source: sw.StagingResult(staged=False, supported=True))
     monkeypatch.setattr(sw, "_novnc_link", lambda: None)
     notifier._last_notification_times.clear()
 

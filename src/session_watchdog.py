@@ -13,6 +13,13 @@ Three layers of protection:
      No duplicate credential configuration needed — configure Telegram once
      in AI Commander and job-agent picks it up automatically.
 
+Reauth staging is resolved per host, never hard-coded to one OS: Terminal.app via
+osascript on macOS, a detected terminal emulator on a POSIX desktop, `cmd.exe` on
+Windows. A host with no terminal — the headless scheduler run this agent normally
+executes as — still gets the escalation over Telegram/desktop with the manual
+`prepare-sessions` command, because a missing terminal must never swallow the
+session failure it was supposed to report.
+
 macOS URL handler (register once):
   bash scripts/install-jobagent-url-handler.sh
 """
@@ -23,6 +30,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -68,6 +76,23 @@ _PREPARE_SESSION_SOURCE_ALIASES = {
     "linkedin-saved": "linkedin",
 }
 
+# POSIX-desktop terminal emulators tried in order, as (executable, flag that
+# introduces the command argv). Presence is probed with shutil.which() rather
+# than assumed. Debian's `x-terminal-emulator` alternative comes first so the
+# user's own configured default wins before we start guessing at specific
+# emulators. The flags differ per emulator and are not interchangeable:
+# gnome-terminal/kitty use `--`, xfce4-terminal needs `-x` to consume the rest
+# of argv, and the rest follow xterm's `-e`.
+_TERMINAL_EMULATORS: tuple[tuple[str, str], ...] = (
+    ("x-terminal-emulator", "-e"),
+    ("gnome-terminal", "--"),
+    ("konsole", "-e"),
+    ("xfce4-terminal", "-x"),
+    ("kitty", "--"),
+    ("alacritty", "-e"),
+    ("xterm", "-e"),
+)
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -79,6 +104,20 @@ class SessionHealth:
     status: str          # healthy | stale | expired | missing
     age_hours: float
     session_path: Path
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class StagingResult:
+    """Outcome of trying to open a terminal running `prepare-sessions`.
+
+    `supported` False means this host/session can never open a terminal window
+    (headless scheduler run, or no terminal emulator installed). That is a
+    capability gap, not a transient error: callers must escalate over a
+    messaging channel instead of retrying a launch that cannot succeed.
+    """
+    staged: bool
+    supported: bool
     detail: str = ""
 
 
@@ -375,50 +414,110 @@ def _prepare_sessions_source(source: str) -> Optional[str]:
     return _PREPARE_SESSION_SOURCE_ALIASES.get(normalized)
 
 
+def _venv_activate_parts() -> list[str]:
+    """Shell tokens that activate the project venv for the current platform.
+
+    POSIX shells source `.venv/bin/activate`; `cmd.exe` uses `call` so control
+    returns to the chained command instead of stopping at the batch file.
+    """
+    if sys.platform == "win32":
+        return ["call", r".venv\Scripts\activate.bat"]
+    return ["source", ".venv/bin/activate"]
+
+
+def _shell_quote(value: str) -> str:
+    """Quote one argument for the shell that will actually run the command.
+
+    `shlex.quote` is POSIX-only: it wraps anything containing a backslash in
+    single quotes, and `cmd.exe` does not treat single quotes as quoting. Since
+    every Windows path contains backslashes, using it there produced a command
+    that always failed — `cd 'C:\\Users\\me\\job-agent'` — not just one that
+    broke on spaces. cmd quotes with double quotes, inside which `&`, `|` and
+    `^` are literal.
+    """
+    if sys.platform == "win32":
+        return '"' + str(value).replace('"', '""') + '"'
+    return shlex.quote(str(value))
+
+
 def _prepare_sessions_command(source: str) -> tuple[str, Optional[str]]:
-    """Build a safe shell command for Terminal staging.
+    """Build a safe shell command for terminal staging.
 
     The second tuple item is the normalized prepare-sessions source, or None
     when no safe source filter should be sent.
     """
     project_dir = Path(__file__).parent.parent
     prepare_source = _prepare_sessions_source(source)
+    # `cd` alone does not switch drive on Windows, so a checkout on D: would
+    # silently leave cmd in the C: working directory.
+    cd_parts = ["cd", "/d"] if sys.platform == "win32" else ["cd"]
     parts = [
-        "cd",
-        shlex.quote(str(project_dir)),
+        *cd_parts,
+        _shell_quote(str(project_dir)),
         "&&",
-        "source",
-        ".venv/bin/activate",
+        *_venv_activate_parts(),
         "&&",
         "python",
         "src/main.py",
         "prepare-sessions",
     ]
     if prepare_source:
-        parts.extend(["--source", shlex.quote(prepare_source)])
+        parts.extend(["--source", _shell_quote(prepare_source)])
     return " ".join(parts), prepare_source
 
 
-def _stage_prepare_sessions(source: str) -> bool:
-    """Open a Terminal window on the Mac and start `prepare-sessions`.
+def _terminal_launch_argv(cmd: str) -> Optional[list[str]]:
+    """Full argv that opens a terminal window running ``cmd``, or None when this
+    platform/session cannot host one.
 
-    Returns True only when the osascript staging command succeeds. A failure is
-    logged and intentionally does not count as a successful notification cycle,
-    so the next watchdog pass may retry staging instead of waiting 12 hours.
+    Availability is probed with ``shutil.which()`` rather than assumed, so a host
+    with no terminal emulator installed reports None up front instead of failing
+    at exec time with ``[Errno 2] No such file or directory``.
+
+    A POSIX run with neither DISPLAY nor WAYLAND_DISPLAY is a headless
+    scheduler run: there is no desktop to draw a window on, so staging is
+    reported unsupported and the caller escalates over a messaging channel.
     """
-    if sys.platform != "darwin":
-        _log.info("session_watchdog.stage_terminal_unavailable source=%s platform=%s", source, sys.platform)
-        try:
-            from .notifier import record_secondary_condition
-            record_secondary_condition(
-                "session_recovery_required",
-                "notification_unavailable",
-                "platform_notification",
-                dedupe_key=f"session-stage:{source}",
-            )
-        except Exception:
-            pass
-        return False
+    if sys.platform == "darwin":
+        osascript = shutil.which("osascript")
+        if not osascript:
+            return None
+        return [osascript, "-e", f'tell application "Terminal" to do script {json.dumps(cmd)}']
+
+    if sys.platform == "win32":
+        comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
+        if not comspec:
+            return None
+        # `start "" cmd /k` opens a new console that stays up once the command
+        # finishes, so the human can read the result the way Terminal.app behaves.
+        return [comspec, "/c", "start", "", "cmd", "/k", cmd]
+
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return None
+    # `source` is a bash/zsh builtin, so the staged command needs bash — without
+    # it the window would open only to fail on venv activation.
+    shell = shutil.which("bash")
+    if not shell:
+        return None
+    for exe, command_flag in _TERMINAL_EMULATORS:
+        resolved = shutil.which(exe)
+        if resolved:
+            return [resolved, command_flag, shell, "-lc", cmd]
+    return None
+
+
+def _stage_prepare_sessions(source: str) -> StagingResult:
+    """Open a terminal window on this host and start `prepare-sessions`.
+
+    `staged` is True only when the launcher exited cleanly. A launcher that
+    exists but fails is a transient error and intentionally does not count as a
+    successful notification cycle, so the next watchdog pass may retry staging
+    instead of waiting 12 hours.
+
+    `supported` is False when the host has no terminal to launch at all. That is
+    not retryable, so the caller must escalate to a messaging channel rather than
+    silently dropping the alert.
+    """
     cmd, prepare_source = _prepare_sessions_command(source)
     if prepare_source != (source or "").strip().lower():
         _log.info(
@@ -426,12 +525,19 @@ def _stage_prepare_sessions(source: str) -> bool:
             source,
             prepare_source or "all",
         )
-    script = f'tell application "Terminal" to do script {json.dumps(cmd)}'
+    argv = _terminal_launch_argv(cmd)
+    if argv is None:
+        _log.info(
+            "session_watchdog.stage_terminal_unsupported source=%s platform=%s",
+            source,
+            sys.platform,
+        )
+        return StagingResult(staged=False, supported=False, detail="no_terminal_available")
     try:
-        result = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10, text=True)
+        result = subprocess.run(argv, capture_output=True, timeout=10, text=True)
     except Exception as exc:
         _log.warning("session_watchdog.stage_terminal_failed source=%s error=%s", source, exc)
-        return False
+        return StagingResult(staged=False, supported=True, detail=str(exc)[:200])
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         _log.warning(
@@ -440,16 +546,25 @@ def _stage_prepare_sessions(source: str) -> bool:
             result.returncode,
             stderr,
         )
-        return False
-    return True
+        return StagingResult(staged=False, supported=True, detail=stderr[:200])
+    return StagingResult(staged=True, supported=True)
 
 
 def _send_deep_link_notification(source: str, message: str) -> None:
-    """Stage reauth and send one durable, rate-limited human escalation.
+    """Stage reauth where a terminal exists, then send one durable, rate-limited
+    human escalation.
 
-    Staging happens before delivery so a failed Terminal launch does not send a
-    link to a flow that is not ready. A failed stage also does not consume the
-    dedupe window, allowing the next watchdog pass to retry.
+    On a host that can open a terminal, staging happens before delivery so a
+    failed launch does not send a link to a flow that is not ready. A failed
+    stage also does not consume the dedupe window, allowing the next watchdog
+    pass to retry.
+
+    On a host that cannot open a terminal at all — the headless scheduler case,
+    which is how this agent actually runs — there is nothing to retry. The
+    escalation is still delivered over Telegram and the desktop, carrying the
+    manual remediation command, and the missing terminal is recorded as a
+    secondary condition so a staging gap never masks the primary session
+    failure.
     """
     prepare_source = _prepare_sessions_source(source)
     deep_link = "jobagent://prepare-sessions"
@@ -467,17 +582,43 @@ def _send_deep_link_notification(source: str, message: str) -> None:
             _send_telegram,
             notification_dedupe_active,
             record_notification_dedupe,
+            record_secondary_condition,
         )
 
         key = f"deep_link:{source}"
         if notification_dedupe_active(key, 12 * 3600):
             return
-        if not _stage_prepare_sessions(source):
-            return
 
+        staging = _stage_prepare_sessions(source)
+        if staging.supported and not staging.staged:
+            return
+        if not staging.supported:
+            manual_cmd, _ = _prepare_sessions_command(source)
+            link_lines.append(f"No terminal on this host — run manually:\n  {manual_cmd}")
+            full_msg = f"{message}\n\n" + "\n".join(link_lines)
+
+        # Deliver before any status-file bookkeeping. `_save_status` does not
+        # catch write errors, so recording the secondary condition first meant a
+        # full or unwritable disk raised into the handler below and dropped the
+        # alert entirely — recreating the exact failure this function exists to
+        # prevent. The desktop channel gets the full text too, so an operator on
+        # a graphical host still sees the manual command when Telegram is
+        # unconfigured or unreachable.
         _send_telegram(full_msg)
-        _desktop_notify(f"{source} session needs refresh", message)
+        _desktop_notify(f"{source} session needs refresh", full_msg)
         record_notification_dedupe(key)
+        if not staging.supported:
+            try:
+                record_secondary_condition(
+                    "session_recovery_required",
+                    "terminal_staging_unavailable",
+                    "prepare_sessions_terminal",
+                    dedupe_key=f"session-stage:{source}",
+                )
+            except Exception as exc:  # noqa: BLE001 — evidence must not undo delivery
+                _log.warning(
+                    "session_watchdog.secondary_condition_failed source=%s error=%s", source, exc
+                )
     except Exception as exc:
         _log.warning("session_watchdog.notify_failed source=%s error=%s", source, exc)
         console.print(f"[yellow]Session alert ({source}):[/yellow] {message}\n{full_msg}")

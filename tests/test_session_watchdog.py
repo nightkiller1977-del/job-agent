@@ -16,7 +16,14 @@ from src.session_watchdog import (
     _prepare_sessions_source,
     _prepare_sessions_command,
     _stage_prepare_sessions,
+    _venv_activate_parts,
+    _shell_quote,
+    StagingResult,
 )
+
+_STAGED = StagingResult(staged=True, supported=True)
+_STAGE_FAILED = StagingResult(staged=False, supported=True, detail="launcher failed")
+_STAGE_UNSUPPORTED = StagingResult(staged=False, supported=False, detail="no_terminal_available")
 
 def test_parse_linkedin_expiry_expired():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -102,8 +109,29 @@ def _fake_run(returncode=0, stdout="", stderr=""):
 
 def _osascript_from_run(mock_run):
     args = mock_run.call_args[0][0]
-    assert args[:2] == ["osascript", "-e"]
+    assert Path(args[0]).name == "osascript"
+    assert args[1] == "-e"
     return args[2]
+
+
+def _fake_which(*available: str):
+    """shutil.which stub: resolve only the named executables, to a fake abs path.
+
+    Terminal-launcher resolution must be driven by the test, never by whatever
+    happens to be installed on the machine running the suite.
+    """
+    allowed = set(available)
+
+    def which(name, *args, **kwargs):
+        return f"/usr/bin/{name}" if name in allowed else None
+
+    return which
+
+
+def _headless(monkeypatch):
+    """Strip the desktop-session markers so POSIX staging is unsupported."""
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
 
 
 def test_resolve_tailscale_ip_success_on_first_candidate():
@@ -175,8 +203,9 @@ def test_prepare_sessions_command_omits_unknown_source():
 
 def test_stage_prepare_sessions_omits_jobspy_backed_source_filter(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which("osascript"))
     with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
-        assert _stage_prepare_sessions("glassdoor") is True
+        assert _stage_prepare_sessions("glassdoor") == StagingResult(staged=True, supported=True)
     script = _osascript_from_run(mock_run)
     assert "prepare-sessions" in script
     assert "--source" not in script
@@ -184,48 +213,241 @@ def test_stage_prepare_sessions_omits_jobspy_backed_source_filter(monkeypatch):
     assert "jobright" not in script
 
 
-def test_linux_session_notification_records_deduped_secondary_without_osascript(tmp_path, monkeypatch):
+def test_headless_session_notification_still_delivers_with_manual_command(tmp_path, monkeypatch):
+    """A host with no terminal must still reach the human — the old code returned
+    early here, so 205 live apply attempts produced zero delivered session alerts."""
     monkeypatch.setattr(sys, "platform", "linux")
+    _headless(monkeypatch)
     monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
-    with patch("src.session_watchdog._novnc_link", return_value=None), patch("src.session_watchdog.subprocess.run") as run:
+    sent = []
+    with patch("src.session_watchdog._novnc_link", return_value=None), \
+         patch("src.session_watchdog.subprocess.run") as run, \
+         patch("src.notifier._send_telegram", side_effect=lambda m: sent.append(m)), \
+         patch("src.notifier._desktop_notify") as desktop, \
+         patch("src.notifier._last_notification_times", {}):
         _send_deep_link_notification("linkedin", "session expired")
         _send_deep_link_notification("linkedin", "session expired")
 
     assert not run.called
+    # Delivered exactly once — the 12h dedupe still applies.
+    assert len(sent) == 1
+    assert desktop.call_count == 1
+    assert "python src/main.py prepare-sessions --source linkedin" in sent[0]
+    assert "No terminal on this host" in sent[0]
+    # The desktop popup carries the manual command too, so an operator on a
+    # graphical host is not left with an unactionable popup when Telegram is
+    # unconfigured.
+    assert "prepare-sessions --source linkedin" in desktop.call_args.args[1]
+
     status = json.loads((tmp_path / "status.json").read_text())
     conditions = status["secondary_conditions"]
     assert len(conditions) == 1
     assert conditions[0]["primary_kind"] == "session_recovery_required"
-    assert conditions[0]["kind"] == "notification_unavailable"
+    assert conditions[0]["kind"] == "terminal_staging_unavailable"
+    assert conditions[0]["operation"] == "prepare_sessions_terminal"
+
+
+def test_unwritable_status_file_cannot_suppress_the_alert(tmp_path, monkeypatch):
+    """Bookkeeping must never undo delivery. `_save_status` does not catch write
+    errors, so recording the secondary condition before sending meant a full or
+    unwritable disk dropped the alert — the very failure this path prevents."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    _headless(monkeypatch)
+    monkeypatch.setattr("src.notifier.STATUS_FILE", tmp_path / "status.json")
+    sent = []
+    with patch("src.session_watchdog._novnc_link", return_value=None), \
+         patch("src.session_watchdog.subprocess.run"), \
+         patch("src.notifier.record_secondary_condition",
+               side_effect=OSError("No space left on device")), \
+         patch("src.notifier._send_telegram", side_effect=lambda m: sent.append(m)), \
+         patch("src.notifier._desktop_notify") as desktop, \
+         patch("src.notifier._last_notification_times", {}):
+        _send_deep_link_notification("linkedin", "session expired")
+
+    assert len(sent) == 1
+    assert "prepare-sessions --source linkedin" in sent[0]
+    assert desktop.call_count == 1
+
 
 def test_stage_prepare_sessions_keeps_supported_source_filter(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which("osascript"))
     with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
-        assert _stage_prepare_sessions("linkedin") is True
+        assert _stage_prepare_sessions("linkedin").staged is True
 
     script = _osascript_from_run(mock_run)
     assert "prepare-sessions --source linkedin" in script
 
 
-def test_stage_prepare_sessions_returns_false_on_osascript_failure(monkeypatch):
+def test_stage_prepare_sessions_reports_retryable_failure_on_osascript_failure(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which("osascript"))
     with patch(
         "src.session_watchdog.subprocess.run",
         return_value=_fake_run(1, stderr="not authorized"),
     ):
-        assert _stage_prepare_sessions("linkedin") is False
+        result = _stage_prepare_sessions("linkedin")
+
+    # A launcher that exists but fails is transient: supported, so the caller
+    # retries next pass instead of burning the dedupe window.
+    assert result.staged is False
+    assert result.supported is True
+    assert "not authorized" in result.detail
 
 
-def test_stage_prepare_sessions_does_not_call_osascript_on_linux(monkeypatch):
-    monkeypatch.setattr(sys, "platform", "linux")
+def test_stage_prepare_sessions_unsupported_when_darwin_lacks_osascript(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which())
     with patch("src.session_watchdog.subprocess.run") as mock_run:
-        assert _stage_prepare_sessions("linkedin") is False
+        result = _stage_prepare_sessions("linkedin")
+
+    assert result == StagingResult(staged=False, supported=False, detail="no_terminal_available")
     mock_run.assert_not_called()
+
+
+def test_stage_prepare_sessions_never_calls_osascript_on_linux(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which("xterm", "bash"))
+    with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
+        assert _stage_prepare_sessions("linkedin").staged is True
+
+    argv = mock_run.call_args[0][0]
+    assert "osascript" not in " ".join(argv)
+
+
+def test_stage_prepare_sessions_launches_detected_linux_terminal(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which("gnome-terminal", "bash"))
+    with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
+        assert _stage_prepare_sessions("linkedin").staged is True
+
+    argv = mock_run.call_args[0][0]
+    assert argv[:4] == ["/usr/bin/gnome-terminal", "--", "/usr/bin/bash", "-lc"]
+    assert "prepare-sessions --source linkedin" in argv[4]
+
+
+def test_stage_prepare_sessions_prefers_configured_default_terminal(monkeypatch):
+    """x-terminal-emulator is the user's own Debian alternative — honour it before
+    guessing at a specific emulator."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(
+        "src.session_watchdog.shutil.which",
+        _fake_which("x-terminal-emulator", "gnome-terminal", "xterm", "bash"),
+    )
+    with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
+        assert _stage_prepare_sessions("linkedin").staged is True
+
+    argv = mock_run.call_args[0][0]
+    assert argv[0] == "/usr/bin/x-terminal-emulator"
+    assert argv[1] == "-e"
+
+
+def test_stage_prepare_sessions_unsupported_on_headless_posix(monkeypatch):
+    """The production failure mode: scheduler run, terminal installed, no desktop."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    _headless(monkeypatch)
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which("gnome-terminal", "bash"))
+    with patch("src.session_watchdog.subprocess.run") as mock_run:
+        result = _stage_prepare_sessions("linkedin")
+
+    assert result.supported is False
+    mock_run.assert_not_called()
+
+
+def test_stage_prepare_sessions_unsupported_when_no_terminal_emulator(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which("bash"))
+    with patch("src.session_watchdog.subprocess.run") as mock_run:
+        assert _stage_prepare_sessions("linkedin").supported is False
+    mock_run.assert_not_called()
+
+
+def test_stage_prepare_sessions_unsupported_without_bash(monkeypatch):
+    """`source .venv/bin/activate` is a bash builtin — opening a window that
+    cannot activate the venv is worse than reporting the gap."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which("xterm"))
+    with patch("src.session_watchdog.subprocess.run") as mock_run:
+        assert _stage_prepare_sessions("linkedin").supported is False
+    mock_run.assert_not_called()
+
+
+def test_stage_prepare_sessions_uses_windows_console(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which())
+    with patch("src.session_watchdog.subprocess.run", return_value=_fake_run(0)) as mock_run:
+        assert _stage_prepare_sessions("linkedin").staged is True
+
+    argv = mock_run.call_args[0][0]
+    assert argv[:6] == [r"C:\Windows\System32\cmd.exe", "/c", "start", "", "cmd", "/k"]
+    assert r"call .venv\Scripts\activate.bat" in argv[6]
+    assert argv[6].endswith('prepare-sessions --source "linkedin"')
+    assert "'" not in argv[6]
+
+
+def test_stage_prepare_sessions_unsupported_on_windows_without_comspec(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("COMSPEC", raising=False)
+    monkeypatch.setattr("src.session_watchdog.shutil.which", _fake_which())
+    with patch("src.session_watchdog.subprocess.run") as mock_run:
+        assert _stage_prepare_sessions("linkedin").supported is False
+    mock_run.assert_not_called()
+
+
+def test_venv_activate_parts_are_platform_specific(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert _venv_activate_parts() == ["source", ".venv/bin/activate"]
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert _venv_activate_parts() == ["source", ".venv/bin/activate"]
+    monkeypatch.setattr(sys, "platform", "win32")
+    # `call` so control returns to the chained `&& python ...`.
+    assert _venv_activate_parts() == ["call", r".venv\Scripts\activate.bat"]
+
+
+def test_shell_quote_uses_cmd_rules_on_windows(monkeypatch):
+    """shlex.quote wraps anything containing a backslash in SINGLE quotes, which
+    cmd.exe does not strip. Every Windows path has backslashes, so using it there
+    produced a command that always failed, not just one that broke on spaces."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert _shell_quote(r"C:\Users\me\job agent") == '"C:\\Users\\me\\job agent"'
+    assert "'" not in _shell_quote(r"C:\Users\me\job-agent")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert _shell_quote("/home/me/job agent") == "'/home/me/job agent'"
+
+
+def test_prepare_sessions_command_is_cmd_compatible_on_windows(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    cmd, mapped = _prepare_sessions_command("linkedin")
+
+    assert mapped == "linkedin"
+    # `cd` alone does not switch drive on Windows.
+    assert cmd.startswith('cd /d "')
+    assert "'" not in cmd
+    assert r"call .venv\Scripts\activate.bat" in cmd
+    assert cmd.endswith('prepare-sessions --source "linkedin"')
+
+
+def test_prepare_sessions_command_keeps_posix_form_off_windows(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    cmd, _ = _prepare_sessions_command("linkedin")
+
+    assert cmd.startswith("cd ")
+    assert "/d" not in cmd.split("&&")[0]
+    assert "source .venv/bin/activate" in cmd
+    assert cmd.endswith("prepare-sessions --source linkedin")
 
 
 def test_send_deep_link_notification_includes_novnc_link_when_available(tmp_path):
     with patch("src.session_watchdog._novnc_link", return_value="http://100.64.1.2:6080/vnc.html?autoconnect=true"), \
-         patch("src.session_watchdog._stage_prepare_sessions", return_value=True) as mock_stage, \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=_STAGED) as mock_stage, \
          patch("src.notifier.STATUS_FILE", tmp_path / "status.json"), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
@@ -242,7 +464,7 @@ def test_send_deep_link_notification_includes_novnc_link_when_available(tmp_path
 
 def test_send_deep_link_notification_omits_jobspy_backed_deep_link_source(tmp_path):
     with patch("src.session_watchdog._novnc_link", return_value=None), \
-         patch("src.session_watchdog._stage_prepare_sessions", return_value=True), \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=_STAGED), \
          patch("src.notifier.STATUS_FILE", tmp_path / "status.json"), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
@@ -256,7 +478,7 @@ def test_send_deep_link_notification_omits_jobspy_backed_deep_link_source(tmp_pa
 
 def test_send_deep_link_notification_omits_novnc_link_when_unresolvable(tmp_path):
     with patch("src.session_watchdog._novnc_link", return_value=None), \
-         patch("src.session_watchdog._stage_prepare_sessions", return_value=True), \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=_STAGED), \
          patch("src.notifier.STATUS_FILE", tmp_path / "status.json"), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
@@ -272,7 +494,7 @@ def test_send_deep_link_notification_omits_novnc_link_when_unresolvable(tmp_path
 def test_send_deep_link_notification_respects_rate_limit(tmp_path):
     cache = {}
     with patch("src.session_watchdog._novnc_link", return_value=None), \
-         patch("src.session_watchdog._stage_prepare_sessions", return_value=True) as mock_stage, \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=_STAGED) as mock_stage, \
          patch("src.notifier.STATUS_FILE", tmp_path / "status.json"), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
@@ -288,7 +510,7 @@ def test_send_deep_link_notification_retries_staging_without_sending_when_stage_
     cache = {}
     status_file = tmp_path / "status.json"
     with patch("src.session_watchdog._novnc_link", return_value=None), \
-         patch("src.session_watchdog._stage_prepare_sessions", return_value=False) as mock_stage, \
+         patch("src.session_watchdog._stage_prepare_sessions", return_value=_STAGE_FAILED) as mock_stage, \
          patch("src.notifier.STATUS_FILE", status_file), \
          patch("src.notifier._send_telegram") as mock_send, \
          patch("src.notifier._desktop_notify"), \
