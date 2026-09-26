@@ -19,10 +19,19 @@ Contract (mirrors the email-agent/Node and Go implementations):
   over failed sends.
 * Default policy: remote export auto-enables in production and is off in
   dev/test unless ``OBSERVABILITY_REMOTE=1``. ``OBSERVABILITY_REMOTE=0`` opts
-  out even in production. Production is detected via the ``RENDER`` env var,
-  which Render sets on every service it runs (this repo's ``render.yaml``
-  defines no explicit mode variable). Local Loki logging (``LOKI_URL``) is
-  independent of this policy and unchanged.
+  out even in production. Production is detected via a present, truthy
+  ``RENDER`` env var (which Render used to set on every service it ran; this
+  repo's ``render.yaml`` defines no explicit mode variable), or via
+  ``CONTAINER_APP_NAME`` — which Azure Container Apps injects into every
+  revision automatically (see
+  https://learn.microsoft.com/azure/container-apps/environment-variables#built-in-environment-variables),
+  giving a real positive signal on the live post-Render-migration deployment
+  (ACES-461) without requiring a permanent ``OBSERVABILITY_REMOTE=1`` opt-in.
+  An environment with neither signal — including an ordinary local/dev/test
+  run, where central-store credential fill can still populate a valid
+  ``LOKI_URL_REMOTE``/``LOKI_REMOTE_AUTH`` pair — still defaults to
+  non-production. Local Loki logging (``LOKI_URL``) is independent of this
+  policy and unchanged.
 """
 from __future__ import annotations
 
@@ -95,9 +104,13 @@ def _valid_push_url(url: str) -> bool:
 
 
 def is_production(env: os._Environ | dict | None = None) -> bool:
-    """Render sets ``RENDER`` on every service (documented in loki_config)."""
+    """A truthy ``RENDER`` or ``CONTAINER_APP_NAME`` (auto-set by Azure
+    Container Apps on every revision) are explicit signals. Nothing
+    recognized — including an ordinary local/dev/test run — stays
+    non-production.
+    """
     env = os.environ if env is None else env
-    return bool(env.get("RENDER"))
+    return bool(env.get("RENDER")) or bool(env.get("CONTAINER_APP_NAME"))
 
 
 def _disabled(reason: str, *, warn: bool = True) -> LokiConfig:

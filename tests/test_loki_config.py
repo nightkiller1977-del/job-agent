@@ -73,12 +73,42 @@ class PairResolutionTests(unittest.TestCase):
         self.assertNotIn("SECRETVALUE", "\n".join(captured.output))
 
 
+class IsProductionTests(unittest.TestCase):
+    """ACES-461: CONTAINER_APP_NAME (Azure's auto-injected signal) is now
+    also explicit production; nothing recognized — including an ordinary
+    local/dev run — stays non-production."""
+
+    def test_missing_all_signals_stays_non_production(self):
+        self.assertFalse(loki_config.is_production({}))
+
+    def test_render_present_and_truthy_is_still_production(self):
+        self.assertTrue(loki_config.is_production({"RENDER": "true"}))
+
+    def test_render_present_but_falsy_is_still_non_production(self):
+        self.assertFalse(loki_config.is_production({"RENDER": ""}))
+
+    def test_container_app_name_present_is_production(self):
+        self.assertTrue(loki_config.is_production({"CONTAINER_APP_NAME": "job-agent-dashboard"}))
+
+
 class PolicyTests(unittest.TestCase):
-    def test_dev_test_off_by_default(self):
+    def test_missing_all_signals_stays_non_production_default_off(self):
         with patch.dict(os.environ, {"LOKI_URL_REMOTE": URL, "LOKI_REMOTE_AUTH": AUTH}, clear=True):
             config = loki_config.resolve_loki_config()
         self.assertFalse(config.enabled)
         self.assertEqual(config.reason, "non_production_default_off")
+
+    def test_render_present_but_falsy_stays_non_production_default_off(self):
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": URL, "LOKI_REMOTE_AUTH": AUTH, "RENDER": ""}, clear=True):
+            config = loki_config.resolve_loki_config()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.reason, "non_production_default_off")
+
+    def test_container_app_name_auto_on(self):
+        # ACES-461: the real Azure Container Apps signal must auto-enable a
+        # valid pair without requiring a manual OBSERVABILITY_REMOTE=1.
+        with patch.dict(os.environ, {"LOKI_URL_REMOTE": URL, "LOKI_REMOTE_AUTH": AUTH, "CONTAINER_APP_NAME": "job-agent-dashboard"}, clear=True):
+            self.assertTrue(loki_config.resolve_loki_config().enabled)
 
     def test_dev_test_on_with_explicit_opt_in(self):
         with patch.dict(os.environ, {"LOKI_URL_REMOTE": URL, "LOKI_REMOTE_AUTH": AUTH, "OBSERVABILITY_REMOTE": "1"}, clear=True):
