@@ -2949,8 +2949,9 @@ class JobrightScraper(BaseScraper):
                     diag.next_data_parsed = true;
                     const pageProps = nd?.props?.pageProps || {};
                     if (typeof pageProps.logined === 'boolean') diag.logined = pageProps.logined;
-                    const job = pageProps.job || pageProps.jobDetail || pageProps.jobInfo;
-                    diag.known_field_found = !!job;
+                    const jobFields = ['job', 'jobDetail', 'jobInfo'];
+                    diag.known_field_found = jobFields.some(key => Object.prototype.hasOwnProperty.call(pageProps, key));
+                    const job = jobFields.map(key => pageProps[key]).find(value => value && typeof value === 'object') || {};
                     const url = (job || {}).externalApplyLink || (job || {}).applyUrl || (job || {}).apply_url
                               || (job || {}).externalUrl || (job || {}).applicationUrl;
                     if (url && !url.includes('jobright.ai')) { diag.url = url; return diag; }
